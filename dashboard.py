@@ -439,7 +439,7 @@ function fmtUptime(s) {
   const sec = Math.floor(s % 60);
   return h + 'h ' + m + 'm ' + sec + 's';
 }
-// Local uptime ticker -- increments between server updates
+// Local uptime ticker -- set base once, tick locally, resync only on bot restart
 let _lastServerUptime = 0;
 let _lastServerUptimeAt = 0;
 setInterval(function() {
@@ -1007,9 +1007,12 @@ function update(data) {
   } else {
     badge.textContent = 'LIVE'; badge.className = 'badge badge-live';
   }
-  _lastServerUptime = data.uptime;
-  _lastServerUptimeAt = Date.now();
-  document.getElementById('uptime').textContent = 'Up ' + fmtUptime(data.uptime);
+  // Only set base once, or resync if bot restarted (uptime dropped)
+  if (!_lastServerUptimeAt || data.uptime < _lastServerUptime) {
+    _lastServerUptime = data.uptime;
+    _lastServerUptimeAt = Date.now();
+    document.getElementById('uptime').textContent = 'Up ' + fmtUptime(data.uptime);
+  }
 
   // Cards
   const p = data.price;

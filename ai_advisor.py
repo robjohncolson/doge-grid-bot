@@ -149,7 +149,7 @@ REASON: [One sentence explanation]"""
 # API call (parameterized for each panelist)
 # ---------------------------------------------------------------------------
 
-def _call_panelist(prompt: str, panelist: dict) -> str:
+def _call_panelist(prompt: str, panelist: dict) -> tuple:
     """
     Call a single AI panelist and return the raw response text.
 
@@ -157,8 +157,12 @@ def _call_panelist(prompt: str, panelist: dict) -> str:
     Handles reasoning models (Kimi K2.5) that may put the answer
     in reasoning_content instead of content.
 
-    Returns the assistant's response text, or empty string on failure.
+    Returns (response_text, error_string).  On success error is "".
+    On failure response_text is "" and error describes what went wrong.
     """
+    # Reasoning models (chain-of-thought) need longer timeouts
+    timeout = 60 if panelist.get("reasoning") else 30
+
     payload = json.dumps({
         "model": panelist["model"],
         "messages": [
@@ -186,7 +190,7 @@ def _call_panelist(prompt: str, panelist: dict) -> str:
     req = urllib.request.Request(panelist["url"], data=payload, headers=headers)
 
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = json.loads(resp.read().decode("utf-8"))
             choices = body.get("choices", [])
             if choices:
@@ -197,23 +201,23 @@ def _call_panelist(prompt: str, panelist: dict) -> str:
                 content = msg.get("content")
                 if not content:
                     content = msg.get("reasoning_content")
-                return content.strip() if content else ""
-            return ""
+                return (content.strip(), "") if content else ("", "Empty response body")
+            return ("", "No choices in response")
 
     except urllib.error.HTTPError as e:
         error_body = e.read().decode("utf-8", errors="replace")
         logger.warning(
             "%s HTTP %d: %s", panelist["name"], e.code, error_body[:200],
         )
-        return ""
+        return ("", f"HTTP {e.code}")
 
     except urllib.error.URLError as e:
         logger.warning("%s connection error: %s", panelist["name"], e.reason)
-        return ""
+        return ("", f"Connection error: {e.reason}")
 
     except Exception as e:
         logger.warning("%s error: %s", panelist["name"], e)
-        return ""
+        return ("", str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -427,7 +431,7 @@ def get_recommendation(market_data: dict, stats_context: str = "") -> dict:
 
     for i, panelist in enumerate(panel):
         try:
-            response = _call_panelist(prompt, panelist)
+            response, err = _call_panelist(prompt, panelist)
             if response:
                 parsed = _parse_response(response)
                 parsed["name"] = panelist["name"]
@@ -438,14 +442,15 @@ def get_recommendation(market_data: dict, stats_context: str = "") -> dict:
                     parsed["action"], parsed["reason"],
                 )
             else:
+                error_reason = err or "No response"
                 votes.append({
                     "name": panelist["name"],
                     "condition": "error",
                     "action": "",
-                    "reason": "No response",
+                    "reason": error_reason,
                     "raw": "",
                 })
-                logger.warning("  %s: no response", panelist["name"])
+                logger.warning("  %s: %s", panelist["name"], error_reason)
 
         except Exception as e:
             votes.append({
