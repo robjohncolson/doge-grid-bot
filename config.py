@@ -59,6 +59,11 @@ AI_API_KEY: str = _env("AI_API_KEY", GROQ_API_KEY or NVIDIA_API_KEY)
 TELEGRAM_BOT_TOKEN: str = _env("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID: str = _env("TELEGRAM_CHAT_ID", "")
 
+# Supabase (PostgREST) -- cloud persistence for fills, prices, and state.
+# Free tier PostgreSQL.  If not set, bot runs fine with local CSV/JSON only.
+SUPABASE_URL: str = _env("SUPABASE_URL", "")
+SUPABASE_KEY: str = _env("SUPABASE_KEY", "")
+
 # ---------------------------------------------------------------------------
 # DRY RUN -- the most important toggle
 # ---------------------------------------------------------------------------
@@ -257,6 +262,7 @@ def print_banner():
         f"  NVIDIA key:      {'configured' if NVIDIA_API_KEY else 'NOT SET'}",
         f"  AI fallback:     {'configured' if AI_API_KEY and not GROQ_API_KEY and not NVIDIA_API_KEY else 'N/A'}",
         f"  Telegram:        {'configured' if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID else 'NOT SET'}",
+        f"  Supabase:        {'configured' if SUPABASE_URL and SUPABASE_KEY else 'NOT SET'}",
         "=" * 60,
         "",
     ]

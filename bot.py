@@ -55,6 +55,7 @@ import notifier
 import dashboard
 import stats_engine
 import telegram_menu
+import supabase_store
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -1048,6 +1049,17 @@ def run():
     # Restore counters from previous session (if any)
     grid_strategy.load_state(state)
 
+    # Start Supabase persistence (loads fills/prices if available)
+    supabase_store.start_writer_thread()
+    sb_fills = supabase_store.load_fills()
+    if sb_fills:
+        state.recent_fills = sb_fills
+        logger.info("Restored %d fills from Supabase", len(sb_fills))
+    sb_prices = supabase_store.load_price_history(since=time.time() - 86400)
+    if sb_prices:
+        state.price_history = sb_prices
+        logger.info("Restored %d price samples from Supabase", len(sb_prices))
+
     # Start health check server (Railway expects a listening port)
     health_server = start_health_server()
 
@@ -1104,6 +1116,7 @@ def run():
             try:
                 current_price = kraken_client.get_price()
                 grid_strategy.record_price(state, current_price)
+                supabase_store.queue_price_point(time.time(), current_price)
                 state.consecutive_errors = 0
             except Exception as e:
                 state.consecutive_errors += 1

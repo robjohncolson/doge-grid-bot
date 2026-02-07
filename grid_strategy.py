@@ -34,6 +34,7 @@ from datetime import datetime, timezone
 
 import config
 import kraken_client
+import supabase_store
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +159,8 @@ def save_state(state: GridState):
         logger.debug("State saved to %s", config.STATE_FILE)
     except Exception as e:
         logger.error("Failed to save state: %s", e)
+
+    supabase_store.save_state(snapshot)
 
 
 def load_state(state: GridState) -> bool:
@@ -882,6 +885,7 @@ def handle_fills(state: GridState, filled_orders: list) -> list:
                 "profit": net_profit,
                 "fees": fees,
             })
+            supabase_store.save_fill(state.recent_fills[-1])
 
             logger.info(
                 "  Sell filled at $%.6f -> placing buy at $%.6f",
@@ -926,6 +930,7 @@ def handle_fills(state: GridState, filled_orders: list) -> list:
                 "profit": 0,
                 "fees": buy_fee,
             })
+            supabase_store.save_fill(state.recent_fills[-1])
 
     return new_orders
 
@@ -1182,7 +1187,7 @@ def _ensure_log_dir():
 
 
 def _log_trade(order: GridOrder, net_profit: float, fees: float):
-    """Append a trade record to trades.csv."""
+    """Append a trade record to trades.csv and Supabase."""
     _ensure_log_dir()
     filepath = os.path.join(config.LOG_DIR, "trades.csv")
     file_exists = os.path.exists(filepath)
@@ -1207,9 +1212,11 @@ def _log_trade(order: GridOrder, net_profit: float, fees: float):
     except Exception as e:
         logger.error("Failed to write trade log: %s", e)
 
+    supabase_store.save_trade(order, net_profit, fees)
+
 
 def _log_daily_summary(state: GridState):
-    """Append a daily summary record to daily_summary.csv."""
+    """Append a daily summary record to daily_summary.csv and Supabase."""
     _ensure_log_dir()
     filepath = os.path.join(config.LOG_DIR, "daily_summary.csv")
     file_exists = os.path.exists(filepath)
@@ -1232,6 +1239,8 @@ def _log_daily_summary(state: GridState):
             ])
     except Exception as e:
         logger.error("Failed to write daily summary: %s", e)
+
+    supabase_store.save_daily_summary(state)
 
 
 def get_status_summary(state: GridState, current_price: float) -> str:
