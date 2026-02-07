@@ -554,7 +554,7 @@ def build_grid(state: GridState, current_price: float) -> list:
         current_price, n_buys, n_sells, state.trend_ratio, skipped,
     )
 
-    placed_orders = list(state.grid_orders)  # Keep adopted orders
+    placed_orders = [o for o in state.grid_orders if o.status == "open"]  # Keep adopted orders only
 
     for level_idx, side, price in levels:
         if level_idx in adopted_levels:
