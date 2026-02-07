@@ -103,12 +103,71 @@ class GridState:
         self.price_history: list = []    # List of (timestamp, price) tuples
         self.recent_fills: list = []     # Recent fills for AI context
 
+        # Trend ratio (asymmetric grid)
+        self.trend_ratio = 0.5           # Buy-side fraction (0.0-1.0), 0.5 = symmetric
+        self.last_build_ratio = 0.5      # Ratio used for current grid (for drift detection)
+        self.trend_ratio_override = None # Manual override via /ratio command (None = auto)
+
+
+# ---------------------------------------------------------------------------
+# Trend ratio (asymmetric grid)
+# ---------------------------------------------------------------------------
+
+TREND_WINDOW_SECONDS = 43200  # 12 hours
+
+def update_trend_ratio(state: GridState):
+    """
+    Compute trend ratio from recent fill history.
+
+    Sell fills = price going up = want more buys (buy pullbacks).
+    Raw ratio = sell_count / total.  Confidence-scaled toward 0.5
+    when there are few fills.  Clamped to [0.25, 0.75].
+
+    Skipped if a manual override is active.
+    """
+    if state.trend_ratio_override is not None:
+        return
+
+    now = time.time()
+    cutoff = now - TREND_WINDOW_SECONDS
+
+    buy_count = 0
+    sell_count = 0
+    for f in state.recent_fills:
+        if f.get("time", 0) > cutoff:
+            if f["side"] == "buy":
+                buy_count += 1
+            else:
+                sell_count += 1
+
+    total = buy_count + sell_count
+    if total == 0:
+        new_ratio = 0.5
+    else:
+        raw_ratio = sell_count / total
+        confidence = min(1.0, total / 8)
+        new_ratio = 0.5 + (raw_ratio - 0.5) * confidence
+
+    new_ratio = max(0.25, min(0.75, new_ratio))
+
+    old_ratio = state.trend_ratio
+    state.trend_ratio = new_ratio
+
+    if abs(new_ratio - old_ratio) >= 0.05:
+        logger.info(
+            "Trend ratio: %.2f -> %.2f (%d buys, %d sells in %dh window)",
+            old_ratio, new_ratio, buy_count, sell_count,
+            TREND_WINDOW_SECONDS // 3600,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Grid calculation
 # ---------------------------------------------------------------------------
 
-def calculate_grid_levels(center_price: float) -> list:
+def calculate_grid_levels(center_price: float,
+                          buy_levels: int = None,
+                          sell_levels: int = None) -> list:
     """
     Calculate grid price levels around a center price.
 
@@ -116,18 +175,25 @@ def calculate_grid_levels(center_price: float) -> list:
       Sell levels: +1=0.0909, +2=0.0918, +3=0.0927, +4=0.0936
       Buy levels:  -1=0.0891, -2=0.0882, -3=0.0873, -4=0.0864
 
+    buy_levels/sell_levels override config.GRID_LEVELS for asymmetric grids.
+
     Returns a list of (level_index, side, price) tuples, sorted by price ascending.
     """
+    if buy_levels is None:
+        buy_levels = config.GRID_LEVELS
+    if sell_levels is None:
+        sell_levels = config.GRID_LEVELS
+
     spacing_mult = config.GRID_SPACING_PCT / 100.0
     levels = []
 
     # Buy levels (below center)
-    for i in range(1, config.GRID_LEVELS + 1):
+    for i in range(1, buy_levels + 1):
         price = center_price * (1.0 - spacing_mult * i)
         levels.append((-i, "buy", price))
 
     # Sell levels (above center)
-    for i in range(1, config.GRID_LEVELS + 1):
+    for i in range(1, sell_levels + 1):
         price = center_price * (1.0 + spacing_mult * i)
         levels.append((i, "sell", price))
 
@@ -136,16 +202,69 @@ def calculate_grid_levels(center_price: float) -> list:
     return levels
 
 
+ORDERMIN_DOGE = 13       # Kraken minimum order volume for XDGUSD
+COSTMIN_USD = 0.50       # Kraken minimum order cost for USD pairs
+CAPITAL_BUDGET_PCT = 0.6 # Fraction of starting capital for worst-case buy exposure
+MIN_GRID_LEVELS = 3      # Floor: always at least 6 total orders
+MAX_GRID_LEVELS = 20     # Ceiling: 40 total orders (rate-limit safe at 0.5s each)
+
+
+def adapt_grid_params(state: GridState, current_price: float):
+    """
+    Recalculate ORDER_SIZE_USD and GRID_LEVELS to maximize grid resolution
+    at the current DOGE price while staying within capital constraints.
+
+    Order size hugs Kraken's 13 DOGE minimum (+ 20% buffer).
+    Grid levels fill the remaining capital budget.
+    Profits grow the effective capital, so the grid expands as you earn.
+    """
+    # Order size: 20% above Kraken volume minimum, or cost minimum
+    min_by_volume = ORDERMIN_DOGE * current_price * 1.2
+    order_size = max(min_by_volume, COSTMIN_USD)
+
+    # Effective capital = starting + accumulated profits
+    effective_capital = config.STARTING_CAPITAL + max(0, state.total_profit_usd)
+
+    # Grid levels: fit as many as capital allows
+    # Worst case at max trend ratio (0.75): 75% of total are buys
+    # total = GRID_LEVELS * 2, max_buys = 1.5 * GRID_LEVELS
+    budget = effective_capital * CAPITAL_BUDGET_PCT
+    levels = int(budget / (1.5 * order_size))
+    levels = max(MIN_GRID_LEVELS, min(MAX_GRID_LEVELS, levels))
+
+    old_size = config.ORDER_SIZE_USD
+    old_levels = config.GRID_LEVELS
+    config.ORDER_SIZE_USD = round(order_size, 2)
+    config.GRID_LEVELS = levels
+
+    if abs(config.ORDER_SIZE_USD - old_size) >= 0.01 or config.GRID_LEVELS != old_levels:
+        total = levels * 2
+        worst_case = int(levels * 1.5) * config.ORDER_SIZE_USD
+        logger.info(
+            "Adaptive grid: $%.2f/order (%d DOGE), %d levels (%d total), "
+            "worst-case $%.0f of $%.0f effective capital ($%.0f start + $%.2f profit)",
+            config.ORDER_SIZE_USD,
+            max(ORDERMIN_DOGE, int(config.ORDER_SIZE_USD / current_price)),
+            levels, total, worst_case, effective_capital,
+            config.STARTING_CAPITAL, max(0, state.total_profit_usd),
+        )
+
+
 def calculate_volume_for_price(price: float) -> float:
     """
     Calculate how many DOGE to buy/sell at a given price to match ORDER_SIZE_USD.
+    Enforces Kraken's 13 DOGE minimum -- if ORDER_SIZE_USD is too small at
+    the current price, volume is floored to ORDERMIN_DOGE (order costs more).
 
     Example: at $0.09/DOGE with ORDER_SIZE_USD=$5:
       volume = $5 / $0.09 = 55.56 DOGE
     """
     if price <= 0:
         return 0.0
-    return config.ORDER_SIZE_USD / price
+    volume = config.ORDER_SIZE_USD / price
+    if volume < ORDERMIN_DOGE:
+        volume = float(ORDERMIN_DOGE)
+    return volume
 
 
 # ---------------------------------------------------------------------------
@@ -163,11 +282,23 @@ def build_grid(state: GridState, current_price: float) -> list:
 
     Returns the list of placed GridOrder objects.
     """
+    # Adapt order size and level count for current price and profits
+    adapt_grid_params(state, current_price)
+
     state.center_price = current_price
     state.grid_orders = []
 
-    levels = calculate_grid_levels(current_price)
-    logger.info("Building grid centered at $%.6f with %d levels", current_price, len(levels))
+    # Compute asymmetric level split from trend ratio
+    total = config.GRID_LEVELS * 2
+    n_buys = max(2, min(total - 2, round(total * state.trend_ratio)))
+    n_sells = total - n_buys
+    state.last_build_ratio = state.trend_ratio
+
+    levels = calculate_grid_levels(current_price, buy_levels=n_buys, sell_levels=n_sells)
+    logger.info(
+        "Building grid centered at $%.6f: %d buys + %d sells (ratio=%.2f)",
+        current_price, n_buys, n_sells, state.trend_ratio,
+    )
 
     placed_orders = []
 
@@ -734,11 +865,19 @@ def get_status_summary(state: GridState, current_price: float) -> str:
 
     prefix = "[DRY RUN] " if config.DRY_RUN else ""
 
+    # Trend ratio display
+    ratio = state.trend_ratio
+    total = config.GRID_LEVELS * 2
+    n_buys = max(2, min(total - 2, round(total * ratio)))
+    n_sells = total - n_buys
+    ratio_src = "manual" if state.trend_ratio_override is not None else "auto"
+
     lines = [
         f"{prefix}DOGE Grid Bot Status",
         f"Price: ${current_price:.6f}",
         f"Grid center: ${state.center_price:.6f}",
         f"Open orders: {open_buys} buys + {open_sells} sells = {len(open_orders)}",
+        f"Trend ratio: {ratio:.0%} buy / {1-ratio:.0%} sell (grid: {n_buys}B+{n_sells}S) [{ratio_src}]",
         f"Today: {state.round_trips_today} round trips, ${state.today_profit_usd:.4f} profit",
         f"Lifetime: {state.total_round_trips} round trips, ${state.total_profit_usd:.4f} profit",
         f"Fees paid: ${state.total_fees_usd:.4f}",

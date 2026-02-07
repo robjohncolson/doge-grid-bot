@@ -48,6 +48,7 @@ import kraken_client
 import grid_strategy
 import ai_advisor
 import notifier
+import dashboard
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -109,22 +110,57 @@ APPROVAL_TIMEOUT = 600  # 10 minutes
 # Fixed step for spacing adjustments -- prevents extreme values
 SPACING_STEP_PCT = 0.25
 
+# Pending web config changes -- written by HTTP thread, read by main loop
+_web_config_pending: dict = {}
 
-class HealthHandler(BaseHTTPRequestHandler):
+
+class DashboardHandler(BaseHTTPRequestHandler):
     """
-    Minimal HTTP handler that returns bot status as JSON.
-    Railway pings this to verify the process is alive.
+    HTTP handler for the web dashboard, JSON API, and legacy health check.
+    Replaces the old HealthHandler with full dashboard routes.
     """
 
     def do_GET(self):
-        """Handle GET requests -- return bot health status."""
+        """Route GET requests."""
+        if self.path == "/":
+            self._send_html(dashboard.DASHBOARD_HTML)
+        elif self.path == "/api/status":
+            self._handle_api_status()
+        elif self.path == "/health":
+            self._handle_health()
+        else:
+            self._send_json({"error": "not found"}, 404)
+
+    def do_POST(self):
+        """Route POST requests."""
+        if self.path == "/api/config":
+            self._handle_api_config()
+        else:
+            self._send_json({"error": "not found"}, 404)
+
+    def _handle_api_status(self):
+        """GET /api/status -- full state snapshot for the dashboard."""
+        if not _bot_state:
+            self._send_json({"error": "bot not initialized"}, 503)
+            return
+
+        # Get current price from price history (last recorded)
+        if _bot_state.price_history:
+            current_price = _bot_state.price_history[-1][1]
+        else:
+            current_price = _bot_state.center_price
+
+        data = dashboard.serialize_state(_bot_state, current_price)
+        self._send_json(data)
+
+    def _handle_health(self):
+        """GET /health -- legacy Railway health check (backwards compatible)."""
         status = {
             "status": "healthy" if _bot_healthy else "unhealthy",
             "mode": "dry_run" if config.DRY_RUN else "live",
             "uptime_seconds": int(time.time() - _bot_start_time) if _bot_start_time else 0,
             "pair": config.PAIR_DISPLAY,
         }
-
         if _bot_state:
             status.update({
                 "center_price": _bot_state.center_price,
@@ -135,10 +171,92 @@ class HealthHandler(BaseHTTPRequestHandler):
                 "is_paused": _bot_state.is_paused,
                 "doge_accumulated": round(_bot_state.doge_accumulated, 2),
             })
+        self._send_json(status)
 
-        body = json.dumps(status, indent=2).encode("utf-8")
-        self.send_response(200)
+    def _handle_api_config(self):
+        """POST /api/config -- validate and queue config changes."""
+        global _web_config_pending
+
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length > 0 else {}
+        except (ValueError, json.JSONDecodeError):
+            self._send_json({"error": "invalid JSON"}, 400)
+            return
+
+        errors = []
+        queued = []
+        pending = {}
+
+        # Validate spacing
+        if "spacing" in body:
+            val = body["spacing"]
+            try:
+                val = float(val)
+                floor = config.ROUND_TRIP_FEE_PCT + 0.1
+                if val < floor:
+                    errors.append(f"spacing must be >= {floor:.2f}% (fees + 0.1%)")
+                else:
+                    pending["spacing"] = round(val, 4)
+                    queued.append("spacing")
+            except (ValueError, TypeError):
+                errors.append("spacing must be a number")
+
+        # Validate ratio
+        if "ratio" in body:
+            val = body["ratio"]
+            if isinstance(val, str) and val.lower() == "auto":
+                pending["ratio"] = "auto"
+                queued.append("ratio=auto")
+            else:
+                try:
+                    val = float(val)
+                    if val < 0.25 or val > 0.75:
+                        errors.append("ratio must be between 0.25 and 0.75")
+                    else:
+                        pending["ratio"] = round(val, 4)
+                        queued.append("ratio")
+                except (ValueError, TypeError):
+                    errors.append("ratio must be a number or 'auto'")
+
+        # Validate interval
+        if "interval" in body:
+            try:
+                val = int(body["interval"])
+                if val < 60 or val > 86400:
+                    errors.append("interval must be between 60 and 86400")
+                else:
+                    pending["interval"] = val
+                    queued.append("interval")
+            except (ValueError, TypeError):
+                errors.append("interval must be an integer")
+
+        if errors:
+            self._send_json({"error": "; ".join(errors)}, 400)
+            return
+
+        if not queued:
+            self._send_json({"error": "no valid fields provided"}, 400)
+            return
+
+        # Thread-safe: assign a new dict (atomic in CPython)
+        _web_config_pending = pending
+        self._send_json({"ok": True, "queued": queued})
+
+    def _send_json(self, data, status=200):
+        """Send a JSON response."""
+        body = json.dumps(data, indent=2).encode("utf-8")
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_html(self, html):
+        """Send an HTML response."""
+        body = html.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -155,7 +273,7 @@ def start_health_server():
         return None
 
     try:
-        server = HTTPServer(("0.0.0.0", config.HEALTH_PORT), HealthHandler)
+        server = HTTPServer(("0.0.0.0", config.HEALTH_PORT), DashboardHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         logger.info("Health check server running on port %d", config.HEALTH_PORT)
@@ -191,6 +309,60 @@ def setup_signal_handlers():
     # SIGBREAK is Windows' equivalent of SIGTERM in some contexts
     if hasattr(signal, "SIGBREAK"):
         signal.signal(signal.SIGBREAK, _signal_handler)
+
+
+# ---------------------------------------------------------------------------
+# Web config integration
+# ---------------------------------------------------------------------------
+
+def _apply_web_config(state: grid_strategy.GridState, current_price: float):
+    """
+    Check for pending web config changes and apply them.
+    Called from the main loop each iteration (main thread only).
+    """
+    global _web_config_pending
+
+    if not _web_config_pending:
+        return
+
+    # Copy + clear (atomic read in CPython)
+    pending = _web_config_pending
+    _web_config_pending = {}
+
+    needs_rebuild = False
+
+    # Apply spacing
+    if "spacing" in pending:
+        old = config.GRID_SPACING_PCT
+        config.GRID_SPACING_PCT = pending["spacing"]
+        logger.info("Web dashboard: spacing %.2f%% -> %.2f%%", old, config.GRID_SPACING_PCT)
+        needs_rebuild = True
+
+    # Apply ratio
+    if "ratio" in pending:
+        val = pending["ratio"]
+        if val == "auto":
+            state.trend_ratio_override = None
+            grid_strategy.update_trend_ratio(state)
+            logger.info("Web dashboard: ratio set to auto (%.2f)", state.trend_ratio)
+            needs_rebuild = True
+        else:
+            state.trend_ratio = val
+            state.trend_ratio_override = val
+            logger.info("Web dashboard: ratio manually set to %.2f", val)
+            needs_rebuild = True
+
+    # Apply AI interval (no rebuild needed)
+    if "interval" in pending:
+        old = config.AI_ADVISOR_INTERVAL
+        config.AI_ADVISOR_INTERVAL = pending["interval"]
+        logger.info("Web dashboard: AI interval %ds -> %ds", old, config.AI_ADVISOR_INTERVAL)
+
+    # Rebuild grid if spacing or ratio changed
+    if needs_rebuild:
+        grid_strategy.cancel_grid(state)
+        orders = grid_strategy.build_grid(state, current_price)
+        logger.info("Web dashboard: grid rebuilt -- %d orders around $%.6f", len(orders), current_price)
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +578,8 @@ def _handle_text_commands(state: grid_strategy.GridState, current_price: float,
             _cmd_status(state, current_price)
         elif command == "/spacing":
             _cmd_spacing(state, current_price, arg)
+        elif command == "/ratio":
+            _cmd_ratio(state, current_price, arg)
         elif command == "/help":
             _cmd_help()
         else:
@@ -477,6 +651,72 @@ def _cmd_spacing(state: grid_strategy.GridState, current_price: float, arg: str)
     )
 
 
+def _cmd_ratio(state: grid_strategy.GridState, current_price: float, arg: str):
+    """
+    Handle /ratio command.
+      /ratio        -- show current ratio and fill counts
+      /ratio <0-1>  -- manually set ratio and rebuild
+      /ratio auto   -- clear manual override, return to fill-based
+    """
+    if not arg:
+        # Show current ratio info
+        now = time.time()
+        cutoff = now - grid_strategy.TREND_WINDOW_SECONDS
+        buy_count = sum(1 for f in state.recent_fills
+                        if f.get("time", 0) > cutoff and f["side"] == "buy")
+        sell_count = sum(1 for f in state.recent_fills
+                         if f.get("time", 0) > cutoff and f["side"] == "sell")
+        total_grid = config.GRID_LEVELS * 2
+        n_buys = max(2, min(total_grid - 2, round(total_grid * state.trend_ratio)))
+        n_sells = total_grid - n_buys
+        src = "manual" if state.trend_ratio_override is not None else "auto"
+        notifier._send_message(
+            f"<b>Trend Ratio</b> [{src}]\n\n"
+            f"Ratio: {state.trend_ratio:.2f} ({state.trend_ratio:.0%} buy / {1-state.trend_ratio:.0%} sell)\n"
+            f"Grid split: {n_buys}B + {n_sells}S\n"
+            f"12h fills: {buy_count} buys, {sell_count} sells ({buy_count+sell_count} total)"
+        )
+        return
+
+    if arg.lower() == "auto":
+        state.trend_ratio_override = None
+        grid_strategy.update_trend_ratio(state)
+        logger.info("Trend ratio set to auto (%.2f) via Telegram", state.trend_ratio)
+        grid_strategy.cancel_grid(state)
+        orders = grid_strategy.build_grid(state, current_price)
+        notifier._send_message(
+            f"Ratio set to auto ({state.trend_ratio:.2f})\n"
+            f"Grid rebuilt: {len(orders)} orders around ${current_price:.6f}"
+        )
+        return
+
+    try:
+        value = float(arg)
+    except (ValueError, TypeError):
+        notifier._send_message(
+            "Usage:\n"
+            "/ratio -- show current ratio\n"
+            "/ratio &lt;0.25-0.75&gt; -- set manual ratio\n"
+            "/ratio auto -- return to fill-based"
+        )
+        return
+
+    if value < 0.25 or value > 0.75:
+        notifier._send_message("Ratio must be between 0.25 and 0.75.")
+        return
+
+    state.trend_ratio = value
+    state.trend_ratio_override = value
+    logger.info("Trend ratio manually set to %.2f via Telegram", value)
+
+    grid_strategy.cancel_grid(state)
+    orders = grid_strategy.build_grid(state, current_price)
+    notifier._send_message(
+        f"Ratio manually set to {value:.2f}\n"
+        f"Grid rebuilt: {len(orders)} orders around ${current_price:.6f}"
+    )
+
+
 def _cmd_help():
     """Handle /help -- list available commands."""
     notifier._send_message(
@@ -485,6 +725,7 @@ def _cmd_help():
         "/interval &lt;sec&gt; -- Set AI check interval (60-86400)\n"
         "/check -- Trigger AI check next cycle\n"
         "/spacing &lt;pct&gt; -- Set grid spacing % and rebuild\n"
+        "/ratio -- Show/set trend ratio (asymmetric grid)\n"
         "/help -- This message"
     )
 
@@ -628,6 +869,19 @@ def run():
                 logger.info("Detected %d fill(s)", len(filled))
                 new_orders = grid_strategy.handle_fills(state, filled)
 
+                # Update trend ratio based on fill history
+                grid_strategy.update_trend_ratio(state)
+
+                # Ratio-drift rebuild: if ratio shifted enough, rebuild grid
+                if abs(state.trend_ratio - state.last_build_ratio) >= 0.2:
+                    logger.info(
+                        "Trend ratio drift: %.2f -> %.2f -- rebuilding grid",
+                        state.last_build_ratio, state.trend_ratio,
+                    )
+                    grid_strategy.cancel_grid(state)
+                    orders = grid_strategy.build_grid(state, current_price)
+                    notifier.notify_grid_built(current_price, len(orders))
+
                 # Send notifications for completed round trips
                 for fill_data in state.recent_fills[-len(filled):]:
                     if fill_data.get("profit", 0) != 0:
@@ -680,6 +934,9 @@ def run():
             # --- 4f2: Poll for approval callbacks & check expiry ---
             _check_approval_expiry()
             _poll_and_handle_callbacks(state, current_price)
+
+            # --- 4f3: Apply web dashboard config changes ---
+            _apply_web_config(state, current_price)
 
             # --- 4g: Check DOGE accumulation ---
             excess = grid_strategy.check_accumulation(state)

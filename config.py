@@ -91,23 +91,22 @@ PAIR_DISPLAY: str = "DOGE/USD"
 # Lowering it: fewer orders, less profit, less risk.
 STARTING_CAPITAL: float = _env("STARTING_CAPITAL", 120.0, float)
 
-# Dollar value of each individual grid order.
-# At $5 per order with 8 grid levels, you need $40 in active orders
-# (worst case: all buys fill simultaneously).
-# Raising it: bigger profits per cycle, but faster capital consumption if price dumps.
-# Lowering it: safer but slower to hit the $5/month target.
-ORDER_SIZE_USD: float = _env("ORDER_SIZE_USD", 5.0, float)
+# Dollar value of each individual grid order (initial value).
+# Overridden at each grid build by adapt_grid_params() which sizes orders
+# near Kraken's 13 DOGE minimum for maximum resolution.
+# Set via env var to force a fixed size (adapt will still run but this
+# becomes the starting point before first build).
+ORDER_SIZE_USD: float = _env("ORDER_SIZE_USD", 3.5, float)
 
 # ---------------------------------------------------------------------------
 # Grid geometry
 # ---------------------------------------------------------------------------
 
-# Number of grid levels ABOVE and BELOW the center price.
-# Total orders = GRID_LEVELS * 2.
-# Example: 4 means 4 buy orders below + 4 sell orders above = 8 total.
-# Raising it: catches more price swings, uses more capital.
-# Lowering it: narrower capture range, uses less capital.
-GRID_LEVELS: int = _env("GRID_LEVELS", 4, int)
+# Number of grid levels per side (initial value).
+# Overridden at each grid build by adapt_grid_params() which maximizes
+# levels within capital constraints at the current DOGE price.
+# Total orders = GRID_LEVELS * 2, split by trend ratio.
+GRID_LEVELS: int = _env("GRID_LEVELS", 10, int)
 
 # Percentage gap between adjacent grid levels.
 # At 1.0%: levels are spaced $0.0009 apart when DOGE is $0.09.
@@ -240,8 +239,8 @@ def print_banner():
         f"  Mode:            {mode}",
         f"  Pair:            {PAIR_DISPLAY}",
         f"  Capital:         ${STARTING_CAPITAL:.2f}",
-        f"  Order size:      ${ORDER_SIZE_USD:.2f}",
-        f"  Grid levels:     {GRID_LEVELS} above + {GRID_LEVELS} below = {GRID_LEVELS * 2} orders",
+        f"  Order size:      ${ORDER_SIZE_USD:.2f} (adaptive, min 13 DOGE)",
+        f"  Grid levels:     {GRID_LEVELS} per side (adaptive, recalc each build)",
         f"  Grid spacing:    {GRID_SPACING_PCT:.2f}%",
         f"  Net per cycle:   {GRID_SPACING_PCT - ROUND_TRIP_FEE_PCT:.2f}% (after {ROUND_TRIP_FEE_PCT:.2f}% fees)",
         f"  Stop floor:      ${STOP_FLOOR:.2f}",
