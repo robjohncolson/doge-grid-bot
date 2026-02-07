@@ -1,10 +1,10 @@
 """
-ai_advisor.py -- Hourly market analysis via Groq free tier API.
+ai_advisor.py -- Hourly market analysis via AI API.
 
 HOW THIS WORKS:
   Every hour, the bot:
     1. Gathers market context (price, changes, spread, fill count)
-    2. Sends a compact prompt to Groq's API (Llama 3.1 8B model)
+    2. Sends a compact prompt to an OpenAI-compatible API
     3. Parses the AI's recommendation
     4. Logs it -- does NOT auto-act on it (v1 is advisory only)
 
@@ -13,14 +13,15 @@ HOW THIS WORKS:
     - Trending up (grid might need to shift upward)
     - Trending down (grid might need to shift, or pause if risk is high)
 
-GROQ FREE TIER:
-  - ~30 requests/minute, ~14,400/day
-  - We use 1 request/hour = 24/day (well within limits)
-  - Model: llama-3.1-8b-instant (fast, free)
-  - If Groq fails, we log the error and continue trading -- AI is never a blocker
+SUPPORTED PROVIDERS:
+  - NVIDIA build.nvidia.com (default, free tier, Kimi 2.5)
+  - Groq (free tier, Llama 3.1)
+  - Any OpenAI-compatible endpoint
+
+  If the API call fails, we log and continue. AI is advisory, never blocks trading.
 
 ZERO DEPENDENCIES:
-  Uses urllib.request to POST to Groq's OpenAI-compatible API.
+  Uses urllib.request to POST to the OpenAI-compatible endpoint.
 """
 
 import json
@@ -36,8 +37,7 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# Groq's OpenAI-compatible endpoint
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+# API URL is configured in config.py (supports NVIDIA, Groq, or any OpenAI-compatible endpoint)
 
 
 def _build_prompt(market_data: dict) -> str:
@@ -64,19 +64,20 @@ ACTION: [continue/pause/widen_spacing/tighten_spacing/reset_grid]
 REASON: [One sentence explanation]"""
 
 
-def _call_groq(prompt: str) -> str:
+def _call_ai(prompt: str) -> str:
     """
-    Call Groq's API with a chat completion request.
+    Call the AI API with a chat completion request.
 
+    Supports any OpenAI-compatible endpoint (NVIDIA, Groq, etc.).
     Uses urllib.request -- no external dependencies.
     Returns the assistant's response text, or empty string on failure.
     """
-    if not config.GROQ_API_KEY:
-        logger.debug("Groq API key not set, skipping AI advisor")
+    if not config.AI_API_KEY:
+        logger.debug("AI API key not set, skipping AI advisor")
         return ""
 
     payload = json.dumps({
-        "model": config.GROQ_MODEL,
+        "model": config.AI_MODEL,
         "messages": [
             {
                 "role": "system",
@@ -95,11 +96,11 @@ def _call_groq(prompt: str) -> str:
 
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {config.GROQ_API_KEY}",
+        "Authorization": f"Bearer {config.AI_API_KEY}",
         "User-Agent": "DOGEGridBot/1.0",
     }
 
-    req = urllib.request.Request(GROQ_API_URL, data=payload, headers=headers)
+    req = urllib.request.Request(config.AI_API_URL, data=payload, headers=headers)
 
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -112,15 +113,15 @@ def _call_groq(prompt: str) -> str:
 
     except urllib.error.HTTPError as e:
         error_body = e.read().decode("utf-8", errors="replace")
-        logger.warning("Groq API HTTP %d: %s", e.code, error_body[:200])
+        logger.warning("AI API HTTP %d: %s", e.code, error_body[:200])
         return ""
 
     except urllib.error.URLError as e:
-        logger.warning("Groq API connection error: %s", e.reason)
+        logger.warning("AI API connection error: %s", e.reason)
         return ""
 
     except Exception as e:
-        logger.warning("Groq API unexpected error: %s", e)
+        logger.warning("AI API unexpected error: %s", e)
         return ""
 
 
@@ -206,7 +207,7 @@ def get_recommendation(market_data: dict) -> dict:
 
     try:
         prompt = _build_prompt(market_data)
-        response = _call_groq(prompt)
+        response = _call_ai(prompt)
 
         if not response:
             logger.info("AI advisor: no response (API key missing or call failed)")

@@ -46,9 +46,10 @@ KRAKEN_API_KEY: str = _env("KRAKEN_API_KEY", "")
 # Your Kraken private (secret) key -- base64-encoded by Kraken.
 KRAKEN_API_SECRET: str = _env("KRAKEN_API_SECRET", "")
 
-# Groq free-tier API key for the AI advisor layer.
-# Get one at https://console.groq.com -- the free tier allows ~30 req/min.
-GROQ_API_KEY: str = _env("GROQ_API_KEY", "")
+# AI advisor API key.  Supports any OpenAI-compatible endpoint.
+# Default: NVIDIA build.nvidia.com (free tier with Kimi 2.5).
+# Also works with Groq (GROQ_API_KEY is checked as fallback).
+AI_API_KEY: str = _env("AI_API_KEY", _env("GROQ_API_KEY", ""))
 
 # Telegram bot token (from @BotFather) and your chat ID (from @userinfobot).
 TELEGRAM_BOT_TOKEN: str = _env("TELEGRAM_BOT_TOKEN", "")
@@ -209,14 +210,18 @@ LOG_DIR: str = _env("LOG_DIR", "logs")
 HEALTH_PORT: int = _env("PORT", _env("HEALTH_PORT", 8080, int), int)
 
 # ---------------------------------------------------------------------------
-# Groq model selection
+# AI advisor settings
 # ---------------------------------------------------------------------------
 
+# OpenAI-compatible API endpoint for the AI advisor.
+# Default: NVIDIA build.nvidia.com (free tier).
+# Alternative: "https://api.groq.com/openai/v1/chat/completions" (Groq)
+AI_API_URL: str = _env("AI_API_URL", "https://integrate.api.nvidia.com/v1/chat/completions")
+
 # Which model to use for the AI advisor.
-# "llama-3.1-8b-instant" is fast and free.  Alternatives:
-#   "llama-3.1-70b-versatile" -- smarter but slower, still free tier
-#   "mixtral-8x7b-32768"     -- good at structured output
-GROQ_MODEL: str = _env("GROQ_MODEL", "llama-3.1-8b-instant")
+# Default: "moonshotai/kimi-k2.5" on NVIDIA (free tier).
+# Groq alternatives: "llama-3.1-8b-instant", "llama-3.1-70b-versatile"
+AI_MODEL: str = _env("AI_MODEL", "moonshotai/kimi-k2.5")
 
 # ---------------------------------------------------------------------------
 # Startup banner -- printed when the bot launches
@@ -245,7 +250,8 @@ def print_banner():
         f"  Health port:     {HEALTH_PORT}",
         f"  Log level:       {LOG_LEVEL}",
         f"  Kraken key:      {'configured' if KRAKEN_API_KEY else 'NOT SET'}",
-        f"  Groq key:        {'configured' if GROQ_API_KEY else 'NOT SET'}",
+        f"  AI model:        {AI_MODEL}",
+        f"  AI key:          {'configured' if AI_API_KEY else 'NOT SET'}",
         f"  Telegram:        {'configured' if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID else 'NOT SET'}",
         "=" * 60,
         "",
