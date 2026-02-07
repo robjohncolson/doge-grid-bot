@@ -436,8 +436,18 @@ function fmtTime(ts) {
 function fmtUptime(s) {
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
-  return h + 'h ' + m + 'm';
+  const sec = Math.floor(s % 60);
+  return h + 'h ' + m + 'm ' + sec + 's';
 }
+// Local uptime ticker -- increments between server updates
+let _lastServerUptime = 0;
+let _lastServerUptimeAt = 0;
+setInterval(function() {
+  if (!_lastServerUptimeAt) return;
+  const elapsed = (Date.now() - _lastServerUptimeAt) / 1000;
+  const current = _lastServerUptime + elapsed;
+  document.getElementById('uptime').textContent = 'Up ' + fmtUptime(current);
+}, 1000);
 
 // === Chart rendering ===
 
@@ -997,6 +1007,8 @@ function update(data) {
   } else {
     badge.textContent = 'LIVE'; badge.className = 'badge badge-live';
   }
+  _lastServerUptime = data.uptime;
+  _lastServerUptimeAt = Date.now();
   document.getElementById('uptime').textContent = 'Up ' + fmtUptime(data.uptime);
 
   // Cards
