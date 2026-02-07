@@ -1,0 +1,19 @@
+# Railway deployment configuration
+# This tells Railway how to run the bot as a worker process.
+
+[build]
+# No build step needed — pure Python, no dependencies to install.
+builder = "nixpacks"
+
+[deploy]
+# Run the bot as a long-running worker process.
+startCommand = "python bot.py"
+
+# Health check — Railway pings this to know the process is alive.
+# The bot runs a tiny HTTP server on $PORT that returns status JSON.
+healthcheckPath = "/"
+healthcheckTimeout = 30
+
+# Restart policy — always restart if the bot crashes.
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

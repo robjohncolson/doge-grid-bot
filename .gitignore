@@ -1,0 +1,23 @@
+# Environment variables (NEVER commit secrets)
+.env
+
+# Trade logs (generated at runtime)
+logs/
+*.csv
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
