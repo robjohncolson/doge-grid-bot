@@ -262,6 +262,41 @@ a{color:#58a6ff}
 .audio-btn{background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;padding:4px 10px;font-size:16px;cursor:pointer;margin-left:8px}
 .audio-btn:hover{background:#30363d;border-color:#8b949e}
 .audio-btn.active{background:#1f3a1f;border-color:#238636;color:#3fb950}
+
+/* Modal */
+.modal-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.75);z-index:1000;justify-content:center;align-items:flex-start;padding:40px 16px;overflow-y:auto}
+.modal-overlay.active{display:flex}
+.modal{background:#161b22;border:1px solid #30363d;border-radius:12px;max-width:740px;width:100%;padding:28px 32px;position:relative;margin-bottom:40px}
+.modal-close{position:absolute;top:12px;right:16px;background:none;border:none;color:#8b949e;font-size:28px;cursor:pointer;line-height:1}
+.modal-close:hover{color:#f0f6fc}
+.modal h3{font-size:17px;color:#f0f6fc;margin-bottom:16px;padding-bottom:10px;border-bottom:2px solid #30363d}
+.modal h4{font-size:12px;color:#58a6ff;margin:18px 0 8px;text-transform:uppercase;letter-spacing:0.8px}
+.modal p,.modal li{font-size:13px;color:#c9d1d9;line-height:1.75;margin-bottom:8px}
+.modal ul{margin:8px 0 12px 20px}
+.modal li{margin-bottom:4px}
+.modal b{color:#f0f6fc}
+.modal .formula{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:14px 18px;margin:12px 0;font-size:15px;color:#e3b341;text-align:center;font-family:'Cascadia Mono','Fira Code',monospace;line-height:1.9}
+.modal .formula .explain{font-size:11px;color:#8b949e;text-align:left;margin-top:10px;line-height:1.6;color:#8b949e}
+.modal .hyp{background:#0d1117;border-left:3px solid #58a6ff;padding:10px 14px;margin:10px 0;font-size:13px;line-height:1.7}
+.modal .hyp b{color:#58a6ff}
+.modal .vtable{width:100%;border-collapse:collapse;margin:12px 0}
+.modal .vtable th,.modal .vtable td{padding:7px 10px;font-size:12px;text-align:left;border-bottom:1px solid #21262d}
+.modal .vtable th{color:#8b949e;font-weight:600}
+.modal .vg{color:#3fb950}.modal .vy{color:#e3b341}.modal .vr{color:#f85149}
+.modal .timeline{border-left:3px solid #30363d;padding-left:20px;margin:16px 0}
+.modal .tl-item{margin-bottom:16px;position:relative}
+.modal .tl-item::before{content:'';position:absolute;left:-26px;top:5px;width:12px;height:12px;border-radius:50%;background:#30363d;border:2px solid #161b22}
+.modal .tl-time{font-size:11px;color:#58a6ff;font-weight:700;text-transform:uppercase}
+.modal .tl-text{font-size:12px;color:#c9d1d9;margin-top:3px;line-height:1.6}
+.modal .note{background:#1c2128;border:1px solid #30363d;border-radius:6px;padding:10px 14px;margin:12px 0;font-size:12px;color:#8b949e;line-height:1.6}
+.acard{cursor:pointer;transition:border-color 0.15s,background 0.15s}
+.acard:hover{border-color:#58a6ff;background:#1c2128}
+.acard .ac-info{float:right;font-size:10px;color:#484f58;letter-spacing:0.3px}
+.acard:hover .ac-info{color:#58a6ff}
+.health-banner{cursor:pointer;transition:border-color 0.15s}
+.health-banner:hover{border-color:#58a6ff !important}
+.health-banner .hb-hint{font-size:10px;color:#484f58;margin-top:4px}
+.health-banner:hover .hb-hint{color:#58a6ff}
 </style>
 </head>
 <body>
@@ -290,9 +325,10 @@ a{color:#58a6ff}
 </div>
 
 <!-- Strategy Health Banner -->
-<div class="health-banner" id="health-banner">
+<div class="health-banner" id="health-banner" onclick="openModal('timeline')" title="Click for timeline &amp; methodology">
   <div class="hb-verdict" id="hb-verdict">Collecting data...</div>
   <div class="hb-summary" id="hb-summary">Statistical analyzers need more fills to produce results</div>
+  <div class="hb-hint">Click for data sufficiency timeline &amp; methodology</div>
 </div>
 
 <!-- Statistical Advisory Board -->
@@ -377,6 +413,13 @@ a{color:#58a6ff}
       <a class="btn" href="/api/export/trades?format=csv" download>Trades CSV</a>
       <a class="btn" href="/api/export/trades?format=json" target="_blank">Trades JSON</a>
     </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="modal-overlay" onclick="if(event.target===this)closeModal()">
+  <div class="modal">
+    <button class="modal-close" onclick="closeModal()">&times;</button>
+    <div id="modal-content"></div>
   </div>
 </div>
 
@@ -501,10 +544,420 @@ const ANALYZER_LABELS = {
   random_walk: 'Market Type',
 };
 
+// === Modal System ===
+
+const MODAL = {};
+
+MODAL.profitability = `
+<h3>Profitability Test</h3>
+<h4>Method: One-Sample <i>t</i>-Test</h4>
+<p>Tests whether the bot's mean profit per round trip is statistically different from zero. This is the same one-sample <i>t</i>-test from AP Statistics -- applied to trading data instead of textbook examples.</p>
+
+<div class="hyp">
+<b>H<sub>0</sub>:</b> &#956; = 0 &emsp;(mean profit per round trip is zero -- the strategy has no edge)<br>
+<b>H<sub>a</sub>:</b> &#956; &#8800; 0 &emsp;(mean profit is significantly different from zero)
+</div>
+
+<h4>Conditions for Inference</h4>
+<ul>
+<li><b>Independence:</b> Each round trip is an independent trial. The bot buys at one grid level and sells at the next level up; each cycle's profit depends on that specific price movement, not previous cycles. (In practice, serial correlation is minimal because grid fills are event-driven, not time-driven.)</li>
+<li><b>Normality:</b> For small <i>n</i>, we need the population of profits to be approximately normal. Profits are bounded below (can't lose more than the order size) and above (capped by grid spacing), making the distribution roughly symmetric. For <i>n</i> &#8805; 30, CLT handles non-normality.</li>
+<li><b>Random sample:</b> Each round trip is a sample from the "process" of grid trading at current market conditions.</li>
+</ul>
+
+<h4>Test Statistic</h4>
+<div class="formula">
+<i>t</i> = <i>x&#772;</i> / (<i>s</i> / &#8730;<i>n</i>)
+<div class="explain">
+where:<br>
+&emsp;<i>x&#772;</i> = sample mean of round-trip profits (&#8721;<i>x<sub>i</sub></i> / <i>n</i>)<br>
+&emsp;<i>s</i> = sample standard deviation = &#8730;[&#8721;(<i>x<sub>i</sub></i> - <i>x&#772;</i>)&#178; / (<i>n</i> - 1)]<br>
+&emsp;<i>n</i> = number of completed round trips<br>
+&emsp;df = <i>n</i> - 1
+</div>
+</div>
+
+<p><b>Distribution under H<sub>0</sub>:</b> The test statistic follows <b>Student's <i>t</i>-distribution</b> with <i>n</i> - 1 degrees of freedom. The implementation uses the regularized incomplete beta function to compute the CDF (no lookup tables needed).</p>
+
+<p><b>Decision rule:</b> Reject H<sub>0</sub> if <i>p</i>-value &lt; &#945; = 0.05</p>
+
+<h4>95% Confidence Interval</h4>
+<div class="formula">
+<i>x&#772;</i> &#177; <i>t</i>*<sub>df, 0.025</sub> &#183; (<i>s</i> / &#8730;<i>n</i>)
+<div class="explain">
+The critical value <i>t</i>* is looked up from a table for df = <i>n</i> - 1. For df &#8805; 120, <i>t</i>* &#8776; 1.96 (approaching the standard normal <i>z</i>*). This interval gives us the range of plausible values for the true mean profit per trip.
+</div>
+</div>
+
+<h4>Interpretation in Context</h4>
+<p>Each round trip works like this: the bot buys DOGE at price level <i>k</i>, then sells at level <i>k</i> + 1. The gross profit = (sell_price - buy_price) &#215; volume. After subtracting Kraken's maker fees on both legs (0.25% each), the net profit depends on whether the grid spacing exceeds the round-trip fee cost.</p>
+<p>The <i>t</i>-test determines whether the observed mean profit is <b>statistically distinguishable from zero</b>, or whether apparent profits could be due to random variation. A "significant profit" means you can confidently say the strategy has a positive expected value -- the profits are real, not sampling noise.</p>
+
+<h4>Power & Minimum Sample Size</h4>
+<p><b>Mathematical minimum:</b> <i>n</i> &#8805; 3 (need df &#8805; 2 for a non-degenerate variance estimate).</p>
+<p><b>Practical reality:</b> With small <i>n</i>, the standard error <i>s</i>/&#8730;<i>n</i> is large, and the confidence interval is wide. The test usually reports "not significant" until <i>n</i> &#8776; 10-20, depending on the <b>effect size</b> (<i>x&#772;</i>/<i>s</i>).</p>
+<p>The bot estimates the minimum <i>n</i> needed for significance at the current effect size:</p>
+<div class="formula">
+<i>n</i><sub>min</sub> = &#8968;(<i>t</i>* &#183; <i>s</i> / |<i>x&#772;</i>|)&#178;&#8969;
+<div class="explain">
+This uses the current effect size to project how many more trips are needed. Wider grid spacing (larger profit per trip relative to variance) reaches significance faster. This is analogous to a power analysis: given the observed effect, how large a sample do we need?
+</div>
+</div>
+
+<h4>Verdict Mapping</h4>
+<table class="vtable">
+<tr><th>Verdict</th><th>Condition</th><th>Meaning</th></tr>
+<tr><td class="vg">SIGNIFICANT PROFIT</td><td><i>p</i> &lt; 0.05 and <i>x&#772;</i> &gt; 0</td><td>Reject H<sub>0</sub>. Profits are statistically real.</td></tr>
+<tr><td class="vr">SIGNIFICANT LOSS</td><td><i>p</i> &lt; 0.05 and <i>x&#772;</i> &#8804; 0</td><td>Reject H<sub>0</sub>. Strategy is reliably losing money.</td></tr>
+<tr><td class="vy">NOT SIGNIFICANT</td><td><i>p</i> &#8805; 0.05</td><td>Fail to reject H<sub>0</sub>. Need more data.</td></tr>
+<tr><td class="vy">INSUFFICIENT DATA</td><td><i>n</i> &lt; 3</td><td>Cannot run the test yet.</td></tr>
+</table>
+`;
+
+MODAL.fill_asymmetry = `
+<h3>Fill Asymmetry</h3>
+<h4>Method: Exact Binomial Test</h4>
+<p>Tests whether buy fills and sell fills occur with equal probability in a 12-hour sliding window. This uses the exact binomial distribution rather than a normal approximation, so it remains valid even at small sample sizes.</p>
+
+<div class="hyp">
+<b>H<sub>0</sub>:</b> <i>p</i> = 0.5 &emsp;(buy and sell fills are equally likely -- range-bound market)<br>
+<b>H<sub>a</sub>:</b> <i>p</i> &#8800; 0.5 &emsp;(one side fills significantly more often -- trending market)
+</div>
+
+<h4>Setup</h4>
+<p>Let <i>X</i> = number of buy fills out of <i>n</i> total fills in the 12-hour window. Under H<sub>0</sub>:</p>
+<div class="formula">
+<i>X</i> ~ Binomial(<i>n</i>, 0.5)
+<div class="explain">
+Each fill is classified as "buy" (price dipped to trigger a buy order) or "sell" (price rose to trigger a sell order). Under a symmetric, range-bound market, these should be equally likely.
+</div>
+</div>
+
+<h4>Conditions</h4>
+<ul>
+<li><b>Independence:</b> Each fill is triggered by a separate price crossing event. While prices are serially correlated, the fill <i>events</i> (crossing a specific level) are approximately independent.</li>
+<li><b>Fixed <i>n</i>:</b> We condition on the total number of fills observed in the window.</li>
+<li><b>Two categories:</b> Each fill is either buy or sell (binary outcome).</li>
+</ul>
+
+<h4>Test Statistic & <i>p</i>-Value</h4>
+<p>Let <i>k</i> = max(buys, sells). The two-tailed exact binomial <i>p</i>-value is:</p>
+<div class="formula">
+<i>p</i>-value = 2 &#183; P(<i>X</i> &#8805; <i>k</i> | <i>n</i>, <i>p</i> = 0.5)
+<div class="explain">
+Computed via the regularized incomplete beta function:<br><br>
+P(<i>X</i> &#8805; <i>k</i>) = 1 - I<sub>0.5</sub>(<i>n</i> - <i>k</i> + 1, <i>k</i>)<br><br>
+where I<sub><i>x</i></sub>(<i>a</i>, <i>b</i>) is the regularized incomplete beta function. This is mathematically equivalent to summing the binomial PMF from <i>k</i> to <i>n</i>, but numerically stable. The factor of 2 makes it two-tailed.
+</div>
+</div>
+
+<div class="note">
+<b>Why exact instead of normal approximation?</b> The familiar z-test for proportions (z = (<i>p&#770;</i> - 0.5) / &#8730;(0.25/<i>n</i>)) requires <i>np</i> &#8805; 10 and <i>n</i>(1-<i>p</i>) &#8805; 10. At small sample sizes (n = 5-15), the exact binomial is more appropriate. The implementation uses the incomplete beta function, which gives exact results at any <i>n</i>.
+</div>
+
+<h4>Confidence Interval: Wilson Score</h4>
+<div class="formula">
+<i>p&#771;</i> &#177; <i>z</i> &#183; &#8730;(<i>p&#770;</i>(1-<i>p&#770;</i>)/<i>n</i> + <i>z</i>&#178;/4<i>n</i>&#178;) / (1 + <i>z</i>&#178;/<i>n</i>)
+<div class="explain">
+where <i>p&#771;</i> = (<i>p&#770;</i> + <i>z</i>&#178;/2<i>n</i>) / (1 + <i>z</i>&#178;/<i>n</i>), <i>z</i> = 1.96 for 95% confidence, and <i>p&#770;</i> = buys/<i>n</i>.<br><br>
+Wilson score is preferred over the Wald interval (<i>p&#770;</i> &#177; <i>z</i>&#8730;(<i>p&#770;</i><i>q&#770;</i>/<i>n</i>)) because it has better coverage probability for small <i>n</i> and proportions near 0 or 1.
+</div>
+</div>
+
+<h4>Interpretation</h4>
+<p>In a range-bound market, price oscillates and fills are balanced:</p>
+<ul>
+<li><b>Buys dominate</b> (p&#770; &gt; 0.5) &#8594; price is falling. The bot keeps buying dips, but sell orders above aren't triggering. This suggests a bearish trend.</li>
+<li><b>Sells dominate</b> (p&#770; &lt; 0.5) &#8594; price is rising. The bot keeps selling rallies, but buy orders below aren't triggering. This suggests a bullish trend.</li>
+</ul>
+<p>Grid bots profit from oscillation, not direction. Persistent asymmetry means the grid should be re-centered, or the buy/sell ratio adjusted to match the trend.</p>
+
+<h4>Sample Size Considerations</h4>
+<p><b>Minimum:</b> <i>n</i> &#8805; 5 fills in the 12h window. At <i>n</i> = 5, only extreme splits (5/0) yield <i>p</i> &lt; 0.05. To detect moderate asymmetry (e.g. 65/35 split), you need <i>n</i> &#8776; 40-50 fills.</p>
+
+<h4>Verdict Mapping</h4>
+<table class="vtable">
+<tr><th>Verdict</th><th>Condition</th><th>Meaning</th></tr>
+<tr><td class="vr">TREND DETECTED</td><td><i>p</i> &lt; 0.05</td><td>Significant directional bias in fills</td></tr>
+<tr><td class="vg">SYMMETRIC</td><td><i>p</i> &#8805; 0.05</td><td>No evidence of trend -- market appears range-bound</td></tr>
+<tr><td class="vy">INSUFFICIENT DATA</td><td><i>n</i> &lt; 5</td><td>Not enough fills in window</td></tr>
+</table>
+`;
+
+MODAL.grid_exceedance = `
+<h3>Hidden Risk (Grid Exceedance)</h3>
+<h4>Method: OHLC Boundary Proportion Analysis</h4>
+<p>Measures how often price escapes the grid's range between the bot's 30-second polling intervals. This is a <b>descriptive risk metric</b> rather than a formal hypothesis test -- it quantifies risk the bot cannot directly observe.</p>
+
+<h4>Setup</h4>
+<p>The grid defines a price corridor [grid<sub>low</sub>, grid<sub>high</sub>] bounded by the outermost buy and sell orders. Kraken provides 5-minute OHLC (Open-High-Low-Close) candles that capture intra-period price extremes the bot's 30-second snapshots miss.</p>
+
+<p>A candle <b>exceeds</b> the grid if:</p>
+<div class="formula">
+High &gt; grid<sub>high</sub> &emsp; OR &emsp; Low &lt; grid<sub>low</sub>
+</div>
+
+<h4>Metrics Computed</h4>
+<div class="formula">
+exceedance% = (candles with breach / total candles) &#215; 100
+<div class="explain">
+Additional metrics tracked:<br>
+&emsp;&#8226; worst_breach% = max over all candles of (breach distance / grid boundary) &#215; 100<br>
+&emsp;&#8226; above_count = candles where High exceeded grid_high<br>
+&emsp;&#8226; below_count = candles where Low went below grid_low<br>
+&emsp;&#8226; Directional skew: if above &#8811; below, price is testing the upside
+</div>
+</div>
+
+<h4>Why This Matters</h4>
+<p>The bot polls every 30 seconds, but cryptocurrency prices can spike dramatically within seconds and revert. These <b>hidden excursions</b> have three implications:</p>
+<ul>
+<li><b>Missed opportunities:</b> Price moved beyond the grid where no orders existed, and potential profit was left on the table.</li>
+<li><b>Underestimated risk:</b> The bot's state shows everything "contained" but price actually breached the boundary, meaning realized volatility exceeds what the grid is capturing.</li>
+<li><b>Breakout precursor:</b> Increasing exceedance frequency often precedes a sustained move beyond the grid, which can cause one-sided fill accumulation.</li>
+</ul>
+
+<div class="note">
+<b>Statistical note:</b> This is deliberately not a hypothesis test. A formal test (e.g. testing if exceedance proportion &gt; 5%) would add complexity without value. The thresholds below are calibrated from empirical observation: at &gt; 20% exceedance, the grid is clearly too narrow for the observed volatility, regardless of p-values.
+</div>
+
+<h4>Decision Thresholds</h4>
+<table class="vtable">
+<tr><th>Verdict</th><th>Condition</th><th>Action</th></tr>
+<tr><td class="vg">CONTAINED</td><td>&#8804; 5% of candles exceed</td><td>Grid covers the price action well</td></tr>
+<tr><td class="vy">MODERATE RISK</td><td>5-20% of candles exceed</td><td>Consider widening grid or adding levels</td></tr>
+<tr><td class="vr">HIGH RISK</td><td>&gt; 20% of candles exceed</td><td>Price regularly escaping -- widen immediately</td></tr>
+</table>
+
+<h4>Data Requirements</h4>
+<p><b>No fills needed.</b> This analyzer uses OHLC candle data fetched every 5 minutes from Kraken's public API. It produces results as soon as candle data is available (~60 seconds after bot start). It examines up to 720 candles (60 hours of 5-minute data), giving it the earliest and most reliable signal of all five analyzers.</p>
+`;
+
+MODAL.fill_rate = `
+<h3>Volatility Regime (Fill Rate)</h3>
+<h4>Method: Poisson <i>z</i>-Test</h4>
+<p>Compares the current hour's fill rate against the historical baseline to detect volatility regime changes. Uses a Poisson process model and the normal approximation for large &#955;.</p>
+
+<div class="hyp">
+<b>H<sub>0</sub>:</b> &#955;<sub>current</sub> = &#955;<sub>baseline</sub> &emsp;(current fill rate equals historical average)<br>
+<b>H<sub>a</sub>:</b> &#955;<sub>current</sub> &#8800; &#955;<sub>baseline</sub> &emsp;(a regime change has occurred)
+</div>
+
+<h4>Poisson Process Model</h4>
+<p>Fill arrivals are modeled as a <b>Poisson process</b> -- events (grid order fills) occur independently at a constant average rate. Under stable volatility, the number of fills per hour follows:</p>
+<div class="formula">
+<i>X</i> ~ Poisson(&#955;)
+<div class="explain">
+where &#955; = expected fills per hour. The Poisson distribution is the natural model for count data where events occur independently at a constant rate -- the same model used for radioactive decay, customer arrivals, and website hits.
+</div>
+</div>
+
+<h4>Conditions</h4>
+<ul>
+<li><b>Independence:</b> Fill events are approximately independent. While prices exhibit serial correlation, the <i>events</i> of crossing specific grid levels are approximately independent over hour-scale windows.</li>
+<li><b>Constant rate (under H<sub>0</sub>):</b> The null hypothesis assumes volatility hasn't changed, so the fill rate should be stable.</li>
+<li><b>Sufficient &#955;:</b> For the normal approximation to hold, we need &#955;<sub>baseline</sub> to be reasonably large (&#8805; 5). The Poisson CLT gives good results even for moderate &#955;.</li>
+</ul>
+
+<h4>Baseline & Current Rate</h4>
+<div class="formula">
+&#955;<sub>baseline</sub> = (fills before last hour) / (hours of earlier history)<br><br>
+observed = fills in the most recent 60 minutes
+</div>
+
+<h4>Test Statistic</h4>
+<div class="formula">
+<i>z</i> = (observed - &#955;<sub>baseline</sub>) / &#8730;&#955;<sub>baseline</sub>
+<div class="explain">
+By the Poisson CLT: for sufficiently large &#955;, the Poisson distribution is approximately Normal(&#955;, &#955;). Since Var(Poisson) = &#955;, the standard deviation is &#8730;&#955;. The <i>z</i>-score measures how many standard deviations the current rate deviates from the expected baseline.
+</div>
+</div>
+
+<h4>Why Sigma Thresholds?</h4>
+<p>This analyzer uses |<i>z</i>| (sigma) thresholds rather than a fixed &#945; because it functions as a <b>continuous monitoring tool</b>, not a one-time test. The sigma scale maps directly to intuitive probability:</p>
+
+<table class="vtable">
+<tr><th>|<i>z</i>| Range</th><th>Verdict</th><th>P(this extreme | H<sub>0</sub>)</th><th>Meaning</th></tr>
+<tr><td>&#8804; 2</td><td class="vg">NORMAL</td><td>~95.4% of the time</td><td>Fill rate consistent with baseline</td></tr>
+<tr><td>2 - 3</td><td class="vy">ELEVATED / REDUCED</td><td>~4.3% of the time</td><td>Moderate regime shift detected</td></tr>
+<tr><td>&gt; 3</td><td class="vr">HIGH VOL / LOW VOL</td><td>&lt; 0.27% of the time</td><td>Strong regime change -- rare under H<sub>0</sub></td></tr>
+</table>
+
+<h4>Interpretation for Grid Trading</h4>
+<ul>
+<li><b>HIGH VOL:</b> Fill rate spiked. Could mean a breakout -- more fills &#8800; more profit if the move is one-directional (triggers buys without matching sells, or vice versa). Consider widening spacing.</li>
+<li><b>LOW VOL:</b> Fill rate dropped. Grid is idle, capital deployed but not earning. Consider tightening spacing to capture smaller oscillations.</li>
+<li><b>NORMAL:</b> Current volatility matches historical. Grid parameters are appropriately sized.</li>
+</ul>
+
+<h4>Data Requirements</h4>
+<p><b>Minimum:</b> 5 total fills AND bot running &gt; 1 hour. The test requires a "before" period (history excluding the last hour) to establish &#955;<sub>baseline</sub>. With less than 1 hour of uptime, there is no pre-period to compare against.</p>
+`;
+
+MODAL.random_walk = `
+<h3>Market Type (Random Walk)</h3>
+<h4>Method: Chi-Squared Goodness-of-Fit Test</h4>
+<p>Tests whether the distribution of fills across grid levels matches the theoretical pattern of a random walk, or reveals mean-reverting or momentum market structure. This is the most important test for grid trading strategy validation.</p>
+
+<div class="hyp">
+<b>H<sub>0</sub>:</b> Fill distribution follows a random walk pattern (harmonic distribution across grid levels)<br>
+<b>H<sub>a</sub>:</b> Fill distribution departs from random walk (mean-reverting or momentum structure)
+</div>
+
+<h4>Theoretical Background: The Harmonic Distribution</h4>
+<p>Under a <b>symmetric random walk</b>, the probability that a particle (price) reaches distance <i>k</i> steps from the origin before returning follows the <b>harmonic distribution</b>:</p>
+<div class="formula">
+P(fill at level <i>k</i>) = (1/<i>k</i>) / <i>H<sub>m</sub></i>
+<div class="explain">
+where <i>H<sub>m</sub></i> = &#8721;<sub><i>i</i>=1</sub><sup><i>m</i></sup> (1/<i>i</i>) is the <i>m</i>-th harmonic number, and <i>m</i> = number of grid levels.<br><br>
+<b>Intuition:</b> A random walk visits nearby levels much more frequently than distant ones. Level 1 (closest to center) is visited ~2x as often as level 2, ~3x as often as level 3, etc. This 1/<i>k</i> decay is a fundamental property of symmetric random walks.
+</div>
+</div>
+
+<h4>Expected Frequencies</h4>
+<div class="formula">
+<i>E<sub>k</sub></i> = <i>n</i> &#183; (1/<i>k</i>) / <i>H<sub>m</sub></i>
+<div class="explain">
+where <i>n</i> = total observed fills. Each fill is classified by its grid level distance:<br>
+<i>k</i> = round(|fill_price - center_price| / grid_spacing), clamped to [1, max_levels]
+</div>
+</div>
+
+<h4>Test Statistic</h4>
+<div class="formula">
+&#967;&#178; = &#8721;<sub><i>k</i></sub> (<i>O<sub>k</sub></i> - <i>E<sub>k</sub></i>)&#178; / <i>E<sub>k</sub></i>
+<div class="explain">
+where <i>O<sub>k</sub></i> = observed fills at level <i>k</i>, <i>E<sub>k</sub></i> = expected fills under H<sub>0</sub>.<br><br>
+<b>Cochran's rule:</b> Adjacent bins are merged when <i>E<sub>k</sub></i> &lt; 5 to ensure the &#967;&#178; approximation is valid. This is standard practice -- the chi-squared distribution is a poor approximation when expected counts are very small.<br><br>
+df = (number of bins after merging) - 1
+</div>
+</div>
+
+<p><b>Distribution under H<sub>0</sub>:</b> &#967;&#178; follows the <b>chi-squared distribution</b> with df degrees of freedom. The <i>p</i>-value = P(&#967;&#178;<sub>df</sub> &gt; observed &#967;&#178;), computed via the regularized lower incomplete gamma function:</p>
+<div class="formula">
+<i>p</i> = 1 - P(<i>a</i>, <i>x</i>) &emsp; where &emsp; <i>a</i> = df/2, &ensp; <i>x</i> = &#967;&#178;/2
+<div class="explain">
+P(<i>a</i>, <i>x</i>) = &#947;(<i>a</i>, <i>x</i>) / &#915;(<i>a</i>) is the lower regularized incomplete gamma function, evaluated using series expansion (for <i>x</i> &lt; <i>a</i> + 1) or continued fraction (otherwise).
+</div>
+</div>
+
+<h4>Direction Indicator: Inner Excess</h4>
+<p>When H<sub>0</sub> is rejected, we determine <i>which way</i> the distribution departs from random walk by computing <b>inner excess</b>:</p>
+<div class="formula">
+inner_excess = &#8721;<sub><i>k</i> &#8804; <i>m</i>/3</sub> (<i>O<sub>k</sub></i> - <i>E<sub>k</sub></i>)
+<div class="explain">
+Sums the deviations from expected for the innermost third of grid levels. Positive inner excess means inner levels are over-represented relative to the random walk prediction.
+</div>
+</div>
+
+<table class="vtable">
+<tr><th>Result</th><th>inner_excess</th><th>Market Interpretation</th></tr>
+<tr><td class="vg">MEAN REVERTING</td><td>&gt; 0 (inner levels over-represented)</td><td>Price tends to return to center after small excursions. Fills cluster near the grid center where round trips complete quickly. <b>Grid strategy has a natural statistical edge.</b></td></tr>
+<tr><td class="vr">MOMENTUM</td><td>&lt; 0 (outer levels over-represented)</td><td>Price tends to continue moving away from center. Fills happen at the extremes, leaving inner orders stranded. <b>Grid strategy is structurally disadvantaged.</b></td></tr>
+<tr><td class="vy">RANDOM WALK</td><td><i>p</i> &#8805; 0.05</td><td>Fail to reject H<sub>0</sub>. Fill distribution is consistent with a random walk. No detectable edge or disadvantage for the grid.</td></tr>
+</table>
+
+<h4>Why This Is the Most Important Test</h4>
+<p>This answers the <b>fundamental question</b> for grid trading: does the market mean-revert or trend?</p>
+<p>Grid bots are inherently <b>mean-reversion strategies</b>. They profit when price oscillates through buy and sell levels, completing round trips. A mean-reverting market is ideal (fills cluster near center, trips complete quickly). A momentum market is the worst case (price moves directionally, accumulating losing positions on one side without completing the offsetting trade).</p>
+<p>This test directly measures the fill-level distribution shape from the bot's own trade data -- the most granular evidence of market microstructure available without external data feeds.</p>
+
+<h4>Data Requirements</h4>
+<p><b>Minimum:</b> &#8805; 10 fills across &#8805; 3 distinct grid levels. The level requirement ensures enough distributional structure to test the shape. With fewer than 3 levels, the &#967;&#178; test has 0 degrees of freedom and is undefined.</p>
+<p>After Cochran's bin merging, at least 2 bins must remain. This is the <b>hardest analyzer to satisfy</b> because it needs both <i>volume</i> (&#8805; 10 fills) and <i>diversity</i> (fills at multiple price levels, requiring price to oscillate across the grid).</p>
+`;
+
+MODAL.timeline = `
+<h3>Data Sufficiency Timeline & Methodology</h3>
+<p>The Statistical Advisory Board runs 5 independent analyzers, each using a different inferential technique from your AP Statistics toolkit. Each activates when it has enough data to produce meaningful results.</p>
+
+<h4>Expected Timeline</h4>
+<p>With 30-second polling and typical DOGE/USD volatility:</p>
+
+<div class="timeline">
+<div class="tl-item">
+<div class="tl-time">~0 min (immediate)</div>
+<div class="tl-text"><b>Grid Exceedance (Hidden Risk)</b> -- Proportion analysis of OHLC candle data from Kraken's public API. No fills needed. Begins analyzing within 60 seconds of bot start. Examines up to 720 five-minute candles (60 hours of data).</div>
+</div>
+<div class="tl-item">
+<div class="tl-time">~15-30 min</div>
+<div class="tl-text"><b>Fill Asymmetry</b> -- Exact binomial test. Needs &#8805; 5 fills in the 12h window. In dry run, simulated fills occur each time price crosses a grid level. One oscillation through the grid can generate several fills, but significance at <i>n</i> = 5 requires an extreme split (5/0).</div>
+</div>
+<div class="tl-item">
+<div class="tl-time">~15-30 min</div>
+<div class="tl-text"><b>Profitability</b> -- One-sample <i>t</i>-test. Needs &#8805; 3 completed round trips (buy-then-sell cycles). Will likely show "not significant" initially because the confidence interval is wide when <i>n</i> is small and <i>s</i>/&#8730;<i>n</i> is large.</div>
+</div>
+<div class="tl-item">
+<div class="tl-time">~1-2 hours</div>
+<div class="tl-text"><b>Fill Rate (Volatility Regime)</b> -- Poisson <i>z</i>-test. Needs &#8805; 5 fills AND &gt; 1 hour of history. Requires a baseline period (all fills before the last hour) to compute &#955;<sub>baseline</sub>, so the bot must accumulate enough pre-history.</div>
+</div>
+<div class="tl-item">
+<div class="tl-time">~2-4 hours</div>
+<div class="tl-text"><b>Random Walk (Market Type)</b> -- &#967;&#178; goodness-of-fit test. Needs &#8805; 10 fills across &#8805; 3 grid levels with expected bins &#8805; 5 after merging. This is the hardest to satisfy because it requires price to oscillate widely enough to generate fills at multiple distinct levels.</div>
+</div>
+<div class="tl-item">
+<div class="tl-time">~4-8 hours</div>
+<div class="tl-text"><b>Profitability reaches significance.</b> With <i>n</i> &#8776; 10-20 round trips, the standard error <i>s</i>/&#8730;<i>n</i> shrinks enough that the 95% CI typically excludes zero (given grid spacing &gt; round-trip fees). The exact timing depends on the effect size |<i>x&#772;</i>|/<i>s</i>.</div>
+</div>
+<div class="tl-item">
+<div class="tl-time">~12-24 hours</div>
+<div class="tl-text"><b>High-confidence results across all analyzers.</b> Fill asymmetry and fill rate have stable baselines. Random walk test has enough fills for reliable &#967;&#178; approximation. The overall health verdict becomes trustworthy.</div>
+</div>
+</div>
+
+<h4>The Five Tests at a Glance</h4>
+<table class="vtable">
+<tr><th>Analyzer</th><th>Statistical Method</th><th>AP Stats Topic</th><th>Minimum Data</th></tr>
+<tr><td>Profitability</td><td>One-sample <i>t</i>-test</td><td>Inference for means</td><td>3 round trips</td></tr>
+<tr><td>Fill Asymmetry</td><td>Exact binomial test</td><td>Inference for proportions</td><td>5 fills in 12h</td></tr>
+<tr><td>Grid Exceedance</td><td>Proportion metric</td><td>Descriptive statistics</td><td>OHLC candles (no fills)</td></tr>
+<tr><td>Fill Rate</td><td>Poisson <i>z</i>-test</td><td>Sampling distributions</td><td>5 fills + 1hr history</td></tr>
+<tr><td>Random Walk</td><td>&#967;&#178; goodness-of-fit</td><td>Chi-squared tests</td><td>10 fills across 3+ levels</td></tr>
+</table>
+
+<h4>Overall Health Verdict Logic</h4>
+<p>The banner verdict is derived from all 5 analyzers with this priority ordering (red conditions override green ones):</p>
+<table class="vtable">
+<tr><th>Verdict</th><th>Color</th><th>Trigger Condition</th></tr>
+<tr><td class="vr">DANGEROUS</td><td>Red</td><td>High volatility AND trending detected simultaneously</td></tr>
+<tr><td class="vr">UNFAVORABLE</td><td>Red</td><td>Random walk test shows momentum market</td></tr>
+<tr><td class="vr">EXPOSED</td><td>Red</td><td>Grid exceedance is HIGH RISK (&gt; 20% of candles)</td></tr>
+<tr><td class="vg">FAVORABLE</td><td>Green</td><td>Random walk test shows mean-reverting market</td></tr>
+<tr><td class="vg">PROFITABLE</td><td>Green</td><td>Profitability <i>t</i>-test is statistically significant</td></tr>
+<tr><td class="vy">CALIBRATING</td><td>Yellow</td><td>All analyzers still have insufficient data</td></tr>
+<tr><td class="vy">NEUTRAL</td><td>Yellow</td><td>Mixed or inconclusive signals</td></tr>
+</table>
+<p>Red takes priority over green: even if the <i>t</i>-test confirms significant profits, a momentum detection overrides because it warns of <i>structural</i> risk that past profits may not predict.</p>
+
+<h4>Implementation Notes</h4>
+<ul>
+<li>All distribution functions (Student's <i>t</i>, &#967;&#178;, binomial via incomplete beta) are implemented in pure Python with no external dependencies. The normal CDF uses the Abramowitz &amp; Stegun rational approximation (~10<sup>-7</sup> accuracy). The incomplete beta uses Lentz's continued fraction. The incomplete gamma uses series expansion or continued fraction depending on the regime.</li>
+<li>The stats engine runs every 60 seconds in the main bot loop. OHLC candle data is fetched from Kraken every 5 minutes.</li>
+<li>All tests use &#945; = 0.05 (two-tailed) as the significance threshold, consistent with AP Statistics conventions.</li>
+</ul>
+`;
+
+function openModal(name) {
+  const content = MODAL[name];
+  if (!content) return;
+  document.getElementById('modal-content').innerHTML = content;
+  document.getElementById('modal-overlay').classList.add('active');
+  document.body.style.overflow = 'hidden';
+}
+
+function closeModal() {
+  document.getElementById('modal-overlay').classList.remove('active');
+  document.body.style.overflow = '';
+}
+
+document.addEventListener('keydown', function(e) { if (e.key === 'Escape') closeModal(); });
+
+// === Advisory board rendering ===
+
 function renderAdvisory(stats) {
   const board = document.getElementById('advisory');
   if (!stats || Object.keys(stats).length === 0) {
-    board.innerHTML = '<div class="acard"><div class="ac-name">STATS ENGINE</div><div class="ac-summary">Collecting data -- analyzers will appear as fills accumulate</div></div>';
+    board.innerHTML = '<div class="acard" onclick="openModal(\'timeline\')"><div class="ac-info">&#9432; details</div><div class="ac-name">STATS ENGINE</div><div class="ac-summary">Collecting data -- analyzers will appear as fills accumulate. Click any card for methodology.</div></div>';
     return;
   }
   // Health banner
@@ -514,14 +967,15 @@ function renderAdvisory(stats) {
   document.getElementById('hb-verdict').textContent = (health.verdict || 'calibrating').toUpperCase().replace(/_/g, ' ');
   document.getElementById('hb-summary').textContent = health.summary || '';
 
-  // Cards
+  // Cards (clickable with info hint)
   let html = '';
   const order = ['profitability', 'fill_asymmetry', 'grid_exceedance', 'fill_rate', 'random_walk'];
   for (const name of order) {
     const r = stats[name];
     if (!r) continue;
     const color = r.color || 'yellow';
-    html += '<div class="acard ac-' + color + '">';
+    html += '<div class="acard ac-' + color + '" onclick="openModal(\'' + name + '\')">';
+    html += '<div class="ac-info">&#9432; details</div>';
     html += '<div class="ac-name">' + (ANALYZER_LABELS[name] || name) + '</div>';
     html += '<div class="ac-verdict v-' + color + '">' + (r.verdict || '').replace(/_/g, ' ').toUpperCase() + '</div>';
     html += '<div class="ac-summary">' + (r.summary || '') + '</div>';
