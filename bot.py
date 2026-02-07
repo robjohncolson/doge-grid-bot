@@ -99,6 +99,16 @@ _bot_state: grid_strategy.GridState = None
 _bot_healthy = True
 _bot_start_time = 0.0
 
+# Pending AI approval -- only one at a time
+# Keys: action (str), message_id (int), created_at (float), recommendation (dict)
+_pending_approval: dict = None
+
+# How long (seconds) before a pending approval expires
+APPROVAL_TIMEOUT = 600  # 10 minutes
+
+# Fixed step for spacing adjustments -- prevents extreme values
+SPACING_STEP_PCT = 0.25
+
 
 class HealthHandler(BaseHTTPRequestHandler):
     """
@@ -181,6 +191,185 @@ def setup_signal_handlers():
     # SIGBREAK is Windows' equivalent of SIGTERM in some contexts
     if hasattr(signal, "SIGBREAK"):
         signal.signal(signal.SIGBREAK, _signal_handler)
+
+
+# ---------------------------------------------------------------------------
+# AI approval workflow
+# ---------------------------------------------------------------------------
+
+def _set_pending_approval(action: str, message_id: int, recommendation: dict):
+    """
+    Store a pending approval.  Overwrites any previous pending approval
+    (new recommendation supersedes the old one).
+    """
+    global _pending_approval
+
+    # If there's already a pending approval, expire it
+    if _pending_approval:
+        old_action = _pending_approval["action"]
+        old_msg_id = _pending_approval["message_id"]
+        logger.info("New recommendation overwrites pending '%s'", old_action)
+        ai_advisor.log_approval_decision(old_action, "expired")
+        notifier.edit_message_text(
+            old_msg_id,
+            f"🧠 <b>AI Advisor</b> -- <i>{old_action}</i>\n\n"
+            f"<s>Expired</s> (superseded by new recommendation)",
+        )
+
+    _pending_approval = {
+        "action": action,
+        "message_id": message_id,
+        "created_at": time.time(),
+        "recommendation": recommendation,
+    }
+    logger.info("Pending approval set: %s (msg_id=%d)", action, message_id)
+
+
+def _check_approval_expiry():
+    """Expire the pending approval if it's older than APPROVAL_TIMEOUT."""
+    global _pending_approval
+
+    if not _pending_approval:
+        return
+
+    age = time.time() - _pending_approval["created_at"]
+    if age >= APPROVAL_TIMEOUT:
+        action = _pending_approval["action"]
+        msg_id = _pending_approval["message_id"]
+        logger.info("Approval expired for '%s' after %ds", action, int(age))
+        ai_advisor.log_approval_decision(action, "expired")
+        notifier.edit_message_text(
+            msg_id,
+            f"🧠 <b>AI Advisor</b> -- <i>{action}</i>\n\n"
+            f"<s>Expired</s> (no response in {APPROVAL_TIMEOUT // 60} min)",
+        )
+        _pending_approval = None
+
+
+def _poll_and_handle_callbacks(state: grid_strategy.GridState, current_price: float):
+    """
+    Poll Telegram for button presses and handle approve/skip.
+    """
+    global _pending_approval
+
+    callbacks = notifier.poll_callbacks()
+    if not callbacks:
+        return
+
+    for cb in callbacks:
+        data = cb["data"]            # e.g. "approve:widen_spacing"
+        cb_msg_id = cb["message_id"]
+        callback_id = cb["callback_id"]
+
+        # Only process if it matches the pending approval's message
+        if not _pending_approval or cb_msg_id != _pending_approval["message_id"]:
+            notifier.answer_callback(callback_id, "No pending action for this message")
+            continue
+
+        parts = data.split(":", 1)
+        if len(parts) != 2:
+            notifier.answer_callback(callback_id, "Invalid callback")
+            continue
+
+        decision, action = parts  # "approve" or "skip", and the action name
+
+        if decision == "approve":
+            notifier.answer_callback(callback_id, f"Approved: {action}")
+            logger.info("User APPROVED action: %s", action)
+            ai_advisor.log_approval_decision(action, "approved")
+
+            # Execute the action
+            _execute_approved_action(state, action, current_price)
+
+            # Update the message to show it was approved
+            notifier.edit_message_text(
+                cb_msg_id,
+                f"🧠 <b>AI Advisor</b> -- <i>{action}</i>\n\n"
+                f"Approved and executed.",
+            )
+            _pending_approval = None
+
+        elif decision == "skip":
+            notifier.answer_callback(callback_id, "Skipped")
+            logger.info("User SKIPPED action: %s", action)
+            ai_advisor.log_approval_decision(action, "skipped")
+
+            notifier.edit_message_text(
+                cb_msg_id,
+                f"🧠 <b>AI Advisor</b> -- <i>{action}</i>\n\n"
+                f"<s>Skipped</s> by user.",
+            )
+            _pending_approval = None
+
+        else:
+            notifier.answer_callback(callback_id, "Unknown decision")
+
+
+def _execute_approved_action(state: grid_strategy.GridState, action: str,
+                             current_price: float):
+    """
+    Execute an approved AI recommendation.
+
+    Actions:
+      widen_spacing   -> increase GRID_SPACING_PCT by 0.25%, rebuild grid
+      tighten_spacing -> decrease GRID_SPACING_PCT by 0.25% (floor at fees+0.1%), rebuild grid
+      pause           -> pause the bot
+      reset_grid      -> cancel and rebuild grid at current price
+    """
+    if action == "widen_spacing":
+        old = config.GRID_SPACING_PCT
+        config.GRID_SPACING_PCT = round(old + SPACING_STEP_PCT, 4)
+        logger.info("Spacing widened: %.2f%% -> %.2f%%", old, config.GRID_SPACING_PCT)
+
+        grid_strategy.cancel_grid(state)
+        orders = grid_strategy.build_grid(state, current_price)
+
+        notifier._send_message(
+            f"Spacing widened: {old:.2f}% -> {config.GRID_SPACING_PCT:.2f}%\n"
+            f"Grid rebuilt: {len(orders)} orders around ${current_price:.6f}"
+        )
+
+    elif action == "tighten_spacing":
+        old = config.GRID_SPACING_PCT
+        floor = config.ROUND_TRIP_FEE_PCT + 0.1
+        new_spacing = round(old - SPACING_STEP_PCT, 4)
+
+        if new_spacing < floor:
+            logger.warning(
+                "Cannot tighten below %.2f%% (fees+0.1%%). Current: %.2f%%",
+                floor, old,
+            )
+            notifier._send_message(
+                f"Cannot tighten spacing below {floor:.2f}% "
+                f"(round-trip fees + 0.1%%). Current: {old:.2f}%"
+            )
+            return
+
+        config.GRID_SPACING_PCT = new_spacing
+        logger.info("Spacing tightened: %.2f%% -> %.2f%%", old, config.GRID_SPACING_PCT)
+
+        grid_strategy.cancel_grid(state)
+        orders = grid_strategy.build_grid(state, current_price)
+
+        notifier._send_message(
+            f"Spacing tightened: {old:.2f}% -> {config.GRID_SPACING_PCT:.2f}%\n"
+            f"Grid rebuilt: {len(orders)} orders around ${current_price:.6f}"
+        )
+
+    elif action == "pause":
+        state.is_paused = True
+        state.pause_reason = "AI advisor (user approved)"
+        logger.info("Bot paused by approved AI recommendation")
+        notifier.notify_risk_event("pause", "Paused by approved AI recommendation")
+
+    elif action == "reset_grid":
+        logger.info("Resetting grid by approved AI recommendation")
+        grid_strategy.cancel_grid(state)
+        orders = grid_strategy.build_grid(state, current_price)
+        notifier.notify_grid_built(current_price, len(orders))
+
+    else:
+        logger.warning("Unknown approved action: %s -- ignoring", action)
 
 
 # ---------------------------------------------------------------------------
@@ -363,8 +552,17 @@ def run():
                 recommendation = ai_advisor.get_recommendation(market_data)
                 state.ai_recommendation = ai_advisor.format_recommendation(recommendation)
 
-                # Notify via Telegram
-                notifier.notify_ai_recommendation(recommendation, current_price)
+                # Send via Telegram (with buttons for actionable recommendations)
+                msg_id = notifier.notify_ai_recommendation(recommendation, current_price)
+
+                # If actionable, set up pending approval
+                action = recommendation.get("action", "continue")
+                if action != "continue" and msg_id:
+                    _set_pending_approval(action, msg_id, recommendation)
+
+            # --- 4f2: Poll for approval callbacks & check expiry ---
+            _check_approval_expiry()
+            _poll_and_handle_callbacks(state, current_price)
 
             # --- 4g: Check DOGE accumulation ---
             excess = grid_strategy.check_accumulation(state)

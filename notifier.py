@@ -27,61 +27,187 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# Telegram Bot API endpoint template
-TELEGRAM_URL = "https://api.telegram.org/bot{token}/sendMessage"
+# Telegram Bot API base URL template
+TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
+
+# Track the last update_id so we only see new callbacks
+_last_update_id = 0
 
 
-def _send_message(text: str, parse_mode: str = "HTML") -> bool:
+def _telegram_api(method: str, payload: dict) -> dict:
     """
-    Send a message via Telegram Bot API.
+    Call any Telegram Bot API method.
 
     Args:
-        text:       Message text (can include HTML formatting)
-        parse_mode: "HTML" or "Markdown" (default: HTML because it's less finicky)
+        method:  API method name (e.g. "sendMessage", "getUpdates")
+        payload: Dict of parameters to send as JSON body
 
     Returns:
-        True if sent successfully, False otherwise.
+        The parsed JSON response dict, or {} on failure.
 
     This function NEVER raises -- failures are logged and swallowed.
-    Notifications must never block trading.
     """
-    if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
-        logger.debug("Telegram not configured, skipping notification")
-        return False
+    if not config.TELEGRAM_BOT_TOKEN:
+        logger.debug("Telegram not configured, skipping %s", method)
+        return {}
 
-    url = TELEGRAM_URL.format(token=config.TELEGRAM_BOT_TOKEN)
-
-    payload = json.dumps({
-        "chat_id": config.TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": parse_mode,
-        "disable_web_page_preview": True,  # Don't expand URLs in messages
-    }).encode("utf-8")
-
+    url = TELEGRAM_API.format(token=config.TELEGRAM_BOT_TOKEN, method=method)
+    data = json.dumps(payload).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
         "User-Agent": "DOGEGridBot/1.0",
     }
-
-    req = urllib.request.Request(url, data=payload, headers=headers)
+    req = urllib.request.Request(url, data=data, headers=headers)
 
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             result = json.loads(resp.read().decode("utf-8"))
             if result.get("ok"):
-                return True
-            else:
-                logger.warning("Telegram API returned ok=false: %s", result)
-                return False
-
+                return result
+            logger.warning("Telegram %s returned ok=false: %s", method, result)
+            return {}
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
-        logger.warning("Telegram HTTP %d: %s", e.code, body[:200])
+        logger.warning("Telegram %s HTTP %d: %s", method, e.code, body[:200])
+        return {}
+    except Exception as e:
+        logger.warning("Telegram %s failed: %s", method, e)
+        return {}
+
+
+def _send_message(text: str, parse_mode: str = "HTML") -> bool:
+    """
+    Send a plain message via Telegram Bot API.
+
+    Returns True if sent successfully, False otherwise.
+    This function NEVER raises -- failures are logged and swallowed.
+    """
+    if not config.TELEGRAM_CHAT_ID:
+        logger.debug("Telegram chat ID not set, skipping notification")
         return False
 
-    except Exception as e:
-        logger.warning("Telegram send failed: %s", e)
-        return False
+    result = _telegram_api("sendMessage", {
+        "chat_id": config.TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True,
+    })
+    return bool(result)
+
+
+def send_with_buttons(text: str, buttons: list, parse_mode: str = "HTML") -> int:
+    """
+    Send a message with inline keyboard buttons.
+
+    Args:
+        text:    Message text (HTML)
+        buttons: List of dicts with "text" and "callback_data" keys.
+                 Each dict becomes one button, all in a single row.
+
+    Returns:
+        The message_id (int) of the sent message, or 0 on failure.
+    """
+    if not config.TELEGRAM_CHAT_ID:
+        return 0
+
+    keyboard = [[{"text": b["text"], "callback_data": b["callback_data"]} for b in buttons]]
+
+    result = _telegram_api("sendMessage", {
+        "chat_id": config.TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True,
+        "reply_markup": {"inline_keyboard": keyboard},
+    })
+
+    if result:
+        return result.get("result", {}).get("message_id", 0)
+    return 0
+
+
+def poll_callbacks() -> list:
+    """
+    Poll Telegram for new callback_query updates (button presses).
+
+    Uses short polling (timeout=0) so it never blocks.
+    Only returns callbacks from the configured TELEGRAM_CHAT_ID.
+
+    Returns:
+        List of dicts: [{"callback_id": str, "data": str, "message_id": int}, ...]
+    """
+    global _last_update_id
+
+    params = {
+        "timeout": 0,
+        "allowed_updates": ["callback_query"],
+    }
+    if _last_update_id > 0:
+        params["offset"] = _last_update_id + 1
+
+    result = _telegram_api("getUpdates", params)
+    if not result:
+        return []
+
+    updates = result.get("result", [])
+    callbacks = []
+
+    for update in updates:
+        update_id = update.get("update_id", 0)
+        if update_id > _last_update_id:
+            _last_update_id = update_id
+
+        cb = update.get("callback_query")
+        if not cb:
+            continue
+
+        # Security: only accept callbacks from configured chat
+        msg = cb.get("message", {})
+        chat = msg.get("chat", {})
+        chat_id = str(chat.get("id", ""))
+
+        if chat_id != str(config.TELEGRAM_CHAT_ID):
+            logger.warning("Ignoring callback from unauthorized chat %s", chat_id)
+            continue
+
+        callbacks.append({
+            "callback_id": cb.get("id", ""),
+            "data": cb.get("data", ""),
+            "message_id": msg.get("message_id", 0),
+        })
+
+    return callbacks
+
+
+def answer_callback(callback_id: str, text: str = ""):
+    """
+    Acknowledge a callback query (removes the 'loading' spinner on the button).
+
+    Args:
+        callback_id: The callback_query id from poll_callbacks()
+        text:        Optional short toast text shown to the user
+    """
+    payload = {"callback_query_id": callback_id}
+    if text:
+        payload["text"] = text
+    _telegram_api("answerCallbackQuery", payload)
+
+
+def edit_message_text(message_id: int, text: str, parse_mode: str = "HTML"):
+    """
+    Edit an existing message (e.g. to remove buttons after action).
+
+    Args:
+        message_id: The message to edit
+        text:       New text content
+    """
+    if not config.TELEGRAM_CHAT_ID:
+        return
+    _telegram_api("editMessageText", {
+        "chat_id": config.TELEGRAM_CHAT_ID,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": parse_mode,
+    })
 
 
 def _prefix() -> str:
@@ -199,21 +325,48 @@ def notify_risk_event(event_type: str, details: str):
     _send_message(text)
 
 
-def notify_ai_recommendation(recommendation: dict, current_price: float):
-    """Send the hourly AI advisor recommendation."""
+def notify_ai_recommendation(recommendation: dict, current_price: float) -> int:
+    """
+    Send the AI advisor recommendation.
+
+    For actionable recommendations (not "continue"), sends inline
+    Approve/Skip buttons and returns the message_id for tracking.
+    For "continue", sends a plain message and returns 0.
+
+    Returns:
+        message_id (int) if buttons were sent, 0 otherwise.
+    """
     condition = recommendation.get("condition", "unknown")
     action = recommendation.get("action", "continue")
     reason = recommendation.get("reason", "No reason given")
 
+    # "continue" means nothing to approve -- send plain notification
+    if action == "continue":
+        text = (
+            f"🧠 <b>{_prefix()}AI Advisor</b>\n\n"
+            f"Price: ${current_price:.6f}\n"
+            f"Market: {condition}\n"
+            f"Recommendation: {action}\n"
+            f"Reason: {reason}\n"
+            f"\n<i>No action needed</i>"
+        )
+        _send_message(text)
+        return 0
+
+    # Actionable recommendation -- send with Approve/Skip buttons
     text = (
         f"🧠 <b>{_prefix()}AI Advisor</b>\n\n"
         f"Price: ${current_price:.6f}\n"
         f"Market: {condition}\n"
-        f"Recommendation: {action}\n"
+        f"Recommendation: <b>{action}</b>\n"
         f"Reason: {reason}\n"
-        f"\n<i>Advisory only -- not auto-acting</i>"
+        f"\n<i>Tap below to approve or skip:</i>"
     )
-    _send_message(text)
+    buttons = [
+        {"text": "Approve", "callback_data": f"approve:{action}"},
+        {"text": "Skip", "callback_data": f"skip:{action}"},
+    ]
+    return send_with_buttons(text, buttons)
 
 
 def notify_accumulation(usd_amount: float, doge_amount: float,

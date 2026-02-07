@@ -185,10 +185,44 @@ def _log_recommendation(market_data: dict, parsed: dict):
                 parsed["condition"],
                 parsed["action"],
                 f"{market_data.get('price', 0):.6f}",
-                "logged_only",  # v1: never auto-followed
+                "pending",  # Updated later by log_approval_decision()
             ])
     except Exception as e:
         logger.error("Failed to write AI recommendation log: %s", e)
+
+
+def log_approval_decision(action: str, decision: str):
+    """
+    Log the user's approval decision (approve/skip/expired) to the CSV.
+
+    Appends a row with the decision so we can track how often
+    the user agrees with the AI vs. overrides it.
+
+    Args:
+        action:   The AI-recommended action (e.g. "widen_spacing")
+        decision: One of "approved", "skipped", "expired"
+    """
+    os.makedirs(config.LOG_DIR, exist_ok=True)
+    filepath = os.path.join(config.LOG_DIR, "ai_recommendations.csv")
+    file_exists = os.path.exists(filepath)
+
+    try:
+        with open(filepath, "a", newline="") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow([
+                    "timestamp", "market_condition", "recommendation",
+                    "current_price", "was_followed",
+                ])
+            writer.writerow([
+                datetime.now(timezone.utc).isoformat(),
+                "",  # no market condition for decision rows
+                action,
+                "",  # no price for decision rows
+                decision,
+            ])
+    except Exception as e:
+        logger.error("Failed to log approval decision: %s", e)
 
 
 # ---------------------------------------------------------------------------
