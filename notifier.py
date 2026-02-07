@@ -360,8 +360,9 @@ def notify_risk_event(event_type: str, details: str):
 
 def notify_ai_recommendation(recommendation: dict, current_price: float) -> int:
     """
-    Send the AI advisor recommendation.
+    Send the AI council recommendation.
 
+    Shows each panelist's vote and the majority verdict.
     For actionable recommendations (not "continue"), sends inline
     Approve/Skip buttons and returns the message_id for tracking.
     For "continue", sends a plain message and returns 0.
@@ -369,31 +370,54 @@ def notify_ai_recommendation(recommendation: dict, current_price: float) -> int:
     Returns:
         message_id (int) if buttons were sent, 0 otherwise.
     """
-    condition = recommendation.get("condition", "unknown")
     action = recommendation.get("action", "continue")
     reason = recommendation.get("reason", "No reason given")
+    panel_votes = recommendation.get("panel_votes", [])
+    panel_size = recommendation.get("panel_size", 0)
+    winner_count = recommendation.get("winner_count", 0)
 
-    # "continue" means nothing to approve -- send plain notification
+    # Build panel votes section
+    if panel_votes:
+        vote_lines = []
+        for v in panel_votes:
+            name = v.get("name", "?")
+            v_action = v.get("action", "?") or "error"
+            v_condition = v.get("condition", "?")
+            v_reason = v.get("reason", "")
+            marker = ">" if v_action == action else " "
+            vote_lines.append(
+                f"{marker} <b>{name}</b>: {v_action} ({v_condition})"
+            )
+            if v_reason:
+                vote_lines.append(f"    <i>{v_reason}</i>")
+        votes_text = "\n".join(vote_lines)
+        verdict = f"{action.upper()} ({winner_count}/{panel_size})"
+        header = f"AI Council"
+    else:
+        # Legacy single-model format
+        condition = recommendation.get("condition", "unknown")
+        votes_text = f"Market: {condition}\nReason: {reason}"
+        verdict = action.upper()
+        header = f"AI Advisor"
+
     if action == "continue":
         text = (
-            f"🧠 <b>{_prefix()}AI Advisor</b>\n\n"
-            f"Price: ${current_price:.6f}\n"
-            f"Market: {condition}\n"
-            f"Recommendation: {action}\n"
-            f"Reason: {reason}\n"
-            f"\n<i>No action needed</i>"
+            f"🧠 <b>{_prefix()}{header}</b>\n\n"
+            f"Price: ${current_price:.6f}\n\n"
+            f"{votes_text}\n\n"
+            f"Verdict: <b>{verdict}</b>\n"
+            f"<i>No action needed</i>"
         )
         _send_message(text)
         return 0
 
     # Actionable recommendation -- send with Approve/Skip buttons
     text = (
-        f"🧠 <b>{_prefix()}AI Advisor</b>\n\n"
-        f"Price: ${current_price:.6f}\n"
-        f"Market: {condition}\n"
-        f"Recommendation: <b>{action}</b>\n"
-        f"Reason: {reason}\n"
-        f"\n<i>Tap below to approve or skip:</i>"
+        f"🧠 <b>{_prefix()}{header}</b>\n\n"
+        f"Price: ${current_price:.6f}\n\n"
+        f"{votes_text}\n\n"
+        f"Verdict: <b>{verdict}</b>\n"
+        f"<i>Tap below to approve or skip:</i>"
     )
     buttons = [
         {"text": "Approve", "callback_data": f"approve:{action}"},

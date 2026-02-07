@@ -88,6 +88,7 @@ class GridState:
         self.total_profit_usd = 0.0      # Cumulative realized profit
         self.today_profit_usd = 0.0      # Today's realized profit (resets at midnight UTC)
         self.today_loss_usd = 0.0        # Today's realized losses (for daily loss limit)
+        self.today_fees_usd = 0.0       # Today's fees paid (resets at midnight UTC)
         self.today_date = ""             # Current date string for reset detection
         self.round_trips_today = 0       # Completed buy->sell cycles today
         self.total_round_trips = 0       # Lifetime round trips
@@ -133,6 +134,7 @@ def save_state(state: GridState):
         "total_profit_usd": state.total_profit_usd,
         "today_profit_usd": state.today_profit_usd,
         "today_loss_usd": state.today_loss_usd,
+        "today_fees_usd": state.today_fees_usd,
         "today_date": state.today_date,
         "round_trips_today": state.round_trips_today,
         "total_round_trips": state.total_round_trips,
@@ -179,6 +181,7 @@ def load_state(state: GridState) -> bool:
     state.total_profit_usd = snapshot.get("total_profit_usd", 0.0)
     state.today_profit_usd = snapshot.get("today_profit_usd", 0.0)
     state.today_loss_usd = snapshot.get("today_loss_usd", 0.0)
+    state.today_fees_usd = snapshot.get("today_fees_usd", 0.0)
     state.today_date = snapshot.get("today_date", "")
     state.round_trips_today = snapshot.get("round_trips_today", 0)
     state.total_round_trips = snapshot.get("total_round_trips", 0)
@@ -675,6 +678,15 @@ def check_fills_live(state: GridState) -> list:
                 order.level, vol_exec,
             )
 
+        elif status in ("canceled", "expired"):
+            # Kraken canceled or expired this order -- mark it so we can replace
+            order.status = "cancelled"
+            logger.warning(
+                "ORDER %s: %s L%+d %.2f DOGE @ $%.6f -- will replace",
+                status.upper(), order.side.upper(), order.level,
+                order.volume, order.price,
+            )
+
         elif status == "open":
             # Check for partial fill (still open but some volume executed)
             vol_exec = float(info.get("vol_exec", 0))
@@ -684,6 +696,34 @@ def check_fills_live(state: GridState) -> list:
                     order.side.upper(), order.level, vol_exec, order.volume, order.price,
                 )
                 order._partial_warned = True
+
+    # Replace canceled/expired orders immediately to fill grid holes
+    cancelled_orders = [o for o in open_orders if o.status == "cancelled"]
+    for order in cancelled_orders:
+        volume = calculate_volume_for_price(order.price)
+        replacement = GridOrder(
+            level=order.level, side=order.side,
+            price=order.price, volume=volume,
+        )
+        # Carry over matched_buy_price for sell replacements
+        if order.matched_buy_price is not None:
+            replacement.matched_buy_price = order.matched_buy_price
+        try:
+            txid = kraken_client.place_order(
+                side=order.side, volume=volume, price=order.price,
+            )
+            replacement.txid = txid
+            replacement.status = "open"
+            replacement.placed_at = time.time()
+            state.grid_orders.append(replacement)
+            logger.info(
+                "REPLACED %s L%+d %.2f DOGE @ $%.6f -> %s",
+                order.side.upper(), order.level, volume, order.price, txid,
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to replace cancelled order L%+d: %s", order.level, e,
+            )
 
     return filled
 
@@ -792,8 +832,11 @@ def handle_fills(state: GridState, filled_orders: list) -> list:
                 fees = (buy_price * filled.volume * config.MAKER_FEE_PCT / 100.0 +
                         filled.price * filled.volume * config.MAKER_FEE_PCT / 100.0)
                 net_profit = gross_profit - fees
+                state.total_round_trips += 1
+                state.round_trips_today += 1
             else:
                 # No cost basis -- initial grid sell or orphan. Book $0 with warning.
+                # NOT a completed round trip -- don't increment counters.
                 logger.warning(
                     "  Sell at $%.6f has no matched_buy_price -- booking $0 profit",
                     filled.price,
@@ -803,9 +846,8 @@ def handle_fills(state: GridState, filled_orders: list) -> list:
 
             state.total_profit_usd += net_profit
             state.today_profit_usd += net_profit
-            state.total_round_trips += 1
-            state.round_trips_today += 1
             state.total_fees_usd += fees
+            state.today_fees_usd += fees
 
             if net_profit < 0:
                 state.today_loss_usd += abs(net_profit)
@@ -871,15 +913,18 @@ def handle_fills(state: GridState, filled_orders: list) -> list:
             new_order.status = "failed"
             state.consecutive_errors += 1
 
-        # Also log the buy fill
+        # Also log the buy fill and track its fee
         if filled.side == "buy":
+            buy_fee = filled.price * filled.volume * config.MAKER_FEE_PCT / 100.0
+            state.total_fees_usd += buy_fee
+            state.today_fees_usd += buy_fee
             state.recent_fills.append({
                 "time": time.time(),
                 "side": "buy",
                 "price": filled.price,
                 "volume": filled.volume,
                 "profit": 0,
-                "fees": filled.price * filled.volume * config.MAKER_FEE_PCT / 100.0,
+                "fees": buy_fee,
             })
 
     return new_orders
@@ -938,6 +983,7 @@ def check_daily_reset(state: GridState):
         state.today_date = today
         state.today_profit_usd = 0.0
         state.today_loss_usd = 0.0
+        state.today_fees_usd = 0.0
         state.round_trips_today = 0
         state.is_paused = False
         state.pause_reason = ""
@@ -994,6 +1040,8 @@ def prune_completed_orders(state: GridState):
             kept.append(o)
         elif o.status == "filled" and o.side == "buy" and o.closed_out:
             pruned += 1  # Round trip complete, safe to drop
+        elif o.status == "filled" and o.side == "sell" and now - o.placed_at > 3600:
+            pruned += 1  # Processed sell, safe to drop
         elif o.status in ("cancelled", "failed") and now - o.placed_at > 3600:
             pruned += 1  # Stale cancelled/failed
         else:

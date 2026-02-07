@@ -1,27 +1,27 @@
 """
-ai_advisor.py -- Hourly market analysis via AI API.
+ai_advisor.py -- Multi-model AI council for grid trading decisions.
 
 HOW THIS WORKS:
-  Every hour, the bot:
+  Every AI_ADVISOR_INTERVAL seconds, the bot:
     1. Gathers market context (price, changes, spread, fill count)
-    2. Sends a compact prompt to an OpenAI-compatible API
-    3. Parses the AI's recommendation
-    4. Logs it -- does NOT auto-act on it (v1 is advisory only)
+    2. Queries multiple AI models (the "council") with the same prompt
+    3. Each model votes on condition and action
+    4. Majority vote determines the final recommendation
+    5. Only surfaces actionable recommendations when the council agrees
 
-  The AI analyzes whether the market is:
-    - Ranging (good for grid trading -- do nothing)
-    - Trending up (grid might need to shift upward)
-    - Trending down (grid might need to shift, or pause if risk is high)
+  The council approach eliminates single-model bias (the "broken record"
+  problem where one model fixates on the same recommendation).
 
 SUPPORTED PROVIDERS:
-  - NVIDIA build.nvidia.com (default, free tier, Kimi 2.5)
-  - Groq (free tier, Llama 3.1)
-  - Any OpenAI-compatible endpoint
+  - Groq (free tier): Llama 3.3 70B + Llama 3.1 8B
+  - NVIDIA build.nvidia.com (free tier): Kimi K2.5
+  - Any OpenAI-compatible endpoint (legacy single-model fallback)
 
-  If the API call fails, we log and continue. AI is advisory, never blocks trading.
+  Set GROQ_API_KEY and/or NVIDIA_API_KEY to enable panelists.
+  Panel auto-configures based on which keys are available.
 
 ZERO DEPENDENCIES:
-  Uses urllib.request to POST to the OpenAI-compatible endpoint.
+  Uses urllib.request to POST to OpenAI-compatible endpoints.
 """
 
 import json
@@ -31,18 +31,91 @@ import os
 import logging
 import urllib.request
 import urllib.error
+from collections import Counter
 from datetime import datetime, timezone
 
 import config
 
 logger = logging.getLogger(__name__)
 
-# API URL is configured in config.py (supports NVIDIA, Groq, or any OpenAI-compatible endpoint)
 
+# ---------------------------------------------------------------------------
+# Council panel definitions
+# ---------------------------------------------------------------------------
+
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+
+# Each tuple: (display_name, model_id, is_reasoning_model)
+GROQ_PANELISTS = [
+    ("Llama-70B", "llama-3.3-70b-versatile", False),
+    ("Llama-8B", "llama-3.1-8b-instant", False),
+]
+
+NVIDIA_PANELISTS = [
+    ("Kimi-K2.5", "moonshotai/kimi-k2.5", True),
+]
+
+# Reasoning models need more tokens (chain-of-thought + answer)
+_REASONING_MAX_TOKENS = 2048
+_INSTRUCT_MAX_TOKENS = 200
+
+
+def _build_panel() -> list:
+    """
+    Build the AI council based on available API keys.
+
+    Returns a list of panelist dicts.  Auto-configures:
+      - GROQ_API_KEY  -> Llama 3.3 70B + Llama 3.1 8B
+      - NVIDIA_API_KEY -> Kimi K2.5
+      - Both keys     -> all three (best diversity)
+      - Neither       -> legacy fallback to AI_API_KEY
+    """
+    panel = []
+
+    if config.GROQ_API_KEY:
+        for name, model, reasoning in GROQ_PANELISTS:
+            panel.append({
+                "name": name,
+                "url": GROQ_URL,
+                "model": model,
+                "key": config.GROQ_API_KEY,
+                "reasoning": reasoning,
+                "max_tokens": _REASONING_MAX_TOKENS if reasoning else _INSTRUCT_MAX_TOKENS,
+            })
+
+    if config.NVIDIA_API_KEY:
+        for name, model, reasoning in NVIDIA_PANELISTS:
+            panel.append({
+                "name": name,
+                "url": NVIDIA_URL,
+                "model": model,
+                "key": config.NVIDIA_API_KEY,
+                "reasoning": reasoning,
+                "max_tokens": _REASONING_MAX_TOKENS if reasoning else _INSTRUCT_MAX_TOKENS,
+            })
+
+    # Legacy fallback: single model from AI_API_KEY + AI_API_URL
+    if not panel and config.AI_API_KEY:
+        panel.append({
+            "name": config.AI_MODEL.split("/")[-1],
+            "url": config.AI_API_URL,
+            "model": config.AI_MODEL,
+            "key": config.AI_API_KEY,
+            "reasoning": False,
+            "max_tokens": _INSTRUCT_MAX_TOKENS,
+        })
+
+    return panel
+
+
+# ---------------------------------------------------------------------------
+# Prompt construction
+# ---------------------------------------------------------------------------
 
 def _build_prompt(market_data: dict, stats_context: str = "") -> str:
     """
-    Build a compact prompt for the AI advisor.
+    Build a compact prompt for each council panelist.
 
     We keep it short to minimize token usage and latency.
     The AI gets: current price, recent changes, spread, fill count,
@@ -72,20 +145,22 @@ REASON: [One sentence explanation]"""
     return prompt
 
 
-def _call_ai(prompt: str) -> str:
+# ---------------------------------------------------------------------------
+# API call (parameterized for each panelist)
+# ---------------------------------------------------------------------------
+
+def _call_panelist(prompt: str, panelist: dict) -> str:
     """
-    Call the AI API with a chat completion request.
+    Call a single AI panelist and return the raw response text.
 
     Supports any OpenAI-compatible endpoint (NVIDIA, Groq, etc.).
-    Uses urllib.request -- no external dependencies.
+    Handles reasoning models (Kimi K2.5) that may put the answer
+    in reasoning_content instead of content.
+
     Returns the assistant's response text, or empty string on failure.
     """
-    if not config.AI_API_KEY:
-        logger.debug("AI API key not set, skipping AI advisor")
-        return ""
-
     payload = json.dumps({
-        "model": config.AI_MODEL,
+        "model": panelist["model"],
         "messages": [
             {
                 "role": "system",
@@ -98,29 +173,27 @@ def _call_ai(prompt: str) -> str:
             },
             {"role": "user", "content": prompt},
         ],
-        "temperature": 0.3,       # Low temperature for consistent analysis
-        "max_tokens": 200,         # Enough for the 3-line structured response
+        "temperature": 0.3,
+        "max_tokens": panelist["max_tokens"],
     }).encode("utf-8")
 
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {config.AI_API_KEY}",
+        "Authorization": f"Bearer {panelist['key']}",
         "User-Agent": "DOGEGridBot/1.0",
     }
 
-    req = urllib.request.Request(config.AI_API_URL, data=payload, headers=headers)
+    req = urllib.request.Request(panelist["url"], data=payload, headers=headers)
 
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             body = json.loads(resp.read().decode("utf-8"))
-            # Extract the assistant message from OpenAI-compatible response
             choices = body.get("choices", [])
             if choices:
                 msg = choices[0].get("message", {})
-                # Some models (like Kimi 2.5) are reasoning models --
-                # they put the answer in "content" but may also have
-                # "reasoning_content" with chain-of-thought.  If content
-                # is null (all tokens spent on reasoning), fall back.
+                # Reasoning models (Kimi K2.5) may put the answer in
+                # "content" but spend tokens on "reasoning_content".
+                # If content is null, fall back to reasoning_content.
                 content = msg.get("content")
                 if not content:
                     content = msg.get("reasoning_content")
@@ -129,17 +202,23 @@ def _call_ai(prompt: str) -> str:
 
     except urllib.error.HTTPError as e:
         error_body = e.read().decode("utf-8", errors="replace")
-        logger.warning("AI API HTTP %d: %s", e.code, error_body[:200])
+        logger.warning(
+            "%s HTTP %d: %s", panelist["name"], e.code, error_body[:200],
+        )
         return ""
 
     except urllib.error.URLError as e:
-        logger.warning("AI API connection error: %s", e.reason)
+        logger.warning("%s connection error: %s", panelist["name"], e.reason)
         return ""
 
     except Exception as e:
-        logger.warning("AI API unexpected error: %s", e)
+        logger.warning("%s error: %s", panelist["name"], e)
         return ""
 
+
+# ---------------------------------------------------------------------------
+# Response parsing
+# ---------------------------------------------------------------------------
 
 def _parse_response(response: str) -> dict:
     """
@@ -174,11 +253,86 @@ def _parse_response(response: str) -> dict:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Vote aggregation
+# ---------------------------------------------------------------------------
+
+def _aggregate_votes(votes: list) -> dict:
+    """
+    Aggregate individual panelist votes into a council recommendation.
+
+    Majority vote (>50%) determines the action.
+    If no majority or all votes failed, default to "continue".
+    This naturally suppresses spam: disagreement -> no action.
+    """
+    valid = [v for v in votes if v.get("action") not in ("", "unknown")]
+
+    if not valid:
+        return {
+            "condition": "unknown",
+            "action": "continue",
+            "reason": "No valid votes from council",
+            "raw": "",
+            "panel_votes": votes,
+            "consensus": False,
+            "panel_size": 0,
+            "winner_count": 0,
+        }
+
+    # Count action votes
+    action_counts = Counter(v["action"] for v in valid)
+    winner_action, winner_count = action_counts.most_common(1)[0]
+
+    # Need strict majority (>50%)
+    has_majority = winner_count > len(valid) / 2
+
+    if has_majority:
+        final_action = winner_action
+        # Use reason from the first voter who picked the winner
+        reason = next(
+            v["reason"] for v in valid if v["action"] == final_action
+        )
+    else:
+        final_action = "continue"
+        # Summarize the split
+        split = ", ".join(
+            f"{count}x {act}" for act, count in action_counts.most_common()
+        )
+        reason = f"Council split ({split}) -- no majority"
+
+    # Majority condition (for display)
+    condition_counts = Counter(v["condition"] for v in valid)
+    final_condition = condition_counts.most_common(1)[0][0]
+
+    return {
+        "condition": final_condition,
+        "action": final_action,
+        "reason": reason,
+        "raw": "",
+        "panel_votes": votes,
+        "vote_counts": dict(action_counts),
+        "consensus": has_majority,
+        "panel_size": len(valid),
+        "winner_count": winner_count if has_majority else 0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# CSV logging
+# ---------------------------------------------------------------------------
+
 def _log_recommendation(market_data: dict, parsed: dict):
-    """Log the AI recommendation to CSV for later analysis."""
+    """Log the council recommendation to CSV for later analysis."""
     os.makedirs(config.LOG_DIR, exist_ok=True)
     filepath = os.path.join(config.LOG_DIR, "ai_recommendations.csv")
     file_exists = os.path.exists(filepath)
+
+    # Summarize panel votes for CSV
+    panel_votes = parsed.get("panel_votes", [])
+    panel_summary = "; ".join(
+        f"{v.get('name', '?')}={v.get('action', '?')}"
+        for v in panel_votes
+    ) if panel_votes else ""
 
     try:
         with open(filepath, "a", newline="") as f:
@@ -186,14 +340,15 @@ def _log_recommendation(market_data: dict, parsed: dict):
             if not file_exists:
                 writer.writerow([
                     "timestamp", "market_condition", "recommendation",
-                    "current_price", "was_followed",
+                    "current_price", "was_followed", "panel_votes",
                 ])
             writer.writerow([
                 datetime.now(timezone.utc).isoformat(),
                 parsed["condition"],
                 parsed["action"],
                 f"{market_data.get('price', 0):.6f}",
-                "pending",  # Updated later by log_approval_decision()
+                "pending",
+                panel_summary,
             ])
     except Exception as e:
         logger.error("Failed to write AI recommendation log: %s", e)
@@ -202,9 +357,6 @@ def _log_recommendation(market_data: dict, parsed: dict):
 def log_approval_decision(action: str, decision: str):
     """
     Log the user's approval decision (approve/skip/expired) to the CSV.
-
-    Appends a row with the decision so we can track how often
-    the user agrees with the AI vs. overrides it.
 
     Args:
         action:   The AI-recommended action (e.g. "widen_spacing")
@@ -220,14 +372,15 @@ def log_approval_decision(action: str, decision: str):
             if not file_exists:
                 writer.writerow([
                     "timestamp", "market_condition", "recommendation",
-                    "current_price", "was_followed",
+                    "current_price", "was_followed", "panel_votes",
                 ])
             writer.writerow([
                 datetime.now(timezone.utc).isoformat(),
-                "",  # no market condition for decision rows
+                "",
                 action,
-                "",  # no price for decision rows
+                "",
                 decision,
+                "",
             ])
     except Exception as e:
         logger.error("Failed to log approval decision: %s", e)
@@ -239,58 +392,116 @@ def log_approval_decision(action: str, decision: str):
 
 def get_recommendation(market_data: dict, stats_context: str = "") -> dict:
     """
-    Run the AI advisor and return its recommendation.
+    Run the AI council and return the aggregated recommendation.
+
+    Queries all configured panelists with the same prompt, then
+    aggregates by majority vote.  Disagreement defaults to "continue"
+    (no action), which naturally suppresses the "broken record" problem.
 
     Args:
         market_data: Dict with keys:
             price, change_1h, change_4h, change_24h,
             spread_pct, recent_fills, grid_center
         stats_context: Optional string of statistical analysis results
-            from stats_engine.format_for_ai().  Fed into the prompt so the
-            LLM reasons about real quantitative signals.
 
     Returns:
-        Dict with keys: condition, action, reason, raw
-        On failure: returns defaults (condition=unknown, action=continue)
+        Dict with keys: condition, action, reason, raw,
+                        panel_votes, consensus, panel_size, winner_count
 
     This function NEVER raises -- failures are logged and defaults returned.
-    The trading bot must never stop because the AI advisor had a hiccup.
     """
-    logger.info("Running AI advisor analysis...")
+    panel = _build_panel()
+    if not panel:
+        logger.info("AI council: no API keys configured")
+        return {
+            "condition": "unknown", "action": "continue",
+            "reason": "No AI keys configured", "raw": "",
+            "panel_votes": [], "consensus": False,
+            "panel_size": 0, "winner_count": 0,
+        }
 
-    try:
-        prompt = _build_prompt(market_data, stats_context)
-        response = _call_ai(prompt)
+    logger.info("Running AI council (%d panelists)...", len(panel))
 
-        if not response:
-            logger.info("AI advisor: no response (API key missing or call failed)")
-            return {"condition": "unknown", "action": "continue", "reason": "No AI response", "raw": ""}
+    prompt = _build_prompt(market_data, stats_context)
+    votes = []
 
-        parsed = _parse_response(response)
-        _log_recommendation(market_data, parsed)
+    for i, panelist in enumerate(panel):
+        try:
+            response = _call_panelist(prompt, panelist)
+            if response:
+                parsed = _parse_response(response)
+                parsed["name"] = panelist["name"]
+                votes.append(parsed)
+                logger.info(
+                    "  %s: %s / %s -- %s",
+                    panelist["name"], parsed["condition"],
+                    parsed["action"], parsed["reason"],
+                )
+            else:
+                votes.append({
+                    "name": panelist["name"],
+                    "condition": "error",
+                    "action": "",
+                    "reason": "No response",
+                    "raw": "",
+                })
+                logger.warning("  %s: no response", panelist["name"])
 
-        logger.info(
-            "AI advisor: condition=%s, action=%s, reason=%s",
-            parsed["condition"], parsed["action"], parsed["reason"],
-        )
+        except Exception as e:
+            votes.append({
+                "name": panelist["name"],
+                "condition": "error",
+                "action": "",
+                "reason": str(e),
+                "raw": "",
+            })
+            logger.warning("  %s: error -- %s", panelist["name"], e)
 
-        return parsed
+        # Brief pause between panelists to respect rate limits
+        if i < len(panel) - 1:
+            time.sleep(1)
 
-    except Exception as e:
-        # This should never happen (we catch everything above),
-        # but defense in depth.
-        logger.error("AI advisor unexpected error: %s", e)
-        return {"condition": "error", "action": "continue", "reason": str(e), "raw": ""}
+    result = _aggregate_votes(votes)
+    _log_recommendation(market_data, result)
+
+    logger.info(
+        "AI council verdict: %s (%d/%d) -- %s",
+        result["action"].upper(),
+        result.get("winner_count", 0),
+        result.get("panel_size", len(panel)),
+        result["reason"],
+    )
+
+    return result
 
 
 def format_recommendation(parsed: dict) -> str:
-    """Format the AI recommendation for Telegram/logging display."""
-    if not parsed or parsed.get("condition") == "unknown":
-        return "AI Advisor: unavailable"
+    """
+    Format the AI council recommendation for status display / logging.
+    Shows each panelist's vote and the majority verdict.
+    """
+    panel_votes = parsed.get("panel_votes", [])
 
-    return (
-        f"AI Advisor:\n"
-        f"  Market: {parsed['condition']}\n"
-        f"  Action: {parsed['action']}\n"
-        f"  Reason: {parsed['reason']}"
-    )
+    if not panel_votes:
+        if parsed.get("condition") == "unknown":
+            return "AI Council: unavailable"
+        return (
+            f"AI Advisor:\n"
+            f"  Market: {parsed['condition']}\n"
+            f"  Action: {parsed['action']}\n"
+            f"  Reason: {parsed['reason']}"
+        )
+
+    lines = ["AI Council:"]
+    for v in panel_votes:
+        name = v.get("name", "?")
+        action = v.get("action", "?") or "error"
+        condition = v.get("condition", "?")
+        lines.append(f"  {name}: {action} ({condition})")
+
+    action = parsed.get("action", "continue")
+    panel_size = parsed.get("panel_size", len(panel_votes))
+    winner_count = parsed.get("winner_count", 0)
+    lines.append(f"  Verdict: {action.upper()} ({winner_count}/{panel_size})")
+
+    return "\n".join(lines)

@@ -46,10 +46,14 @@ KRAKEN_API_KEY: str = _env("KRAKEN_API_KEY", "")
 # Your Kraken private (secret) key -- base64-encoded by Kraken.
 KRAKEN_API_SECRET: str = _env("KRAKEN_API_SECRET", "")
 
-# AI advisor API key.  Supports any OpenAI-compatible endpoint.
-# Default: NVIDIA build.nvidia.com (free tier with Kimi 2.5).
-# Also works with Groq (GROQ_API_KEY is checked as fallback).
-AI_API_KEY: str = _env("AI_API_KEY", _env("GROQ_API_KEY", ""))
+# AI Council API keys.  Set one or both for multi-model voting.
+# Groq (free tier): Llama 3.3 70B + Llama 3.1 8B
+# NVIDIA build.nvidia.com (free tier): Kimi K2.5
+GROQ_API_KEY: str = _env("GROQ_API_KEY", "")
+NVIDIA_API_KEY: str = _env("NVIDIA_API_KEY", "")
+
+# Legacy fallback -- used only if neither GROQ nor NVIDIA key is set.
+AI_API_KEY: str = _env("AI_API_KEY", GROQ_API_KEY or NVIDIA_API_KEY)
 
 # Telegram bot token (from @BotFather) and your chat ID (from @userinfobot).
 TELEGRAM_BOT_TOKEN: str = _env("TELEGRAM_BOT_TOKEN", "")
@@ -212,19 +216,14 @@ STATE_FILE: str = os.path.join(LOG_DIR, "state.json")
 HEALTH_PORT: int = _env("PORT", _env("HEALTH_PORT", 8080, int), int)
 
 # ---------------------------------------------------------------------------
-# AI advisor settings
+# AI council settings
 # ---------------------------------------------------------------------------
 
-# OpenAI-compatible API endpoint for the AI advisor.
-# Default: NVIDIA build.nvidia.com (free tier).
-# Alternative: "https://api.groq.com/openai/v1/chat/completions" (Groq)
+# The council queries multiple models and uses majority vote.
+# Panel is auto-configured from GROQ_API_KEY / NVIDIA_API_KEY.
+# These legacy settings are only used as single-model fallback
+# when neither panel key is set.
 AI_API_URL: str = _env("AI_API_URL", "https://integrate.api.nvidia.com/v1/chat/completions")
-
-# Which model to use for the AI advisor.
-# Default: "meta/llama-3.1-8b-instruct" on NVIDIA (free tier, fast, clean output).
-# Avoid reasoning models (kimi-k2.5) -- they waste tokens on chain-of-thought
-# and return empty content.  Instruct models give structured 3-line responses.
-# Groq alternatives: "llama-3.1-8b-instant", "llama-3.1-70b-versatile"
 AI_MODEL: str = _env("AI_MODEL", "meta/llama-3.1-8b-instruct")
 
 # ---------------------------------------------------------------------------
@@ -250,12 +249,13 @@ def print_banner():
         f"  Daily loss limit: ${DAILY_LOSS_LIMIT:.2f}",
         f"  Drift reset:     {GRID_DRIFT_RESET_PCT:.1f}%",
         f"  Poll interval:   {POLL_INTERVAL_SECONDS}s",
-        f"  AI advisor:      every {AI_ADVISOR_INTERVAL // 60} min",
+        f"  AI council:      every {AI_ADVISOR_INTERVAL // 60} min",
         f"  Health port:     {HEALTH_PORT}",
         f"  Log level:       {LOG_LEVEL}",
         f"  Kraken key:      {'configured' if KRAKEN_API_KEY else 'NOT SET'}",
-        f"  AI model:        {AI_MODEL}",
-        f"  AI key:          {'configured' if AI_API_KEY else 'NOT SET'}",
+        f"  Groq key:        {'configured' if GROQ_API_KEY else 'NOT SET'}",
+        f"  NVIDIA key:      {'configured' if NVIDIA_API_KEY else 'NOT SET'}",
+        f"  AI fallback:     {'configured' if AI_API_KEY and not GROQ_API_KEY and not NVIDIA_API_KEY else 'N/A'}",
         f"  Telegram:        {'configured' if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID else 'NOT SET'}",
         "=" * 60,
         "",

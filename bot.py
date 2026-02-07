@@ -552,7 +552,7 @@ def _set_pending_approval(action: str, message_id: int, recommendation: dict):
         ai_advisor.log_approval_decision(old_action, "expired")
         notifier.edit_message_text(
             old_msg_id,
-            f"🧠 <b>AI Advisor</b> -- <i>{old_action}</i>\n\n"
+            f"🧠 <b>AI Council</b> -- <i>{old_action}</i>\n\n"
             f"<s>Expired</s> (superseded by new recommendation)",
         )
 
@@ -580,7 +580,7 @@ def _check_approval_expiry():
         ai_advisor.log_approval_decision(action, "expired")
         notifier.edit_message_text(
             msg_id,
-            f"🧠 <b>AI Advisor</b> -- <i>{action}</i>\n\n"
+            f"🧠 <b>AI Council</b> -- <i>{action}</i>\n\n"
             f"<s>Expired</s> (no response in {APPROVAL_TIMEOUT // 60} min)",
         )
         _pending_approval = None
@@ -641,7 +641,7 @@ def _poll_and_handle_callbacks(state: grid_strategy.GridState, current_price: fl
             # Update the message to show it was approved
             notifier.edit_message_text(
                 cb_msg_id,
-                f"🧠 <b>AI Advisor</b> -- <i>{action}</i>\n\n"
+                f"🧠 <b>AI Council</b> -- <i>{action}</i>\n\n"
                 f"Approved and executed.",
             )
             _pending_approval = None
@@ -653,7 +653,7 @@ def _poll_and_handle_callbacks(state: grid_strategy.GridState, current_price: fl
 
             notifier.edit_message_text(
                 cb_msg_id,
-                f"🧠 <b>AI Advisor</b> -- <i>{action}</i>\n\n"
+                f"🧠 <b>AI Council</b> -- <i>{action}</i>\n\n"
                 f"<s>Skipped</s> by user.",
             )
             _pending_approval = None
@@ -1119,17 +1119,22 @@ def run():
                 continue
 
             # --- 4b: Check daily reset ---
+            # Capture yesterday's values BEFORE reset zeroes them
             old_date = state.today_date
+            old_profit = state.today_profit_usd
+            old_trips = state.round_trips_today
+            old_loss = state.today_loss_usd
+            old_fees = state.today_fees_usd
             grid_strategy.check_daily_reset(state)
 
-            # Send daily summary at date boundary
+            # Send daily summary at date boundary (using captured values)
             if old_date and old_date != state.today_date and old_date != last_daily_summary_date:
                 last_daily_summary_date = old_date
                 notifier.notify_daily_summary(
                     date=old_date,
-                    trades=state.round_trips_today,
-                    profit=state.today_profit_usd,
-                    fees=state.total_fees_usd,
+                    trades=old_trips,
+                    profit=old_profit,
+                    fees=old_fees,
                     doge_accumulated=state.doge_accumulated,
                     total_profit=state.total_profit_usd,
                     total_trips=state.total_round_trips,
@@ -1148,7 +1153,9 @@ def run():
             if should_pause and not state.is_paused:
                 state.is_paused = True
                 state.pause_reason = reason
-                logger.warning("PAUSED: %s", reason)
+                grid_strategy.cancel_grid(state)
+                grid_strategy.save_state(state)
+                logger.warning("PAUSED: %s -- cancelled open orders", reason)
                 notifier.notify_risk_event("daily_limit", reason)
 
             if state.is_paused:
