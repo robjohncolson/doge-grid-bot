@@ -147,6 +147,9 @@ def save_state(state: GridState):
         "open_txids": [o.txid for o in state.grid_orders
                        if o.status == "open" and o.txid],
         "saved_at": time.time(),
+        # Runtime config overrides (survive deploys via Supabase)
+        "grid_spacing_pct": config.GRID_SPACING_PCT,
+        "ai_advisor_interval": config.AI_ADVISOR_INTERVAL,
     }
     tmp_path = config.STATE_FILE + ".tmp"
     try:

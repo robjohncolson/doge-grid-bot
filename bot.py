@@ -1047,10 +1047,48 @@ def run():
     _bot_state = state
 
     # Restore counters from previous session (if any)
-    grid_strategy.load_state(state)
+    # Try local state file first, then fall back to Supabase cloud state
+    local_loaded = grid_strategy.load_state(state)
 
-    # Start Supabase persistence (loads fills/prices if available)
+    # Start Supabase persistence (loads fills/prices/state if available)
     supabase_store.start_writer_thread()
+
+    if not local_loaded:
+        sb_state = supabase_store.load_state()
+        if sb_state:
+            state.center_price = sb_state.get("center_price", 0.0)
+            state.total_profit_usd = sb_state.get("total_profit_usd", 0.0)
+            state.today_profit_usd = sb_state.get("today_profit_usd", 0.0)
+            state.today_loss_usd = sb_state.get("today_loss_usd", 0.0)
+            state.today_fees_usd = sb_state.get("today_fees_usd", 0.0)
+            state.today_date = sb_state.get("today_date", "")
+            state.round_trips_today = sb_state.get("round_trips_today", 0)
+            state.total_round_trips = sb_state.get("total_round_trips", 0)
+            state.total_fees_usd = sb_state.get("total_fees_usd", 0.0)
+            state.doge_accumulated = sb_state.get("doge_accumulated", 0.0)
+            state.last_accumulation = sb_state.get("last_accumulation", 0.0)
+            state.trend_ratio = sb_state.get("trend_ratio", 0.5)
+            state.trend_ratio_override = sb_state.get("trend_ratio_override", None)
+            # Restore runtime config overrides (spacing, AI interval)
+            saved_spacing = sb_state.get("grid_spacing_pct")
+            if saved_spacing and saved_spacing != config.GRID_SPACING_PCT:
+                logger.info(
+                    "Restoring spacing from Supabase: %.2f%% -> %.2f%%",
+                    config.GRID_SPACING_PCT, saved_spacing,
+                )
+                config.GRID_SPACING_PCT = saved_spacing
+            saved_ai_interval = sb_state.get("ai_advisor_interval")
+            if saved_ai_interval and saved_ai_interval != config.AI_ADVISOR_INTERVAL:
+                logger.info(
+                    "Restoring AI interval from Supabase: %ds -> %ds",
+                    config.AI_ADVISOR_INTERVAL, saved_ai_interval,
+                )
+                config.AI_ADVISOR_INTERVAL = saved_ai_interval
+            logger.info(
+                "State restored from Supabase: $%.4f profit, %d round trips",
+                state.total_profit_usd, state.total_round_trips,
+            )
+
     sb_fills = supabase_store.load_fills()
     if sb_fills:
         state.recent_fills = sb_fills
