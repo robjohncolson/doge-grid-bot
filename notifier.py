@@ -125,57 +125,76 @@ def send_with_buttons(text: str, buttons: list, parse_mode: str = "HTML") -> int
     return 0
 
 
-def poll_callbacks() -> list:
+def poll_updates() -> tuple:
     """
-    Poll Telegram for new callback_query updates (button presses).
+    Poll Telegram for new updates (button presses and text commands).
 
     Uses short polling (timeout=0) so it never blocks.
-    Only returns callbacks from the configured TELEGRAM_CHAT_ID.
+    Only returns updates from the configured TELEGRAM_CHAT_ID.
 
     Returns:
-        List of dicts: [{"callback_id": str, "data": str, "message_id": int}, ...]
+        Tuple of (callbacks, commands):
+          callbacks: [{"callback_id": str, "data": str, "message_id": int}, ...]
+          commands:  [{"text": str, "message_id": int}, ...]
     """
     global _last_update_id
 
     params = {
         "timeout": 0,
-        "allowed_updates": ["callback_query"],
+        "allowed_updates": ["callback_query", "message"],
     }
     if _last_update_id > 0:
         params["offset"] = _last_update_id + 1
 
     result = _telegram_api("getUpdates", params)
     if not result:
-        return []
+        return [], []
 
     updates = result.get("result", [])
     callbacks = []
+    commands = []
 
     for update in updates:
         update_id = update.get("update_id", 0)
         if update_id > _last_update_id:
             _last_update_id = update_id
 
+        # Handle callback queries (button presses)
         cb = update.get("callback_query")
-        if not cb:
+        if cb:
+            msg = cb.get("message", {})
+            chat = msg.get("chat", {})
+            chat_id = str(chat.get("id", ""))
+
+            if chat_id != str(config.TELEGRAM_CHAT_ID):
+                logger.warning("Ignoring callback from unauthorized chat %s", chat_id)
+                continue
+
+            callbacks.append({
+                "callback_id": cb.get("id", ""),
+                "data": cb.get("data", ""),
+                "message_id": msg.get("message_id", 0),
+            })
             continue
 
-        # Security: only accept callbacks from configured chat
-        msg = cb.get("message", {})
-        chat = msg.get("chat", {})
-        chat_id = str(chat.get("id", ""))
+        # Handle text messages (commands)
+        msg = update.get("message")
+        if not msg:
+            continue
 
+        chat_id = str(msg.get("chat", {}).get("id", ""))
         if chat_id != str(config.TELEGRAM_CHAT_ID):
-            logger.warning("Ignoring callback from unauthorized chat %s", chat_id)
+            logger.warning("Ignoring message from unauthorized chat %s", chat_id)
             continue
 
-        callbacks.append({
-            "callback_id": cb.get("id", ""),
-            "data": cb.get("data", ""),
-            "message_id": msg.get("message_id", 0),
-        })
+        text = msg.get("text", "")
+        if text.startswith("/"):
+            commands.append({
+                "text": text,
+                "message_id": msg.get("message_id", 0),
+            })
 
-    return callbacks
+    return callbacks, commands
 
 
 def answer_callback(callback_id: str, text: str = ""):

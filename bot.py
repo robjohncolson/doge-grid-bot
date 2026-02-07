@@ -248,11 +248,16 @@ def _check_approval_expiry():
 
 def _poll_and_handle_callbacks(state: grid_strategy.GridState, current_price: float):
     """
-    Poll Telegram for button presses and handle approve/skip.
+    Poll Telegram for button presses and text commands, then handle them.
     """
     global _pending_approval
 
-    callbacks = notifier.poll_callbacks()
+    callbacks, commands = notifier.poll_updates()
+
+    # Handle text commands
+    if commands:
+        _handle_text_commands(state, current_price, commands)
+
     if not callbacks:
         return
 
@@ -370,6 +375,118 @@ def _execute_approved_action(state: grid_strategy.GridState, action: str,
 
     else:
         logger.warning("Unknown approved action: %s -- ignoring", action)
+
+
+# ---------------------------------------------------------------------------
+# Telegram text commands
+# ---------------------------------------------------------------------------
+
+def _handle_text_commands(state: grid_strategy.GridState, current_price: float,
+                          commands: list):
+    """
+    Dispatch Telegram text commands (e.g. /status, /interval 600).
+    Each command gets a reply message sent back to Telegram.
+    """
+    for cmd in commands:
+        text = cmd["text"].strip()
+        parts = text.split(None, 1)  # split on first whitespace
+        command = parts[0].lower()
+        # Strip @botname suffix (e.g. /help@MyBot)
+        if "@" in command:
+            command = command.split("@")[0]
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
+        logger.info("Telegram command: %s (arg=%r)", command, arg)
+
+        if command == "/interval":
+            _cmd_interval(arg)
+        elif command == "/check":
+            _cmd_check(state)
+        elif command == "/status":
+            _cmd_status(state, current_price)
+        elif command == "/spacing":
+            _cmd_spacing(state, current_price, arg)
+        elif command == "/help":
+            _cmd_help()
+        else:
+            notifier._send_message(f"Unknown command: <code>{command}</code>\nSend /help for available commands.")
+
+
+def _cmd_interval(arg: str):
+    """Handle /interval <seconds> -- change AI advisor check interval."""
+    try:
+        seconds = int(arg)
+    except (ValueError, TypeError):
+        notifier._send_message("Usage: /interval &lt;seconds&gt;\nExample: /interval 600")
+        return
+
+    if seconds < 60 or seconds > 86400:
+        notifier._send_message("Interval must be between 60 and 86400 seconds.")
+        return
+
+    config.AI_ADVISOR_INTERVAL = seconds
+    minutes = seconds / 60
+    if minutes == int(minutes):
+        label = f"{int(minutes)} min"
+    else:
+        label = f"{minutes:.1f} min"
+    notifier._send_message(f"AI interval set to {seconds}s ({label})")
+    logger.info("AI_ADVISOR_INTERVAL changed to %ds via Telegram", seconds)
+
+
+def _cmd_check(state: grid_strategy.GridState):
+    """Handle /check -- trigger immediate AI advisor check."""
+    state.last_ai_check = 0
+    notifier._send_message("AI check will run next cycle (~30s)")
+    logger.info("Immediate AI check requested via Telegram")
+
+
+def _cmd_status(state: grid_strategy.GridState, current_price: float):
+    """Handle /status -- reply with current bot status."""
+    summary = grid_strategy.get_status_summary(state, current_price)
+    # Wrap in <pre> for monospace formatting in Telegram
+    notifier._send_message(f"<pre>{summary}</pre>")
+
+
+def _cmd_spacing(state: grid_strategy.GridState, current_price: float, arg: str):
+    """Handle /spacing <pct> -- set grid spacing and rebuild grid."""
+    try:
+        new_spacing = float(arg)
+    except (ValueError, TypeError):
+        notifier._send_message("Usage: /spacing &lt;percent&gt;\nExample: /spacing 1.5")
+        return
+
+    floor = config.ROUND_TRIP_FEE_PCT + 0.1
+    if new_spacing < floor:
+        notifier._send_message(
+            f"Spacing must be >= {floor:.2f}% (fees + 0.1%).\n"
+            f"Current: {config.GRID_SPACING_PCT:.2f}%"
+        )
+        return
+
+    old = config.GRID_SPACING_PCT
+    config.GRID_SPACING_PCT = round(new_spacing, 4)
+    logger.info("GRID_SPACING_PCT changed %.2f%% -> %.2f%% via Telegram", old, new_spacing)
+
+    grid_strategy.cancel_grid(state)
+    orders = grid_strategy.build_grid(state, current_price)
+
+    notifier._send_message(
+        f"Spacing: {old:.2f}% -> {config.GRID_SPACING_PCT:.2f}%\n"
+        f"Grid rebuilt: {len(orders)} orders around ${current_price:.6f}"
+    )
+
+
+def _cmd_help():
+    """Handle /help -- list available commands."""
+    notifier._send_message(
+        "<b>Bot Commands</b>\n\n"
+        "/status -- Current bot status\n"
+        "/interval &lt;sec&gt; -- Set AI check interval (60-86400)\n"
+        "/check -- Trigger AI check next cycle\n"
+        "/spacing &lt;pct&gt; -- Set grid spacing % and rebuild\n"
+        "/help -- This message"
+    )
 
 
 # ---------------------------------------------------------------------------
