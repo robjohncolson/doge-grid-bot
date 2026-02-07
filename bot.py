@@ -49,6 +49,7 @@ import grid_strategy
 import ai_advisor
 import notifier
 import dashboard
+import stats_engine
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -113,6 +114,10 @@ SPACING_STEP_PCT = 0.25
 # Pending web config changes -- written by HTTP thread, read by main loop
 _web_config_pending: dict = {}
 
+# OHLC candle cache for stats engine (fetched every 5 min)
+_ohlc_cache: list = []
+_ohlc_last_fetch: float = 0.0
+
 
 class DashboardHandler(BaseHTTPRequestHandler):
     """
@@ -126,6 +131,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_html(dashboard.DASHBOARD_HTML)
         elif self.path == "/api/status":
             self._handle_api_status()
+        elif self.path == "/api/stats":
+            self._handle_api_stats()
         elif self.path == "/health":
             self._handle_health()
         else:
@@ -152,6 +159,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         data = dashboard.serialize_state(_bot_state, current_price)
         self._send_json(data)
+
+    def _handle_api_stats(self):
+        """GET /api/stats -- stats engine results only."""
+        if not _bot_state:
+            self._send_json({"error": "bot not initialized"}, 503)
+            return
+        self._send_json(_bot_state.stats_results or {})
 
     def _handle_health(self):
         """GET /health -- legacy Railway health check (backwards compatible)."""
@@ -580,6 +594,8 @@ def _handle_text_commands(state: grid_strategy.GridState, current_price: float,
             _cmd_spacing(state, current_price, arg)
         elif command == "/ratio":
             _cmd_ratio(state, current_price, arg)
+        elif command == "/stats":
+            _cmd_stats(state)
         elif command == "/help":
             _cmd_help()
         else:
@@ -717,6 +733,33 @@ def _cmd_ratio(state: grid_strategy.GridState, current_price: float, arg: str):
     )
 
 
+def _cmd_stats(state: grid_strategy.GridState):
+    """Handle /stats -- show statistical analysis results."""
+    results = state.stats_results
+    if not results:
+        notifier._send_message("Stats engine hasn't run yet. Wait ~60s for first analysis.")
+        return
+
+    lines = ["<b>Statistical Advisory Board</b>\n"]
+
+    health = results.get("overall_health", {})
+    if health:
+        lines.append(f"Overall: <b>{health.get('verdict', 'N/A').upper()}</b>")
+        lines.append(f"{health.get('summary', '')}\n")
+
+    for name in ("profitability", "fill_asymmetry", "grid_exceedance",
+                 "fill_rate", "random_walk"):
+        r = results.get(name)
+        if not r:
+            continue
+        label = name.replace("_", " ").title()
+        verdict = r.get("verdict", "?").replace("_", " ").upper()
+        lines.append(f"<b>{label}</b>: {verdict}")
+        lines.append(f"  {r.get('summary', '')}")
+
+    notifier._send_message("\n".join(lines))
+
+
 def _cmd_help():
     """Handle /help -- list available commands."""
     notifier._send_message(
@@ -726,6 +769,7 @@ def _cmd_help():
         "/check -- Trigger AI check next cycle\n"
         "/spacing &lt;pct&gt; -- Set grid spacing % and rebuild\n"
         "/ratio -- Show/set trend ratio (asymmetric grid)\n"
+        "/stats -- Statistical analysis results\n"
         "/help -- This message"
     )
 
@@ -739,7 +783,7 @@ def run():
     Main bot entry point.  Runs the complete lifecycle:
     init -> build grid -> loop -> shutdown.
     """
-    global _bot_state, _bot_healthy, _bot_start_time
+    global _bot_state, _bot_healthy, _bot_start_time, _ohlc_cache, _ohlc_last_fetch
 
     # --- Phase 1: Initialize ---
     setup_logging()
@@ -920,7 +964,8 @@ def run():
                     "grid_center": state.center_price,
                 }
 
-                recommendation = ai_advisor.get_recommendation(market_data)
+                stats_context = stats_engine.format_for_ai(state.stats_results)
+                recommendation = ai_advisor.get_recommendation(market_data, stats_context)
                 state.ai_recommendation = ai_advisor.format_recommendation(recommendation)
 
                 # Send via Telegram (with buttons for actionable recommendations)
@@ -937,6 +982,23 @@ def run():
 
             # --- 4f3: Apply web dashboard config changes ---
             _apply_web_config(state, current_price)
+
+            # --- 4f4: Run stats engine (every 60s) ---
+            if now - state.stats_last_run >= 60:
+                state.stats_last_run = now
+                # Refresh OHLC cache every 5 minutes
+                if now - _ohlc_last_fetch >= 300:
+                    try:
+                        _ohlc_cache = kraken_client.get_ohlc(interval=5)
+                        _ohlc_last_fetch = now
+                    except Exception as e:
+                        logger.debug("OHLC fetch failed: %s", e)
+                try:
+                    state.stats_results = stats_engine.run_all(
+                        state, current_price, _ohlc_cache
+                    )
+                except Exception as e:
+                    logger.debug("Stats engine error: %s", e)
 
             # --- 4g: Check DOGE accumulation ---
             excess = grid_strategy.check_accumulation(state)

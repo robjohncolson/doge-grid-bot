@@ -40,14 +40,15 @@ logger = logging.getLogger(__name__)
 # API URL is configured in config.py (supports NVIDIA, Groq, or any OpenAI-compatible endpoint)
 
 
-def _build_prompt(market_data: dict) -> str:
+def _build_prompt(market_data: dict, stats_context: str = "") -> str:
     """
     Build a compact prompt for the AI advisor.
 
     We keep it short to minimize token usage and latency.
-    The AI gets: current price, recent changes, spread, fill count.
+    The AI gets: current price, recent changes, spread, fill count,
+    and optionally the output of the statistical analyzers.
     """
-    return f"""You are a crypto grid trading advisor. Analyze this DOGE/USD market data and give a brief recommendation.
+    prompt = f"""You are a crypto grid trading advisor. Analyze this DOGE/USD market data and give a brief recommendation.
 
 Current price: ${market_data.get('price', 0):.6f}
 1h change: {market_data.get('change_1h', 0):.2f}%
@@ -56,12 +57,19 @@ Current price: ${market_data.get('price', 0):.6f}
 Bid-ask spread: {market_data.get('spread_pct', 0):.3f}%
 Grid fills (last hour): {market_data.get('recent_fills', 0)}
 Grid center: ${market_data.get('grid_center', 0):.6f}
-Grid spacing: {config.GRID_SPACING_PCT}%
+Grid spacing: {config.GRID_SPACING_PCT}%"""
+
+    if stats_context:
+        prompt += f"\n\n{stats_context}"
+
+    prompt += """
 
 Answer in exactly this format (3 lines only):
 CONDITION: [ranging/trending_up/trending_down/volatile/low_volume]
 ACTION: [continue/pause/widen_spacing/tighten_spacing/reset_grid]
 REASON: [One sentence explanation]"""
+
+    return prompt
 
 
 def _call_ai(prompt: str) -> str:
@@ -229,7 +237,7 @@ def log_approval_decision(action: str, decision: str):
 # Public API
 # ---------------------------------------------------------------------------
 
-def get_recommendation(market_data: dict) -> dict:
+def get_recommendation(market_data: dict, stats_context: str = "") -> dict:
     """
     Run the AI advisor and return its recommendation.
 
@@ -237,6 +245,9 @@ def get_recommendation(market_data: dict) -> dict:
         market_data: Dict with keys:
             price, change_1h, change_4h, change_24h,
             spread_pct, recent_fills, grid_center
+        stats_context: Optional string of statistical analysis results
+            from stats_engine.format_for_ai().  Fed into the prompt so the
+            LLM reasons about real quantitative signals.
 
     Returns:
         Dict with keys: condition, action, reason, raw
@@ -248,7 +259,7 @@ def get_recommendation(market_data: dict) -> dict:
     logger.info("Running AI advisor analysis...")
 
     try:
-        prompt = _build_prompt(market_data)
+        prompt = _build_prompt(market_data, stats_context)
         response = _call_ai(prompt)
 
         if not response:

@@ -108,6 +108,10 @@ class GridState:
         self.last_build_ratio = 0.5      # Ratio used for current grid (for drift detection)
         self.trend_ratio_override = None # Manual override via /ratio command (None = auto)
 
+        # Statistical analysis
+        self.stats_results = {}          # Latest stats_engine.run_all() output
+        self.stats_last_run = 0.0        # Timestamp of last stats run
+
 
 # ---------------------------------------------------------------------------
 # Trend ratio (asymmetric grid)

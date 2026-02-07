@@ -4,14 +4,16 @@ dashboard.py -- Web dashboard for the DOGE grid trading bot.
 Serves a single-page dark-theme dashboard via the existing health server.
 No external dependencies -- the HTML/CSS/JS is a Python string constant.
 
-Two public symbols:
-  DASHBOARD_HTML  -- the full HTML page (served on GET /)
-  serialize_state -- converts GridState + price into a JSON-ready dict
+Three public symbols:
+  DASHBOARD_HTML   -- the full HTML page (served on GET /)
+  serialize_state  -- converts GridState + price into a JSON-ready dict
+  (stats_engine)   -- imported lazily to avoid circular imports
 """
 
 import time
 import config
 import grid_strategy
+import stats_engine
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +75,32 @@ def serialize_state(state: grid_strategy.GridState, current_price: float) -> dic
     from bot import _bot_start_time
     uptime = int(now - _bot_start_time) if _bot_start_time else 0
 
+    # -- Chart data: price sparkline (downsample to ~200 points) --
+    price_chart = []
+    if state.price_history:
+        step = max(1, len(state.price_history) // 200)
+        price_chart = [
+            [round(t, 1), round(p, 6)]
+            for i, (t, p) in enumerate(state.price_history) if i % step == 0
+        ]
+
+    # -- Chart data: fill rate per hour (last 24h) --
+    fill_rate_chart = [0] * 24
+    for f in state.recent_fills:
+        ft = f.get("time", 0)
+        if ft > 0:
+            hours_ago = (now - ft) / 3600
+            if 0 <= hours_ago < 24:
+                bucket = 23 - int(hours_ago)
+                if 0 <= bucket < 24:
+                    fill_rate_chart[bucket] += 1
+
+    # -- Chart data: profit scatter --
+    profit_chart = [
+        [round(f.get("time", 0), 1), round(f.get("profit", 0), 4)]
+        for f in state.recent_fills if f.get("profit", 0) != 0
+    ]
+
     return {
         "price": {
             "current": round(current_price, 6),
@@ -114,6 +142,14 @@ def serialize_state(state: grid_strategy.GridState, current_price: float) -> dic
         "mode": "dry_run" if config.DRY_RUN else "live",
         "paused": state.is_paused,
         "pause_reason": state.pause_reason,
+        # New: chart data
+        "charts": {
+            "price": price_chart,
+            "fill_rate": fill_rate_chart,
+            "profits": profit_chart,
+        },
+        # New: stats results
+        "stats": state.stats_results if state.stats_results else {},
     }
 
 
@@ -150,7 +186,6 @@ a{color:#58a6ff}
 .section{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px}
 .section h2{font-size:14px;color:#f0f6fc;margin-bottom:12px;border-bottom:1px solid #30363d;padding-bottom:8px}
 
-/* Grid ladder */
 .ladder{max-height:400px;overflow-y:auto}
 .ladder table{width:100%;border-collapse:collapse}
 .ladder th,.ladder td{padding:4px 8px;text-align:right;font-size:12px}
@@ -160,7 +195,6 @@ a{color:#58a6ff}
 .ladder .marker{background:#1c2128;font-weight:700}
 .ladder .marker td{color:#e3b341}
 
-/* Trend bar */
 .trend-bar-wrap{margin-bottom:12px}
 .trend-bar{display:flex;height:24px;border-radius:4px;overflow:hidden;margin-top:4px}
 .trend-bar .buy-bar{background:#238636}
@@ -168,13 +202,11 @@ a{color:#58a6ff}
 .trend-bar span{display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#fff}
 .trend-meta{display:flex;justify-content:space-between;font-size:11px;color:#8b949e;margin-top:4px}
 
-/* Params table */
 .params{width:100%;border-collapse:collapse}
 .params td{padding:4px 0;font-size:12px}
 .params td:first-child{color:#8b949e;width:45%}
 .params td:last-child{color:#f0f6fc;text-align:right}
 
-/* Controls */
 .controls{display:flex;flex-direction:column;gap:10px}
 .ctrl-row{display:flex;align-items:center;gap:8px}
 .ctrl-row label{font-size:12px;color:#8b949e;width:70px}
@@ -187,7 +219,6 @@ a{color:#58a6ff}
 .ctrl-msg.ok{color:#3fb950}
 .ctrl-msg.err{color:#f85149}
 
-/* Fills table */
 .fills{max-height:350px;overflow-y:auto}
 .fills table{width:100%;border-collapse:collapse}
 .fills th,.fills td{padding:4px 8px;text-align:right;font-size:12px}
@@ -197,8 +228,37 @@ a{color:#58a6ff}
 .fills .profit-pos{color:#3fb950}
 .fills .profit-neg{color:#f85149}
 
-/* AI rec */
 .ai-rec{font-size:12px;color:#8b949e;white-space:pre-wrap;line-height:1.5}
+
+/* Charts row */
+.charts-row{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:20px}
+@media(max-width:900px){.charts-row{grid-template-columns:1fr}}
+.chart-box{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px}
+.chart-box h3{font-size:12px;color:#8b949e;margin-bottom:8px}
+.chart-box canvas{width:100%;height:120px;display:block}
+.chart-empty{color:#30363d;font-size:11px;text-align:center;padding:40px 0}
+
+/* Strategy health banner */
+.health-banner{background:#161b22;border:2px solid #30363d;border-radius:8px;padding:16px;margin-bottom:20px;text-align:center}
+.health-banner .hb-verdict{font-size:18px;font-weight:700;margin-bottom:4px}
+.health-banner .hb-summary{font-size:13px;color:#8b949e}
+.hb-green{border-color:#238636}.hb-green .hb-verdict{color:#3fb950}
+.hb-yellow{border-color:#9e6a03}.hb-yellow .hb-verdict{color:#e3b341}
+.hb-red{border-color:#da3633}.hb-red .hb-verdict{color:#f85149}
+
+/* Advisory board */
+.advisory{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;margin-bottom:20px}
+.acard{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px;border-left:4px solid #30363d}
+.acard.ac-green{border-left-color:#238636}
+.acard.ac-yellow{border-left-color:#9e6a03}
+.acard.ac-red{border-left-color:#da3633}
+.acard .ac-name{font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:0.5px}
+.acard .ac-verdict{font-size:13px;font-weight:700;margin:4px 0}
+.acard .ac-verdict.v-green{color:#3fb950}
+.acard .ac-verdict.v-yellow{color:#e3b341}
+.acard .ac-verdict.v-red{color:#f85149}
+.acard .ac-summary{font-size:12px;color:#c9d1d9;line-height:1.4}
+.acard .ac-conf{font-size:10px;color:#484f58;margin-top:6px}
 </style>
 </head>
 <body>
@@ -218,6 +278,22 @@ a{color:#58a6ff}
   <div class="card"><div class="label">DOGE Accumulated</div><div class="value" id="c-doge">--</div><div class="sub" id="c-doge-sub">&nbsp;</div></div>
 </div>
 
+<!-- Charts -->
+<div class="charts-row">
+  <div class="chart-box"><h3>Price (24h)</h3><canvas id="chart-price"></canvas></div>
+  <div class="chart-box"><h3>Fill Rate (hourly, 24h)</h3><canvas id="chart-fills"></canvas></div>
+  <div class="chart-box"><h3>Round Trip Profits</h3><canvas id="chart-profits"></canvas></div>
+</div>
+
+<!-- Strategy Health Banner -->
+<div class="health-banner" id="health-banner">
+  <div class="hb-verdict" id="hb-verdict">Collecting data...</div>
+  <div class="hb-summary" id="hb-summary">Statistical analyzers need more fills to produce results</div>
+</div>
+
+<!-- Statistical Advisory Board -->
+<div class="advisory" id="advisory"></div>
+
 <div class="sections">
   <!-- Grid ladder -->
   <div class="section">
@@ -228,7 +304,7 @@ a{color:#58a6ff}
     </div>
   </div>
 
-  <!-- Right column: trend + params + controls -->
+  <!-- Right column -->
   <div class="section">
     <h2>Trend Ratio</h2>
     <div class="trend-bar-wrap">
@@ -294,8 +370,7 @@ function fmt(n, d) { return n != null ? n.toFixed(d) : '--'; }
 function fmtUSD(n) { return n != null ? '$' + n.toFixed(4) : '--'; }
 function fmtTime(ts) {
   if (!ts) return '--';
-  const d = new Date(ts * 1000);
-  return d.toLocaleTimeString();
+  return new Date(ts * 1000).toLocaleTimeString();
 }
 function fmtUptime(s) {
   const h = Math.floor(s / 3600);
@@ -303,21 +378,153 @@ function fmtUptime(s) {
   return h + 'h ' + m + 'm';
 }
 
+// === Chart rendering ===
+
+function setupCanvas(id) {
+  const canvas = document.getElementById(id);
+  if (!canvas) return null;
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  return { ctx, w: rect.width, h: rect.height };
+}
+
+function drawSparkline(id, data, color) {
+  const c = setupCanvas(id);
+  if (!c || !data || data.length < 2) return;
+  const { ctx, w, h } = c;
+  ctx.clearRect(0, 0, w, h);
+  const vals = data.map(d => d[1]);
+  const mn = Math.min(...vals), mx = Math.max(...vals);
+  const range = mx - mn || 1;
+  // axis labels
+  ctx.fillStyle = '#484f58';
+  ctx.font = '10px monospace';
+  ctx.fillText('$' + mx.toFixed(4), 2, 10);
+  ctx.fillText('$' + mn.toFixed(4), 2, h - 2);
+  // line
+  const pad = 55;
+  ctx.beginPath();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.5;
+  for (let i = 0; i < data.length; i++) {
+    const x = pad + (i / (data.length - 1)) * (w - pad - 4);
+    const y = 4 + (1 - (vals[i] - mn) / range) * (h - 12);
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+}
+
+function drawBars(id, data, colorFn) {
+  const c = setupCanvas(id);
+  if (!c || !data || data.length === 0) return;
+  const { ctx, w, h } = c;
+  ctx.clearRect(0, 0, w, h);
+  const mx = Math.max(...data, 1);
+  const bw = (w - 4) / data.length;
+  for (let i = 0; i < data.length; i++) {
+    const bh = (data[i] / mx) * (h - 16);
+    ctx.fillStyle = colorFn ? colorFn(data[i]) : '#58a6ff';
+    ctx.fillRect(2 + i * bw + 1, h - bh - 12, bw - 2, bh);
+  }
+  // x-axis labels
+  ctx.fillStyle = '#484f58';
+  ctx.font = '9px monospace';
+  ctx.fillText('-24h', 2, h - 1);
+  ctx.fillText('now', w - 22, h - 1);
+  // max label
+  ctx.fillText('max:' + mx, 2, 10);
+}
+
+function drawProfitDots(id, data) {
+  const c = setupCanvas(id);
+  if (!c || !data || data.length === 0) return;
+  const { ctx, w, h } = c;
+  ctx.clearRect(0, 0, w, h);
+  const vals = data.map(d => d[1]);
+  const mn = Math.min(...vals, 0), mx = Math.max(...vals, 0);
+  const range = mx - mn || 1;
+  // zero line
+  const zeroY = 4 + (1 - (0 - mn) / range) * (h - 12);
+  ctx.strokeStyle = '#30363d';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath();
+  ctx.moveTo(0, zeroY);
+  ctx.lineTo(w, zeroY);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  // dots
+  for (let i = 0; i < data.length; i++) {
+    const x = 4 + (i / Math.max(data.length - 1, 1)) * (w - 8);
+    const y = 4 + (1 - (vals[i] - mn) / range) * (h - 12);
+    ctx.fillStyle = vals[i] >= 0 ? '#3fb950' : '#f85149';
+    ctx.beginPath();
+    ctx.arc(x, y, 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // labels
+  ctx.fillStyle = '#484f58';
+  ctx.font = '10px monospace';
+  if (mx > 0) ctx.fillText('+$' + mx.toFixed(4), 2, 10);
+  if (mn < 0) ctx.fillText('-$' + Math.abs(mn).toFixed(4), 2, h - 2);
+}
+
+// === Advisory board rendering ===
+
+const ANALYZER_LABELS = {
+  profitability: 'Profitability Test',
+  fill_asymmetry: 'Fill Asymmetry',
+  grid_exceedance: 'Hidden Risk',
+  fill_rate: 'Volatility Regime',
+  random_walk: 'Market Type',
+};
+
+function renderAdvisory(stats) {
+  const board = document.getElementById('advisory');
+  if (!stats || Object.keys(stats).length === 0) {
+    board.innerHTML = '<div class="acard"><div class="ac-name">STATS ENGINE</div><div class="ac-summary">Collecting data -- analyzers will appear as fills accumulate</div></div>';
+    return;
+  }
+  // Health banner
+  const health = stats.overall_health || {};
+  const hb = document.getElementById('health-banner');
+  hb.className = 'health-banner hb-' + (health.color || 'yellow');
+  document.getElementById('hb-verdict').textContent = (health.verdict || 'calibrating').toUpperCase().replace(/_/g, ' ');
+  document.getElementById('hb-summary').textContent = health.summary || '';
+
+  // Cards
+  let html = '';
+  const order = ['profitability', 'fill_asymmetry', 'grid_exceedance', 'fill_rate', 'random_walk'];
+  for (const name of order) {
+    const r = stats[name];
+    if (!r) continue;
+    const color = r.color || 'yellow';
+    html += '<div class="acard ac-' + color + '">';
+    html += '<div class="ac-name">' + (ANALYZER_LABELS[name] || name) + '</div>';
+    html += '<div class="ac-verdict v-' + color + '">' + (r.verdict || '').replace(/_/g, ' ').toUpperCase() + '</div>';
+    html += '<div class="ac-summary">' + (r.summary || '') + '</div>';
+    html += '<div class="ac-conf">Confidence: ' + (r.confidence || 'none') + '</div>';
+    html += '</div>';
+  }
+  board.innerHTML = html;
+}
+
+// === Main update ===
+
 function update(data) {
   // Badge
   const badge = document.getElementById('badge');
   if (data.paused) {
-    badge.textContent = 'PAUSED';
-    badge.className = 'badge badge-paused';
+    badge.textContent = 'PAUSED'; badge.className = 'badge badge-paused';
   } else if (data.mode === 'dry_run') {
-    badge.textContent = 'DRY RUN';
-    badge.className = 'badge badge-dry';
+    badge.textContent = 'DRY RUN'; badge.className = 'badge badge-dry';
   } else {
-    badge.textContent = 'LIVE';
-    badge.className = 'badge badge-live';
+    badge.textContent = 'LIVE'; badge.className = 'badge badge-live';
   }
-
-  // Uptime
   document.getElementById('uptime').textContent = 'Up ' + fmtUptime(data.uptime);
 
   // Cards
@@ -326,7 +533,6 @@ function update(data) {
   document.getElementById('c-price-sub').textContent = 'drift ' + fmt(p.drift_pct, 2) + '%';
   document.getElementById('c-center').textContent = '$' + fmt(p.center, 6);
   document.getElementById('c-center-sub').textContent = 'grid center';
-
   const pr = data.profit;
   document.getElementById('c-today').textContent = fmtUSD(pr.today);
   document.getElementById('c-today-sub').textContent = pr.round_trips_today + ' trips today';
@@ -336,13 +542,22 @@ function update(data) {
   document.getElementById('c-trips-sub').textContent = 'lifetime';
   document.getElementById('c-doge').textContent = fmt(pr.doge_accumulated, 2);
 
+  // Charts
+  if (data.charts) {
+    drawSparkline('chart-price', data.charts.price, '#58a6ff');
+    drawBars('chart-fills', data.charts.fill_rate, function(v) { return v > 0 ? '#58a6ff' : '#21262d'; });
+    drawProfitDots('chart-profits', data.charts.profits);
+  }
+
+  // Stats advisory board
+  renderAdvisory(data.stats);
+
   // Grid ladder
   const tbody = document.getElementById('ladder-body');
   let rows = '';
   const cp = p.current;
   let markerPlaced = false;
   for (const o of data.grid) {
-    // Insert current price marker row
     if (!markerPlaced && o.price < cp) {
       rows += '<tr class="marker"><td></td><td></td><td>$' + fmt(cp, 6) + '</td><td>PRICE</td><td></td></tr>';
       markerPlaced = true;
@@ -371,23 +586,23 @@ function update(data) {
   document.getElementById('trend-fills').textContent = t.buy_12h + ' buys / ' + t.sell_12h + ' sells (12h)';
 
   // Params
-  const c = data.config;
-  document.getElementById('p-size').textContent = '$' + fmt(c.order_size, 2);
-  document.getElementById('p-levels').textContent = c.grid_levels + ' per side (' + (c.grid_levels * 2) + ' total)';
-  document.getElementById('p-spacing').textContent = fmt(c.spacing_pct, 2) + '%';
-  document.getElementById('p-capital').textContent = '$' + fmt(c.effective_capital, 2);
-  document.getElementById('p-fees').textContent = fmt(c.round_trip_fee_pct, 2) + '%';
-  document.getElementById('p-ai').textContent = c.ai_interval + 's (' + Math.round(c.ai_interval / 60) + ' min)';
+  const cfg = data.config;
+  document.getElementById('p-size').textContent = '$' + fmt(cfg.order_size, 2);
+  document.getElementById('p-levels').textContent = cfg.grid_levels + ' per side (' + (cfg.grid_levels * 2) + ' total)';
+  document.getElementById('p-spacing').textContent = fmt(cfg.spacing_pct, 2) + '%';
+  document.getElementById('p-capital').textContent = '$' + fmt(cfg.effective_capital, 2);
+  document.getElementById('p-fees').textContent = fmt(cfg.round_trip_fee_pct, 2) + '%';
+  document.getElementById('p-ai').textContent = cfg.ai_interval + 's (' + Math.round(cfg.ai_interval / 60) + ' min)';
   document.getElementById('p-airec').textContent = data.ai_recommendation;
 
-  // Populate input placeholders from current values
+  // Populate input placeholders
   const inS = document.getElementById('in-spacing');
   const inR = document.getElementById('in-ratio');
   const inI = document.getElementById('in-interval');
-  if (!inS.value) inS.placeholder = fmt(c.spacing_pct, 2);
+  if (!inS.value) inS.placeholder = fmt(cfg.spacing_pct, 2);
   if (!inR.value) inR.placeholder = fmt(t.ratio, 2);
-  if (!inI.value) inI.placeholder = c.ai_interval;
-  inS.min = c.min_spacing;
+  if (!inI.value) inI.placeholder = cfg.ai_interval;
+  inS.min = cfg.min_spacing;
 
   // Recent fills (last 20)
   const fb = document.getElementById('fills-body');
@@ -405,6 +620,8 @@ function update(data) {
   fb.innerHTML = frows || '<tr><td colspan="5" style="text-align:center;color:#8b949e">No fills yet</td></tr>';
 }
 
+// === Controls ===
+
 function showMsg(text, ok) {
   const el = document.getElementById('ctrl-msg');
   el.textContent = text;
@@ -414,52 +631,24 @@ function showMsg(text, ok) {
 
 async function postConfig(body) {
   try {
-    const r = await fetch(CONFIG, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(body)
-    });
+    const r = await fetch(CONFIG, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
     const d = await r.json();
     if (r.ok) {
       showMsg('Queued: ' + (d.queued || []).join(', '), true);
-      // Clear inputs
       document.getElementById('in-spacing').value = '';
       document.getElementById('in-ratio').value = '';
       document.getElementById('in-interval').value = '';
-    } else {
-      showMsg(d.error || 'Error', false);
-    }
-  } catch(e) {
-    showMsg('Network error', false);
-  }
+    } else { showMsg(d.error || 'Error', false); }
+  } catch(e) { showMsg('Network error', false); }
 }
 
-function applySpacing() {
-  const v = parseFloat(document.getElementById('in-spacing').value);
-  if (isNaN(v)) return showMsg('Enter a spacing value', false);
-  postConfig({spacing: v});
-}
-function applyRatio() {
-  const v = parseFloat(document.getElementById('in-ratio').value);
-  if (isNaN(v)) return showMsg('Enter a ratio value', false);
-  postConfig({ratio: v});
-}
-function applyRatioAuto() {
-  postConfig({ratio: 'auto'});
-}
-function applyInterval() {
-  const v = parseInt(document.getElementById('in-interval').value);
-  if (isNaN(v)) return showMsg('Enter an interval value', false);
-  postConfig({interval: v});
-}
+function applySpacing() { const v = parseFloat(document.getElementById('in-spacing').value); if (isNaN(v)) return showMsg('Enter a spacing value', false); postConfig({spacing: v}); }
+function applyRatio() { const v = parseFloat(document.getElementById('in-ratio').value); if (isNaN(v)) return showMsg('Enter a ratio value', false); postConfig({ratio: v}); }
+function applyRatioAuto() { postConfig({ratio: 'auto'}); }
+function applyInterval() { const v = parseInt(document.getElementById('in-interval').value); if (isNaN(v)) return showMsg('Enter an interval value', false); postConfig({interval: v}); }
 
-async function poll() {
-  try {
-    const r = await fetch(API);
-    if (r.ok) update(await r.json());
-  } catch(e) {}
-}
-
+// === Polling ===
+async function poll() { try { const r = await fetch(API); if (r.ok) update(await r.json()); } catch(e) {} }
 poll();
 setInterval(poll, 5000);
 </script>
