@@ -74,7 +74,8 @@ def _enabled() -> bool:
 # ---------------------------------------------------------------------------
 
 def _request(method: str, path: str, body: dict = None,
-             params: dict = None, timeout: int = 10) -> dict:
+             params: dict = None, timeout: int = 10,
+             upsert: bool = False) -> dict:
     """
     Make a PostgREST request to Supabase.  Never raises.
 
@@ -84,6 +85,7 @@ def _request(method: str, path: str, body: dict = None,
         body:    JSON body for POST/PATCH
         params:  Query params dict
         timeout: Request timeout in seconds
+        upsert:  If True, add resolution=merge-duplicates to Prefer header
 
     Returns:
         Parsed JSON response (list or dict), or None on failure.
@@ -95,17 +97,19 @@ def _request(method: str, path: str, body: dict = None,
     if params:
         url += "?" + urllib.parse.urlencode(params, doseq=True)
 
+    prefer = "return=minimal"
+    if method == "GET":
+        prefer = "return=representation"
+    elif upsert:
+        prefer = "return=minimal, resolution=merge-duplicates"
+
     headers = {
         "apikey": config.SUPABASE_KEY,
         "Authorization": f"Bearer {config.SUPABASE_KEY}",
         "Content-Type": "application/json",
-        "Prefer": "return=minimal",
+        "Prefer": prefer,
         "User-Agent": "DOGEGridBot/1.0",
     }
-
-    # For reads, we want the response body
-    if method == "GET":
-        headers["Prefer"] = "return=representation"
 
     data = None
     if body is not None:
@@ -320,6 +324,7 @@ def _flush_queue():
                 "POST", "/rest/v1/bot_state",
                 body=last_row,
                 params={"on_conflict": "key"},
+                upsert=True,
             )
             if result is None:
                 logger.debug("Supabase: bot_state upsert failed")
@@ -330,6 +335,7 @@ def _flush_queue():
                     "POST", f"/rest/v1/{table}",
                     body=row,
                     params={"on_conflict": "date"},
+                    upsert=True,
                 )
         else:
             # Bulk insert
