@@ -29,6 +29,7 @@ import time
 import logging
 import csv
 import os
+import json
 from datetime import datetime, timezone
 
 import config
@@ -46,13 +47,15 @@ class GridOrder:
     Represents one order in the grid.
 
     Attributes:
-        level:      Grid level index (-4 to +4, 0 is center, negative = buy, positive = sell)
-        side:       "buy" or "sell"
-        price:      Limit price in USD
-        volume:     DOGE amount
-        txid:       Kraken transaction ID (or dry-run fake ID)
-        status:     "pending", "open", "filled", "cancelled"
-        placed_at:  Unix timestamp when placed
+        level:              Grid level index (-4 to +4, 0 is center, negative = buy, positive = sell)
+        side:               "buy" or "sell"
+        price:              Limit price in USD
+        volume:             DOGE amount
+        txid:               Kraken transaction ID (or dry-run fake ID)
+        status:             "pending", "open", "filled", "cancelled"
+        placed_at:          Unix timestamp when placed
+        matched_buy_price:  For sell orders: the buy price this sell is paired with (cost basis)
+        closed_out:         True when a buy's paired sell has completed (round trip done)
     """
     def __init__(self, level: int, side: str, price: float, volume: float):
         self.level = level
@@ -62,6 +65,8 @@ class GridOrder:
         self.txid = None
         self.status = "pending"
         self.placed_at = 0.0
+        self.matched_buy_price = None
+        self.closed_out = False
 
     def __repr__(self):
         return (f"GridOrder(L{self.level:+d} {self.side} "
@@ -114,6 +119,89 @@ class GridState:
 
 
 # ---------------------------------------------------------------------------
+# State persistence
+# ---------------------------------------------------------------------------
+
+def save_state(state: GridState):
+    """
+    Save a minimal state snapshot to disk for crash recovery.
+    Written atomically (write tmp then rename) to avoid corruption.
+    """
+    _ensure_log_dir()
+    snapshot = {
+        "center_price": state.center_price,
+        "total_profit_usd": state.total_profit_usd,
+        "today_profit_usd": state.today_profit_usd,
+        "today_loss_usd": state.today_loss_usd,
+        "today_date": state.today_date,
+        "round_trips_today": state.round_trips_today,
+        "total_round_trips": state.total_round_trips,
+        "total_fees_usd": state.total_fees_usd,
+        "doge_accumulated": state.doge_accumulated,
+        "last_accumulation": state.last_accumulation,
+        "trend_ratio": state.trend_ratio,
+        "trend_ratio_override": state.trend_ratio_override,
+        "open_txids": [o.txid for o in state.grid_orders
+                       if o.status == "open" and o.txid],
+        "saved_at": time.time(),
+    }
+    tmp_path = config.STATE_FILE + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, indent=2)
+        # Atomic rename (works on Windows if dest doesn't exist, so remove first)
+        if os.path.exists(config.STATE_FILE):
+            os.remove(config.STATE_FILE)
+        os.rename(tmp_path, config.STATE_FILE)
+        logger.debug("State saved to %s", config.STATE_FILE)
+    except Exception as e:
+        logger.error("Failed to save state: %s", e)
+
+
+def load_state(state: GridState) -> bool:
+    """
+    Restore counters from a previous state snapshot.
+    Returns True if a snapshot was loaded, False otherwise.
+    Does NOT restore grid_orders -- that's done by reconcile_on_startup().
+    """
+    if not os.path.exists(config.STATE_FILE):
+        logger.info("No state file found at %s -- starting fresh", config.STATE_FILE)
+        return False
+
+    try:
+        with open(config.STATE_FILE, "r", encoding="utf-8") as f:
+            snapshot = json.load(f)
+    except Exception as e:
+        logger.warning("Failed to read state file: %s -- starting fresh", e)
+        return False
+
+    state.center_price = snapshot.get("center_price", 0.0)
+    state.total_profit_usd = snapshot.get("total_profit_usd", 0.0)
+    state.today_profit_usd = snapshot.get("today_profit_usd", 0.0)
+    state.today_loss_usd = snapshot.get("today_loss_usd", 0.0)
+    state.today_date = snapshot.get("today_date", "")
+    state.round_trips_today = snapshot.get("round_trips_today", 0)
+    state.total_round_trips = snapshot.get("total_round_trips", 0)
+    state.total_fees_usd = snapshot.get("total_fees_usd", 0.0)
+    state.doge_accumulated = snapshot.get("doge_accumulated", 0.0)
+    state.last_accumulation = snapshot.get("last_accumulation", 0.0)
+    state.trend_ratio = snapshot.get("trend_ratio", 0.5)
+    state.trend_ratio_override = snapshot.get("trend_ratio_override", None)
+
+    saved_at = snapshot.get("saved_at", 0)
+    age_min = (time.time() - saved_at) / 60 if saved_at else 0
+    txid_count = len(snapshot.get("open_txids", []))
+
+    logger.info(
+        "State restored from %s (%.0f min old): "
+        "$%.4f profit, %d round trips, %d open txids",
+        config.STATE_FILE, age_min,
+        state.total_profit_usd, state.total_round_trips, txid_count,
+    )
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Trend ratio (asymmetric grid)
 # ---------------------------------------------------------------------------
 
@@ -163,6 +251,66 @@ def update_trend_ratio(state: GridState):
             old_ratio, new_ratio, buy_count, sell_count,
             TREND_WINDOW_SECONDS // 3600,
         )
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight validation
+# ---------------------------------------------------------------------------
+
+def validate_config(current_price: float) -> bool:
+    """
+    Run pre-flight checks before the first grid build.
+    Returns True if safe to proceed, False if a critical check fails.
+    Logs warnings for non-critical issues.
+    """
+    ok = True
+    warnings = []
+
+    # Critical: spacing must exceed round-trip fees or every trade loses money
+    if config.GRID_SPACING_PCT <= config.ROUND_TRIP_FEE_PCT:
+        msg = (
+            "GRID_SPACING_PCT (%.2f%%) <= ROUND_TRIP_FEE_PCT (%.2f%%) -- "
+            "every trade is a guaranteed loss" % (
+                config.GRID_SPACING_PCT, config.ROUND_TRIP_FEE_PCT))
+        logger.critical(msg)
+        warnings.append(msg)
+        ok = False
+
+    # Critical: capital check -- worst-case buy exposure must not exceed 90% of capital
+    total = config.GRID_LEVELS * 2
+    max_buys = int(total * 0.75)  # Worst case at max trend ratio
+    max_exposure = config.ORDER_SIZE_USD * max_buys
+    if max_exposure > config.STARTING_CAPITAL * 0.9:
+        msg = (
+            "Over-leveraged: worst-case buy exposure $%.2f > 90%% of capital $%.2f "
+            "(order_size=$%.2f x %d max buys)" % (
+                max_exposure, config.STARTING_CAPITAL * 0.9,
+                config.ORDER_SIZE_USD, max_buys))
+        logger.critical(msg)
+        warnings.append(msg)
+        ok = False
+
+    # Warning: order size below Kraken minimum DOGE volume
+    doge_per_order = config.ORDER_SIZE_USD / current_price if current_price > 0 else 0
+    if doge_per_order < ORDERMIN_DOGE:
+        msg = (
+            "ORDER_SIZE_USD $%.2f = %.1f DOGE at $%.6f -- below Kraken min %d DOGE "
+            "(adapt_grid_params will fix this, but order cost will exceed ORDER_SIZE_USD)" % (
+                config.ORDER_SIZE_USD, doge_per_order, current_price, ORDERMIN_DOGE))
+        logger.warning(msg)
+        warnings.append(msg)
+        # Not critical -- adapt_grid_params floors volume to ORDERMIN_DOGE
+
+    if warnings:
+        try:
+            import notifier
+            notifier.notify_error("Validation:\n" + "\n".join(warnings))
+        except Exception:
+            pass
+
+    if ok:
+        logger.info("Pre-flight validation passed")
+    return ok
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +420,105 @@ def calculate_volume_for_price(price: float) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Startup reconciliation
+# ---------------------------------------------------------------------------
+
+def reconcile_on_startup(state: GridState, current_price: float) -> int:
+    """
+    Adopt open orders on Kraken that belong to this bot, cancel orphans.
+
+    Called between price fetch and grid build on startup.
+    1. Fetch all open orders from Kraken, filter to XDGUSD
+    2. For each, check if it's near a valid grid level
+    3. If yes, adopt it into state.grid_orders
+    4. If no, cancel it (orphan from a previous crashed session)
+
+    Returns the number of adopted orders.
+    """
+    if config.DRY_RUN:
+        logger.info("[DRY RUN] Skipping startup reconciliation")
+        return 0
+
+    try:
+        open_orders = kraken_client.get_open_orders()
+    except Exception as e:
+        logger.error("Reconciliation: failed to fetch open orders: %s", e)
+        return 0
+
+    if not open_orders:
+        logger.info("Reconciliation: no open orders found on Kraken")
+        return 0
+
+    # Build the grid levels we'd expect for the current price
+    adapt_grid_params(state, current_price)
+    total = config.GRID_LEVELS * 2
+    n_buys = max(2, min(total - 2, round(total * state.trend_ratio)))
+    n_sells = total - n_buys
+    expected_levels = calculate_grid_levels(current_price, buy_levels=n_buys, sell_levels=n_sells)
+    # Build a set of (side, price) for quick matching
+    level_map = {}  # price_key -> (level_idx, side, price)
+    for level_idx, side, price in expected_levels:
+        level_map[(side, round(price, 6))] = (level_idx, side, price)
+
+    adopted = 0
+    orphans = 0
+    spacing_tolerance = config.GRID_SPACING_PCT / 100.0 * current_price * 0.3  # 30% of one spacing
+
+    for txid, info in open_orders.items():
+        descr = info.get("descr", {})
+        pair = descr.get("pair", "")
+        # Kraken may use various pair formats
+        if "XDG" not in pair.upper() and "DOGE" not in pair.upper():
+            continue  # Not our pair, skip
+
+        side = descr.get("type", "")
+        order_price = float(descr.get("price", 0))
+        order_vol = float(info.get("vol", 0))
+
+        if not side or order_price <= 0:
+            continue
+
+        # Try to match to a grid level
+        matched_level = None
+        for (lside, lprice_key), (level_idx, _, lprice) in level_map.items():
+            if lside == side and abs(order_price - lprice) <= spacing_tolerance:
+                matched_level = (level_idx, lside, lprice)
+                break
+
+        if matched_level:
+            level_idx, _, _ = matched_level
+            order = GridOrder(level=level_idx, side=side, price=order_price, volume=order_vol)
+            order.txid = txid
+            order.status = "open"
+            order.placed_at = time.time()
+            state.grid_orders.append(order)
+            adopted += 1
+            # Remove from level_map so build_grid doesn't duplicate
+            for key, val in list(level_map.items()):
+                if val[0] == level_idx:
+                    del level_map[key]
+                    break
+            logger.info(
+                "Reconcile: adopted %s L%+d %.2f DOGE @ $%.6f -> %s",
+                side.upper(), level_idx, order_vol, order_price, txid,
+            )
+        else:
+            # Orphan -- cancel it
+            logger.warning(
+                "Reconcile: cancelling orphan %s %.2f DOGE @ $%.6f -> %s",
+                side.upper(), order_vol, order_price, txid,
+            )
+            kraken_client.cancel_order(txid)
+            orphans += 1
+
+    logger.info(
+        "Reconciliation complete: %d adopted, %d orphans cancelled",
+        adopted, orphans,
+    )
+    return adopted
+
+
+# ---------------------------------------------------------------------------
 # Grid lifecycle
 # ---------------------------------------------------------------------------
 
@@ -281,7 +528,7 @@ def build_grid(state: GridState, current_price: float) -> list:
 
     1. Calculate all level prices
     2. Calculate volume for each level
-    3. Create GridOrder objects
+    3. Create GridOrder objects (skip levels already covered by adopted orders)
     4. Place orders via Kraken (or simulate in dry run)
 
     Returns the list of placed GridOrder objects.
@@ -290,7 +537,9 @@ def build_grid(state: GridState, current_price: float) -> list:
     adapt_grid_params(state, current_price)
 
     state.center_price = current_price
-    state.grid_orders = []
+
+    # Identify levels already covered by adopted orders (from reconciliation)
+    adopted_levels = {o.level for o in state.grid_orders if o.status == "open"}
 
     # Compute asymmetric level split from trend ratio
     total = config.GRID_LEVELS * 2
@@ -299,14 +548,19 @@ def build_grid(state: GridState, current_price: float) -> list:
     state.last_build_ratio = state.trend_ratio
 
     levels = calculate_grid_levels(current_price, buy_levels=n_buys, sell_levels=n_sells)
+    skipped = len([l for l in levels if l[0] in adopted_levels])
     logger.info(
-        "Building grid centered at $%.6f: %d buys + %d sells (ratio=%.2f)",
-        current_price, n_buys, n_sells, state.trend_ratio,
+        "Building grid centered at $%.6f: %d buys + %d sells (ratio=%.2f, %d adopted)",
+        current_price, n_buys, n_sells, state.trend_ratio, skipped,
     )
 
-    placed_orders = []
+    placed_orders = list(state.grid_orders)  # Keep adopted orders
 
     for level_idx, side, price in levels:
+        if level_idx in adopted_levels:
+            logger.debug("  Grid L%+d: skipped (already adopted)", level_idx)
+            continue
+
         volume = calculate_volume_for_price(price)
 
         order = GridOrder(level=level_idx, side=side, price=price, volume=volume)
@@ -341,25 +595,30 @@ def build_grid(state: GridState, current_price: float) -> list:
 
 def cancel_grid(state: GridState) -> int:
     """
-    Cancel all orders in the current grid.
+    Cancel all open orders in the current grid by txid.
+    Only cancels orders the bot placed (not unrelated orders on the account).
     Returns the number of orders cancelled.
     """
     cancelled = 0
+    open_orders = [o for o in state.grid_orders if o.status == "open" and o.txid]
 
     if config.DRY_RUN:
-        # In dry run, just mark them all cancelled
-        for order in state.grid_orders:
-            if order.status == "open":
+        for order in open_orders:
+            order.status = "cancelled"
+            cancelled += 1
+        logger.info("[DRY RUN] Cancelled %d grid orders by txid", cancelled)
+    else:
+        for i, order in enumerate(open_orders):
+            ok = kraken_client.cancel_order(order.txid)
+            if ok:
                 order.status = "cancelled"
                 cancelled += 1
-        logger.info("[DRY RUN] Cancelled %d grid orders", cancelled)
-    else:
-        # In live mode, cancel via API
-        count = kraken_client.cancel_all_orders()
-        for order in state.grid_orders:
-            order.status = "cancelled"
-        cancelled = count
-        logger.info("Cancelled %d orders via API", count)
+            else:
+                logger.warning("Failed to cancel order %s (L%+d)", order.txid, order.level)
+            # Rate-limit guard: sleep every 10 cancels
+            if (i + 1) % 10 == 0 and i + 1 < len(open_orders):
+                time.sleep(2)
+        logger.info("Cancelled %d/%d grid orders by txid", cancelled, len(open_orders))
 
     return cancelled
 
@@ -371,6 +630,9 @@ def cancel_grid(state: GridState) -> int:
 def check_fills_live(state: GridState) -> list:
     """
     [LIVE MODE] Check which grid orders have been filled by querying Kraken.
+
+    Uses actual vol_exec from Kraken for filled volume (not our estimate).
+    Logs a warning for partial fills but waits for full fill before acting.
 
     Returns a list of GridOrder objects that were filled since last check.
     """
@@ -394,18 +656,34 @@ def check_fills_live(state: GridState) -> list:
     filled = []
 
     for order in open_orders:
-        if order.txid in order_info:
-            info = order_info[order.txid]
-            status = info.get("status", "")
+        if order.txid not in order_info:
+            continue
 
-            if status == "closed":
-                # Order fully filled!
-                order.status = "filled"
-                filled.append(order)
-                logger.info(
-                    "FILLED: %s %.2f DOGE @ $%.6f (L%+d)",
-                    order.side.upper(), order.volume, order.price, order.level,
+        info = order_info[order.txid]
+        status = info.get("status", "")
+
+        if status == "closed":
+            # Order fully filled -- use actual executed volume from Kraken
+            vol_exec = float(info.get("vol_exec", order.volume))
+            if vol_exec > 0:
+                order.volume = vol_exec
+            order.status = "filled"
+            filled.append(order)
+            logger.info(
+                "FILLED: %s %.2f DOGE @ $%.6f (L%+d) [vol_exec=%.2f]",
+                order.side.upper(), order.volume, order.price,
+                order.level, vol_exec,
+            )
+
+        elif status == "open":
+            # Check for partial fill (still open but some volume executed)
+            vol_exec = float(info.get("vol_exec", 0))
+            if vol_exec > 0 and not getattr(order, '_partial_warned', False):
+                logger.warning(
+                    "PARTIAL FILL: %s L%+d %.2f/%.2f DOGE @ $%.6f -- waiting for full fill",
+                    order.side.upper(), order.level, vol_exec, order.volume, order.price,
                 )
+                order._partial_warned = True
 
     return filled
 
@@ -507,11 +785,21 @@ def handle_fills(state: GridState, filled_orders: list) -> list:
             new_side = "buy"
             new_price = filled.price * (1.0 - config.GRID_SPACING_PCT / 100.0)
 
-            # Record profit from completed sell
-            # When a sell fills, we already bought lower -> that's a completed round trip
-            gross_profit = filled.volume * filled.price * (config.GRID_SPACING_PCT / 100.0)
-            fees = filled.volume * filled.price * config.ROUND_TRIP_FEE_PCT / 100.0
-            net_profit = gross_profit - fees
+            # Record profit from completed sell using actual cost basis
+            if filled.matched_buy_price is not None:
+                buy_price = filled.matched_buy_price
+                gross_profit = (filled.price - buy_price) * filled.volume
+                fees = (buy_price * filled.volume * config.MAKER_FEE_PCT / 100.0 +
+                        filled.price * filled.volume * config.MAKER_FEE_PCT / 100.0)
+                net_profit = gross_profit - fees
+            else:
+                # No cost basis -- initial grid sell or orphan. Book $0 with warning.
+                logger.warning(
+                    "  Sell at $%.6f has no matched_buy_price -- booking $0 profit",
+                    filled.price,
+                )
+                net_profit = 0.0
+                fees = filled.price * filled.volume * config.MAKER_FEE_PCT / 100.0
 
             state.total_profit_usd += net_profit
             state.today_profit_usd += net_profit
@@ -522,10 +810,21 @@ def handle_fills(state: GridState, filled_orders: list) -> list:
             if net_profit < 0:
                 state.today_loss_usd += abs(net_profit)
 
+            # Mark the matched buy as closed out (Fix 3)
+            if filled.matched_buy_price is not None:
+                for o in state.grid_orders:
+                    if (o.side == "buy" and o.status == "filled"
+                            and not o.closed_out
+                            and abs(o.price - filled.matched_buy_price) < 1e-9):
+                        o.closed_out = True
+                        break
+
             logger.info(
-                "  ROUND TRIP COMPLETE! Sell at $%.6f -> profit: $%.4f "
-                "(fees: $%.4f) | Total: $%.4f (%d trips)",
-                filled.price, net_profit, fees,
+                "  ROUND TRIP COMPLETE! Sell at $%.6f (bought at $%.6f) "
+                "-> profit: $%.4f (fees: $%.4f) | Total: $%.4f (%d trips)",
+                filled.price,
+                filled.matched_buy_price if filled.matched_buy_price is not None else 0.0,
+                net_profit, fees,
                 state.total_profit_usd, state.total_round_trips,
             )
 
@@ -550,6 +849,10 @@ def handle_fills(state: GridState, filled_orders: list) -> list:
         # Place the new opposite order
         volume = calculate_volume_for_price(new_price)
         new_order = GridOrder(level=new_level, side=new_side, price=new_price, volume=volume)
+
+        # Carry cost basis: if a buy filled, the replacement sell knows the buy price
+        if filled.side == "buy":
+            new_order.matched_buy_price = filled.price
 
         try:
             txid = kraken_client.place_order(
@@ -656,10 +959,11 @@ def check_risk_limits(state: GridState, current_price: float) -> tuple:
     # Estimate portfolio value: cash + value of any DOGE held
     # In a grid bot, our max exposure is GRID_LEVELS * ORDER_SIZE_USD on each side
     # Simple approximation: starting capital - max possible loss from open buys
-    open_buys = [o for o in state.grid_orders if o.side == "buy" and o.status == "open"]
-    filled_buys = [o for o in state.grid_orders if o.side == "buy" and o.status == "filled"]
+    # Only count filled buys that haven't been closed out by a paired sell
+    filled_buys = [o for o in state.grid_orders
+                   if o.side == "buy" and o.status == "filled" and not o.closed_out]
 
-    # Worst case: all filled buys are now worth less
+    # Worst case: all un-closed filled buys are now worth less
     unrealized_loss = 0.0
     for order in filled_buys:
         unrealized_loss += (order.price - current_price) * order.volume
@@ -674,6 +978,30 @@ def check_risk_limits(state: GridState, current_price: float) -> tuple:
         return (True, False, f"Too many consecutive API errors: {state.consecutive_errors}")
 
     return (False, False, "")
+
+
+def prune_completed_orders(state: GridState):
+    """
+    Remove stale orders from grid_orders to prevent unbounded memory growth.
+    Keeps: all open orders, un-closed filled buys, recent filled sells.
+    Prunes: closed-out buys, cancelled orders older than 1 hour.
+    """
+    now = time.time()
+    kept = []
+    pruned = 0
+    for o in state.grid_orders:
+        if o.status == "open":
+            kept.append(o)
+        elif o.status == "filled" and o.side == "buy" and o.closed_out:
+            pruned += 1  # Round trip complete, safe to drop
+        elif o.status in ("cancelled", "failed") and now - o.placed_at > 3600:
+            pruned += 1  # Stale cancelled/failed
+        else:
+            kept.append(o)
+
+    if pruned > 0:
+        state.grid_orders = kept
+        logger.debug("Pruned %d completed/stale orders (%d remaining)", pruned, len(kept))
 
 
 # ---------------------------------------------------------------------------

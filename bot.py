@@ -1045,6 +1045,9 @@ def run():
     state = grid_strategy.GridState()
     _bot_state = state
 
+    # Restore counters from previous session (if any)
+    grid_strategy.load_state(state)
+
     # Start health check server (Railway expects a listening port)
     health_server = start_health_server()
 
@@ -1066,8 +1069,19 @@ def run():
     # Record initial price
     grid_strategy.record_price(state, current_price)
 
+    # --- Phase 2b: Validation guardrails ---
+    if not grid_strategy.validate_config(current_price):
+        logger.critical("Pre-flight validation FAILED -- refusing to start")
+        notifier.notify_error("Bot refused to start: validation failed (check logs)")
+        return
+
     # Notify startup
     notifier.notify_startup(current_price)
+
+    # --- Phase 2c: Startup reconciliation ---
+    adopted = grid_strategy.reconcile_on_startup(state, current_price)
+    if adopted > 0:
+        logger.info("Reconciliation adopted %d orders from previous session", adopted)
 
     # --- Phase 3: Build initial grid ---
     logger.info("Building initial grid...")
@@ -1189,6 +1203,10 @@ def run():
                             trip_count=state.total_round_trips,
                         )
 
+                # Prune completed orders and save state after each fill batch
+                grid_strategy.prune_completed_orders(state)
+                grid_strategy.save_state(state)
+
             # --- 4f: Run AI advisor (hourly) ---
             now = time.time()
             if now - state.last_ai_check >= config.AI_ADVISOR_INTERVAL:
@@ -1263,10 +1281,11 @@ def run():
                         state.doge_accumulated, current_price,
                     )
 
-            # --- 4h: Periodic status log ---
+            # --- 4h: Periodic status log + state save ---
             if int(now) % 300 < config.POLL_INTERVAL_SECONDS:
                 # Log status roughly every 5 minutes
                 logger.info(grid_strategy.get_status_summary(state, current_price))
+                grid_strategy.save_state(state)
 
             # --- 4i: Sleep until next poll ---
             elapsed = time.time() - loop_start
@@ -1296,6 +1315,9 @@ def run():
     # --- Phase 5: Graceful shutdown ---
     logger.info("Shutting down...")
     _bot_healthy = False
+
+    # Save state before cancelling (preserves open txids for next startup)
+    grid_strategy.save_state(state)
 
     # CRITICAL: Cancel all open orders before exiting
     logger.info("Cancelling all open orders...")

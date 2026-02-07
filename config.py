@@ -199,6 +199,9 @@ LOG_LEVEL: str = _env("LOG_LEVEL", "INFO")
 # Directory for CSV trade logs.  Relative to the bot's working directory.
 LOG_DIR: str = _env("LOG_DIR", "logs")
 
+# State snapshot file for persistence across restarts.
+STATE_FILE: str = os.path.join(LOG_DIR, "state.json")
+
 # ---------------------------------------------------------------------------
 # Health-check HTTP server
 # ---------------------------------------------------------------------------
