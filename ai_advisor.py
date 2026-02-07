@@ -108,7 +108,8 @@ def _call_ai(prompt: str) -> str:
             # Extract the assistant message from OpenAI-compatible response
             choices = body.get("choices", [])
             if choices:
-                return choices[0].get("message", {}).get("content", "").strip()
+                content = choices[0].get("message", {}).get("content")
+                return content.strip() if content else ""
             return ""
 
     except urllib.error.HTTPError as e:
