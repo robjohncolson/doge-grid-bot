@@ -101,8 +101,8 @@ def send_with_buttons(text: str, buttons: list, parse_mode: str = "HTML") -> int
 
     Args:
         text:    Message text (HTML)
-        buttons: List of dicts with "text" and "callback_data" keys.
-                 Each dict becomes one button, all in a single row.
+        buttons: Flat list of dicts (single row) OR list-of-lists (multi-row).
+                 Each dict has "text" and "callback_data" keys.
 
     Returns:
         The message_id (int) of the sent message, or 0 on failure.
@@ -110,7 +110,16 @@ def send_with_buttons(text: str, buttons: list, parse_mode: str = "HTML") -> int
     if not config.TELEGRAM_CHAT_ID:
         return 0
 
-    keyboard = [[{"text": b["text"], "callback_data": b["callback_data"]} for b in buttons]]
+    # Detect flat list vs list-of-lists
+    if buttons and isinstance(buttons[0], dict):
+        # Flat list -- single row (backward compatible)
+        keyboard = [[{"text": b["text"], "callback_data": b["callback_data"]} for b in buttons]]
+    else:
+        # List-of-lists -- multi-row
+        keyboard = [
+            [{"text": b["text"], "callback_data": b["callback_data"]} for b in row]
+            for row in buttons
+        ]
 
     result = _telegram_api("sendMessage", {
         "chat_id": config.TELEGRAM_CHAT_ID,
@@ -211,22 +220,27 @@ def answer_callback(callback_id: str, text: str = ""):
     _telegram_api("answerCallbackQuery", payload)
 
 
-def edit_message_text(message_id: int, text: str, parse_mode: str = "HTML"):
+def edit_message_text(message_id: int, text: str, parse_mode: str = "HTML",
+                      reply_markup=None):
     """
     Edit an existing message (e.g. to remove buttons after action).
 
     Args:
-        message_id: The message to edit
-        text:       New text content
+        message_id:   The message to edit
+        text:         New text content
+        reply_markup: Optional inline keyboard dict (same format as send_with_buttons)
     """
     if not config.TELEGRAM_CHAT_ID:
         return
-    _telegram_api("editMessageText", {
+    payload = {
         "chat_id": config.TELEGRAM_CHAT_ID,
         "message_id": message_id,
         "text": text,
         "parse_mode": parse_mode,
-    })
+    }
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    _telegram_api("editMessageText", payload)
 
 
 def _prefix() -> str:

@@ -259,6 +259,9 @@ a{color:#58a6ff}
 .acard .ac-verdict.v-red{color:#f85149}
 .acard .ac-summary{font-size:12px;color:#c9d1d9;line-height:1.4}
 .acard .ac-conf{font-size:10px;color:#484f58;margin-top:6px}
+.audio-btn{background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:4px;padding:4px 10px;font-size:16px;cursor:pointer;margin-left:8px}
+.audio-btn:hover{background:#30363d;border-color:#8b949e}
+.audio-btn.active{background:#1f3a1f;border-color:#238636;color:#3fb950}
 </style>
 </head>
 <body>
@@ -266,6 +269,7 @@ a{color:#58a6ff}
 <div class="header">
   <h1>DOGE Grid Bot</h1>
   <span id="badge" class="badge badge-dry">---</span>
+  <button class="audio-btn" id="audio-btn" onclick="toggleAudio()" title="Toggle audio alerts">&#x1f507;</button>
   <span class="uptime" id="uptime">--</span>
 </div>
 
@@ -358,6 +362,20 @@ a{color:#58a6ff}
     <div class="fills" id="fills-wrap">
       <table><thead><tr><th>Time</th><th>Side</th><th>Price</th><th>Volume</th><th>Profit</th></tr></thead>
       <tbody id="fills-body"></tbody></table>
+    </div>
+  </div>
+</div>
+
+<div class="sections">
+  <div class="section" style="grid-column:1/-1">
+    <h2>Export Data</h2>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <a class="btn" href="/api/export/fills?format=csv" download>Fills CSV</a>
+      <a class="btn" href="/api/export/fills?format=json" target="_blank">Fills JSON</a>
+      <a class="btn" href="/api/export/stats?format=csv" download>Stats CSV</a>
+      <a class="btn" href="/api/export/stats?format=json" target="_blank">Stats JSON</a>
+      <a class="btn" href="/api/export/trades?format=csv" download>Trades CSV</a>
+      <a class="btn" href="/api/export/trades?format=json" target="_blank">Trades JSON</a>
     </div>
   </div>
 </div>
@@ -618,6 +636,9 @@ function update(data) {
            + '<td class="' + pcls + '">' + (f.profit ? fmtUSD(f.profit) : '--') + '</td></tr>';
   }
   fb.innerHTML = frows || '<tr><td colspan="5" style="text-align:center;color:#8b949e">No fills yet</td></tr>';
+
+  // Check for audio alerts
+  checkAlerts(data);
 }
 
 // === Controls ===
@@ -647,10 +668,97 @@ function applyRatio() { const v = parseFloat(document.getElementById('in-ratio')
 function applyRatioAuto() { postConfig({ratio: 'auto'}); }
 function applyInterval() { const v = parseInt(document.getElementById('in-interval').value); if (isNaN(v)) return showMsg('Enter an interval value', false); postConfig({interval: v}); }
 
-// === Polling ===
+// === Audio Alerts ===
+let audioEnabled = localStorage.getItem('audioEnabled') === 'true';
+let audioCtx = null;
+let prevState = null;
+
+function initAudioBtn() {
+  const btn = document.getElementById('audio-btn');
+  if (audioEnabled) { btn.innerHTML = '&#x1f50a;'; btn.classList.add('active'); }
+  else { btn.innerHTML = '&#x1f507;'; btn.classList.remove('active'); }
+}
+initAudioBtn();
+
+function toggleAudio() {
+  audioEnabled = !audioEnabled;
+  localStorage.setItem('audioEnabled', audioEnabled);
+  if (audioEnabled && !audioCtx) {
+    try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch(e) {}
+  }
+  initAudioBtn();
+}
+
+function beep(freq, duration, volume) {
+  if (!audioEnabled || !audioCtx) return;
+  try {
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.frequency.value = freq;
+    gain.gain.value = volume || 0.3;
+    osc.start();
+    osc.stop(audioCtx.currentTime + (duration || 0.15));
+  } catch(e) {}
+}
+
+function speak(text) {
+  if (!audioEnabled || !window.speechSynthesis) return;
+  try {
+    const u = new SpeechSynthesisUtterance(text);
+    u.rate = 1.1;
+    window.speechSynthesis.speak(u);
+  } catch(e) {}
+}
+
+function checkAlerts(data) {
+  if (!prevState) { prevState = data; return; }
+  // New fill
+  if (data.profit && prevState.profit && data.profit.round_trips > prevState.profit.round_trips) {
+    beep(880, 0.15, 0.3);
+    const fills = data.recent_fills;
+    if (fills && fills.length > 0) {
+      const f = fills[0];
+      speak('Fill: ' + f.side + ' at ' + f.price.toFixed(4));
+    }
+  }
+  // Verdict change
+  if (data.stats && data.stats.overall_health && prevState.stats && prevState.stats.overall_health) {
+    const nv = data.stats.overall_health.verdict || '';
+    const ov = prevState.stats.overall_health.verdict || '';
+    if (nv && nv !== ov) {
+      beep(660, 0.2, 0.25);
+      speak('Verdict changed to ' + nv.replace(/_/g, ' '));
+    }
+  }
+  // Bot paused
+  if (data.paused && !prevState.paused) {
+    beep(220, 0.3, 0.4);
+    setTimeout(function(){ beep(220, 0.3, 0.4); }, 400);
+    speak('Warning: bot paused');
+  }
+  prevState = data;
+}
+
+// === SSE Live Feed ===
+let evtSource = null;
+function startSSE() {
+  if (evtSource) { evtSource.close(); evtSource = null; }
+  evtSource = new EventSource('/api/stream');
+  evtSource.onmessage = function(e) {
+    try { const data = JSON.parse(e.data); if (!data.error) update(data); } catch(ex) {}
+  };
+  evtSource.onerror = function() {
+    evtSource.close(); evtSource = null;
+    // fallback to polling
+    setInterval(poll, 5000);
+  };
+}
 async function poll() { try { const r = await fetch(API); if (r.ok) update(await r.json()); } catch(e) {} }
+// Initial fetch for immediate render, then start SSE
 poll();
-setInterval(poll, 5000);
+startSSE();
 </script>
 </body>
 </html>

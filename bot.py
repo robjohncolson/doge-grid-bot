@@ -41,6 +41,10 @@ import threading
 import json
 import os
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
+from urllib.parse import urlparse, parse_qs
+import csv
+import io
 from datetime import datetime, timezone
 
 import config
@@ -50,6 +54,7 @@ import ai_advisor
 import notifier
 import dashboard
 import stats_engine
+import telegram_menu
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -119,6 +124,11 @@ _ohlc_cache: list = []
 _ohlc_last_fetch: float = 0.0
 
 
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    """HTTPServer that handles each request in a new thread (for SSE)."""
+    daemon_threads = True
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
     """
     HTTP handler for the web dashboard, JSON API, and legacy health check.
@@ -133,6 +143,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._handle_api_status()
         elif self.path == "/api/stats":
             self._handle_api_stats()
+        elif self.path == "/api/stream":
+            self._handle_sse()
+        elif self.path.startswith("/api/export/"):
+            self._handle_export()
         elif self.path == "/health":
             self._handle_health()
         else:
@@ -186,6 +200,146 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "doge_accumulated": round(_bot_state.doge_accumulated, 2),
             })
         self._send_json(status)
+
+    def _handle_sse(self):
+        """GET /api/stream -- Server-Sent Events stream of bot state."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+        try:
+            while True:
+                if not _bot_state:
+                    data = json.dumps({"error": "bot not initialized"})
+                else:
+                    if _bot_state.price_history:
+                        current_price = _bot_state.price_history[-1][1]
+                    else:
+                        current_price = _bot_state.center_price
+                    data = json.dumps(dashboard.serialize_state(_bot_state, current_price))
+
+                self.wfile.write(f"data: {data}\n\n".encode("utf-8"))
+                self.wfile.flush()
+                time.sleep(3)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            pass
+
+    def _handle_export(self):
+        """Route /api/export/* requests."""
+        parsed = urlparse(self.path)
+        parts = parsed.path.strip("/").split("/")  # ["api", "export", "<type>"]
+        params = parse_qs(parsed.query)
+        fmt = params.get("format", ["json"])[0].lower()
+
+        if len(parts) < 3:
+            self._send_json({"error": "missing export type"}, 400)
+            return
+
+        export_type = parts[2]
+        if export_type == "fills":
+            self._export_fills(fmt)
+        elif export_type == "stats":
+            self._export_stats(fmt)
+        elif export_type == "trades":
+            self._export_trades(fmt)
+        else:
+            self._send_json({"error": f"unknown export type: {export_type}"}, 404)
+
+    def _export_fills(self, fmt):
+        """Export recent fills as CSV or JSON."""
+        if not _bot_state:
+            self._send_json({"error": "bot not initialized"}, 503)
+            return
+
+        fills = []
+        for f in _bot_state.recent_fills:
+            fills.append({
+                "time": datetime.fromtimestamp(f.get("time", 0), tz=timezone.utc).isoformat() if f.get("time") else "",
+                "side": f["side"],
+                "price": round(f["price"], 6),
+                "volume": round(f["volume"], 2),
+                "profit": round(f.get("profit", 0), 4),
+                "fees": round(f.get("fees", 0), 4),
+            })
+
+        if fmt == "csv":
+            self._send_csv_data(fills, ["time", "side", "price", "volume", "profit", "fees"], "fills.csv")
+        else:
+            self._send_json(fills)
+
+    def _export_stats(self, fmt):
+        """Export stats results as CSV or JSON."""
+        if not _bot_state:
+            self._send_json({"error": "bot not initialized"}, 503)
+            return
+
+        results = _bot_state.stats_results or {}
+        if fmt == "csv":
+            rows = []
+            for name, r in results.items():
+                if name == "overall_health":
+                    continue
+                if isinstance(r, dict):
+                    rows.append({
+                        "analyzer": name,
+                        "verdict": r.get("verdict", ""),
+                        "confidence": r.get("confidence", ""),
+                        "summary": r.get("summary", ""),
+                    })
+            self._send_csv_data(rows, ["analyzer", "verdict", "confidence", "summary"], "stats.csv")
+        else:
+            self._send_json(results)
+
+    def _export_trades(self, fmt):
+        """Export trade history from logs/trades.csv."""
+        filepath = os.path.join(config.LOG_DIR, "trades.csv")
+        if not os.path.exists(filepath):
+            if fmt == "csv":
+                self._send_csv_raw("", "trades.csv")
+            else:
+                self._send_json([])
+            return
+
+        try:
+            with open(filepath, "r", newline="", encoding="utf-8") as f:
+                content = f.read()
+        except Exception as e:
+            self._send_json({"error": str(e)}, 500)
+            return
+
+        if fmt == "csv":
+            self._send_csv_raw(content, "trades.csv")
+        else:
+            rows = []
+            try:
+                reader = csv.DictReader(io.StringIO(content))
+                for row in reader:
+                    rows.append(row)
+            except Exception:
+                pass
+            self._send_json(rows)
+
+    def _send_csv_data(self, rows, fieldnames, filename):
+        """Serialize list of dicts to CSV and send with download header."""
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+        self._send_csv_raw(output.getvalue(), filename)
+
+    def _send_csv_raw(self, content, filename):
+        """Send raw CSV string with Content-Disposition header."""
+        body = content.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _handle_api_config(self):
         """POST /api/config -- validate and queue config changes."""
@@ -287,7 +441,7 @@ def start_health_server():
         return None
 
     try:
-        server = HTTPServer(("0.0.0.0", config.HEALTH_PORT), DashboardHandler)
+        server = ThreadingHTTPServer(("0.0.0.0", config.HEALTH_PORT), DashboardHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         logger.info("Health check server running on port %d", config.HEALTH_PORT)
@@ -452,6 +606,18 @@ def _poll_and_handle_callbacks(state: grid_strategy.GridState, current_price: fl
         cb_msg_id = cb["message_id"]
         callback_id = cb["callback_id"]
 
+        # Menu navigation callbacks (m:screen)
+        if data.startswith("m:"):
+            screen = data[2:]
+            _handle_menu_nav(state, current_price, screen, cb_msg_id, callback_id)
+            continue
+
+        # Menu action callbacks (ma:action)
+        if data.startswith("ma:"):
+            action = data[3:]
+            _handle_menu_action(state, current_price, action, cb_msg_id, callback_id)
+            continue
+
         # Only process if it matches the pending approval's message
         if not _pending_approval or cb_msg_id != _pending_approval["message_id"]:
             notifier.answer_callback(callback_id, "No pending action for this message")
@@ -596,6 +762,8 @@ def _handle_text_commands(state: grid_strategy.GridState, current_price: float,
             _cmd_ratio(state, current_price, arg)
         elif command == "/stats":
             _cmd_stats(state)
+        elif command == "/menu":
+            _cmd_menu()
         elif command == "/help":
             _cmd_help()
         else:
@@ -765,6 +933,7 @@ def _cmd_help():
     notifier._send_message(
         "<b>Bot Commands</b>\n\n"
         "/status -- Current bot status\n"
+        "/menu -- Interactive button menu\n"
         "/interval &lt;sec&gt; -- Set AI check interval (60-86400)\n"
         "/check -- Trigger AI check next cycle\n"
         "/spacing &lt;pct&gt; -- Set grid spacing % and rebuild\n"
@@ -772,6 +941,88 @@ def _cmd_help():
         "/stats -- Statistical analysis results\n"
         "/help -- This message"
     )
+
+
+def _cmd_menu():
+    """Handle /menu -- send interactive button menu."""
+    text, keyboard = telegram_menu.build_main_menu()
+    notifier.send_with_buttons(text, keyboard)
+
+
+def _handle_menu_nav(state: grid_strategy.GridState, current_price: float,
+                     screen: str, message_id: int, callback_id: str):
+    """Navigate to a menu screen by editing the existing message."""
+    if screen == "main":
+        text, keyboard = telegram_menu.build_main_menu()
+    elif screen == "status":
+        text, keyboard = telegram_menu.build_status_screen(state, current_price)
+    elif screen == "grid":
+        text, keyboard = telegram_menu.build_grid_screen(state, current_price)
+    elif screen == "stats":
+        text, keyboard = telegram_menu.build_stats_screen(state)
+    elif screen == "settings":
+        text, keyboard = telegram_menu.build_settings_screen()
+    else:
+        notifier.answer_callback(callback_id, "Unknown screen")
+        return
+
+    notifier.answer_callback(callback_id)
+    # Build reply_markup in Telegram API format
+    reply_markup = {"inline_keyboard": [
+        [{"text": b["text"], "callback_data": b["callback_data"]} for b in row]
+        for row in keyboard
+    ]}
+    notifier.edit_message_text(message_id, text, reply_markup=reply_markup)
+
+
+def _handle_menu_action(state: grid_strategy.GridState, current_price: float,
+                        action: str, message_id: int, callback_id: str):
+    """Execute a settings action from the menu, then refresh the settings screen."""
+    if action == "spacing_up":
+        old = config.GRID_SPACING_PCT
+        config.GRID_SPACING_PCT = round(old + SPACING_STEP_PCT, 4)
+        notifier.answer_callback(callback_id, f"Spacing: {old:.2f}% -> {config.GRID_SPACING_PCT:.2f}%")
+        logger.info("Menu: spacing widened %.2f%% -> %.2f%%", old, config.GRID_SPACING_PCT)
+        grid_strategy.cancel_grid(state)
+        grid_strategy.build_grid(state, current_price)
+
+    elif action == "spacing_down":
+        old = config.GRID_SPACING_PCT
+        floor = config.ROUND_TRIP_FEE_PCT + 0.1
+        new_val = round(old - SPACING_STEP_PCT, 4)
+        if new_val < floor:
+            notifier.answer_callback(callback_id, f"Can't go below {floor:.2f}%")
+            return
+        config.GRID_SPACING_PCT = new_val
+        notifier.answer_callback(callback_id, f"Spacing: {old:.2f}% -> {new_val:.2f}%")
+        logger.info("Menu: spacing tightened %.2f%% -> %.2f%%", old, new_val)
+        grid_strategy.cancel_grid(state)
+        grid_strategy.build_grid(state, current_price)
+
+    elif action == "ratio_auto":
+        state.trend_ratio_override = None
+        grid_strategy.update_trend_ratio(state)
+        notifier.answer_callback(callback_id, f"Ratio auto: {state.trend_ratio:.2f}")
+        logger.info("Menu: ratio set to auto (%.2f)", state.trend_ratio)
+        grid_strategy.cancel_grid(state)
+        grid_strategy.build_grid(state, current_price)
+
+    elif action == "ai_check":
+        state.last_ai_check = 0
+        notifier.answer_callback(callback_id, "AI check queued")
+        logger.info("Menu: immediate AI check requested")
+
+    else:
+        notifier.answer_callback(callback_id, "Unknown action")
+        return
+
+    # Refresh settings screen
+    text, keyboard = telegram_menu.build_settings_screen()
+    reply_markup = {"inline_keyboard": [
+        [{"text": b["text"], "callback_data": b["callback_data"]} for b in row]
+        for row in keyboard
+    ]}
+    notifier.edit_message_text(message_id, text, reply_markup=reply_markup)
 
 
 # ---------------------------------------------------------------------------
