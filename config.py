@@ -219,9 +219,11 @@ HEALTH_PORT: int = _env("PORT", _env("HEALTH_PORT", 8080, int), int)
 AI_API_URL: str = _env("AI_API_URL", "https://integrate.api.nvidia.com/v1/chat/completions")
 
 # Which model to use for the AI advisor.
-# Default: "moonshotai/kimi-k2.5" on NVIDIA (free tier).
+# Default: "meta/llama-3.1-8b-instruct" on NVIDIA (free tier, fast, clean output).
+# Avoid reasoning models (kimi-k2.5) -- they waste tokens on chain-of-thought
+# and return empty content.  Instruct models give structured 3-line responses.
 # Groq alternatives: "llama-3.1-8b-instant", "llama-3.1-70b-versatile"
-AI_MODEL: str = _env("AI_MODEL", "moonshotai/kimi-k2.5")
+AI_MODEL: str = _env("AI_MODEL", "meta/llama-3.1-8b-instruct")
 
 # ---------------------------------------------------------------------------
 # Startup banner -- printed when the bot launches

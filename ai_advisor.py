@@ -91,7 +91,7 @@ def _call_ai(prompt: str) -> str:
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.3,       # Low temperature for consistent analysis
-        "max_tokens": 150,         # Keep responses short
+        "max_tokens": 200,         # Enough for the 3-line structured response
     }).encode("utf-8")
 
     headers = {
@@ -108,7 +108,14 @@ def _call_ai(prompt: str) -> str:
             # Extract the assistant message from OpenAI-compatible response
             choices = body.get("choices", [])
             if choices:
-                content = choices[0].get("message", {}).get("content")
+                msg = choices[0].get("message", {})
+                # Some models (like Kimi 2.5) are reasoning models --
+                # they put the answer in "content" but may also have
+                # "reasoning_content" with chain-of-thought.  If content
+                # is null (all tokens spent on reasoning), fall back.
+                content = msg.get("content")
+                if not content:
+                    content = msg.get("reasoning_content")
                 return content.strip() if content else ""
             return ""
 
