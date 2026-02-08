@@ -492,62 +492,40 @@ INITIAL (2 entries flanking market)
        |                           |
        |    1. Cancel stale sell entry
        |    2. SELL = exit at buy_price * (1 + PAIR_PROFIT_PCT)   role=exit
-       |    3. BUY  = entry at market - PAIR_ENTRY_PCT            role=entry
        |                           |
-       |    State: 1 buy entry + 1 sell exit
+       |    State: 1 sell exit only (1 order on book)
        |                           |
        |    --- SELL EXIT fills (ROUND TRIP) ---
        |        1. Record profit, log trade
-       |        2. SELL = entry at market + PAIR_ENTRY_PCT        role=entry
-       |        3. Refresh BUY entry if stale (> PAIR_REFRESH_PCT from market)
+       |        2. BUY  = entry at market - PAIR_ENTRY_PCT        role=entry
+       |        3. SELL = entry at market + PAIR_ENTRY_PCT        role=entry
        |        -> Back to INITIAL
        |
        |--- SELL ENTRY fills ------.
        |                           |
        |    1. Cancel stale buy entry
        |    2. BUY  = exit at sell_price * (1 - PAIR_PROFIT_PCT)  role=exit
-       |    3. SELL = entry at market + PAIR_ENTRY_PCT             role=entry
        |                           |
-       |    State: 1 sell entry + 1 buy exit
+       |    State: 1 buy exit only (1 order on book)
        |                           |
        |    --- BUY EXIT fills (ROUND TRIP) ---
        |        1. Record profit, log trade
        |        2. BUY  = entry at market - PAIR_ENTRY_PCT        role=entry
-       |        3. Refresh SELL entry if stale (> PAIR_REFRESH_PCT from market)
+       |        3. SELL = entry at market + PAIR_ENTRY_PCT        role=entry
        |        -> Back to INITIAL
 ```
 
 ### Key Invariant
 
-Always exactly 2 open orders. Entry orders refresh when they drift
-more than `PAIR_REFRESH_PCT` from market. Exit orders never move
-(profit target is fixed at the fill price).
+Either 2 open orders (both entries, INITIAL state) or 1 open order
+(exit only, waiting for round trip). Entry fills never place a new
+same-side entry -- this eliminates the race condition where both
+entries fill and break the invariant.
 
-### Race Condition: Both Entries Fill (Live)
+### Offline Fill Recovery
 
-If both entries fill within the 30s poll gap before the bot can cancel one,
-the second entry implicitly closes the position opened by the first.
-
-```
-BUY entry fills -> bot places SELL exit
-                -> before bot cancels SELL entry, it also fills
-
-Now: orphaned SELL exit exists for an already-closed long position.
-
-_close_orphaned_exit() detects this:
-  1. Find orphaned exit (same side as filled entry, role=exit)
-  2. Look up cost basis from orphan's matched_buy_price
-  3. Book PnL: (sell_entry_price - buy_entry_price) * vol - fees
-  4. Cancel orphaned exit
-  5. Log as RACE CLOSE
-```
-
-Same logic applies in reverse (sell entry fills first, then buy entry).
-
-### Race Condition: Both Entries Fill (Offline)
-
-If both entries fill while the bot is offline (between deploys),
-`_reconcile_offline_fills()` detects the dual fill on startup.
+If fills happen while the bot is offline (between deploys),
+`_reconcile_offline_fills()` detects them on startup via trade history.
 
 ```
 Offline: BUY entry @ $0.098 fills, then SELL entry @ $0.0984 fills.

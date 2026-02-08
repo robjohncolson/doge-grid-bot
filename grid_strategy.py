@@ -1641,7 +1641,7 @@ def handle_pair_fill(state: GridState, filled_orders: list,
                      current_price: float) -> list:
     """
     Core pair state machine. For each filled order, place the appropriate
-    counter-orders to maintain exactly 2 open orders.
+    counter-orders. Entry fills -> exit only. Exit fills -> fresh pair of entries.
 
     Returns list of new GridOrder objects placed.
     """
@@ -1652,7 +1652,7 @@ def handle_pair_fill(state: GridState, filled_orders: list,
         is_exit = filled.order_role == "exit"
 
         # ---------------------------------------------------------------
-        # BUY ENTRY fills -> cancel stale sell entry, place sell exit + new buy entry
+        # BUY ENTRY fills -> cancel stale sell entry, place sell exit only
         # ---------------------------------------------------------------
         if filled.side == "buy" and is_entry:
             logger.info(
@@ -1685,15 +1685,8 @@ def handle_pair_fill(state: GridState, filled_orders: list,
             if o:
                 new_orders.append(o)
 
-            # Place new buy entry flanking market
-            entry_price = round(
-                current_price * (1 - config.PAIR_ENTRY_PCT / 100.0), 6)
-            o = _place_pair_order(state, "buy", entry_price, "entry")
-            if o:
-                new_orders.append(o)
-
         # ---------------------------------------------------------------
-        # SELL EXIT fills -> round trip complete! place sell entry, refresh buy
+        # SELL EXIT fills -> round trip complete! place fresh pair of entries
         # ---------------------------------------------------------------
         elif filled.side == "sell" and is_exit:
             buy_price = filled.matched_buy_price
@@ -1744,18 +1737,21 @@ def handle_pair_fill(state: GridState, filled_orders: list,
             })
             supabase_store.save_fill(state.recent_fills[-1])
 
-            # Place new sell entry
-            entry_price = round(
-                current_price * (1 + config.PAIR_ENTRY_PCT / 100.0), 6)
-            o = _place_pair_order(state, "sell", entry_price, "entry")
+            # Round trip complete -- place fresh pair of entries
+            buy_entry_price = round(
+                current_price * (1 - config.PAIR_ENTRY_PCT / 100.0), 6)
+            o = _place_pair_order(state, "buy", buy_entry_price, "entry")
             if o:
                 new_orders.append(o)
 
-            # Refresh buy entry if stale
-            _refresh_entry_if_stale(state, "buy", current_price)
+            sell_entry_price = round(
+                current_price * (1 + config.PAIR_ENTRY_PCT / 100.0), 6)
+            o = _place_pair_order(state, "sell", sell_entry_price, "entry")
+            if o:
+                new_orders.append(o)
 
         # ---------------------------------------------------------------
-        # SELL ENTRY fills -> cancel stale buy entry, place buy exit + new sell entry
+        # SELL ENTRY fills -> cancel stale buy entry, place buy exit only
         # ---------------------------------------------------------------
         elif filled.side == "sell" and is_entry:
             logger.info(
@@ -1788,15 +1784,8 @@ def handle_pair_fill(state: GridState, filled_orders: list,
             if o:
                 new_orders.append(o)
 
-            # Place new sell entry flanking market
-            entry_price = round(
-                current_price * (1 + config.PAIR_ENTRY_PCT / 100.0), 6)
-            o = _place_pair_order(state, "sell", entry_price, "entry")
-            if o:
-                new_orders.append(o)
-
         # ---------------------------------------------------------------
-        # BUY EXIT fills -> round trip complete! place buy entry, refresh sell
+        # BUY EXIT fills -> round trip complete! place fresh pair of entries
         # ---------------------------------------------------------------
         elif filled.side == "buy" and is_exit:
             sell_price = filled.matched_sell_price
@@ -1847,15 +1836,18 @@ def handle_pair_fill(state: GridState, filled_orders: list,
             })
             supabase_store.save_fill(state.recent_fills[-1])
 
-            # Place new buy entry
-            entry_price = round(
+            # Round trip complete -- place fresh pair of entries
+            buy_entry_price = round(
                 current_price * (1 - config.PAIR_ENTRY_PCT / 100.0), 6)
-            o = _place_pair_order(state, "buy", entry_price, "entry")
+            o = _place_pair_order(state, "buy", buy_entry_price, "entry")
             if o:
                 new_orders.append(o)
 
-            # Refresh sell entry if stale
-            _refresh_entry_if_stale(state, "sell", current_price)
+            sell_entry_price = round(
+                current_price * (1 + config.PAIR_ENTRY_PCT / 100.0), 6)
+            o = _place_pair_order(state, "sell", sell_entry_price, "entry")
+            if o:
+                new_orders.append(o)
 
     return new_orders
 
