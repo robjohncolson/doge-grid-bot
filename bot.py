@@ -1220,53 +1220,16 @@ def _restore_from_supabase(state: grid_strategy.GridState):
     state.last_accumulation = sb_state.get("last_accumulation", 0.0)
     state.trend_ratio = sb_state.get("trend_ratio", 0.5)
     state.trend_ratio_override = sb_state.get("trend_ratio_override", None)
-    # Pair mode should never have negative realized profit
-    if config.STRATEGY_MODE == "pair":
-        sanitized = False
-        if state.total_profit_usd < 0:
-            logger.warning(
-                "[%s] Supabase total_profit_usd %.4f < 0 -- resetting to 0",
-                pair_name, state.total_profit_usd,
-            )
-            state.total_profit_usd = 0.0
-            sanitized = True
-        if state.today_profit_usd < 0:
-            logger.warning(
-                "[%s] Supabase today_profit_usd %.4f < 0 -- resetting to 0",
-                pair_name, state.today_profit_usd,
-            )
-            state.today_profit_usd = 0.0
-            sanitized = True
-        if sanitized:
-            state.today_loss_usd = max(0.0, state.today_loss_usd)
-            # region agent log
-            try:
-                _payload = {
-                    "runId": "pre",
-                    "hypothesisId": "H6",
-                    "location": "bot.py:_restore_from_supabase",
-                    "message": "supabase_state_sanitized",
-                    "data": {
-                        "pair": pair_name,
-                        "total_profit_usd": state.total_profit_usd,
-                        "today_profit_usd": state.today_profit_usd,
-                        "today_loss_usd": state.today_loss_usd,
-                    },
-                    "timestamp": int(time.time() * 1000),
-                }
-                _payload_json = json.dumps(_payload)
-                try:
-                    with open(r"c:\Users\ColsonR\grid-bot\doge-grid-bot\.cursor\debug.log", "a", encoding="utf-8") as _dbg_f:
-                        _dbg_f.write(_payload_json + "\n")
-                except Exception:
-                    pass
-                try:
-                    logger.info("DEBUG_LOG %s", _payload_json)
-                except Exception:
-                    pass
-            except Exception:
-                pass
-            # endregion agent log
+    # Restore pair mode identity fields
+    state.pair_state = sb_state.get("pair_state", "S0")
+    state.cycle_a = sb_state.get("cycle_a", 1)
+    state.cycle_b = sb_state.get("cycle_b", 1)
+    state._saved_open_orders = sb_state.get("open_orders", [])
+    # Restore completed cycles
+    saved_cycles = sb_state.get("completed_cycles", [])
+    state.completed_cycles = [
+        grid_strategy.CompletedCycle.from_dict(c) for c in saved_cycles
+    ]
     # Restore runtime config overrides
     saved_spacing = sb_state.get("grid_spacing_pct")
     if saved_spacing and saved_spacing != config.GRID_SPACING_PCT:
@@ -1585,6 +1548,9 @@ def run():
 
                 if config.STRATEGY_MODE == "pair":
                     market_data["position_state"] = grid_strategy.get_position_state(ai_state)
+                    market_data["pair_state"] = ai_state.pair_state
+                    market_data["cycle_a"] = ai_state.cycle_a
+                    market_data["cycle_b"] = ai_state.cycle_b
                     market_data["today_profit"] = ai_state.today_profit_usd
                     market_data["total_profit"] = ai_state.total_profit_usd
                     market_data["today_loss"] = ai_state.today_loss_usd
@@ -1593,6 +1559,13 @@ def run():
                     market_data["entry_pct"] = ai_state.entry_pct
                     market_data["profit_pct"] = ai_state.profit_pct
                     market_data["daily_loss_limit"] = ai_state.daily_loss_limit
+                    # Per-trade stats from completed cycles
+                    a_cycles = [c for c in ai_state.completed_cycles if c.trade_id == "A"]
+                    b_cycles = [c for c in ai_state.completed_cycles if c.trade_id == "B"]
+                    market_data["trade_a_cycles"] = len(a_cycles)
+                    market_data["trade_a_net"] = sum(c.net_profit for c in a_cycles)
+                    market_data["trade_b_cycles"] = len(b_cycles)
+                    market_data["trade_b_net"] = sum(c.net_profit for c in b_cycles)
 
                 stats_context = stats_engine.format_for_ai(ai_state.stats_results)
                 recommendation = ai_advisor.get_recommendation(market_data, stats_context)

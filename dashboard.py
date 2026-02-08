@@ -44,6 +44,10 @@ def serialize_state(state: grid_strategy.GridState, current_price: float) -> dic
         }
         if config.STRATEGY_MODE == "pair":
             order_data["role"] = getattr(o, "order_role", "")
+            order_data["trade_id"] = getattr(o, "trade_id", None)
+            order_data["cycle"] = getattr(o, "cycle", 0)
+            order_data["matched_buy_price"] = getattr(o, "matched_buy_price", None)
+            order_data["matched_sell_price"] = getattr(o, "matched_sell_price", None)
         orders.append(order_data)
     orders.sort(key=lambda x: x["price"], reverse=True)
 
@@ -156,6 +160,14 @@ def serialize_state(state: grid_strategy.GridState, current_price: float) -> dic
         "mode": "dry_run" if config.DRY_RUN else "live",
         "paused": state.is_paused,
         "pause_reason": state.pause_reason,
+        # Pair mode state machine
+        "pair_state": getattr(state, "pair_state", "S0"),
+        "cycle_a": getattr(state, "cycle_a", 1),
+        "cycle_b": getattr(state, "cycle_b", 1),
+        # Completed cycles (most recent 50 for dashboard)
+        "completed_cycles": [
+            c.to_dict() for c in getattr(state, "completed_cycles", [])[-50:]
+        ],
         # New: chart data
         "charts": {
             "price": price_chart,
@@ -244,6 +256,37 @@ a{color:#58a6ff}
 
 .ai-rec{font-size:12px;color:#8b949e;white-space:pre-wrap;line-height:1.5}
 
+/* Pair state machine banner */
+.pair-state-bar{display:none;background:#161b22;border:2px solid #30363d;border-radius:8px;padding:14px 20px;margin-bottom:20px;text-align:center}
+.pair-state-bar .ps-label{font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:1px}
+.pair-state-bar .ps-state{font-size:22px;font-weight:700;color:#e3b341;margin:4px 0}
+.pair-state-bar .ps-desc{font-size:12px;color:#8b949e}
+.pair-state-bar.ps-S0{border-color:#238636} .pair-state-bar.ps-S0 .ps-state{color:#3fb950}
+.pair-state-bar.ps-S1a{border-color:#9e6a03} .pair-state-bar.ps-S1a .ps-state{color:#e3b341}
+.pair-state-bar.ps-S1b{border-color:#9e6a03} .pair-state-bar.ps-S1b .ps-state{color:#e3b341}
+.pair-state-bar.ps-S2{border-color:#da3633} .pair-state-bar.ps-S2 .ps-state{color:#f85149}
+
+/* Trade A/B panels */
+.pair-panels{display:none;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px}
+@media(max-width:600px){.pair-panels{grid-template-columns:1fr}}
+.pair-panel{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px;border-top:3px solid #30363d}
+.pair-panel.trade-a{border-top-color:#f85149}
+.pair-panel.trade-b{border-top-color:#3fb950}
+.pair-panel .pp-title{font-size:13px;font-weight:700;margin-bottom:8px}
+.pair-panel.trade-a .pp-title{color:#f85149}
+.pair-panel.trade-b .pp-title{color:#3fb950}
+.pair-panel .pp-row{display:flex;justify-content:space-between;font-size:12px;padding:3px 0}
+.pair-panel .pp-row .pp-label{color:#8b949e}
+.pair-panel .pp-row .pp-val{color:#f0f6fc;font-weight:600}
+
+/* Completed cycles table */
+.cycles{max-height:300px;overflow-y:auto}
+.cycles table{width:100%;border-collapse:collapse}
+.cycles th,.cycles td{padding:4px 8px;text-align:right;font-size:12px}
+.cycles th{color:#8b949e;position:sticky;top:0;background:#161b22}
+.cycles .trade-a-tag{color:#f85149;font-weight:700}
+.cycles .trade-b-tag{color:#3fb950;font-weight:700}
+
 /* Charts row */
 .charts-row{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:20px}
 @media(max-width:900px){.charts-row{grid-template-columns:1fr}}
@@ -331,6 +374,33 @@ a{color:#58a6ff}
   <div class="card"><div class="label">DOGE Accumulated</div><div class="value" id="c-doge">--</div><div class="sub" id="c-doge-sub">&nbsp;</div></div>
 </div>
 
+<!-- Pair State Machine (pair mode only) -->
+<div class="pair-state-bar" id="pair-state-bar">
+  <div class="ps-label">State Machine</div>
+  <div class="ps-state" id="ps-state">S0</div>
+  <div class="ps-desc" id="ps-desc">Both entries open</div>
+</div>
+
+<!-- Trade A/B Panels (pair mode only) -->
+<div class="pair-panels" id="pair-panels">
+  <div class="pair-panel trade-a">
+    <div class="pp-title">Trade A (Short)</div>
+    <div class="pp-row"><span class="pp-label">Cycle</span><span class="pp-val" id="pp-a-cycle">--</span></div>
+    <div class="pp-row"><span class="pp-label">Completed</span><span class="pp-val" id="pp-a-completed">--</span></div>
+    <div class="pp-row"><span class="pp-label">Net P&amp;L</span><span class="pp-val" id="pp-a-pnl">--</span></div>
+    <div class="pp-row"><span class="pp-label">Avg profit</span><span class="pp-val" id="pp-a-avg">--</span></div>
+    <div class="pp-row"><span class="pp-label">Status</span><span class="pp-val" id="pp-a-status">--</span></div>
+  </div>
+  <div class="pair-panel trade-b">
+    <div class="pp-title">Trade B (Long)</div>
+    <div class="pp-row"><span class="pp-label">Cycle</span><span class="pp-val" id="pp-b-cycle">--</span></div>
+    <div class="pp-row"><span class="pp-label">Completed</span><span class="pp-val" id="pp-b-completed">--</span></div>
+    <div class="pp-row"><span class="pp-label">Net P&amp;L</span><span class="pp-val" id="pp-b-pnl">--</span></div>
+    <div class="pp-row"><span class="pp-label">Avg profit</span><span class="pp-val" id="pp-b-avg">--</span></div>
+    <div class="pp-row"><span class="pp-label">Status</span><span class="pp-val" id="pp-b-status">--</span></div>
+  </div>
+</div>
+
 <!-- Charts -->
 <div class="charts-row">
   <div class="chart-box"><h3>Price (24h)</h3><canvas id="chart-price"></canvas></div>
@@ -406,6 +476,17 @@ a{color:#58a6ff}
         <button onclick="applyInterval()">Apply</button>
       </div>
       <div id="ctrl-msg" class="ctrl-msg">&nbsp;</div>
+    </div>
+  </div>
+</div>
+
+<!-- Completed Cycles (pair mode only) -->
+<div class="sections" id="cycles-section" style="display:none">
+  <div class="section" style="grid-column:1/-1">
+    <h2>Completed Cycles (recent)</h2>
+    <div class="cycles" id="cycles-wrap">
+      <table><thead><tr><th>Time</th><th>Trade</th><th>Cycle</th><th>Entry</th><th>Exit</th><th>Volume</th><th>Net P&amp;L</th></tr></thead>
+      <tbody id="cycles-body"></tbody></table>
     </div>
   </div>
 </div>
@@ -1149,6 +1230,72 @@ function update(data) {
     drawProfitDots('chart-profits', data.charts.profits);
   }
 
+  // Pair state machine + Trade A/B panels
+  const psBar = document.getElementById('pair-state-bar');
+  const ppDiv = document.getElementById('pair-panels');
+  const cycSec = document.getElementById('cycles-section');
+  if (isPair) {
+    // State machine banner
+    const ps = data.pair_state || 'S0';
+    const psDesc = {S0:'Both entries open',S1a:'Trade A entered (exit pending)',S1b:'Trade B entered (exit pending)',S2:'Both entered (both exits pending)'}[ps] || ps;
+    psBar.style.display = 'block';
+    psBar.className = 'pair-state-bar ps-' + ps;
+    document.getElementById('ps-state').textContent = ps;
+    document.getElementById('ps-desc').textContent = psDesc;
+
+    // Trade A/B panels
+    ppDiv.style.display = 'grid';
+    const cycles = data.completed_cycles || [];
+    const aCyc = cycles.filter(c => c.trade_id === 'A');
+    const bCyc = cycles.filter(c => c.trade_id === 'B');
+    const aNet = aCyc.reduce((s,c) => s + c.net_profit, 0);
+    const bNet = bCyc.reduce((s,c) => s + c.net_profit, 0);
+    const aAvg = aCyc.length > 0 ? aNet / aCyc.length : 0;
+    const bAvg = bCyc.length > 0 ? bNet / bCyc.length : 0;
+    // Derive per-trade status from open orders
+    const openOrders = data.grid.filter(o => o.status === 'open');
+    const aOrders = openOrders.filter(o => o.trade_id === 'A');
+    const bOrders = openOrders.filter(o => o.trade_id === 'B');
+    const aStatus = aOrders.length > 0 ? aOrders.map(o => o.role || o.side).join(', ') : 'idle';
+    const bStatus = bOrders.length > 0 ? bOrders.map(o => o.role || o.side).join(', ') : 'idle';
+
+    document.getElementById('pp-a-cycle').textContent = '#' + (data.cycle_a || 1);
+    document.getElementById('pp-a-completed').textContent = aCyc.length + ' cycles';
+    document.getElementById('pp-a-pnl').textContent = fmtUSD(aNet);
+    document.getElementById('pp-a-pnl').style.color = aNet >= 0 ? '#3fb950' : '#f85149';
+    document.getElementById('pp-a-avg').textContent = fmtUSD(aAvg);
+    document.getElementById('pp-a-status').textContent = aStatus;
+
+    document.getElementById('pp-b-cycle').textContent = '#' + (data.cycle_b || 1);
+    document.getElementById('pp-b-completed').textContent = bCyc.length + ' cycles';
+    document.getElementById('pp-b-pnl').textContent = fmtUSD(bNet);
+    document.getElementById('pp-b-pnl').style.color = bNet >= 0 ? '#3fb950' : '#f85149';
+    document.getElementById('pp-b-avg').textContent = fmtUSD(bAvg);
+    document.getElementById('pp-b-status').textContent = bStatus;
+
+    // Completed cycles table
+    cycSec.style.display = '';
+    const cb = document.getElementById('cycles-body');
+    let crows = '';
+    const sortedCycles = cycles.slice().reverse();
+    for (const c of sortedCycles.slice(0, 30)) {
+      const tag = c.trade_id === 'A' ? 'trade-a-tag' : 'trade-b-tag';
+      const pcls = c.net_profit > 0 ? 'profit-pos' : (c.net_profit < 0 ? 'profit-neg' : '');
+      crows += '<tr><td>' + fmtTime(c.exit_time) + '</td>'
+             + '<td class="' + tag + '">' + c.trade_id + '</td>'
+             + '<td>' + c.cycle + '</td>'
+             + '<td>$' + fmt(c.entry_price, 6) + '</td>'
+             + '<td>$' + fmt(c.exit_price, 6) + '</td>'
+             + '<td>' + fmt(c.volume, 2) + '</td>'
+             + '<td class="' + pcls + '">' + fmtUSD(c.net_profit) + '</td></tr>';
+    }
+    cb.innerHTML = crows || '<tr><td colspan="7" style="text-align:center;color:#8b949e">No completed cycles yet</td></tr>';
+  } else {
+    psBar.style.display = 'none';
+    ppDiv.style.display = 'none';
+    cycSec.style.display = 'none';
+  }
+
   // Stats advisory board
   renderAdvisory(data.stats);
 
@@ -1167,7 +1314,13 @@ function update(data) {
       markerPlaced = true;
     }
     const cls = o.side === 'buy' ? 'buy' : 'sell';
-    const col1 = isPair ? (o.role || '--') : ((o.level > 0 ? '+' : '') + o.level);
+    let col1;
+    if (isPair) {
+      const tid = o.trade_id ? (o.trade_id + '.' + (o.cycle || 0)) : '';
+      col1 = (o.role || '--') + (tid ? ' ' + tid : '');
+    } else {
+      col1 = (o.level > 0 ? '+' : '') + o.level;
+    }
     rows += '<tr><td>' + col1 + '</td>'
           + '<td class="' + cls + '">' + o.side.toUpperCase() + '</td>'
           + '<td>$' + fmt(o.price, 6) + '</td>'

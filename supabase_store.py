@@ -41,20 +41,25 @@ logger = logging.getLogger(__name__)
 # Pair column compatibility
 # ---------------------------------------------------------------------------
 
-def _note_pair_column(err_body: str):
-    """Set pair-column support flag if Supabase reports missing column."""
-    global _pair_column_supported
-    if _pair_column_supported is False:
-        return
-    if "pair" in err_body and "does not exist" in err_body:
-        _pair_column_supported = False
+def _note_missing_column(err_body: str):
+    """Detect missing columns from Supabase error responses."""
+    global _pair_column_supported, _identity_columns_supported
+    if "does not exist" in err_body:
+        if "pair" in err_body and _pair_column_supported is not False:
+            _pair_column_supported = False
+        if ("trade_id" in err_body or "cycle" in err_body) and _identity_columns_supported is not False:
+            _identity_columns_supported = False
 
 
-def _strip_pair_if_needed(row: dict) -> dict:
-    """Remove pair column for legacy schemas without pair support."""
-    if _pair_column_supported is False and "pair" in row:
+def _strip_unsupported_columns(row: dict) -> dict:
+    """Remove columns not supported by the current schema."""
+    if _pair_column_supported is False or _identity_columns_supported is False:
         row = dict(row)
+    if _pair_column_supported is False:
         row.pop("pair", None)
+    if _identity_columns_supported is False:
+        row.pop("trade_id", None)
+        row.pop("cycle", None)
     return row
 
 
@@ -72,8 +77,9 @@ _write_queue: collections.deque = collections.deque(maxlen=MAX_QUEUE_SIZE)
 _price_buffer: list = []
 _price_buffer_lock = threading.Lock()
 
-# Pair column support (older schemas may not have it)
-_pair_column_supported = None  # None=unknown, True/False after detection
+# Column support flags (older schemas may not have these)
+_pair_column_supported = None       # None=unknown, True/False after detection
+_identity_columns_supported = None  # trade_id, cycle columns
 
 # Writer thread state
 _writer_thread: threading.Thread = None
@@ -148,7 +154,7 @@ def _request(method: str, path: str, body: dict = None,
             return {}
     except urllib.error.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")[:200]
-        _note_pair_column(err_body)
+        _note_missing_column(err_body)
         logger.warning("Supabase %s %s HTTP %d: %s", method, path, e.code, err_body)
         return None
     except Exception as e:
@@ -160,7 +166,8 @@ def _request(method: str, path: str, body: dict = None,
 # Write operations (queue-based, non-blocking)
 # ---------------------------------------------------------------------------
 
-def save_fill(fill: dict, pair: str = "XDGUSD"):
+def save_fill(fill: dict, pair: str = "XDGUSD",
+              trade_id: str = None, cycle: int = None):
     """Queue a fill record for persistence."""
     if not _enabled():
         return
@@ -173,7 +180,10 @@ def save_fill(fill: dict, pair: str = "XDGUSD"):
         "fees": fill.get("fees", 0),
         "pair": pair,
     }
-    _write_queue.append(("fills", _strip_pair_if_needed(row)))
+    if trade_id is not None:
+        row["trade_id"] = trade_id
+        row["cycle"] = cycle or 0
+    _write_queue.append(("fills", _strip_unsupported_columns(row)))
 
 
 def save_trade(order, net_profit: float, fees: float, pair: str = "XDGUSD"):
@@ -191,7 +201,11 @@ def save_trade(order, net_profit: float, fees: float, pair: str = "XDGUSD"):
         "grid_level": order.level,
         "pair": pair,
     }
-    _write_queue.append(("trades", _strip_pair_if_needed(row)))
+    tid = getattr(order, "trade_id", None)
+    if tid is not None:
+        row["trade_id"] = tid
+        row["cycle"] = getattr(order, "cycle", 0)
+    _write_queue.append(("trades", _strip_unsupported_columns(row)))
 
 
 def save_daily_summary(state, pair: str = "XDGUSD"):
@@ -207,7 +221,7 @@ def save_daily_summary(state, pair: str = "XDGUSD"):
         "net_profit": f"{state.today_profit_usd:.4f}",
         "doge_accumulated": f"{state.doge_accumulated:.2f}",
     }
-    _write_queue.append(("daily_summaries", _strip_pair_if_needed(row)))
+    _write_queue.append(("daily_summaries", _strip_unsupported_columns(row)))
 
 
 def save_state(snapshot: dict, pair: str = "XDGUSD"):
@@ -226,7 +240,7 @@ def queue_price_point(timestamp: float, price: float, pair: str = "XDGUSD"):
         return
     with _price_buffer_lock:
         row = {"time": timestamp, "price": price, "pair": pair}
-        _price_buffer.append(_strip_pair_if_needed(row))
+        _price_buffer.append(_strip_unsupported_columns(row))
 
 
 # ---------------------------------------------------------------------------
@@ -270,66 +284,6 @@ def load_fills(limit: int = 500, pair: str = "XDGUSD") -> list:
     # Reverse so oldest is first (matches in-memory order)
     fills = list(reversed(result))
     logger.info("Supabase: loaded %d fills", len(fills))
-    neg_profit_count = sum(1 for f in fills if f.get("profit", 0) < 0)
-    if config.STRATEGY_MODE == "pair" and neg_profit_count > 0:
-        for f in fills:
-            if f.get("profit", 0) < 0:
-                f["profit"] = 0
-        logger.warning(
-            "Supabase: sanitized %d negative profits for pair mode",
-            neg_profit_count,
-        )
-        # region agent log
-        try:
-            _payload = {
-                "runId": "pre",
-                "hypothesisId": "H6",
-                "location": "supabase_store.py:load_fills",
-                "message": "supabase_negative_profit_sanitized",
-                "data": {
-                    "sanitized_count": neg_profit_count,
-                },
-                "timestamp": int(time.time() * 1000),
-            }
-            _payload_json = json.dumps(_payload)
-            try:
-                with open(r"c:\Users\ColsonR\grid-bot\doge-grid-bot\.cursor\debug.log", "a", encoding="utf-8") as _dbg_f:
-                    _dbg_f.write(_payload_json + "\n")
-            except Exception:
-                pass
-            try:
-                logger.info("DEBUG_LOG %s", _payload_json)
-            except Exception:
-                pass
-        except Exception:
-            pass
-        # endregion agent log
-    # region agent log
-    try:
-        _payload = {
-            "runId": "pre",
-            "hypothesisId": "H3",
-            "location": "supabase_store.py:load_fills",
-            "message": "supabase_fills_loaded",
-            "data": {
-                "count": len(fills),
-                "neg_profit_count": neg_profit_count,
-            },
-            "timestamp": int(time.time() * 1000),
-        }
-        _payload_json = json.dumps(_payload)
-        try:
-            with open(r"c:\Users\ColsonR\grid-bot\doge-grid-bot\.cursor\debug.log", "a", encoding="utf-8") as _dbg_f:
-                _dbg_f.write(_payload_json + "\n")
-        except Exception:
-            pass
-        try:
-            logger.info("DEBUG_LOG %s", _payload_json)
-        except Exception:
-            pass
-    except Exception:
-        pass
-    # endregion agent log
     return fills
 
 

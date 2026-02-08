@@ -133,15 +133,17 @@ Grid fills (last hour): {market_data.get('recent_fills', 0)}
 Grid center: ${market_data.get('grid_center', 0):.6f}
 """
     if config.STRATEGY_MODE == "pair":
-        prompt += f"Strategy: single-pair (2 orders)\nEntry distance: {market_data.get('entry_pct', config.PAIR_ENTRY_PCT)}%\nProfit target: {market_data.get('profit_pct', config.PAIR_PROFIT_PCT)}%"
-
-        # Position and P&L context
-        pos = market_data.get("position_state", "flat")
-        prompt += f"\nPosition: {pos}"
-        prompt += f"\nToday P&L: ${market_data.get('today_profit', 0):.4f} profit, ${market_data.get('today_loss', 0):.4f} loss"
-        prompt += f"\nDaily loss limit: ${market_data.get('daily_loss_limit', 0):.2f}"
-        prompt += f"\nRound trips: {market_data.get('round_trips_today', 0)} today, {market_data.get('total_round_trips', 0)} lifetime"
-        prompt += f"\nTotal profit: ${market_data.get('total_profit', 0):.4f}"
+        prompt += f"""Strategy: single-pair (Trade A = short-side, Trade B = long-side)
+Entry distance: {market_data.get('entry_pct', config.PAIR_ENTRY_PCT)}%
+Profit target: {market_data.get('profit_pct', config.PAIR_PROFIT_PCT)}%
+State machine: {market_data.get('pair_state', 'S0')} (S0=both entries, S1a=A exit+B entry, S1b=A entry+B exit, S2=both exits)
+Position: {market_data.get('position_state', 'flat')}
+Trade A (short): {market_data.get('trade_a_cycles', 0)} cycles, ${market_data.get('trade_a_net', 0):.4f} net (cycle #{market_data.get('cycle_a', 1)})
+Trade B (long): {market_data.get('trade_b_cycles', 0)} cycles, ${market_data.get('trade_b_net', 0):.4f} net (cycle #{market_data.get('cycle_b', 1)})
+Today P&L: ${market_data.get('today_profit', 0):.4f} profit, ${market_data.get('today_loss', 0):.4f} loss
+Daily loss limit: ${market_data.get('daily_loss_limit', 0):.2f}
+Round trips: {market_data.get('round_trips_today', 0)} today, {market_data.get('total_round_trips', 0)} lifetime
+Total profit: ${market_data.get('total_profit', 0):.4f}"""
     else:
         prompt += f"Grid spacing: {config.GRID_SPACING_PCT}%"
 
@@ -186,15 +188,16 @@ def _call_panelist(prompt: str, panelist: dict, pair_display: str = "DOGE/USD") 
 
     if config.STRATEGY_MODE == "pair":
         system_content = (
-            "You are a concise crypto market analyst advising a single-pair "
-            f"market-making bot on {pair_display}. The bot maintains exactly two limit "
-            "orders: one buy and one sell. Each order is either an 'entry' "
-            "(flanking the market price) or an 'exit' (profit target from a "
-            "filled entry). Entry distance controls how far entries sit from "
-            "market -- wider means fewer fills but less risk; tighter means "
-            "more fills but more whipsaw risk. Profit target controls the "
-            "round trip size -- wider means more profit per trip but slower "
-            "fills; tighter means faster trips but less profit each. "
+            "You are a concise crypto market analyst advising a pair trading "
+            f"bot on {pair_display}. The bot runs two concurrent trades: "
+            "Trade A (short-side: sell entry, buy exit) and "
+            "Trade B (long-side: buy entry, sell exit). "
+            "State machine: S0=both entries open, S1a=A entered (exit pending), "
+            "S1b=B entered (exit pending), S2=both entered. "
+            "Entry distance controls how far entries sit from market -- "
+            "wider means fewer fills but less risk. Profit target controls "
+            "the round trip size -- wider means more profit per trip but "
+            "slower fills. Both parameters apply symmetrically to A and B. "
             "Be direct and specific. Never recommend buying or selling -- "
             "only recommend parameter adjustments."
         )
