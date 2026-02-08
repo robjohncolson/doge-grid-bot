@@ -53,9 +53,13 @@ def serialize_state(state: grid_strategy.GridState, current_price: float) -> dic
                   if f.get("time", 0) > cutoff and f["side"] == "buy")
     sell_12h = sum(1 for f in state.recent_fills
                    if f.get("time", 0) > cutoff and f["side"] == "sell")
-    total_grid = config.GRID_LEVELS * 2
-    n_buys = max(2, min(total_grid - 2, round(total_grid * state.trend_ratio)))
-    n_sells = total_grid - n_buys
+    if config.STRATEGY_MODE == "pair":
+        n_buys = 1
+        n_sells = 1
+    else:
+        total_grid = config.GRID_LEVELS * 2
+        n_buys = max(2, min(total_grid - 2, round(total_grid * state.trend_ratio)))
+        n_sells = total_grid - n_buys
     ratio_source = "manual" if state.trend_ratio_override is not None else "auto"
 
     # -- Effective capital --
@@ -309,7 +313,7 @@ a{color:#58a6ff}
 <body>
 
 <div class="header">
-  <h1>DOGE Grid Bot</h1>
+  <h1 id="bot-title">DOGE Grid Bot</h1>
   <span id="badge" class="badge badge-dry">---</span>
   <button class="audio-btn" id="audio-btn" onclick="toggleAudio()" title="Toggle audio alerts">&#x1f507;</button>
   <span class="uptime" id="uptime">--</span>
@@ -344,15 +348,16 @@ a{color:#58a6ff}
 <div class="sections">
   <!-- Grid ladder -->
   <div class="section">
-    <h2>Grid Ladder</h2>
+    <h2 id="ladder-title">Grid Ladder</h2>
     <div class="ladder" id="ladder-wrap">
-      <table><thead><tr><th>Lvl</th><th>Side</th><th>Price</th><th>Volume</th><th>Status</th></tr></thead>
+      <table><thead><tr id="ladder-head"><th>Lvl</th><th>Side</th><th>Price</th><th>Volume</th><th>Status</th></tr></thead>
       <tbody id="ladder-body"></tbody></table>
     </div>
   </div>
 
   <!-- Right column -->
   <div class="section">
+    <div id="trend-section">
     <h2>Trend Ratio</h2>
     <div class="trend-bar-wrap">
       <div class="trend-bar">
@@ -364,12 +369,15 @@ a{color:#58a6ff}
         <span id="trend-fills">0 buys / 0 sells (12h)</span>
       </div>
     </div>
+    </div>
 
     <h2 style="margin-top:16px">Adaptive Parameters</h2>
     <table class="params">
       <tr><td>Order size</td><td id="p-size">--</td></tr>
-      <tr><td>Grid levels</td><td id="p-levels">--</td></tr>
-      <tr><td>Spacing</td><td id="p-spacing">--</td></tr>
+      <tr id="p-levels-row"><td>Grid levels</td><td id="p-levels">--</td></tr>
+      <tr><td id="p-spacing-label">Spacing</td><td id="p-spacing">--</td></tr>
+      <tr id="p-entry-row" style="display:none"><td>Entry distance</td><td id="p-entry">--</td></tr>
+      <tr id="p-refresh-row" style="display:none"><td>Refresh drift</td><td id="p-refresh">--</td></tr>
       <tr><td>Effective capital</td><td id="p-capital">--</td></tr>
       <tr><td>Fees (round trip)</td><td id="p-fees">--</td></tr>
       <tr><td>AI interval</td><td id="p-ai">--</td></tr>
@@ -379,11 +387,11 @@ a{color:#58a6ff}
     <h2 style="margin-top:16px">Controls</h2>
     <div class="controls">
       <div class="ctrl-row">
-        <label>Spacing %</label>
+        <label id="ctrl-spacing-label">Spacing %</label>
         <input type="number" id="in-spacing" step="0.1" min="0.6">
         <button onclick="applySpacing()">Apply</button>
       </div>
-      <div class="ctrl-row">
+      <div class="ctrl-row" id="ctrl-ratio-row">
         <label>Ratio</label>
         <input type="number" id="in-ratio" step="0.05" min="0.25" max="0.75">
         <button onclick="applyRatio()">Apply</button>
@@ -1021,12 +1029,20 @@ function update(data) {
     document.getElementById('uptime').textContent = 'Up ' + fmtUptime(data.uptime);
   }
 
+  // Pair mode detection
+  const cfg = data.config;
+  const isPair = cfg.strategy_mode === 'pair';
+
+  // Title + section headers
+  document.getElementById('bot-title').textContent = isPair ? 'DOGE Pair Bot' : 'DOGE Grid Bot';
+  document.getElementById('ladder-title').textContent = isPair ? 'Active Orders' : 'Grid Ladder';
+
   // Cards
   const p = data.price;
   document.getElementById('c-price').textContent = '$' + fmt(p.current, 6);
   document.getElementById('c-price-sub').textContent = 'drift ' + fmt(p.drift_pct, 2) + '%';
   document.getElementById('c-center').textContent = '$' + fmt(p.center, 6);
-  document.getElementById('c-center-sub').textContent = 'grid center';
+  document.getElementById('c-center-sub').textContent = isPair ? 'center' : 'grid center';
   const pr = data.profit;
   document.getElementById('c-today').textContent = fmtUSD(pr.today);
   document.getElementById('c-today-sub').textContent = pr.round_trips_today + ' trips today';
@@ -1047,6 +1063,10 @@ function update(data) {
   renderAdvisory(data.stats);
 
   // Grid ladder
+  const lhead = document.getElementById('ladder-head');
+  lhead.innerHTML = isPair
+    ? '<th>Role</th><th>Side</th><th>Price</th><th>Volume</th><th>Status</th>'
+    : '<th>Lvl</th><th>Side</th><th>Price</th><th>Volume</th><th>Status</th>';
   const tbody = document.getElementById('ladder-body');
   let rows = '';
   const cp = p.current;
@@ -1057,7 +1077,8 @@ function update(data) {
       markerPlaced = true;
     }
     const cls = o.side === 'buy' ? 'buy' : 'sell';
-    rows += '<tr><td>' + (o.level > 0 ? '+' : '') + o.level + '</td>'
+    const col1 = isPair ? (o.role || '--') : ((o.level > 0 ? '+' : '') + o.level);
+    rows += '<tr><td>' + col1 + '</td>'
           + '<td class="' + cls + '">' + o.side.toUpperCase() + '</td>'
           + '<td>$' + fmt(o.price, 6) + '</td>'
           + '<td>' + fmt(o.volume, 2) + '</td>'
@@ -1068,33 +1089,49 @@ function update(data) {
   }
   tbody.innerHTML = rows;
 
-  // Trend bar
+  // Trend bar (hidden in pair mode)
   const t = data.trend;
-  const buyBar = document.getElementById('trend-buy');
-  const sellBar = document.getElementById('trend-sell');
-  buyBar.style.width = t.buy_pct + '%';
-  buyBar.textContent = t.buy_pct + '% Buy (' + t.grid_buys + ')';
-  sellBar.style.width = t.sell_pct + '%';
-  sellBar.textContent = t.sell_pct + '% Sell (' + t.grid_sells + ')';
-  document.getElementById('trend-source').textContent = 'Source: ' + t.source;
-  document.getElementById('trend-fills').textContent = t.buy_12h + ' buys / ' + t.sell_12h + ' sells (12h)';
+  document.getElementById('trend-section').style.display = isPair ? 'none' : '';
+  if (!isPair) {
+    const buyBar = document.getElementById('trend-buy');
+    const sellBar = document.getElementById('trend-sell');
+    buyBar.style.width = t.buy_pct + '%';
+    buyBar.textContent = t.buy_pct + '% Buy (' + t.grid_buys + ')';
+    sellBar.style.width = t.sell_pct + '%';
+    sellBar.textContent = t.sell_pct + '% Sell (' + t.grid_sells + ')';
+    document.getElementById('trend-source').textContent = 'Source: ' + t.source;
+    document.getElementById('trend-fills').textContent = t.buy_12h + ' buys / ' + t.sell_12h + ' sells (12h)';
+  }
 
   // Params
-  const cfg = data.config;
   document.getElementById('p-size').textContent = '$' + fmt(cfg.order_size, 2);
-  document.getElementById('p-levels').textContent = cfg.grid_levels + ' per side (' + (cfg.grid_levels * 2) + ' total)';
+  document.getElementById('p-levels-row').style.display = isPair ? 'none' : '';
+  if (!isPair) {
+    document.getElementById('p-levels').textContent = cfg.grid_levels + ' per side (' + (cfg.grid_levels * 2) + ' total)';
+  }
+  document.getElementById('p-spacing-label').textContent = isPair ? 'Profit target' : 'Spacing';
   document.getElementById('p-spacing').textContent = fmt(cfg.spacing_pct, 2) + '%';
+  document.getElementById('p-entry-row').style.display = isPair ? '' : 'none';
+  document.getElementById('p-refresh-row').style.display = isPair ? '' : 'none';
+  if (isPair) {
+    document.getElementById('p-entry').textContent = fmt(cfg.pair_entry_pct, 2) + '%';
+    document.getElementById('p-refresh').textContent = fmt(cfg.pair_refresh_pct, 2) + '%';
+  }
   document.getElementById('p-capital').textContent = '$' + fmt(cfg.effective_capital, 2);
   document.getElementById('p-fees').textContent = fmt(cfg.round_trip_fee_pct, 2) + '%';
   document.getElementById('p-ai').textContent = cfg.ai_interval + 's (' + Math.round(cfg.ai_interval / 60) + ' min)';
   document.getElementById('p-airec').textContent = data.ai_recommendation;
+
+  // Controls (pair mode adjustments)
+  document.getElementById('ctrl-spacing-label').textContent = isPair ? 'Profit %' : 'Spacing %';
+  document.getElementById('ctrl-ratio-row').style.display = isPair ? 'none' : '';
 
   // Populate input placeholders
   const inS = document.getElementById('in-spacing');
   const inR = document.getElementById('in-ratio');
   const inI = document.getElementById('in-interval');
   if (!inS.value) inS.placeholder = fmt(cfg.spacing_pct, 2);
-  if (!inR.value) inR.placeholder = fmt(t.ratio, 2);
+  if (!isPair && !inR.value) inR.placeholder = fmt(t.ratio, 2);
   if (!inI.value) inI.placeholder = cfg.ai_interval;
   inS.min = cfg.min_spacing;
 
