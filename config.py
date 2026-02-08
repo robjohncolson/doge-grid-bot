@@ -40,7 +40,10 @@ def _env(name, default, cast=str):
 # ---------------------------------------------------------------------------
 
 # Your Kraken API key. Create one at https://www.kraken.com/u/security/api
-# Permissions needed: Query Funds, Create & Modify Orders, Cancel/Close Orders, Query Open Orders & Trades
+# Permissions needed: Query Funds, Create & Modify Orders, Cancel/Close Orders,
+#   Query Open Orders & Trades, Query Closed Orders & Trades
+# IMPORTANT: "Query Closed Orders & Trades" is required for fill detection!
+# Without it, QueryOrders won't return filled orders and the bot misses fills.
 KRAKEN_API_KEY: str = _env("KRAKEN_API_KEY", "")
 
 # Your Kraken private (secret) key -- base64-encoded by Kraken.

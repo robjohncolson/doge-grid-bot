@@ -650,7 +650,51 @@ def cancel_grid(state: GridState) -> int:
 # Fill detection
 # ---------------------------------------------------------------------------
 
-def check_fills_live(state: GridState) -> list:
+def _check_trade_history_fallback(state: GridState, open_orders: list,
+                                  filled: list):
+    """
+    Cross-check open orders against Kraken trade history.
+    If a trade matches an order we think is "open", mark it as filled.
+    Called when the sanity check detects price has moved past an open order.
+    """
+    try:
+        # Look back 1 hour of trade history
+        trades = kraken_client.get_trades_history(start=time.time() - 3600)
+    except Exception as e:
+        logger.debug("Trade history fallback failed: %s", e)
+        return
+
+    if not trades:
+        return
+
+    # Build a set of open txids for fast lookup
+    open_txids = {o.txid for o in open_orders if o.status == "open" and o.txid}
+
+    for trade_txid, trade_info in trades.items():
+        order_txid = trade_info.get("ordertxid", "")
+        if order_txid not in open_txids:
+            continue
+
+        # Found a trade matching an order we think is open
+        for order in open_orders:
+            if order.txid != order_txid or order.status != "open":
+                continue
+
+            vol_exec = float(trade_info.get("vol", order.volume))
+            if vol_exec > 0:
+                order.volume = vol_exec
+            order.status = "filled"
+            filled.append(order)
+            logger.warning(
+                "TRADE HISTORY FALLBACK: %s %.2f DOGE @ $%.6f was FILLED "
+                "(trade=%s, ordertxid=%s) -- QueryOrders missed it!",
+                order.side.upper(), order.volume, order.price,
+                trade_txid, order_txid,
+            )
+            break
+
+
+def check_fills_live(state: GridState, current_price: float = 0.0) -> list:
     """
     [LIVE MODE] Check which grid orders have been filled by querying Kraken.
 
@@ -676,10 +720,35 @@ def check_fills_live(state: GridState) -> list:
         return []
 
     state.consecutive_errors = 0  # Reset on success
+
+    # Diagnostic: log query result counts
+    if len(order_info) != len(txids):
+        logger.warning(
+            "QueryOrders mismatch: sent %d txids, got %d back -- missing: %s",
+            len(txids), len(order_info),
+            [t for t in txids if t not in order_info],
+        )
+
+    # Summarize statuses returned
+    status_counts = {}
+    for txid, info in order_info.items():
+        s = info.get("status", "unknown")
+        status_counts[s] = status_counts.get(s, 0) + 1
+    status_summary = ", ".join(f"{c} {s}" for s, c in sorted(status_counts.items()))
+    logger.debug(
+        "QueryOrders: %d queried, %d returned (%s)",
+        len(txids), len(order_info), status_summary,
+    )
+
     filled = []
 
     for order in open_orders:
         if order.txid not in order_info:
+            logger.warning(
+                "Order %s %s @ $%.6f (txid=%s) not in QueryOrders response",
+                order.side.upper(), order.order_role or "?",
+                order.price, order.txid,
+            )
             continue
 
         info = order_info[order.txid]
@@ -716,6 +785,35 @@ def check_fills_live(state: GridState) -> list:
                     order.side.upper(), order.level, vol_exec, order.volume, order.price,
                 )
                 order._partial_warned = True
+
+    # Sanity check: warn if price has clearly moved past an "open" order
+    stale_detected = False
+    if current_price > 0:
+        for order in open_orders:
+            if order.status != "open":
+                continue
+            if order.side == "buy" and current_price < order.price * 0.995:
+                logger.warning(
+                    "STALE OPEN? BUY @ $%.6f still 'open' but price $%.6f is "
+                    "%.2f%% below -- possible missed fill (txid=%s)",
+                    order.price, current_price,
+                    (order.price - current_price) / order.price * 100,
+                    order.txid,
+                )
+                stale_detected = True
+            elif order.side == "sell" and current_price > order.price * 1.005:
+                logger.warning(
+                    "STALE OPEN? SELL @ $%.6f still 'open' but price $%.6f is "
+                    "%.2f%% above -- possible missed fill (txid=%s)",
+                    order.price, current_price,
+                    (current_price - order.price) / order.price * 100,
+                    order.txid,
+                )
+                stale_detected = True
+
+    # Trade history fallback: if sanity check flagged stale orders, cross-check
+    if stale_detected:
+        _check_trade_history_fallback(state, open_orders, filled)
 
     # Replace canceled/expired orders immediately to fill grid holes
     cancelled_orders = [o for o in open_orders if o.status == "cancelled"]
@@ -793,7 +891,7 @@ def check_fills(state: GridState, current_price: float = 0.0) -> list:
     if config.DRY_RUN:
         return check_fills_dry_run(state, current_price)
     else:
-        return check_fills_live(state)
+        return check_fills_live(state, current_price)
 
 
 # ---------------------------------------------------------------------------
@@ -1652,6 +1750,19 @@ def _refresh_entry_if_stale(state, side, current_price):
             continue
         distance_pct = abs(o.price - current_price) / current_price * 100.0
         if distance_pct > config.PAIR_REFRESH_PCT:
+            # Check if this order already filled before we cancel it
+            if not config.DRY_RUN:
+                try:
+                    info = kraken_client.query_orders([o.txid])
+                    if info.get(o.txid, {}).get("status") == "closed":
+                        logger.info(
+                            "  Entry %s @ $%.6f already filled -- skipping "
+                            "cancel (txid=%s)", side.upper(), o.price, o.txid,
+                        )
+                        return False  # Let check_fills_live handle it
+                except Exception:
+                    pass  # If query fails, proceed with cancel
+
             logger.info(
                 "  Refreshing stale %s entry: $%.6f is %.2f%% from market $%.6f",
                 side.upper(), o.price, distance_pct, current_price,
@@ -1687,6 +1798,19 @@ def refresh_stale_entries(state: GridState, current_price: float) -> bool:
             continue
         distance_pct = abs(o.price - current_price) / current_price * 100.0
         if distance_pct > config.PAIR_REFRESH_PCT:
+            # Check if this order already filled before we cancel it
+            if not config.DRY_RUN:
+                try:
+                    info = kraken_client.query_orders([o.txid])
+                    if info.get(o.txid, {}).get("status") == "closed":
+                        logger.info(
+                            "Entry %s @ $%.6f already filled -- skipping cancel "
+                            "(txid=%s)", o.side.upper(), o.price, o.txid,
+                        )
+                        continue  # Let check_fills_live handle it
+                except Exception:
+                    pass  # If query fails, proceed with cancel
+
             logger.info(
                 "Pair drift: %s entry $%.6f is %.2f%% from market $%.6f "
                 "(threshold: %.1f%%)",

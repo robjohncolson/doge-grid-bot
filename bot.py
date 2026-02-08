@@ -1263,21 +1263,7 @@ def run():
                 time.sleep(config.POLL_INTERVAL_SECONDS)
                 continue
 
-            # --- 4d: Check grid drift ---
-            if grid_strategy.check_grid_drift(state, current_price):
-                old_center = state.center_price
-                drift_pct = abs(current_price - old_center) / old_center * 100.0
-
-                logger.info("Resetting grid: drift %.2f%% from $%.6f to $%.6f",
-                            drift_pct, old_center, current_price)
-
-                grid_strategy.cancel_grid(state)
-                orders = grid_strategy.build_grid(state, current_price)
-
-                notifier.notify_grid_reset(old_center, current_price, drift_pct)
-                notifier.notify_grid_built(current_price, len(orders))
-
-            # --- 4e: Check for fills ---
+            # --- 4d: Check for fills (BEFORE drift check to avoid race) ---
             filled = grid_strategy.check_fills(state, current_price)
 
             if filled:
@@ -1313,6 +1299,20 @@ def run():
                 # Prune completed orders and save state after each fill batch
                 grid_strategy.prune_completed_orders(state)
                 grid_strategy.save_state(state)
+
+            # --- 4e: Check grid drift ---
+            if grid_strategy.check_grid_drift(state, current_price):
+                old_center = state.center_price
+                drift_pct = abs(current_price - old_center) / old_center * 100.0
+
+                logger.info("Resetting grid: drift %.2f%% from $%.6f to $%.6f",
+                            drift_pct, old_center, current_price)
+
+                grid_strategy.cancel_grid(state)
+                orders = grid_strategy.build_grid(state, current_price)
+
+                notifier.notify_grid_reset(old_center, current_price, drift_pct)
+                notifier.notify_grid_built(current_price, len(orders))
 
             # --- 4f: Run AI advisor (hourly) ---
             now = time.time()

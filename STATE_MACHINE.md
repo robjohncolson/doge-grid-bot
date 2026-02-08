@@ -49,11 +49,11 @@
               │                │ ok              │ stop_floor ──► SHUTDOWN
               │                │                 │ daily_limit ─► PAUSED
               │    ┌───────────▼───────────┐     │
-              │    │    CHECK DRIFT        │     │
+              │    │    CHECK FILLS        │     │
               │    └───────────┬───────────┘     │
               │                │                 │
               │    ┌───────────▼───────────┐     │
-              │    │    CHECK FILLS        │     │
+              │    │    CHECK DRIFT        │     │
               │    └───────────┬───────────┘     │
               │                │                 │
               │    ┌───────────▼───────────┐     │
@@ -97,12 +97,7 @@ CHECK_RISK_LIMITS
   ├── daily_loss >= DAILY_LOSS_LIMIT ──► CANCEL_GRID ──► PAUSED ──► sleep ──► next iteration
   │
   ▼ ok
-CHECK_GRID_DRIFT
-  │
-  ├── drift >= GRID_DRIFT_RESET_PCT ──► CANCEL_GRID ──► BUILD_GRID
-  │
-  ▼ no drift
-CHECK_FILLS
+CHECK_FILLS (runs BEFORE drift check to avoid cancel-before-detect race)
   │
   ├── no fills ──► skip
   │
@@ -119,6 +114,11 @@ CHECK_FILLS
   │     └── prune_completed_orders + save_state
   │
   ▼
+CHECK_GRID_DRIFT
+  │
+  ├── drift >= GRID_DRIFT_RESET_PCT ──► CANCEL_GRID ──► BUILD_GRID
+  │
+  ▼ no drift
 AI_COUNCIL (if interval elapsed)
   │
   ├── query each panelist (Llama-70B, Llama-8B, Kimi-K2.5)
@@ -192,6 +192,11 @@ SLEEP (remaining poll interval)
 ```
 
 ### Fill & Status Handling (live mode only)
+
+**API key requirement:** "Query Closed Orders & Trades" permission is
+required for `QueryOrders` to return filled orders. Without it, filled
+orders silently disappear from the response.
+
 ```
               ┌────────┐
               │  open  │
@@ -199,15 +204,15 @@ SLEEP (remaining poll interval)
                   │
      query_orders() from Kraken
                   │
-        ┌─────────┼──────────┬──────────────┐
-        │         │          │              │
-   status=closed  │   status=open     status=canceled
-        │         │   + vol_exec>0    or expired
-        ▼         │          │              │
-   ┌────────┐     │    log PARTIAL         ▼
-   │ filled │     │    FILL warning   ┌───────────┐
-   └────────┘     │    (stay open)    │ cancelled │
-   vol = vol_exec │                   └─────┬─────┘
+        ┌─────────┼──────────┬──────────────┬──────────────┐
+        │         │          │              │              │
+   status=closed  │   status=open     status=canceled   txid MISSING
+        │         │   + vol_exec>0    or expired        from response
+        ▼         │          │              │              │
+   ┌────────┐     │    log PARTIAL         ▼         log WARNING
+   │ filled │     │    FILL warning   ┌───────────┐  (possible API
+   └────────┘     │    (stay open)    │ cancelled │   key permission
+   vol = vol_exec │                   └─────┬─────┘   issue)
                   │                         │
            status=open                 place_order()
            + vol_exec=0                (same level/price)
@@ -216,6 +221,31 @@ SLEEP (remaining poll interval)
             (no change)              ┌────────┐
                                      │  open  │  (replacement)
                                      └────────┘
+
+  After status loop:
+       │
+       ▼
+  SANITY CHECK: price moved >0.5% past any "open" order?
+       │
+       ├── no ──► continue
+       │
+       ├── yes ──► log "STALE OPEN?" warning
+       │           │
+       │           ▼
+       │     TRADE HISTORY FALLBACK
+       │     get_trades_history() from Kraken
+       │           │
+       │     ┌─────┴─────┐
+       │     │           │
+       │   trade matches  no match
+       │   open order     │
+       │     │            ▼
+       │     ▼         (no action)
+       │   mark FILLED
+       │   log "FALLBACK" warning
+       │
+       ▼
+  (continue to replacement logic)
 ```
 
 ## 4. Risk / Pause State Machine
@@ -447,6 +477,15 @@ INITIAL (2 entries flanking market)
 Always exactly 2 open orders. Entry orders refresh when they drift
 more than `PAIR_REFRESH_PCT` from market. Exit orders never move
 (profit target is fixed at the fill price).
+
+### Entry Refresh Safety
+
+Before cancelling a stale entry, `refresh_stale_entries()` queries
+the order status via `query_orders()`. If the order is already
+`closed` (filled), the cancel is skipped and the fill is left for
+`check_fills_live()` to process on the next cycle. This prevents
+the race where drift-cancel runs right after a fill but before
+fill detection.
 
 ### Pair vs Grid Comparison
 
