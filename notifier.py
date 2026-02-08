@@ -252,13 +252,13 @@ def _prefix() -> str:
 # Notification methods -- one for each event type
 # ---------------------------------------------------------------------------
 
-def notify_startup(current_price: float):
+def notify_startup(current_price: float, pair_display: str = "DOGE/USD"):
     """Send startup notification with bot configuration summary."""
     mode = "DRY RUN (simulated)" if config.DRY_RUN else "LIVE TRADING"
     text = (
-        f"🤖 <b>{_prefix()}DOGE Grid Bot Started</b>\n\n"
+        f"🤖 <b>{_prefix()}{pair_display} Grid Bot Started</b>\n\n"
         f"Mode: {mode}\n"
-        f"DOGE Price: ${current_price:.6f}\n"
+        f"{pair_display} Price: ${current_price:.6f}\n"
         f"Capital: ${config.STARTING_CAPITAL:.2f}\n"
         f"Grid: {config.GRID_LEVELS}×2 levels, {config.GRID_SPACING_PCT}% spacing\n"
         f"Order size: ${config.ORDER_SIZE_USD:.2f}\n"
@@ -268,22 +268,24 @@ def notify_startup(current_price: float):
     _send_message(text)
 
 
-def notify_shutdown(reason: str = "Manual"):
+def notify_shutdown(reason: str = "Manual", pair_display: str = ""):
     """Send shutdown notification."""
-    text = f"🛑 <b>{_prefix()}DOGE Grid Bot Stopped</b>\n\nReason: {reason}"
+    label = f"{pair_display} " if pair_display else ""
+    text = f"🛑 <b>{_prefix()}{label}Grid Bot Stopped</b>\n\nReason: {reason}"
     _send_message(text)
 
 
 def notify_round_trip(side: str, price: float, volume: float,
-                      profit: float, total_profit: float, trip_count: int):
+                      profit: float, total_profit: float, trip_count: int,
+                      pair_display: str = "DOGE/USD"):
     """
     Notify on a completed round trip (buy->sell or sell->buy cycle).
     This is the "cha-ching" notification -- the bot made money!
     """
     emoji = "💰" if profit > 0 else "📉"
     text = (
-        f"{emoji} <b>{_prefix()}Round Trip Complete</b>\n\n"
-        f"Sell: {volume:.2f} DOGE @ ${price:.6f}\n"
+        f"{emoji} <b>{_prefix()}{pair_display} Round Trip</b>\n\n"
+        f"Sell: {volume:.2f} @ ${price:.6f}\n"
         f"Net profit: ${profit:.4f}\n"
         f"Today total: ${total_profit:.4f}\n"
         f"Trip #{trip_count}"
@@ -291,10 +293,11 @@ def notify_round_trip(side: str, price: float, volume: float,
     _send_message(text)
 
 
-def notify_grid_built(center_price: float, num_orders: int):
+def notify_grid_built(center_price: float, num_orders: int,
+                      pair_display: str = "DOGE/USD"):
     """Notify when a new grid is built or rebuilt."""
     text = (
-        f"📊 <b>{_prefix()}Grid Built</b>\n\n"
+        f"📊 <b>{_prefix()}{pair_display} Grid Built</b>\n\n"
         f"Center: ${center_price:.6f}\n"
         f"Orders: {num_orders}\n"
         f"Range: ${center_price * (1 - config.GRID_SPACING_PCT * config.GRID_LEVELS / 100):.6f}"
@@ -303,10 +306,11 @@ def notify_grid_built(center_price: float, num_orders: int):
     _send_message(text)
 
 
-def notify_grid_reset(old_center: float, new_center: float, drift_pct: float):
+def notify_grid_reset(old_center: float, new_center: float, drift_pct: float,
+                      pair_display: str = "DOGE/USD"):
     """Notify when the grid is reset due to price drift."""
     text = (
-        f"🔄 <b>{_prefix()}Grid Reset (Drift)</b>\n\n"
+        f"🔄 <b>{_prefix()}{pair_display} Grid Reset</b>\n\n"
         f"Old center: ${old_center:.6f}\n"
         f"New center: ${new_center:.6f}\n"
         f"Drift: {drift_pct:.2f}%"
@@ -336,7 +340,7 @@ def notify_daily_summary(date: str, trades: int, profit: float,
     _send_message(text)
 
 
-def notify_risk_event(event_type: str, details: str):
+def notify_risk_event(event_type: str, details: str, pair_display: str = ""):
     """
     Send alert for risk events:
       - stop_floor: approaching or hit the stop floor
@@ -351,8 +355,9 @@ def notify_risk_event(event_type: str, details: str):
         "resume": "▶️",
     }
     emoji = emoji_map.get(event_type, "⚠️")
+    label = f"{pair_display} " if pair_display else ""
     text = (
-        f"{emoji} <b>{_prefix()}Risk Alert: {event_type.upper()}</b>\n\n"
+        f"{emoji} <b>{_prefix()}{label}Risk Alert: {event_type.upper()}</b>\n\n"
         f"{details}"
     )
     _send_message(text)

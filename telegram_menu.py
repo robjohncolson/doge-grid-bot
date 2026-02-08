@@ -12,8 +12,13 @@ import grid_strategy
 
 
 def build_main_menu():
-    """Main menu -- 4 buttons in a 2x2 grid + nothing else."""
-    text = "<b>DOGE Grid Bot Menu</b>\nSelect an option:"
+    """Main menu -- 4 buttons in a 2x2 grid + pair selector if multiple pairs."""
+    pair_count = len(config.PAIRS)
+    if pair_count > 1:
+        pair_names = ", ".join(pc.display for pc in config.PAIRS.values())
+        text = f"<b>Grid Bot Menu</b> ({pair_names})\nSelect an option:"
+    else:
+        text = "<b>Grid Bot Menu</b>\nSelect an option:"
     keyboard = [
         [
             {"text": "Status", "callback_data": "m:status"},
@@ -115,7 +120,7 @@ def build_settings_screen():
         text = (
             f"<b>Settings</b> [pair mode]\n\n"
             f"Profit target: {config.PAIR_PROFIT_PCT:.2f}% (min {floor:.2f}%)\n"
-            f"Entry distance: {config.PAIR_ENTRY_PCT:.2f}%\n"
+            f"Entry distance: {config.PAIR_ENTRY_PCT:.2f}% (min 0.05%)\n"
             f"Refresh drift: {config.PAIR_REFRESH_PCT:.2f}%\n"
             f"Order size: ${config.ORDER_SIZE_USD:.2f}\n"
             f"AI interval: {config.AI_ADVISOR_INTERVAL}s ({config.AI_ADVISOR_INTERVAL // 60} min)\n"
@@ -125,6 +130,10 @@ def build_settings_screen():
             [
                 {"text": "Profit +", "callback_data": "ma:spacing_up"},
                 {"text": "Profit -", "callback_data": "ma:spacing_down"},
+            ],
+            [
+                {"text": "Entry +", "callback_data": "ma:entry_up"},
+                {"text": "Entry -", "callback_data": "ma:entry_down"},
             ],
             [
                 {"text": "AI Check Now", "callback_data": "ma:ai_check"},

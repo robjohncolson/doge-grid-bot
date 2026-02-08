@@ -103,7 +103,9 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 # Global reference so the health handler can read bot state
-_bot_state: grid_strategy.GridState = None
+# Maps pair_name -> GridState (e.g. {"XDGUSD": state, "SOLUSD": state})
+_bot_states: dict = {}
+_current_prices: dict = {}   # pair_name -> latest price
 _bot_healthy = True
 _bot_start_time = 0.0
 
@@ -117,12 +119,34 @@ APPROVAL_TIMEOUT = 600  # 10 minutes
 # Fixed step for spacing adjustments -- prevents extreme values
 SPACING_STEP_PCT = 0.25
 
+# Step for entry distance adjustments (smaller than spacing to fine-tune)
+ENTRY_STEP_PCT = 0.1
+
 # Pending web config changes -- written by HTTP thread, read by main loop
 _web_config_pending: dict = {}
 
-# OHLC candle cache for stats engine (fetched every 5 min)
-_ohlc_cache: list = []
-_ohlc_last_fetch: float = 0.0
+# OHLC candle cache for stats engine -- per pair
+_ohlc_caches: dict = {}       # pair_name -> list
+_ohlc_last_fetches: dict = {} # pair_name -> float
+
+
+def _first_state():
+    """Return the first (or only) pair's state for backward-compatible code paths."""
+    if not _bot_states:
+        return None
+    return next(iter(_bot_states.values()))
+
+
+def _first_pair_name():
+    """Return the first pair name."""
+    if not _bot_states:
+        return config.PAIR
+    return next(iter(_bot_states))
+
+
+def _get_price(pair_name: str) -> float:
+    """Get latest known price for a pair."""
+    return _current_prices.get(pair_name, 0.0)
 
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
@@ -162,25 +186,36 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _handle_api_status(self):
         """GET /api/status -- full state snapshot for the dashboard."""
-        if not _bot_state:
+        if not _bot_states:
             self._send_json({"error": "bot not initialized"}, 503)
             return
 
-        # Get current price from price history (last recorded)
-        if _bot_state.price_history:
-            current_price = _bot_state.price_history[-1][1]
-        else:
-            current_price = _bot_state.center_price
+        # Support ?pair= query param; default to first pair
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        pair_name = params.get("pair", [_first_pair_name()])[0]
+        state = _bot_states.get(pair_name, _first_state())
+        current_price = _get_price(state.pair_name)
+        if not current_price and state.price_history:
+            current_price = state.price_history[-1][1]
+        elif not current_price:
+            current_price = state.center_price
 
-        data = dashboard.serialize_state(_bot_state, current_price)
+        data = dashboard.serialize_state(state, current_price)
+        # Add list of configured pairs for dashboard pair selector
+        data["configured_pairs"] = [
+            {"pair": pn, "display": st.pair_display}
+            for pn, st in _bot_states.items()
+        ]
         self._send_json(data)
 
     def _handle_api_stats(self):
         """GET /api/stats -- stats engine results only."""
-        if not _bot_state:
+        state = _first_state()
+        if not state:
             self._send_json({"error": "bot not initialized"}, 503)
             return
-        self._send_json(_bot_state.stats_results or {})
+        self._send_json(state.stats_results or {})
 
     def _handle_health(self):
         """GET /health -- legacy Railway health check (backwards compatible)."""
@@ -188,17 +223,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "status": "healthy" if _bot_healthy else "unhealthy",
             "mode": "dry_run" if config.DRY_RUN else "live",
             "uptime_seconds": int(time.time() - _bot_start_time) if _bot_start_time else 0,
-            "pair": config.PAIR_DISPLAY,
+            "pairs": [st.pair_display for st in _bot_states.values()] if _bot_states else [config.PAIR_DISPLAY],
         }
-        if _bot_state:
+        if _bot_states:
+            # Aggregate across all pairs
+            total_profit = sum(st.total_profit_usd for st in _bot_states.values())
+            total_trips = sum(st.total_round_trips for st in _bot_states.values())
+            today_trips = sum(st.round_trips_today for st in _bot_states.values())
+            total_open = sum(
+                len([o for o in st.grid_orders if o.status == "open"])
+                for st in _bot_states.values()
+            )
+            any_paused = any(st.is_paused for st in _bot_states.values())
+            total_doge = sum(st.doge_accumulated for st in _bot_states.values())
             status.update({
-                "center_price": _bot_state.center_price,
-                "total_profit": round(_bot_state.total_profit_usd, 4),
-                "total_round_trips": _bot_state.total_round_trips,
-                "today_round_trips": _bot_state.round_trips_today,
-                "open_orders": len([o for o in _bot_state.grid_orders if o.status == "open"]),
-                "is_paused": _bot_state.is_paused,
-                "doge_accumulated": round(_bot_state.doge_accumulated, 2),
+                "total_profit": round(total_profit, 4),
+                "total_round_trips": total_trips,
+                "today_round_trips": today_trips,
+                "open_orders": total_open,
+                "is_paused": any_paused,
+                "doge_accumulated": round(total_doge, 2),
             })
         self._send_json(status)
 
@@ -213,14 +257,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         try:
             while True:
-                if not _bot_state:
+                state = _first_state()
+                if not state:
                     data = json.dumps({"error": "bot not initialized"})
                 else:
-                    if _bot_state.price_history:
-                        current_price = _bot_state.price_history[-1][1]
-                    else:
-                        current_price = _bot_state.center_price
-                    data = json.dumps(dashboard.serialize_state(_bot_state, current_price))
+                    current_price = _get_price(state.pair_name)
+                    if not current_price and state.price_history:
+                        current_price = state.price_history[-1][1]
+                    elif not current_price:
+                        current_price = state.center_price
+                    data = json.dumps(dashboard.serialize_state(state, current_price))
 
                 self.wfile.write(f"data: {data}\n\n".encode("utf-8"))
                 self.wfile.flush()
@@ -251,12 +297,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _export_fills(self, fmt):
         """Export recent fills as CSV or JSON."""
-        if not _bot_state:
+        state = _first_state()
+        if not state:
             self._send_json({"error": "bot not initialized"}, 503)
             return
 
         fills = []
-        for f in _bot_state.recent_fills:
+        for f in state.recent_fills:
             fills.append({
                 "time": datetime.fromtimestamp(f.get("time", 0), tz=timezone.utc).isoformat() if f.get("time") else "",
                 "side": f["side"],
@@ -273,11 +320,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _export_stats(self, fmt):
         """Export stats results as CSV or JSON."""
-        if not _bot_state:
+        state = _first_state()
+        if not state:
             self._send_json({"error": "bot not initialized"}, 503)
             return
 
-        results = _bot_state.stats_results or {}
+        results = state.stats_results or {}
         if fmt == "csv":
             rows = []
             for name, r in results.items():
@@ -387,6 +435,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         queued.append("ratio")
                 except (ValueError, TypeError):
                     errors.append("ratio must be a number or 'auto'")
+
+        # Validate entry_pct (pair mode)
+        if "entry_pct" in body:
+            val = body["entry_pct"]
+            try:
+                val = float(val)
+                if val < 0.05:
+                    errors.append("entry_pct must be >= 0.05%")
+                else:
+                    pending["entry_pct"] = round(val, 4)
+                    queued.append("entry_pct")
+            except (ValueError, TypeError):
+                errors.append("entry_pct must be a number")
 
         # Validate interval
         if "interval" in body:
@@ -525,6 +586,13 @@ def _apply_web_config(state: grid_strategy.GridState, current_price: float):
             state.trend_ratio_override = val
             logger.info("Web dashboard: ratio manually set to %.2f", val)
             needs_rebuild = True
+
+    # Apply entry_pct (pair mode)
+    if "entry_pct" in pending:
+        old = config.PAIR_ENTRY_PCT
+        config.PAIR_ENTRY_PCT = pending["entry_pct"]
+        logger.info("Web dashboard: entry distance %.2f%% -> %.2f%%", old, config.PAIR_ENTRY_PCT)
+        needs_rebuild = True
 
     # Apply AI interval (no rebuild needed)
     if "interval" in pending:
@@ -751,6 +819,39 @@ def _execute_approved_action(state: grid_strategy.GridState, action: str,
         state.pause_reason = "AI advisor (user approved)"
         logger.info("Bot paused by approved AI recommendation")
         notifier.notify_risk_event("pause", "Paused by approved AI recommendation")
+
+    elif action == "widen_entry":
+        old = config.PAIR_ENTRY_PCT
+        config.PAIR_ENTRY_PCT = round(old + ENTRY_STEP_PCT, 4)
+        logger.info("Entry distance widened: %.2f%% -> %.2f%%", old, config.PAIR_ENTRY_PCT)
+        grid_strategy.cancel_grid(state)
+        orders = grid_strategy.build_grid(state, current_price)
+        notifier._send_message(
+            f"Entry distance widened: {old:.2f}% -> {config.PAIR_ENTRY_PCT:.2f}%\n"
+            f"Pair rebuilt: {len(orders)} orders around ${current_price:.6f}"
+        )
+
+    elif action == "tighten_entry":
+        old = config.PAIR_ENTRY_PCT
+        new_val = round(old - ENTRY_STEP_PCT, 4)
+        floor = 0.05
+        if new_val < floor:
+            logger.warning(
+                "Cannot tighten entry below %.2f%%. Current: %.2f%%",
+                floor, old,
+            )
+            notifier._send_message(
+                f"Cannot tighten entry below {floor:.2f}%. Current: {old:.2f}%"
+            )
+            return
+        config.PAIR_ENTRY_PCT = new_val
+        logger.info("Entry distance tightened: %.2f%% -> %.2f%%", old, new_val)
+        grid_strategy.cancel_grid(state)
+        orders = grid_strategy.build_grid(state, current_price)
+        notifier._send_message(
+            f"Entry distance tightened: {old:.2f}% -> {new_val:.2f}%\n"
+            f"Pair rebuilt: {len(orders)} orders around ${current_price:.6f}"
+        )
 
     elif action == "reset_grid":
         logger.info("Resetting grid by approved AI recommendation")
@@ -1056,6 +1157,27 @@ def _handle_menu_action(state: grid_strategy.GridState, current_price: float,
         grid_strategy.cancel_grid(state)
         grid_strategy.build_grid(state, current_price)
 
+    elif action == "entry_up":
+        old = config.PAIR_ENTRY_PCT
+        config.PAIR_ENTRY_PCT = round(old + ENTRY_STEP_PCT, 4)
+        notifier.answer_callback(callback_id, f"Entry: {old:.2f}% -> {config.PAIR_ENTRY_PCT:.2f}%")
+        logger.info("Menu: entry distance widened %.2f%% -> %.2f%%", old, config.PAIR_ENTRY_PCT)
+        grid_strategy.cancel_grid(state)
+        grid_strategy.build_grid(state, current_price)
+
+    elif action == "entry_down":
+        old = config.PAIR_ENTRY_PCT
+        new_val = round(old - ENTRY_STEP_PCT, 4)
+        floor = 0.05
+        if new_val < floor:
+            notifier.answer_callback(callback_id, f"Can't go below {floor:.2f}%")
+            return
+        config.PAIR_ENTRY_PCT = new_val
+        notifier.answer_callback(callback_id, f"Entry: {old:.2f}% -> {new_val:.2f}%")
+        logger.info("Menu: entry distance tightened %.2f%% -> %.2f%%", old, new_val)
+        grid_strategy.cancel_grid(state)
+        grid_strategy.build_grid(state, current_price)
+
     elif action == "ai_check":
         state.last_ai_check = 0
         notifier.answer_callback(callback_id, "AI check queued")
@@ -1078,12 +1200,65 @@ def _handle_menu_action(state: grid_strategy.GridState, current_price: float,
 # Main bot logic
 # ---------------------------------------------------------------------------
 
+def _restore_from_supabase(state: grid_strategy.GridState):
+    """Restore a single pair's state from Supabase cloud."""
+    pair_name = state.pair_name
+    sb_state = supabase_store.load_state(pair=pair_name)
+    if not sb_state:
+        return False
+
+    state.center_price = sb_state.get("center_price", 0.0)
+    state.total_profit_usd = sb_state.get("total_profit_usd", 0.0)
+    state.today_profit_usd = sb_state.get("today_profit_usd", 0.0)
+    state.today_loss_usd = sb_state.get("today_loss_usd", 0.0)
+    state.today_fees_usd = sb_state.get("today_fees_usd", 0.0)
+    state.today_date = sb_state.get("today_date", "")
+    state.round_trips_today = sb_state.get("round_trips_today", 0)
+    state.total_round_trips = sb_state.get("total_round_trips", 0)
+    state.total_fees_usd = sb_state.get("total_fees_usd", 0.0)
+    state.doge_accumulated = sb_state.get("doge_accumulated", 0.0)
+    state.last_accumulation = sb_state.get("last_accumulation", 0.0)
+    state.trend_ratio = sb_state.get("trend_ratio", 0.5)
+    state.trend_ratio_override = sb_state.get("trend_ratio_override", None)
+    # Restore runtime config overrides
+    saved_spacing = sb_state.get("grid_spacing_pct")
+    if saved_spacing and saved_spacing != config.GRID_SPACING_PCT:
+        logger.info(
+            "[%s] Restoring spacing from Supabase: %.2f%% -> %.2f%%",
+            pair_name, config.GRID_SPACING_PCT, saved_spacing,
+        )
+        config.GRID_SPACING_PCT = saved_spacing
+    saved_entry_pct = sb_state.get("pair_entry_pct")
+    if saved_entry_pct and saved_entry_pct != state.entry_pct:
+        logger.info(
+            "[%s] Restoring entry distance from Supabase: %.2f%% -> %.2f%%",
+            pair_name, state.entry_pct, saved_entry_pct,
+        )
+        state.entry_pct = saved_entry_pct
+    saved_ai_interval = sb_state.get("ai_advisor_interval")
+    if saved_ai_interval and saved_ai_interval != config.AI_ADVISOR_INTERVAL:
+        logger.info(
+            "[%s] Restoring AI interval from Supabase: %ds -> %ds",
+            pair_name, config.AI_ADVISOR_INTERVAL, saved_ai_interval,
+        )
+        config.AI_ADVISOR_INTERVAL = saved_ai_interval
+    logger.info(
+        "[%s] State restored from Supabase: $%.4f profit, %d round trips",
+        pair_name, state.total_profit_usd, state.total_round_trips,
+    )
+    return True
+
+
 def run():
     """
     Main bot entry point.  Runs the complete lifecycle:
     init -> build grid -> loop -> shutdown.
+
+    Supports multiple pairs: iterates sequentially over each configured pair
+    per cycle.  Rate limit budget: ~15 API calls per 30s cycle, safe for 3-4 pairs.
     """
-    global _bot_state, _bot_healthy, _bot_start_time, _ohlc_cache, _ohlc_last_fetch
+    global _bot_states, _current_prices, _bot_healthy, _bot_start_time
+    global _ohlc_caches, _ohlc_last_fetches
 
     # --- Phase 1: Initialize ---
     setup_logging()
@@ -1091,308 +1266,346 @@ def run():
     config.print_banner()
 
     _bot_start_time = time.time()
-    state = grid_strategy.GridState()
-    _bot_state = state
 
-    # Restore counters from previous session (if any)
-    # Try local state file first, then fall back to Supabase cloud state
-    local_loaded = grid_strategy.load_state(state)
+    # Create one GridState per configured pair
+    for pair_name, pc in config.PAIRS.items():
+        state = grid_strategy.GridState(pair_config=pc)
+        _bot_states[pair_name] = state
+        _current_prices[pair_name] = 0.0
+        _ohlc_caches[pair_name] = []
+        _ohlc_last_fetches[pair_name] = 0.0
+        logger.info("Initialized state for %s (%s)", pc.display, pair_name)
 
-    # Start Supabase persistence (loads fills/prices/state if available)
+    # Start Supabase persistence (one writer thread for all pairs)
     supabase_store.start_writer_thread()
 
-    if not local_loaded:
-        sb_state = supabase_store.load_state()
-        if sb_state:
-            state.center_price = sb_state.get("center_price", 0.0)
-            state.total_profit_usd = sb_state.get("total_profit_usd", 0.0)
-            state.today_profit_usd = sb_state.get("today_profit_usd", 0.0)
-            state.today_loss_usd = sb_state.get("today_loss_usd", 0.0)
-            state.today_fees_usd = sb_state.get("today_fees_usd", 0.0)
-            state.today_date = sb_state.get("today_date", "")
-            state.round_trips_today = sb_state.get("round_trips_today", 0)
-            state.total_round_trips = sb_state.get("total_round_trips", 0)
-            state.total_fees_usd = sb_state.get("total_fees_usd", 0.0)
-            state.doge_accumulated = sb_state.get("doge_accumulated", 0.0)
-            state.last_accumulation = sb_state.get("last_accumulation", 0.0)
-            state.trend_ratio = sb_state.get("trend_ratio", 0.5)
-            state.trend_ratio_override = sb_state.get("trend_ratio_override", None)
-            # Restore runtime config overrides (spacing, AI interval)
-            saved_spacing = sb_state.get("grid_spacing_pct")
-            if saved_spacing and saved_spacing != config.GRID_SPACING_PCT:
-                logger.info(
-                    "Restoring spacing from Supabase: %.2f%% -> %.2f%%",
-                    config.GRID_SPACING_PCT, saved_spacing,
-                )
-                config.GRID_SPACING_PCT = saved_spacing
-            saved_ai_interval = sb_state.get("ai_advisor_interval")
-            if saved_ai_interval and saved_ai_interval != config.AI_ADVISOR_INTERVAL:
-                logger.info(
-                    "Restoring AI interval from Supabase: %ds -> %ds",
-                    config.AI_ADVISOR_INTERVAL, saved_ai_interval,
-                )
-                config.AI_ADVISOR_INTERVAL = saved_ai_interval
-            logger.info(
-                "State restored from Supabase: $%.4f profit, %d round trips",
-                state.total_profit_usd, state.total_round_trips,
-            )
-
-    sb_fills = supabase_store.load_fills()
-    if sb_fills:
-        state.recent_fills = sb_fills
-        logger.info("Restored %d fills from Supabase", len(sb_fills))
-    sb_prices = supabase_store.load_price_history(since=time.time() - 86400)
-    if sb_prices:
-        state.price_history = sb_prices
-        logger.info("Restored %d price samples from Supabase", len(sb_prices))
+    # Restore state per pair (local file first, then Supabase)
+    for pair_name, state in _bot_states.items():
+        local_loaded = grid_strategy.load_state(state)
+        if not local_loaded:
+            _restore_from_supabase(state)
+        # Restore fills and price history from Supabase
+        sb_fills = supabase_store.load_fills(pair=pair_name)
+        if sb_fills:
+            state.recent_fills = sb_fills
+            logger.info("[%s] Restored %d fills from Supabase", pair_name, len(sb_fills))
+        sb_prices = supabase_store.load_price_history(since=time.time() - 86400)
+        if sb_prices:
+            state.price_history = sb_prices
+            logger.info("[%s] Restored %d price samples from Supabase", pair_name, len(sb_prices))
 
     # Start health check server (Railway expects a listening port)
     health_server = start_health_server()
 
-    # --- Phase 2: Fetch initial price ---
-    logger.info("Fetching current DOGE price...")
-    try:
-        current_price = kraken_client.get_price()
-        bid, ask, spread = kraken_client.get_spread()
-        logger.info(
-            "DOGE price: $%.6f (bid=$%.6f, ask=$%.6f, spread=%.3f%%)",
-            current_price, bid, ask, spread,
-        )
-    except Exception as e:
-        logger.error("Failed to fetch initial price: %s", e)
-        logger.error("Cannot start bot without a price. Check your network / Kraken status.")
-        notifier.notify_error(f"Bot failed to start: cannot fetch DOGE price\n{e}")
-        return
+    # --- Phase 2: Fetch initial prices per pair ---
+    for pair_name, state in _bot_states.items():
+        logger.info("[%s] Fetching current price...", state.pair_display)
+        try:
+            current_price = kraken_client.get_price(pair=pair_name)
+            bid, ask, spread = kraken_client.get_spread(pair=pair_name)
+            _current_prices[pair_name] = current_price
+            logger.info(
+                "[%s] Price: $%.6f (bid=$%.6f, ask=$%.6f, spread=%.3f%%)",
+                state.pair_display, current_price, bid, ask, spread,
+            )
+        except Exception as e:
+            logger.error("[%s] Failed to fetch initial price: %s", pair_name, e)
+            notifier.notify_error(f"Bot failed to start {state.pair_display}: cannot fetch price\n{e}")
+            return
 
-    # Record initial price
-    grid_strategy.record_price(state, current_price)
+        grid_strategy.record_price(state, current_price)
 
     # --- Phase 2b: Validation guardrails ---
-    if not grid_strategy.validate_config(current_price):
+    first_price = _current_prices[_first_pair_name()]
+    if not grid_strategy.validate_config(first_price):
         logger.critical("Pre-flight validation FAILED -- refusing to start")
         notifier.notify_error("Bot refused to start: validation failed (check logs)")
         return
 
-    # Notify startup
-    notifier.notify_startup(current_price)
+    # Notify startup (once, listing all pairs)
+    pair_labels = ", ".join(st.pair_display for st in _bot_states.values())
+    notifier.notify_startup(first_price, pair_display=pair_labels)
 
-    # --- Phase 2c: Startup reconciliation ---
-    adopted = grid_strategy.reconcile_on_startup(state, current_price)
-    if adopted > 0:
-        logger.info("Reconciliation adopted %d orders from previous session", adopted)
+    # --- Phase 2c: Startup reconciliation + build grid per pair ---
+    for pair_name, state in _bot_states.items():
+        current_price = _current_prices[pair_name]
+        adopted = grid_strategy.reconcile_on_startup(state, current_price)
+        if adopted > 0:
+            logger.info("[%s] Reconciliation adopted %d orders", pair_name, adopted)
 
-    # --- Phase 3: Build initial grid ---
-    logger.info("Building initial grid...")
-    orders = grid_strategy.build_grid(state, current_price)
-    logger.info("Grid built: %d orders placed", len(orders))
-    notifier.notify_grid_built(current_price, len(orders))
+        logger.info("[%s] Building initial grid...", state.pair_display)
+        orders = grid_strategy.build_grid(state, current_price)
+        logger.info("[%s] Grid built: %d orders placed", state.pair_display, len(orders))
+        notifier.notify_grid_built(current_price, len(orders), pair_display=state.pair_display)
 
-    # Initialize daily tracking
-    grid_strategy.check_daily_reset(state)
+        grid_strategy.check_daily_reset(state)
 
     # --- Phase 4: Main loop ---
-    logger.info("Entering main loop (poll every %ds)...", config.POLL_INTERVAL_SECONDS)
+    logger.info("Entering main loop (poll every %ds, %d pair(s))...",
+                config.POLL_INTERVAL_SECONDS, len(_bot_states))
     last_daily_summary_date = ""
+    _global_consecutive_errors = 0
 
     while not _shutdown_requested:
         try:
             loop_start = time.time()
+            all_paused = True
+            should_stop_global = False
 
-            # --- 4a: Fetch current price ---
-            try:
-                current_price = kraken_client.get_price()
-                grid_strategy.record_price(state, current_price)
-                supabase_store.queue_price_point(time.time(), current_price)
-                state.consecutive_errors = 0
-            except Exception as e:
-                state.consecutive_errors += 1
-                logger.error(
-                    "Price fetch failed (%d/%d): %s",
-                    state.consecutive_errors, config.MAX_CONSECUTIVE_ERRORS, e,
-                )
-                if state.consecutive_errors >= config.MAX_CONSECUTIVE_ERRORS:
-                    logger.critical("Too many consecutive errors -- stopping bot")
-                    notifier.notify_risk_event("error", f"Max consecutive errors reached: {e}")
-                    break
-                time.sleep(config.POLL_INTERVAL_SECONDS)
-                continue
+            # ============================================================
+            # Per-pair operations
+            # ============================================================
+            for pair_name, state in _bot_states.items():
 
-            # --- 4b: Check daily reset ---
-            # Capture yesterday's values BEFORE reset zeroes them
-            old_date = state.today_date
-            old_profit = state.today_profit_usd
-            old_trips = state.round_trips_today
-            old_loss = state.today_loss_usd
-            old_fees = state.today_fees_usd
-            grid_strategy.check_daily_reset(state)
-
-            # Send daily summary at date boundary (using captured values)
-            if old_date and old_date != state.today_date and old_date != last_daily_summary_date:
-                last_daily_summary_date = old_date
-                notifier.notify_daily_summary(
-                    date=old_date,
-                    trades=old_trips,
-                    profit=old_profit,
-                    fees=old_fees,
-                    doge_accumulated=state.doge_accumulated,
-                    total_profit=state.total_profit_usd,
-                    total_trips=state.total_round_trips,
-                )
-
-            # --- 4c: Check risk limits ---
-            should_stop, should_pause, reason = grid_strategy.check_risk_limits(
-                state, current_price
-            )
-
-            if should_stop:
-                logger.critical("STOP triggered: %s", reason)
-                notifier.notify_risk_event("stop_floor", reason)
-                break
-
-            if should_pause and not state.is_paused:
-                state.is_paused = True
-                state.pause_reason = reason
-                grid_strategy.cancel_grid(state)
-                grid_strategy.save_state(state)
-                logger.warning("PAUSED: %s -- cancelled open orders", reason)
-                notifier.notify_risk_event("daily_limit", reason)
-
-            if state.is_paused:
-                # Don't trade, just wait for the day to reset
-                logger.debug("Bot paused: %s -- waiting for daily reset", state.pause_reason)
-                time.sleep(config.POLL_INTERVAL_SECONDS)
-                continue
-
-            # --- 4d: Check for fills (BEFORE drift check to avoid race) ---
-            filled = grid_strategy.check_fills(state, current_price)
-
-            if filled:
-                logger.info("Detected %d fill(s)", len(filled))
-                new_orders = grid_strategy.handle_fills(state, filled, current_price)
-
-                # Update trend ratio based on fill history (grid mode only)
-                if config.STRATEGY_MODE != "pair":
-                    grid_strategy.update_trend_ratio(state)
-
-                # Ratio-drift rebuild: if ratio shifted enough, rebuild grid (grid mode only)
-                if config.STRATEGY_MODE != "pair" and abs(state.trend_ratio - state.last_build_ratio) >= 0.2:
-                    logger.info(
-                        "Trend ratio drift: %.2f -> %.2f -- rebuilding grid",
-                        state.last_build_ratio, state.trend_ratio,
+                # --- 4a: Fetch current price ---
+                try:
+                    current_price = kraken_client.get_price(pair=pair_name)
+                    _current_prices[pair_name] = current_price
+                    grid_strategy.record_price(state, current_price)
+                    supabase_store.queue_price_point(time.time(), current_price, pair=pair_name)
+                    state.consecutive_errors = 0
+                    _global_consecutive_errors = 0
+                except Exception as e:
+                    state.consecutive_errors += 1
+                    _global_consecutive_errors += 1
+                    logger.error(
+                        "[%s] Price fetch failed (%d/%d): %s",
+                        pair_name, state.consecutive_errors,
+                        config.MAX_CONSECUTIVE_ERRORS, e,
                     )
+                    if _global_consecutive_errors >= config.MAX_CONSECUTIVE_ERRORS:
+                        logger.critical("Too many consecutive errors across pairs -- stopping bot")
+                        notifier.notify_risk_event("error", f"Max errors reached: {e}")
+                        should_stop_global = True
+                        break
+                    continue  # Skip this pair this cycle
+
+                # --- 4b: Check daily reset ---
+                old_date = state.today_date
+                old_profit = state.today_profit_usd
+                old_trips = state.round_trips_today
+                old_fees = state.today_fees_usd
+                grid_strategy.check_daily_reset(state)
+
+                if old_date and old_date != state.today_date and old_date != last_daily_summary_date:
+                    last_daily_summary_date = old_date
+                    # Aggregate daily summary across all pairs
+                    total_day_profit = sum(st.today_profit_usd for st in _bot_states.values())
+                    total_day_trips = sum(st.round_trips_today for st in _bot_states.values())
+                    total_day_fees = sum(st.today_fees_usd for st in _bot_states.values())
+                    total_doge = sum(st.doge_accumulated for st in _bot_states.values())
+                    total_profit = sum(st.total_profit_usd for st in _bot_states.values())
+                    total_trips = sum(st.total_round_trips for st in _bot_states.values())
+                    notifier.notify_daily_summary(
+                        date=old_date,
+                        trades=total_day_trips,
+                        profit=total_day_profit,
+                        fees=total_day_fees,
+                        doge_accumulated=total_doge,
+                        total_profit=total_profit,
+                        total_trips=total_trips,
+                    )
+
+                # --- 4c: Check risk limits (per-pair) ---
+                should_stop, should_pause, reason = grid_strategy.check_risk_limits(
+                    state, current_price
+                )
+
+                if should_stop:
+                    logger.critical("[%s] STOP triggered: %s", pair_name, reason)
+                    notifier.notify_risk_event("stop_floor", reason, pair_display=state.pair_display)
+                    should_stop_global = True
+                    break
+
+                if should_pause and not state.is_paused:
+                    state.is_paused = True
+                    state.pause_reason = reason
+                    grid_strategy.cancel_grid(state)
+                    grid_strategy.save_state(state)
+                    logger.warning("[%s] PAUSED: %s", pair_name, reason)
+                    notifier.notify_risk_event("daily_limit", reason, pair_display=state.pair_display)
+
+                if state.is_paused:
+                    logger.debug("[%s] Paused: %s", pair_name, state.pause_reason)
+                    continue  # Skip trading for this pair
+
+                all_paused = False
+
+                # --- 4d: Check for fills ---
+                filled = grid_strategy.check_fills(state, current_price)
+
+                if filled:
+                    logger.info("[%s] Detected %d fill(s)", pair_name, len(filled))
+                    grid_strategy.handle_fills(state, filled, current_price)
+
+                    if config.STRATEGY_MODE != "pair":
+                        grid_strategy.update_trend_ratio(state)
+
+                    if config.STRATEGY_MODE != "pair" and abs(state.trend_ratio - state.last_build_ratio) >= 0.2:
+                        logger.info(
+                            "[%s] Trend ratio drift: %.2f -> %.2f -- rebuilding",
+                            pair_name, state.last_build_ratio, state.trend_ratio,
+                        )
+                        grid_strategy.cancel_grid(state)
+                        orders = grid_strategy.build_grid(state, current_price)
+                        notifier.notify_grid_built(current_price, len(orders), pair_display=state.pair_display)
+
+                    for fill_data in state.recent_fills[-len(filled):]:
+                        if fill_data.get("profit", 0) != 0:
+                            notifier.notify_round_trip(
+                                side=fill_data["side"],
+                                price=fill_data["price"],
+                                volume=fill_data["volume"],
+                                profit=fill_data["profit"],
+                                total_profit=state.today_profit_usd,
+                                trip_count=state.total_round_trips,
+                                pair_display=state.pair_display,
+                            )
+
+                    grid_strategy.prune_completed_orders(state)
+                    grid_strategy.save_state(state)
+
+                # --- 4e: Check grid drift ---
+                if grid_strategy.check_grid_drift(state, current_price):
+                    old_center = state.center_price
+                    drift_pct = abs(current_price - old_center) / old_center * 100.0
+
+                    logger.info("[%s] Resetting grid: drift %.2f%% from $%.6f to $%.6f",
+                                pair_name, drift_pct, old_center, current_price)
+
                     grid_strategy.cancel_grid(state)
                     orders = grid_strategy.build_grid(state, current_price)
-                    notifier.notify_grid_built(current_price, len(orders))
 
-                # Send notifications for completed round trips
-                for fill_data in state.recent_fills[-len(filled):]:
-                    if fill_data.get("profit", 0) != 0:
-                        notifier.notify_round_trip(
-                            side=fill_data["side"],
-                            price=fill_data["price"],
-                            volume=fill_data["volume"],
-                            profit=fill_data["profit"],
-                            total_profit=state.today_profit_usd,
-                            trip_count=state.total_round_trips,
-                        )
+                    notifier.notify_grid_reset(old_center, current_price, drift_pct, pair_display=state.pair_display)
+                    notifier.notify_grid_built(current_price, len(orders), pair_display=state.pair_display)
 
-                # Prune completed orders and save state after each fill batch
-                grid_strategy.prune_completed_orders(state)
-                grid_strategy.save_state(state)
+            # End per-pair loop
 
-            # --- 4e: Check grid drift ---
-            if grid_strategy.check_grid_drift(state, current_price):
-                old_center = state.center_price
-                drift_pct = abs(current_price - old_center) / old_center * 100.0
+            if should_stop_global:
+                break
 
-                logger.info("Resetting grid: drift %.2f%% from $%.6f to $%.6f",
-                            drift_pct, old_center, current_price)
+            if all_paused and _bot_states:
+                logger.debug("All pairs paused -- waiting for daily reset")
+                time.sleep(config.POLL_INTERVAL_SECONDS)
+                continue
 
-                grid_strategy.cancel_grid(state)
-                orders = grid_strategy.build_grid(state, current_price)
-
-                notifier.notify_grid_reset(old_center, current_price, drift_pct)
-                notifier.notify_grid_built(current_price, len(orders))
-
-            # --- 4f: Run AI advisor (hourly) ---
+            # ============================================================
+            # Global operations (once per cycle, after all pairs)
+            # ============================================================
             now = time.time()
-            if now - state.last_ai_check >= config.AI_ADVISOR_INTERVAL:
-                state.last_ai_check = now
 
-                # Gather market context
-                price_changes = grid_strategy.get_price_changes(state, current_price)
-                _, _, spread_pct = kraken_client.get_spread()
+            # --- 4f: Run AI advisor (hourly, using first pair's context) ---
+            ai_state = _first_state()
+            ai_price = _current_prices.get(_first_pair_name(), 0.0)
+            if ai_state and now - ai_state.last_ai_check >= config.AI_ADVISOR_INTERVAL:
+                ai_state.last_ai_check = now
+                ai_pair = _first_pair_name()
 
-                # Count recent fills (last hour)
+                # Force-refresh stats before AI call
+                try:
+                    ohlc_last = _ohlc_last_fetches.get(ai_pair, 0.0)
+                    if now - ohlc_last >= 300:
+                        try:
+                            _ohlc_caches[ai_pair] = kraken_client.get_ohlc(pair=ai_pair, interval=5)
+                            _ohlc_last_fetches[ai_pair] = now
+                        except Exception as e:
+                            logger.debug("OHLC fetch failed: %s", e)
+                    ai_state.stats_results = stats_engine.run_all(
+                        ai_state, ai_price, _ohlc_caches.get(ai_pair, []))
+                    ai_state.stats_last_run = now
+                except Exception as e:
+                    logger.debug("Stats refresh before AI failed: %s", e)
+
+                price_changes = grid_strategy.get_price_changes(ai_state, ai_price)
+                _, _, spread_pct = kraken_client.get_spread(pair=ai_pair)
+
                 hour_ago = now - 3600
                 recent_count = len([
-                    f for f in state.recent_fills
+                    f for f in ai_state.recent_fills
                     if f.get("time", 0) > hour_ago
                 ])
 
                 market_data = {
-                    "price": current_price,
+                    "price": ai_price,
+                    "pair_display": ai_state.pair_display,
                     "change_1h": price_changes["1h"],
                     "change_4h": price_changes["4h"],
                     "change_24h": price_changes["24h"],
                     "spread_pct": spread_pct,
                     "recent_fills": recent_count,
-                    "grid_center": state.center_price,
+                    "grid_center": ai_state.center_price,
                 }
 
-                stats_context = stats_engine.format_for_ai(state.stats_results)
+                if config.STRATEGY_MODE == "pair":
+                    market_data["position_state"] = grid_strategy.get_position_state(ai_state)
+                    market_data["today_profit"] = ai_state.today_profit_usd
+                    market_data["total_profit"] = ai_state.total_profit_usd
+                    market_data["today_loss"] = ai_state.today_loss_usd
+                    market_data["round_trips_today"] = ai_state.round_trips_today
+                    market_data["total_round_trips"] = ai_state.total_round_trips
+                    market_data["entry_pct"] = ai_state.entry_pct
+                    market_data["profit_pct"] = ai_state.profit_pct
+                    market_data["daily_loss_limit"] = config.DAILY_LOSS_LIMIT
+
+                stats_context = stats_engine.format_for_ai(ai_state.stats_results)
                 recommendation = ai_advisor.get_recommendation(market_data, stats_context)
-                state.ai_recommendation = ai_advisor.format_recommendation(recommendation)
+                ai_state.ai_recommendation = ai_advisor.format_recommendation(recommendation)
 
-                # Send via Telegram (with buttons for actionable recommendations)
-                msg_id = notifier.notify_ai_recommendation(recommendation, current_price)
-
-                # If actionable, set up pending approval
+                msg_id = notifier.notify_ai_recommendation(recommendation, ai_price)
                 action = recommendation.get("action", "continue")
                 if action != "continue" and msg_id:
                     _set_pending_approval(action, msg_id, recommendation)
 
             # --- 4f2: Poll for approval callbacks & check expiry ---
             _check_approval_expiry()
-            _poll_and_handle_callbacks(state, current_price)
+            # Use first pair for Telegram callbacks (commands/menus operate on first pair)
+            first_st = _first_state()
+            first_price = _current_prices.get(_first_pair_name(), 0.0)
+            if first_st:
+                _poll_and_handle_callbacks(first_st, first_price)
 
             # --- 4f3: Apply web dashboard config changes ---
-            _apply_web_config(state, current_price)
+            if first_st:
+                _apply_web_config(first_st, first_price)
 
-            # --- 4f4: Run stats engine (every 60s) ---
-            if now - state.stats_last_run >= 60:
-                state.stats_last_run = now
-                # Refresh OHLC cache every 5 minutes
-                if now - _ohlc_last_fetch >= 300:
+            # --- 4f4: Run stats engine per pair (every 60s) ---
+            for pair_name, state in _bot_states.items():
+                if now - state.stats_last_run >= 60:
+                    state.stats_last_run = now
+                    ohlc_last = _ohlc_last_fetches.get(pair_name, 0.0)
+                    if now - ohlc_last >= 300:
+                        try:
+                            _ohlc_caches[pair_name] = kraken_client.get_ohlc(pair=pair_name, interval=5)
+                            _ohlc_last_fetches[pair_name] = now
+                        except Exception as e:
+                            logger.debug("[%s] OHLC fetch failed: %s", pair_name, e)
                     try:
-                        _ohlc_cache = kraken_client.get_ohlc(interval=5)
-                        _ohlc_last_fetch = now
+                        cp = _current_prices.get(pair_name, 0.0)
+                        state.stats_results = stats_engine.run_all(
+                            state, cp, _ohlc_caches.get(pair_name, [])
+                        )
                     except Exception as e:
-                        logger.debug("OHLC fetch failed: %s", e)
-                try:
-                    state.stats_results = stats_engine.run_all(
-                        state, current_price, _ohlc_cache
-                    )
-                except Exception as e:
-                    logger.debug("Stats engine error: %s", e)
+                        logger.debug("[%s] Stats engine error: %s", pair_name, e)
 
-            # --- 4g: Check DOGE accumulation ---
-            excess = grid_strategy.check_accumulation(state)
-            if excess > 0:
-                doge_bought = grid_strategy.execute_accumulation(
-                    state, excess, current_price
-                )
-                if doge_bought > 0:
-                    notifier.notify_accumulation(
-                        excess, doge_bought,
-                        state.doge_accumulated, current_price,
+            # --- 4g: Check accumulation (aggregate across pairs, execute on first) ---
+            if first_st:
+                excess = grid_strategy.check_accumulation(first_st)
+                if excess > 0:
+                    doge_bought = grid_strategy.execute_accumulation(
+                        first_st, excess, first_price
                     )
+                    if doge_bought > 0:
+                        notifier.notify_accumulation(
+                            excess, doge_bought,
+                            first_st.doge_accumulated, first_price,
+                        )
 
             # --- 4h: Periodic status log + state save ---
             if int(now) % 300 < config.POLL_INTERVAL_SECONDS:
-                # Log status roughly every 5 minutes
-                logger.info(grid_strategy.get_status_summary(state, current_price))
-                grid_strategy.save_state(state)
+                for pair_name, state in _bot_states.items():
+                    cp = _current_prices.get(pair_name, 0.0)
+                    logger.info(grid_strategy.get_status_summary(state, cp))
+                    grid_strategy.save_state(state)
 
             # --- 4i: Sleep until next poll ---
             elapsed = time.time() - loop_start
@@ -1405,44 +1618,46 @@ def run():
             break
 
         except Exception as e:
-            # Catch-all for unexpected errors in the main loop
-            state.consecutive_errors += 1
+            _global_consecutive_errors += 1
             logger.error("Main loop error (%d/%d): %s",
-                         state.consecutive_errors, config.MAX_CONSECUTIVE_ERRORS, e,
+                         _global_consecutive_errors, config.MAX_CONSECUTIVE_ERRORS, e,
                          exc_info=True)
 
-            if state.consecutive_errors >= config.MAX_CONSECUTIVE_ERRORS:
+            if _global_consecutive_errors >= config.MAX_CONSECUTIVE_ERRORS:
                 logger.critical("Too many errors -- stopping bot")
                 notifier.notify_error(f"Bot stopping: too many errors\nLast: {e}")
                 break
 
-            # Brief sleep before retry
             time.sleep(5)
 
     # --- Phase 5: Graceful shutdown ---
     logger.info("Shutting down...")
     _bot_healthy = False
 
-    # Save state before cancelling (preserves open txids for next startup)
-    grid_strategy.save_state(state)
+    total_profit = 0.0
+    total_trips = 0
+    total_fees = 0.0
+    total_doge = 0.0
 
-    # CRITICAL: Cancel all open orders before exiting
-    logger.info("Cancelling all open orders...")
-    cancelled = grid_strategy.cancel_grid(state)
-    logger.info("Cancelled %d orders", cancelled)
+    for pair_name, state in _bot_states.items():
+        grid_strategy.save_state(state)
+        logger.info("[%s] Cancelling open orders...", pair_name)
+        cancelled = grid_strategy.cancel_grid(state)
+        logger.info("[%s] Cancelled %d orders", pair_name, cancelled)
+        total_profit += state.total_profit_usd
+        total_trips += state.total_round_trips
+        total_fees += state.total_fees_usd
+        total_doge += state.doge_accumulated
 
-    # Log final state
-    logger.info("Final state:")
-    logger.info("  Total profit: $%.4f", state.total_profit_usd)
-    logger.info("  Total round trips: %d", state.total_round_trips)
-    logger.info("  Total fees: $%.4f", state.total_fees_usd)
-    logger.info("  DOGE accumulated: %.2f", state.doge_accumulated)
+    logger.info("Final state (all pairs):")
+    logger.info("  Total profit: $%.4f", total_profit)
+    logger.info("  Total round trips: %d", total_trips)
+    logger.info("  Total fees: $%.4f", total_fees)
+    logger.info("  DOGE accumulated: %.2f", total_doge)
 
-    # Send shutdown notification
     shutdown_reason = "Signal received" if _shutdown_requested else "Error limit reached"
     notifier.notify_shutdown(shutdown_reason)
 
-    # Stop health server
     if health_server:
         health_server.shutdown()
 

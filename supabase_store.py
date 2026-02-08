@@ -136,7 +136,7 @@ def _request(method: str, path: str, body: dict = None,
 # Write operations (queue-based, non-blocking)
 # ---------------------------------------------------------------------------
 
-def save_fill(fill: dict):
+def save_fill(fill: dict, pair: str = "XDGUSD"):
     """Queue a fill record for persistence."""
     if not _enabled():
         return
@@ -147,10 +147,11 @@ def save_fill(fill: dict):
         "volume": fill["volume"],
         "profit": fill.get("profit", 0),
         "fees": fill.get("fees", 0),
+        "pair": pair,
     }))
 
 
-def save_trade(order, net_profit: float, fees: float):
+def save_trade(order, net_profit: float, fees: float, pair: str = "XDGUSD"):
     """Queue a trade record for persistence (mirrors trades.csv)."""
     if not _enabled():
         return
@@ -163,6 +164,7 @@ def save_trade(order, net_profit: float, fees: float):
         "fee": f"{fees:.4f}",
         "profit": f"{net_profit:.4f}",
         "grid_level": order.level,
+        "pair": pair,
     }))
 
 
@@ -180,29 +182,29 @@ def save_daily_summary(state):
     }))
 
 
-def save_state(snapshot: dict):
-    """Queue a bot state upsert (single row, keyed by 'current')."""
+def save_state(snapshot: dict, pair: str = "XDGUSD"):
+    """Queue a bot state upsert (keyed by pair name for multi-pair)."""
     if not _enabled():
         return
     _write_queue.append(("bot_state", {
-        "key": "current",
+        "key": pair,
         "data": snapshot,
     }))
 
 
-def queue_price_point(timestamp: float, price: float):
+def queue_price_point(timestamp: float, price: float, pair: str = "XDGUSD"):
     """Buffer a price sample (flushed every 5 min by writer thread)."""
     if not _enabled():
         return
     with _price_buffer_lock:
-        _price_buffer.append({"time": timestamp, "price": price})
+        _price_buffer.append({"time": timestamp, "price": price, "pair": pair})
 
 
 # ---------------------------------------------------------------------------
 # Read operations (startup only)
 # ---------------------------------------------------------------------------
 
-def load_fills(limit: int = 500) -> list:
+def load_fills(limit: int = 500, pair: str = "XDGUSD") -> list:
     """
     Load recent fills from Supabase on startup.
 
@@ -215,11 +217,15 @@ def load_fills(limit: int = 500) -> list:
     if not _enabled():
         return []
 
-    result = _request("GET", "/rest/v1/fills", params={
+    params = {
         "select": "time,side,price,volume,profit,fees",
         "order": "time.desc",
         "limit": str(limit),
-    })
+    }
+    # Filter by pair if column exists (backward compatible with old schemas)
+    params["pair"] = f"eq.{pair}"
+
+    result = _request("GET", "/rest/v1/fills", params=params)
 
     if result is None:
         logger.warning("Supabase: failed to load fills -- starting fresh")
@@ -234,12 +240,13 @@ def load_fills(limit: int = 500) -> list:
     return fills
 
 
-def load_price_history(since: float = None) -> list:
+def load_price_history(since: float = None, pair: str = "XDGUSD") -> list:
     """
     Load price history from Supabase on startup.
 
     Args:
         since: Unix timestamp cutoff (loads only prices newer than this)
+        pair: Kraken pair name to filter by
 
     Returns a list of (timestamp, price) tuples, or [] on failure.
     """
@@ -250,6 +257,7 @@ def load_price_history(since: float = None) -> list:
         "select": "time,price",
         "order": "time.asc",
         "limit": "3000",
+        "pair": f"eq.{pair}",
     }
     if since is not None:
         params["time"] = f"gt.{since}"
@@ -268,20 +276,29 @@ def load_price_history(since: float = None) -> list:
     return prices
 
 
-def load_state() -> dict:
+def load_state(pair: str = "XDGUSD") -> dict:
     """
     Load bot state snapshot from Supabase.
 
     Returns the state data dict, or {} on failure.
+    Tries pair-keyed state first, falls back to legacy "current" key.
     """
     if not _enabled():
         return {}
 
     result = _request("GET", "/rest/v1/bot_state", params={
-        "key": "eq.current",
+        "key": f"eq.{pair}",
         "select": "data",
         "limit": "1",
     })
+
+    # Fallback to legacy "current" key for backward compatibility
+    if (result is None or (isinstance(result, list) and len(result) == 0)) and pair == "XDGUSD":
+        result = _request("GET", "/rest/v1/bot_state", params={
+            "key": "eq.current",
+            "select": "data",
+            "limit": "1",
+        })
 
     if result is None:
         logger.warning("Supabase: failed to load state -- using local")

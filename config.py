@@ -12,6 +12,7 @@ HOW TO READ THIS FILE:
 """
 
 import os
+import json as _json
 import logging
 
 # ---------------------------------------------------------------------------
@@ -257,6 +258,87 @@ AI_API_URL: str = _env("AI_API_URL", "https://integrate.api.nvidia.com/v1/chat/c
 AI_MODEL: str = _env("AI_MODEL", "meta/llama-3.1-8b-instruct")
 
 # ---------------------------------------------------------------------------
+# Multi-pair configuration
+# ---------------------------------------------------------------------------
+
+class PairConfig:
+    """Per-pair configuration for multi-pair mode.
+
+    Each instance holds the trading parameters for one Kraken pair.
+    When PAIRS env var is absent, a single PairConfig is auto-built
+    from the existing single-pair env vars (backward compatible).
+    """
+    def __init__(self, pair: str, display: str, entry_pct: float,
+                 profit_pct: float, refresh_pct: float = 1.0,
+                 order_size_usd: float = 3.5, daily_loss_limit: float = 3.0,
+                 stop_floor: float = 100.0, min_volume: float = 13,
+                 price_decimals: int = 6, filter_strings: list = None):
+        self.pair = pair
+        self.display = display
+        self.entry_pct = entry_pct
+        self.profit_pct = profit_pct
+        self.refresh_pct = refresh_pct
+        self.order_size_usd = order_size_usd
+        self.daily_loss_limit = daily_loss_limit
+        self.stop_floor = stop_floor
+        self.min_volume = min_volume
+        self.price_decimals = price_decimals
+        self.filter_strings = filter_strings or [pair[:3].upper()]
+
+
+def _build_pairs() -> dict:
+    """
+    Parse PAIRS env var (JSON array) into a dict of pair_name -> PairConfig.
+    If PAIRS env var is absent, auto-build a single entry from existing globals.
+    """
+    raw = os.environ.get("PAIRS", "")
+    if raw:
+        try:
+            items = _json.loads(raw)
+            pairs = {}
+            for item in items:
+                pc = PairConfig(
+                    pair=item["pair"],
+                    display=item.get("display", item["pair"]),
+                    entry_pct=item.get("entry_pct", PAIR_ENTRY_PCT),
+                    profit_pct=item.get("profit_pct", PAIR_PROFIT_PCT),
+                    refresh_pct=item.get("refresh_pct", PAIR_REFRESH_PCT),
+                    order_size_usd=item.get("order_size_usd", ORDER_SIZE_USD),
+                    daily_loss_limit=item.get("daily_loss_limit", DAILY_LOSS_LIMIT),
+                    stop_floor=item.get("stop_floor", STOP_FLOOR),
+                    min_volume=item.get("min_volume", 13),
+                    price_decimals=item.get("price_decimals", 6),
+                    filter_strings=item.get("filter_strings"),
+                )
+                pairs[pc.pair] = pc
+            if pairs:
+                return pairs
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                "Failed to parse PAIRS env var: %s -- falling back to single pair", e)
+
+    # Fallback: build single entry from existing globals
+    return {
+        PAIR: PairConfig(
+            pair=PAIR,
+            display=PAIR_DISPLAY,
+            entry_pct=PAIR_ENTRY_PCT,
+            profit_pct=PAIR_PROFIT_PCT,
+            refresh_pct=PAIR_REFRESH_PCT,
+            order_size_usd=ORDER_SIZE_USD,
+            daily_loss_limit=DAILY_LOSS_LIMIT,
+            stop_floor=STOP_FLOOR,
+            min_volume=13,
+            price_decimals=6,
+            filter_strings=["XDG", "DOGE"],
+        ),
+    }
+
+
+PAIRS: dict = _build_pairs()
+
+
+# ---------------------------------------------------------------------------
 # Startup banner -- printed when the bot launches
 # ---------------------------------------------------------------------------
 
@@ -267,11 +349,11 @@ def print_banner():
     lines = [
         "",
         "=" * 60,
-        "  DOGE GRID TRADING BOT",
+        "  GRID TRADING BOT",
         "=" * 60,
         f"  Mode:            {mode}",
         f"  Strategy:        {strategy}",
-        f"  Pair:            {PAIR_DISPLAY}",
+        f"  Pairs:           {', '.join(pc.display for pc in PAIRS.values())}",
         f"  Capital:         ${STARTING_CAPITAL:.2f}",
         f"  Order size:      ${ORDER_SIZE_USD:.2f} (adaptive, min 13 DOGE)",
     ]

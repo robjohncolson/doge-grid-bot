@@ -132,14 +132,30 @@ Grid fills (last hour): {market_data.get('recent_fills', 0)}
 Grid center: ${market_data.get('grid_center', 0):.6f}
 """
     if config.STRATEGY_MODE == "pair":
-        prompt += f"Strategy: single-pair (2 orders)\nEntry distance: {config.PAIR_ENTRY_PCT}%\nProfit target: {config.PAIR_PROFIT_PCT}%"
+        prompt += f"Strategy: single-pair (2 orders)\nEntry distance: {market_data.get('entry_pct', config.PAIR_ENTRY_PCT)}%\nProfit target: {market_data.get('profit_pct', config.PAIR_PROFIT_PCT)}%"
+
+        # Position and P&L context
+        pos = market_data.get("position_state", "flat")
+        prompt += f"\nPosition: {pos}"
+        prompt += f"\nToday P&L: ${market_data.get('today_profit', 0):.4f} profit, ${market_data.get('today_loss', 0):.4f} loss"
+        prompt += f"\nDaily loss limit: ${market_data.get('daily_loss_limit', 0):.2f}"
+        prompt += f"\nRound trips: {market_data.get('round_trips_today', 0)} today, {market_data.get('total_round_trips', 0)} lifetime"
+        prompt += f"\nTotal profit: ${market_data.get('total_profit', 0):.4f}"
     else:
         prompt += f"Grid spacing: {config.GRID_SPACING_PCT}%"
 
     if stats_context:
         prompt += f"\n\n{stats_context}"
 
-    prompt += """
+    if config.STRATEGY_MODE == "pair":
+        prompt += """
+
+Answer in exactly this format (3 lines only):
+CONDITION: [ranging/trending_up/trending_down/volatile/low_volume]
+ACTION: [continue/pause/widen_spacing/tighten_spacing/widen_entry/tighten_entry/reset_grid]
+REASON: [One sentence explanation]"""
+    else:
+        prompt += """
 
 Answer in exactly this format (3 lines only):
 CONDITION: [ranging/trending_up/trending_down/volatile/low_volume]
@@ -167,18 +183,32 @@ def _call_panelist(prompt: str, panelist: dict) -> tuple:
     # Reasoning models (chain-of-thought) need longer timeouts
     timeout = 60 if panelist.get("reasoning") else 30
 
+    if config.STRATEGY_MODE == "pair":
+        system_content = (
+            "You are a concise crypto market analyst advising a single-pair "
+            "market-making bot on DOGE/USD. The bot maintains exactly two limit "
+            "orders: one buy and one sell. Each order is either an 'entry' "
+            "(flanking the market price) or an 'exit' (profit target from a "
+            "filled entry). Entry distance controls how far entries sit from "
+            "market -- wider means fewer fills but less risk; tighter means "
+            "more fills but more whipsaw risk. Profit target controls the "
+            "round trip size -- wider means more profit per trip but slower "
+            "fills; tighter means faster trips but less profit each. "
+            "Be direct and specific. Never recommend buying or selling -- "
+            "only recommend parameter adjustments."
+        )
+    else:
+        system_content = (
+            "You are a concise crypto market analyst. "
+            "Give structured recommendations for a DOGE/USD grid trading bot. "
+            "Be direct and specific. Never recommend buying or selling -- "
+            "only recommend grid parameter adjustments."
+        )
+
     payload = json.dumps({
         "model": panelist["model"],
         "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a concise crypto market analyst. "
-                    "Give structured recommendations for a DOGE/USD grid trading bot. "
-                    "Be direct and specific. Never recommend buying or selling -- "
-                    "only recommend grid parameter adjustments."
-                ),
-            },
+            {"role": "system", "content": system_content},
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.3,

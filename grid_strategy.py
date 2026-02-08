@@ -82,8 +82,15 @@ class GridState:
     """
     Complete state of the grid trading system.
     This is the "brain" -- it tracks everything the bot needs to make decisions.
+
+    An optional pair_config (config.PairConfig) provides per-pair overrides.
+    If set, properties like entry_pct, profit_pct, etc. read from pair_config;
+    otherwise they fall back to global config values.
     """
-    def __init__(self):
+    def __init__(self, pair_config=None):
+        # Per-pair config (None = use global config, backward compatible)
+        self.pair_config = pair_config
+
         # Grid geometry
         self.center_price = 0.0          # Price the grid is built around
         self.grid_orders: list = []      # List of GridOrder objects
@@ -122,10 +129,75 @@ class GridState:
         self.stats_results = {}          # Latest stats_engine.run_all() output
         self.stats_last_run = 0.0        # Timestamp of last stats run
 
+    # -- Per-pair property accessors (fall back to global config) --
+
+    @property
+    def pair_name(self) -> str:
+        if self.pair_config:
+            return self.pair_config.pair
+        return config.PAIR
+
+    @property
+    def pair_display(self) -> str:
+        if self.pair_config:
+            return self.pair_config.display
+        return config.PAIR_DISPLAY
+
+    @property
+    def entry_pct(self) -> float:
+        if self.pair_config:
+            return self.pair_config.entry_pct
+        return config.PAIR_ENTRY_PCT
+
+    @entry_pct.setter
+    def entry_pct(self, val):
+        if self.pair_config:
+            self.pair_config.entry_pct = val
+        else:
+            config.PAIR_ENTRY_PCT = val
+
+    @property
+    def profit_pct(self) -> float:
+        if self.pair_config:
+            return self.pair_config.profit_pct
+        return config.PAIR_PROFIT_PCT
+
+    @profit_pct.setter
+    def profit_pct(self, val):
+        if self.pair_config:
+            self.pair_config.profit_pct = val
+        else:
+            config.PAIR_PROFIT_PCT = val
+
+    @property
+    def refresh_pct(self) -> float:
+        if self.pair_config:
+            return self.pair_config.refresh_pct
+        return config.PAIR_REFRESH_PCT
+
+    @property
+    def min_volume(self) -> float:
+        if self.pair_config:
+            return self.pair_config.min_volume
+        return ORDERMIN_DOGE
+
+    @property
+    def price_decimals(self) -> int:
+        if self.pair_config:
+            return self.pair_config.price_decimals
+        return 6
+
 
 # ---------------------------------------------------------------------------
 # State persistence
 # ---------------------------------------------------------------------------
+
+def _state_file_path(state: GridState) -> str:
+    """Return the state file path for this pair (or the global default)."""
+    if state.pair_config and len(config.PAIRS) > 1:
+        return os.path.join(config.LOG_DIR, f"state_{state.pair_name}.json")
+    return config.STATE_FILE
+
 
 def save_state(state: GridState):
     """
@@ -153,22 +225,24 @@ def save_state(state: GridState):
         "strategy_mode": config.STRATEGY_MODE,
         # Runtime config overrides (survive deploys via Supabase)
         "grid_spacing_pct": config.GRID_SPACING_PCT,
-        "pair_profit_pct": config.PAIR_PROFIT_PCT,
+        "pair_profit_pct": state.profit_pct,
+        "pair_entry_pct": state.entry_pct,
         "ai_advisor_interval": config.AI_ADVISOR_INTERVAL,
     }
-    tmp_path = config.STATE_FILE + ".tmp"
+    state_path = _state_file_path(state)
+    tmp_path = state_path + ".tmp"
     try:
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(snapshot, f, indent=2)
         # Atomic rename (works on Windows if dest doesn't exist, so remove first)
-        if os.path.exists(config.STATE_FILE):
-            os.remove(config.STATE_FILE)
-        os.rename(tmp_path, config.STATE_FILE)
-        logger.debug("State saved to %s", config.STATE_FILE)
+        if os.path.exists(state_path):
+            os.remove(state_path)
+        os.rename(tmp_path, state_path)
+        logger.debug("State saved to %s", state_path)
     except Exception as e:
         logger.error("Failed to save state: %s", e)
 
-    supabase_store.save_state(snapshot)
+    supabase_store.save_state(snapshot, pair=state.pair_name)
 
 
 def load_state(state: GridState) -> bool:
@@ -177,12 +251,13 @@ def load_state(state: GridState) -> bool:
     Returns True if a snapshot was loaded, False otherwise.
     Does NOT restore grid_orders -- that's done by reconcile_on_startup().
     """
-    if not os.path.exists(config.STATE_FILE):
-        logger.info("No state file found at %s -- starting fresh", config.STATE_FILE)
+    state_path = _state_file_path(state)
+    if not os.path.exists(state_path):
+        logger.info("No state file found at %s -- starting fresh", state_path)
         return False
 
     try:
-        with open(config.STATE_FILE, "r", encoding="utf-8") as f:
+        with open(state_path, "r", encoding="utf-8") as f:
             snapshot = json.load(f)
     except Exception as e:
         logger.warning("Failed to read state file: %s -- starting fresh", e)
@@ -202,6 +277,15 @@ def load_state(state: GridState) -> bool:
     state.trend_ratio = snapshot.get("trend_ratio", 0.5)
     state.trend_ratio_override = snapshot.get("trend_ratio_override", None)
 
+    # Restore pair_entry_pct runtime override
+    saved_entry_pct = snapshot.get("pair_entry_pct")
+    if saved_entry_pct and saved_entry_pct != state.entry_pct:
+        logger.info(
+            "Restoring entry distance from state: %.2f%% -> %.2f%%",
+            state.entry_pct, saved_entry_pct,
+        )
+        state.entry_pct = saved_entry_pct
+
     saved_at = snapshot.get("saved_at", 0)
     age_min = (time.time() - saved_at) / 60 if saved_at else 0
     txid_count = len(snapshot.get("open_txids", []))
@@ -209,7 +293,7 @@ def load_state(state: GridState) -> bool:
     logger.info(
         "State restored from %s (%.0f min old): "
         "$%.4f profit, %d round trips, %d open txids",
-        config.STATE_FILE, age_min,
+        state_path, age_min,
         state.total_profit_usd, state.total_round_trips, txid_count,
     )
     return True
@@ -419,11 +503,15 @@ def adapt_grid_params(state: GridState, current_price: float):
         )
 
 
-def calculate_volume_for_price(price: float) -> float:
+def calculate_volume_for_price(price: float, state: GridState = None) -> float:
     """
     Calculate how many DOGE to buy/sell at a given price to match ORDER_SIZE_USD.
-    Enforces Kraken's 13 DOGE minimum -- if ORDER_SIZE_USD is too small at
-    the current price, volume is floored to ORDERMIN_DOGE (order costs more).
+    Enforces Kraken's minimum volume -- if ORDER_SIZE_USD is too small at
+    the current price, volume is floored to the minimum (order costs more).
+
+    Args:
+        price: Limit price in USD.
+        state: Optional GridState; if set, uses state.min_volume for the floor.
 
     Example: at $0.09/DOGE with ORDER_SIZE_USD=$5:
       volume = $5 / $0.09 = 55.56 DOGE
@@ -431,8 +519,9 @@ def calculate_volume_for_price(price: float) -> float:
     if price <= 0:
         return 0.0
     volume = config.ORDER_SIZE_USD / price
-    if volume < ORDERMIN_DOGE:
-        volume = float(ORDERMIN_DOGE)
+    min_vol = state.min_volume if state and state.pair_config else ORDERMIN_DOGE
+    if volume < min_vol:
+        volume = float(min_vol)
     return volume
 
 
@@ -484,11 +573,17 @@ def reconcile_on_startup(state: GridState, current_price: float) -> int:
     orphans = 0
     spacing_tolerance = config.GRID_SPACING_PCT / 100.0 * current_price * 0.3  # 30% of one spacing
 
+    # Determine pair filter strings
+    if state.pair_config:
+        filter_strings = state.pair_config.filter_strings
+    else:
+        filter_strings = ["XDG", "DOGE"]
+
     for txid, info in open_orders.items():
         descr = info.get("descr", {})
         pair = descr.get("pair", "")
         # Kraken may use various pair formats
-        if "XDG" not in pair.upper() and "DOGE" not in pair.upper():
+        if not any(s in pair.upper() for s in filter_strings):
             continue  # Not our pair, skip
 
         side = descr.get("type", "")
@@ -1003,7 +1098,7 @@ def handle_fills(state: GridState, filled_orders: list, current_price: float = 0
                 "profit": net_profit,
                 "fees": fees,
             })
-            supabase_store.save_fill(state.recent_fills[-1])
+            supabase_store.save_fill(state.recent_fills[-1], pair=state.pair_name)
 
             logger.info(
                 "  Sell filled at $%.6f -> placing buy at $%.6f",
@@ -1048,7 +1143,7 @@ def handle_fills(state: GridState, filled_orders: list, current_price: float = 0
                 "profit": 0,
                 "fees": buy_fee,
             })
-            supabase_store.save_fill(state.recent_fills[-1])
+            supabase_store.save_fill(state.recent_fills[-1], pair=state.pair_name)
 
     return new_orders
 
@@ -1425,7 +1520,8 @@ def build_pair(state: GridState, current_price: float) -> list:
     """
     # Pair mode: keep user's ORDER_SIZE_USD but floor at Kraken minimums.
     # No grid-level capital budgeting (only 2 orders, not 40).
-    min_by_volume = ORDERMIN_DOGE * current_price * 1.2
+    min_vol = state.min_volume if state.pair_config else ORDERMIN_DOGE
+    min_by_volume = min_vol * current_price * 1.2
     config.ORDER_SIZE_USD = max(config.ORDER_SIZE_USD, min_by_volume, COSTMIN_USD)
 
     state.center_price = current_price
@@ -1443,8 +1539,10 @@ def build_pair(state: GridState, current_price: float) -> list:
         if o.status == "open":
             adopted_sides.add(o.side)
 
-    buy_price = round(current_price * (1 - config.PAIR_ENTRY_PCT / 100.0), 6)
-    sell_price = round(current_price * (1 + config.PAIR_ENTRY_PCT / 100.0), 6)
+    entry_pct = state.entry_pct
+    decimals = state.price_decimals
+    buy_price = round(current_price * (1 - entry_pct / 100.0), decimals)
+    sell_price = round(current_price * (1 + entry_pct / 100.0), decimals)
 
     logger.info(
         "Building pair at $%.6f: buy entry $%.6f, sell entry $%.6f",
@@ -1458,12 +1556,13 @@ def build_pair(state: GridState, current_price: float) -> list:
             logger.debug("  Pair %s: skipped (already adopted)", side.upper())
             continue
 
-        volume = calculate_volume_for_price(price)
+        volume = calculate_volume_for_price(price, state)
         order = GridOrder(level=level, side=side, price=price, volume=volume)
         order.order_role = "entry"
 
         try:
-            txid = kraken_client.place_order(side=side, volume=volume, price=price)
+            txid = kraken_client.place_order(
+                side=side, volume=volume, price=price, pair=state.pair_name)
             order.txid = txid
             order.status = "open"
             order.placed_at = time.time()
@@ -1493,13 +1592,15 @@ def _build_pair_with_position(state: GridState, last_fill: dict,
     """
     fill_side = last_fill["side"]
     fill_price = last_fill["price"]
+    decimals = state.price_decimals
+    profit_pct = state.profit_pct
 
     if fill_side == "buy":
         exit_side = "sell"
-        exit_price = round(fill_price * (1 + config.PAIR_PROFIT_PCT / 100.0), 6)
+        exit_price = round(fill_price * (1 + profit_pct / 100.0), decimals)
     else:
         exit_side = "buy"
-        exit_price = round(fill_price * (1 - config.PAIR_PROFIT_PCT / 100.0), 6)
+        exit_price = round(fill_price * (1 - profit_pct / 100.0), decimals)
 
     # Look for an adopted order at the exit price (may be mislabeled as entry)
     tol = exit_price * 0.005  # 0.5% tolerance
@@ -1540,12 +1641,13 @@ def _build_pair_with_position(state: GridState, last_fill: dict,
         o.status == "open" and o.side == exit_side and o.order_role == "entry"
         for o in state.grid_orders)
     if not has_opposite_entry:
+        entry_pct = state.entry_pct
         if exit_side == "sell":
             entry_price = round(
-                current_price * (1 + config.PAIR_ENTRY_PCT / 100.0), 6)
+                current_price * (1 + entry_pct / 100.0), decimals)
         else:
             entry_price = round(
-                current_price * (1 - config.PAIR_ENTRY_PCT / 100.0), 6)
+                current_price * (1 - entry_pct / 100.0), decimals)
         logger.info(
             "Position recovery: placing %s entry @ $%.6f",
             exit_side.upper(), entry_price)
@@ -1560,7 +1662,7 @@ def _place_pair_order(state, side, price, role, matched_buy=None,
     Place a single pair order and add it to state.grid_orders.
     Returns the GridOrder on success, None on failure.
     """
-    volume = calculate_volume_for_price(price)
+    volume = calculate_volume_for_price(price, state)
     level = -1 if side == "buy" else +1
     order = GridOrder(level=level, side=side, price=price, volume=volume)
     order.order_role = role
@@ -1570,7 +1672,8 @@ def _place_pair_order(state, side, price, role, matched_buy=None,
         order.matched_sell_price = matched_sell
 
     try:
-        txid = kraken_client.place_order(side=side, volume=volume, price=price)
+        txid = kraken_client.place_order(
+            side=side, volume=volume, price=price, pair=state.pair_name)
         order.txid = txid
         order.status = "open"
         order.placed_at = time.time()
@@ -1691,7 +1794,7 @@ def _close_orphaned_exit(state, filled_entry):
         "profit": net_profit,
         "fees": fees,
     })
-    supabase_store.save_fill(state.recent_fills[-1])
+    supabase_store.save_fill(state.recent_fills[-1], pair=state.pair_name)
 
     # Cancel the orphaned exit order
     _cancel_open_by_role(state, filled_entry.side, "exit")
@@ -1730,6 +1833,9 @@ def handle_pair_fill(state: GridState, filled_orders: list,
     Returns list of new GridOrder objects placed.
     """
     new_orders = []
+    decimals = state.price_decimals
+    profit_pct = state.profit_pct
+    entry_pct = state.entry_pct
 
     for filled in filled_orders:
         is_entry = filled.order_role == "entry"
@@ -1753,14 +1859,14 @@ def handle_pair_fill(state: GridState, filled_orders: list,
                 "price": filled.price, "volume": filled.volume,
                 "profit": 0, "fees": buy_fee,
             })
-            supabase_store.save_fill(state.recent_fills[-1])
+            supabase_store.save_fill(state.recent_fills[-1], pair=state.pair_name)
 
             # If both entries filled (sell entry also filled), close orphaned position
             _close_orphaned_exit(state, filled)
 
             # Place sell exit at profit target
             exit_price = round(
-                filled.price * (1 + config.PAIR_PROFIT_PCT / 100.0), 6)
+                filled.price * (1 + profit_pct / 100.0), decimals)
             o = _place_pair_order(
                 state, "sell", exit_price, "exit",
                 matched_buy=filled.price)
@@ -1817,19 +1923,19 @@ def handle_pair_fill(state: GridState, filled_orders: list,
                 "price": filled.price, "volume": filled.volume,
                 "profit": net_profit, "fees": fees,
             })
-            supabase_store.save_fill(state.recent_fills[-1])
+            supabase_store.save_fill(state.recent_fills[-1], pair=state.pair_name)
 
             # Round trip complete -- cancel remaining sell entry, place fresh pair
             _cancel_open_by_role(state, "sell", "entry")
 
             buy_entry_price = round(
-                current_price * (1 - config.PAIR_ENTRY_PCT / 100.0), 6)
+                current_price * (1 - entry_pct / 100.0), decimals)
             o = _place_pair_order(state, "buy", buy_entry_price, "entry")
             if o:
                 new_orders.append(o)
 
             sell_entry_price = round(
-                current_price * (1 + config.PAIR_ENTRY_PCT / 100.0), 6)
+                current_price * (1 + entry_pct / 100.0), decimals)
             o = _place_pair_order(state, "sell", sell_entry_price, "entry")
             if o:
                 new_orders.append(o)
@@ -1852,14 +1958,14 @@ def handle_pair_fill(state: GridState, filled_orders: list,
                 "price": filled.price, "volume": filled.volume,
                 "profit": 0, "fees": sell_fee,
             })
-            supabase_store.save_fill(state.recent_fills[-1])
+            supabase_store.save_fill(state.recent_fills[-1], pair=state.pair_name)
 
             # If both entries filled (buy entry also filled), close orphaned position
             _close_orphaned_exit(state, filled)
 
             # Place buy exit at profit target
             exit_price = round(
-                filled.price * (1 - config.PAIR_PROFIT_PCT / 100.0), 6)
+                filled.price * (1 - profit_pct / 100.0), decimals)
             o = _place_pair_order(
                 state, "buy", exit_price, "exit",
                 matched_sell=filled.price)
@@ -1916,19 +2022,19 @@ def handle_pair_fill(state: GridState, filled_orders: list,
                 "price": filled.price, "volume": filled.volume,
                 "profit": net_profit, "fees": fees,
             })
-            supabase_store.save_fill(state.recent_fills[-1])
+            supabase_store.save_fill(state.recent_fills[-1], pair=state.pair_name)
 
             # Round trip complete -- cancel remaining buy entry, place fresh pair
             _cancel_open_by_role(state, "buy", "entry")
 
             buy_entry_price = round(
-                current_price * (1 - config.PAIR_ENTRY_PCT / 100.0), 6)
+                current_price * (1 - entry_pct / 100.0), decimals)
             o = _place_pair_order(state, "buy", buy_entry_price, "entry")
             if o:
                 new_orders.append(o)
 
             sell_entry_price = round(
-                current_price * (1 + config.PAIR_ENTRY_PCT / 100.0), 6)
+                current_price * (1 + entry_pct / 100.0), decimals)
             o = _place_pair_order(state, "sell", sell_entry_price, "entry")
             if o:
                 new_orders.append(o)
@@ -1941,11 +2047,15 @@ def _refresh_entry_if_stale(state, side, current_price):
     If the entry order on the given side is too far from market, cancel and replace.
     Exit orders are never touched.
     """
+    entry_pct = state.entry_pct
+    refresh_pct = state.refresh_pct
+    decimals = state.price_decimals
+
     for o in state.grid_orders:
         if o.status != "open" or o.side != side or o.order_role != "entry":
             continue
         distance_pct = abs(o.price - current_price) / current_price * 100.0
-        if distance_pct > config.PAIR_REFRESH_PCT:
+        if distance_pct > refresh_pct:
             # Check if this order already filled before we cancel it
             if not config.DRY_RUN:
                 try:
@@ -1971,10 +2081,10 @@ def _refresh_entry_if_stale(state, side, current_price):
 
             if side == "buy":
                 new_price = round(
-                    current_price * (1 - config.PAIR_ENTRY_PCT / 100.0), 6)
+                    current_price * (1 - entry_pct / 100.0), decimals)
             else:
                 new_price = round(
-                    current_price * (1 + config.PAIR_ENTRY_PCT / 100.0), 6)
+                    current_price * (1 + entry_pct / 100.0), decimals)
             _place_pair_order(state, side, new_price, "entry")
             return True
     return False
@@ -1988,12 +2098,16 @@ def refresh_stale_entries(state: GridState, current_price: float) -> bool:
 
     Returns True if any entries were refreshed (triggers rebuild notification).
     """
+    refresh_pct = state.refresh_pct
+    entry_pct = state.entry_pct
+    decimals = state.price_decimals
+
     refreshed = False
     for o in list(state.grid_orders):
         if o.status != "open" or o.order_role != "entry":
             continue
         distance_pct = abs(o.price - current_price) / current_price * 100.0
-        if distance_pct > config.PAIR_REFRESH_PCT:
+        if distance_pct > refresh_pct:
             # Check if this order already filled before we cancel it
             if not config.DRY_RUN:
                 try:
@@ -2011,7 +2125,7 @@ def refresh_stale_entries(state: GridState, current_price: float) -> bool:
                 "Pair drift: %s entry $%.6f is %.2f%% from market $%.6f "
                 "(threshold: %.1f%%)",
                 o.side.upper(), o.price, distance_pct,
-                current_price, config.PAIR_REFRESH_PCT,
+                current_price, state.refresh_pct,
             )
             if config.DRY_RUN:
                 o.status = "cancelled"
@@ -2021,10 +2135,10 @@ def refresh_stale_entries(state: GridState, current_price: float) -> bool:
 
             if o.side == "buy":
                 new_price = round(
-                    current_price * (1 - config.PAIR_ENTRY_PCT / 100.0), 6)
+                    current_price * (1 - entry_pct / 100.0), decimals)
             else:
                 new_price = round(
-                    current_price * (1 + config.PAIR_ENTRY_PCT / 100.0), 6)
+                    current_price * (1 + entry_pct / 100.0), decimals)
             _place_pair_order(state, o.side, new_price, "entry")
             refreshed = True
 
@@ -2052,14 +2166,20 @@ def reconcile_pair_on_startup(state: GridState, current_price: float) -> int:
         logger.info("Pair reconciliation: no open orders found on Kraken")
         return 0
 
-    # Classify XDGUSD orders by side
+    # Determine pair filter strings
+    if state.pair_config:
+        filter_strings = state.pair_config.filter_strings
+    else:
+        filter_strings = ["XDG", "DOGE"]
+
+    # Classify orders by side
     our_buys = []
     our_sells = []
 
     for txid, info in open_orders.items():
         descr = info.get("descr", {})
         pair = descr.get("pair", "")
-        if "XDG" not in pair.upper() and "DOGE" not in pair.upper():
+        if not any(s in pair.upper() for s in filter_strings):
             continue
 
         side = descr.get("type", "")
@@ -2133,13 +2253,17 @@ def reconcile_pair_on_startup(state: GridState, current_price: float) -> int:
 
 def _reconcile_offline_fills(state: GridState, current_price: float):
     """
-    Check recent trade history for XDGUSD fills that happened while the
-    bot was offline.  If a buy filled but no sell exit exists on the book,
-    place one.  Same for sell fills with no buy exit.
+    Check recent trade history for fills that happened while the bot was
+    offline.  If a buy filled but no sell exit exists on the book, place one.
+    Same for sell fills with no buy exit.
 
     This closes the gap where a fill between deploys was invisible because
     startup reconciliation only looks at open orders.
     """
+    profit_pct = state.profit_pct
+    entry_pct = state.entry_pct
+    decimals = state.price_decimals
+
     try:
         # Look back 6 hours of trade history
         trades = kraken_client.get_trades_history(
@@ -2152,11 +2276,17 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
         logger.info("Offline fill check: no recent trades")
         return
 
-    # Filter to XDGUSD trades only
+    # Determine pair filter strings
+    if state.pair_config:
+        filter_strings = state.pair_config.filter_strings
+    else:
+        filter_strings = ["XDG", "DOGE"]
+
+    # Filter to our pair's trades only
     doge_trades = []
     for trade_txid, info in trades.items():
         pair = info.get("pair", "")
-        if "XDG" not in pair.upper() and "DOGE" not in pair.upper():
+        if not any(s in pair.upper() for s in filter_strings):
             continue
         doge_trades.append({
             "txid": trade_txid,
@@ -2218,7 +2348,7 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
             last_sell = t
 
     placed = 0
-    tol = config.PAIR_PROFIT_PCT / 200.0  # half profit pct as tolerance
+    tol = profit_pct / 200.0  # half profit pct as tolerance
 
     # --- Step 2: Dual fill -- classify each as EXIT vs ENTRY ---
     # Kraken trade history has no role info, so we match each fill's price
@@ -2230,7 +2360,7 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
         buy_cost_basis = None
         for rf in reversed(state.recent_fills):
             if rf["side"] == "sell":
-                expected = rf["price"] * (1 - config.PAIR_PROFIT_PCT / 100.0)
+                expected = rf["price"] * (1 - profit_pct / 100.0)
                 if (expected > 0
                         and abs(last_buy["price"] - expected) / expected < tol):
                     buy_is_exit = True
@@ -2242,7 +2372,7 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
         sell_cost_basis = None
         for rf in reversed(state.recent_fills):
             if rf["side"] == "buy":
-                expected = rf["price"] * (1 + config.PAIR_PROFIT_PCT / 100.0)
+                expected = rf["price"] * (1 + profit_pct / 100.0)
                 if (expected > 0
                         and abs(last_sell["price"] - expected) / expected < tol):
                     sell_is_exit = True
@@ -2285,7 +2415,7 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                     "price": buy_p, "volume": close_vol,
                     "profit": net_profit, "fees": fee_buy,
                 })
-                supabase_store.save_fill(state.recent_fills[-1])
+                supabase_store.save_fill(state.recent_fills[-1], pair=state.pair_name)
 
             if sell_is_exit:
                 buy_p = sell_cost_basis
@@ -2313,14 +2443,14 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                     "price": sell_p, "volume": close_vol,
                     "profit": net_profit, "fees": fee_sell,
                 })
-                supabase_store.save_fill(state.recent_fills[-1])
+                supabase_store.save_fill(state.recent_fills[-1], pair=state.pair_name)
 
             # Handle remaining entry fill(s) -- place exit only
             if buy_is_exit and not sell_is_exit:
                 # Sell is a new entry -> place buy exit only
                 sp = last_sell["price"]
                 exit_price = round(
-                    sp * (1 - config.PAIR_PROFIT_PCT / 100.0), 6)
+                    sp * (1 - profit_pct / 100.0), decimals)
                 o = _place_pair_order(
                     state, "buy", exit_price, "exit", matched_sell=sp)
                 if o:
@@ -2333,7 +2463,7 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                     "price": sp, "volume": last_sell["volume"],
                     "profit": 0, "fees": sell_fee,
                 })
-                supabase_store.save_fill(state.recent_fills[-1])
+                supabase_store.save_fill(state.recent_fills[-1], pair=state.pair_name)
                 logger.info(
                     "Offline exit+entry: buy exit booked, "
                     "placed %d exit order for sell entry position", placed)
@@ -2342,7 +2472,7 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                 # Buy is a new entry -> place sell exit only
                 bp = last_buy["price"]
                 exit_price = round(
-                    bp * (1 + config.PAIR_PROFIT_PCT / 100.0), 6)
+                    bp * (1 + profit_pct / 100.0), decimals)
                 o = _place_pair_order(
                     state, "sell", exit_price, "exit", matched_buy=bp)
                 if o:
@@ -2355,7 +2485,7 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                     "price": bp, "volume": last_buy["volume"],
                     "profit": 0, "fees": buy_fee,
                 })
-                supabase_store.save_fill(state.recent_fills[-1])
+                supabase_store.save_fill(state.recent_fills[-1], pair=state.pair_name)
                 logger.info(
                     "Offline exit+entry: sell exit booked, "
                     "placed %d exit order for buy entry position", placed)
@@ -2363,9 +2493,9 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
             else:
                 # Both exits -- position is flat, place fresh entry pair
                 buy_entry = round(
-                    current_price * (1 - config.PAIR_ENTRY_PCT / 100.0), 6)
+                    current_price * (1 - entry_pct / 100.0), decimals)
                 sell_entry = round(
-                    current_price * (1 + config.PAIR_ENTRY_PCT / 100.0), 6)
+                    current_price * (1 + entry_pct / 100.0), decimals)
                 o1 = _place_pair_order(state, "buy", buy_entry, "entry")
                 o2 = _place_pair_order(state, "sell", sell_entry, "entry")
                 placed = (1 if o1 else 0) + (1 if o2 else 0)
@@ -2384,9 +2514,9 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
             first, second = last_sell, last_buy
 
         if first["side"] == "buy":
-            expected_exit = first["price"] * (1 + config.PAIR_PROFIT_PCT / 100.0)
+            expected_exit = first["price"] * (1 + profit_pct / 100.0)
         else:
-            expected_exit = first["price"] * (1 - config.PAIR_PROFIT_PCT / 100.0)
+            expected_exit = first["price"] * (1 - profit_pct / 100.0)
 
         is_round_trip = (
             expected_exit > 0
@@ -2422,14 +2552,14 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
             "profit": 0,
             "fees": fee_buy if first["side"] == "buy" else fee_sell,
         })
-        supabase_store.save_fill(state.recent_fills[-1])
+        supabase_store.save_fill(state.recent_fills[-1], pair=state.pair_name)
         state.recent_fills.append({
             "time": second["time"], "side": second["side"],
             "price": second["price"], "volume": close_vol,
             "profit": net_profit,
             "fees": fee_sell if second["side"] == "sell" else fee_buy,
         })
-        supabase_store.save_fill(state.recent_fills[-1])
+        supabase_store.save_fill(state.recent_fills[-1], pair=state.pair_name)
 
         # Cancel stale orders
         _cancel_open_by_role(state, "buy", "entry")
@@ -2446,9 +2576,9 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                 close_vol, net_profit,
             )
             buy_entry = round(
-                current_price * (1 - config.PAIR_ENTRY_PCT / 100.0), 6)
+                current_price * (1 - entry_pct / 100.0), decimals)
             sell_entry = round(
-                current_price * (1 + config.PAIR_ENTRY_PCT / 100.0), 6)
+                current_price * (1 + entry_pct / 100.0), decimals)
             o1 = _place_pair_order(state, "buy", buy_entry, "entry")
             o2 = _place_pair_order(state, "sell", sell_entry, "entry")
             placed = (1 if o1 else 0) + (1 if o2 else 0)
@@ -2465,7 +2595,7 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
             )
             if second["side"] == "sell":
                 exit_price = round(
-                    second["price"] * (1 - config.PAIR_PROFIT_PCT / 100.0), 6)
+                    second["price"] * (1 - profit_pct / 100.0), decimals)
                 o = _place_pair_order(
                     state, "buy", exit_price, "exit",
                     matched_sell=second["price"])
@@ -2473,7 +2603,7 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                     placed += 1
             else:
                 exit_price = round(
-                    second["price"] * (1 + config.PAIR_PROFIT_PCT / 100.0), 6)
+                    second["price"] * (1 + profit_pct / 100.0), decimals)
                 o = _place_pair_order(
                     state, "sell", exit_price, "exit",
                     matched_buy=second["price"])
@@ -2490,7 +2620,7 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
     # If there's a recent buy fill but no sell exit on the book, place one
     if last_buy and not has_sell_exit:
         buy_price = last_buy["price"]
-        exit_price = round(buy_price * (1 + config.PAIR_PROFIT_PCT / 100.0), 6)
+        exit_price = round(buy_price * (1 + profit_pct / 100.0), decimals)
         logger.warning(
             "OFFLINE FILL RECOVERY: Buy filled @ $%.6f (%.2f DOGE) at %s "
             "-- placing sell exit @ $%.6f",
@@ -2512,13 +2642,13 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                 "price": buy_price, "volume": last_buy["volume"],
                 "profit": 0, "fees": buy_fee,
             })
-            supabase_store.save_fill(state.recent_fills[-1])
+            supabase_store.save_fill(state.recent_fills[-1], pair=state.pair_name)
 
     # If there's a recent sell fill but no buy exit on the book, place one
     if last_sell and not has_buy_exit:
         sell_price = last_sell["price"]
         exit_price = round(
-            sell_price * (1 - config.PAIR_PROFIT_PCT / 100.0), 6)
+            sell_price * (1 - profit_pct / 100.0), decimals)
         logger.warning(
             "OFFLINE FILL RECOVERY: Sell filled @ $%.6f (%.2f DOGE) at %s "
             "-- placing buy exit @ $%.6f",
@@ -2540,12 +2670,29 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                 "price": sell_price, "volume": last_sell["volume"],
                 "profit": 0, "fees": sell_fee,
             })
-            supabase_store.save_fill(state.recent_fills[-1])
+            supabase_store.save_fill(state.recent_fills[-1], pair=state.pair_name)
 
     if placed:
         logger.info("Offline fill recovery: placed %d orders", placed)
     else:
         logger.info("Offline fill check: no unhandled fills found")
+
+
+def get_position_state(state: GridState) -> str:
+    """
+    Determine the current position state for pair mode.
+    Returns "long" (holding DOGE from buy entry), "short" (sold DOGE from
+    sell entry), or "flat" (no open position / only entries on book).
+    """
+    open_orders = [o for o in state.grid_orders if o.status == "open"]
+    has_sell_exit = any(o.side == "sell" and o.order_role == "exit" for o in open_orders)
+    has_buy_exit = any(o.side == "buy" and o.order_role == "exit" for o in open_orders)
+
+    if has_sell_exit:
+        return "long"   # Bought DOGE, waiting for sell exit
+    if has_buy_exit:
+        return "short"  # Sold DOGE, waiting for buy exit
+    return "flat"
 
 
 def get_status_summary(state: GridState, current_price: float) -> str:
@@ -2564,11 +2711,11 @@ def get_status_summary(state: GridState, current_price: float) -> str:
         entry_orders = [o for o in open_orders if o.order_role == "entry"]
         exit_orders = [o for o in open_orders if o.order_role == "exit"]
         lines = [
-            f"{prefix}DOGE Pair Bot Status",
+            f"{prefix}{state.pair_display} Pair Bot Status",
             f"Price: ${current_price:.6f}",
             f"Center: ${state.center_price:.6f}",
             f"Open: {open_buys}B + {open_sells}S ({len(entry_orders)} entry, {len(exit_orders)} exit)",
-            f"Entry dist: {config.PAIR_ENTRY_PCT:.2f}% | Profit tgt: {config.PAIR_PROFIT_PCT:.2f}%",
+            f"Entry dist: {state.entry_pct:.2f}% | Profit tgt: {state.profit_pct:.2f}%",
             f"Today: {state.round_trips_today} round trips, ${state.today_profit_usd:.4f} profit",
             f"Lifetime: {state.total_round_trips} round trips, ${state.total_profit_usd:.4f} profit",
             f"Fees paid: ${state.total_fees_usd:.4f}",
@@ -2583,7 +2730,7 @@ def get_status_summary(state: GridState, current_price: float) -> str:
         ratio_src = "manual" if state.trend_ratio_override is not None else "auto"
 
         lines = [
-            f"{prefix}DOGE Grid Bot Status",
+            f"{prefix}{state.pair_display} Grid Bot Status",
             f"Price: ${current_price:.6f}",
             f"Grid center: ${state.center_price:.6f}",
             f"Open orders: {open_buys} buys + {open_sells} sells = {len(open_orders)}",

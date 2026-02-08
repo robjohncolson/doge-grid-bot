@@ -43,7 +43,7 @@ def serialize_state(state: grid_strategy.GridState, current_price: float) -> dic
             "status": o.status,
         }
         if config.STRATEGY_MODE == "pair":
-            order_data["role"] = o.order_role
+            order_data["role"] = getattr(o, "order_role", "")
         orders.append(order_data)
     orders.sort(key=lambda x: x["price"], reverse=True)
 
@@ -53,7 +53,8 @@ def serialize_state(state: grid_strategy.GridState, current_price: float) -> dic
                   if f.get("time", 0) > cutoff and f["side"] == "buy")
     sell_12h = sum(1 for f in state.recent_fills
                    if f.get("time", 0) > cutoff and f["side"] == "sell")
-    if config.STRATEGY_MODE == "pair":
+    is_pair_mode = config.STRATEGY_MODE == "pair"
+    if is_pair_mode:
         n_buys = 1
         n_sells = 1
     else:
@@ -135,17 +136,19 @@ def serialize_state(state: grid_strategy.GridState, current_price: float) -> dic
         },
         "config": {
             "strategy_mode": config.STRATEGY_MODE,
-            "order_size": config.ORDER_SIZE_USD,
+            "order_size": state.pair_config.order_size_usd if state.pair_config else config.ORDER_SIZE_USD,
             "grid_levels": config.GRID_LEVELS,
-            "spacing_pct": config.PAIR_PROFIT_PCT if config.STRATEGY_MODE == "pair" else config.GRID_SPACING_PCT,
+            "spacing_pct": state.profit_pct if is_pair_mode else config.GRID_SPACING_PCT,
             "effective_capital": round(effective_capital, 2),
             "starting_capital": config.STARTING_CAPITAL,
             "ai_interval": config.AI_ADVISOR_INTERVAL,
             "round_trip_fee_pct": config.ROUND_TRIP_FEE_PCT,
             "min_spacing": round(config.ROUND_TRIP_FEE_PCT + 0.1, 2),
-            "pair_entry_pct": config.PAIR_ENTRY_PCT,
-            "pair_profit_pct": config.PAIR_PROFIT_PCT,
-            "pair_refresh_pct": config.PAIR_REFRESH_PCT,
+            "pair_entry_pct": state.entry_pct,
+            "pair_profit_pct": state.profit_pct,
+            "pair_refresh_pct": state.refresh_pct,
+            "pair_name": state.pair_name,
+            "pair_display": state.pair_display,
         },
         "recent_fills": recent,
         "ai_recommendation": state.ai_recommendation or "No recommendation yet",

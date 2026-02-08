@@ -843,7 +843,11 @@ def run_all(state, current_price, ohlc_data=None):
 
 
 def format_for_ai(results):
-    """Format stats as context for the AI advisor prompt."""
+    """Format stats as context for the AI advisor prompt.
+
+    Each analyzer line is prefixed with its verdict in uppercase brackets
+    so the AI can quickly parse signal strength.
+    """
     if not results:
         return ""
 
@@ -854,11 +858,13 @@ def format_for_ai(results):
                  "round_trip_duration"):
         r = results.get(name)
         if r:
-            lines.append(f"- {r['summary']}")
+            verdict = r.get("verdict", "unknown").upper()
+            lines.append(f"- [{verdict}] {r['summary']}")
 
     health = results.get("overall_health", {})
     if health:
-        lines.append(f"OVERALL: {health.get('summary', 'N/A')}")
+        health_verdict = health.get("verdict", "unknown").upper()
+        lines.append(f"OVERALL: [{health_verdict}] {health.get('summary', 'N/A')}")
 
     return "\n".join(lines)
 
