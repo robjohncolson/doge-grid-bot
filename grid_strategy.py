@@ -2116,6 +2116,140 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
 
     placed = 0
 
+    # --- Dual offline fill: detect race condition vs normal round trip ---
+    if last_buy and last_sell:
+        # Sort chronologically
+        if last_buy["time"] <= last_sell["time"]:
+            first, second = last_buy, last_sell
+        else:
+            first, second = last_sell, last_buy
+
+        # Was the second fill an exit for the first?
+        # Check if its price is near the first's profit target.
+        if first["side"] == "buy":
+            expected_exit = first["price"] * (1 + config.PAIR_PROFIT_PCT / 100.0)
+        else:
+            expected_exit = first["price"] * (1 - config.PAIR_PROFIT_PCT / 100.0)
+
+        tol = config.PAIR_PROFIT_PCT / 200.0  # half profit pct as tolerance
+        is_round_trip = (
+            expected_exit > 0
+            and abs(second["price"] - expected_exit) / expected_exit < tol
+        )
+
+        # PnL computation (same for both cases)
+        if first["side"] == "buy":
+            buy_p, sell_p = first["price"], second["price"]
+        else:
+            buy_p, sell_p = second["price"], first["price"]
+
+        close_vol = first["volume"]
+        gross = (sell_p - buy_p) * close_vol
+        fee_buy = buy_p * close_vol * config.MAKER_FEE_PCT / 100.0
+        fee_sell = sell_p * close_vol * config.MAKER_FEE_PCT / 100.0
+        net_profit = gross - fee_buy - fee_sell
+
+        # Book the round trip
+        state.total_profit_usd += net_profit
+        state.today_profit_usd += net_profit
+        state.total_round_trips += 1
+        state.round_trips_today += 1
+        state.total_fees_usd += fee_buy + fee_sell
+        state.today_fees_usd += fee_buy + fee_sell
+        if net_profit < 0:
+            state.today_loss_usd += abs(net_profit)
+
+        # Record both fills
+        state.recent_fills.append({
+            "time": first["time"], "side": first["side"],
+            "price": first["price"], "volume": first["volume"],
+            "profit": 0,
+            "fees": fee_buy if first["side"] == "buy" else fee_sell,
+        })
+        supabase_store.save_fill(state.recent_fills[-1])
+        state.recent_fills.append({
+            "time": second["time"], "side": second["side"],
+            "price": second["price"], "volume": close_vol,
+            "profit": net_profit,
+            "fees": fee_sell if second["side"] == "sell" else fee_buy,
+        })
+        supabase_store.save_fill(state.recent_fills[-1])
+
+        # Cancel any stale open orders before placing new pair
+        _cancel_open_by_role(state, "buy", "entry")
+        _cancel_open_by_role(state, "buy", "exit")
+        _cancel_open_by_role(state, "sell", "entry")
+        _cancel_open_by_role(state, "sell", "exit")
+
+        if is_round_trip:
+            # ---- Normal round trip completed offline ----
+            logger.warning(
+                "OFFLINE ROUND TRIP: %s entry $%.6f -> %s exit $%.6f "
+                "(%.2f DOGE) -> net $%.4f",
+                first["side"].upper(), first["price"],
+                second["side"].upper(), second["price"],
+                close_vol, net_profit,
+            )
+            # Position is flat -- place fresh entry pair
+            buy_entry = round(
+                current_price * (1 - config.PAIR_ENTRY_PCT / 100.0), 6)
+            sell_entry = round(
+                current_price * (1 + config.PAIR_ENTRY_PCT / 100.0), 6)
+            o1 = _place_pair_order(state, "buy", buy_entry, "entry")
+            o2 = _place_pair_order(state, "sell", sell_entry, "entry")
+            placed = (1 if o1 else 0) + (1 if o2 else 0)
+            logger.info(
+                "Offline round trip recovery: placed %d fresh entries "
+                "(B $%.6f / S $%.6f)", placed, buy_entry, sell_entry)
+        else:
+            # ---- Race condition: both entries filled offline ----
+            # Second entry implicitly closed first's position.
+            logger.warning(
+                "OFFLINE RACE CONDITION: %s entry $%.6f + %s entry $%.6f "
+                "(%.2f DOGE) -- second closed first -> net $%.4f",
+                first["side"].upper(), first["price"],
+                second["side"].upper(), second["price"],
+                close_vol, net_profit,
+            )
+            # Place exit for the LATER fill's still-open position
+            if second["side"] == "sell":
+                # Short from sell entry -- buy exit at profit target
+                exit_price = round(
+                    second["price"] * (1 - config.PAIR_PROFIT_PCT / 100.0), 6)
+                o = _place_pair_order(
+                    state, "buy", exit_price, "exit",
+                    matched_sell=second["price"])
+                if o:
+                    placed += 1
+                # Companion: sell entry
+                sell_entry = round(
+                    current_price * (1 + config.PAIR_ENTRY_PCT / 100.0), 6)
+                o = _place_pair_order(state, "sell", sell_entry, "entry")
+                if o:
+                    placed += 1
+            else:
+                # Long from buy entry -- sell exit at profit target
+                exit_price = round(
+                    second["price"] * (1 + config.PAIR_PROFIT_PCT / 100.0), 6)
+                o = _place_pair_order(
+                    state, "sell", exit_price, "exit",
+                    matched_buy=second["price"])
+                if o:
+                    placed += 1
+                # Companion: buy entry
+                buy_entry = round(
+                    current_price * (1 - config.PAIR_ENTRY_PCT / 100.0), 6)
+                o = _place_pair_order(state, "buy", buy_entry, "entry")
+                if o:
+                    placed += 1
+            logger.info(
+                "Offline race recovery: placed %d orders for %s position",
+                placed, second["side"].upper())
+
+        return  # Dual-fill handled -- skip single-fill logic
+
+    # --- Single offline fill (only buy OR only sell) ---
+
     # If there's a recent buy fill but no sell exit on the book, place one
     if last_buy and not has_sell_exit:
         buy_price = last_buy["price"]
