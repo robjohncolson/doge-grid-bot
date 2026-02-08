@@ -490,37 +490,56 @@ INITIAL (2 entries flanking market)
        |
        |--- BUY ENTRY fills -------.
        |                           |
-       |    1. Cancel stale sell entry
-       |    2. SELL = exit at buy_price * (1 + PAIR_PROFIT_PCT)   role=exit
+       |    1. SELL = exit at buy_price * (1 + PAIR_PROFIT_PCT)   role=exit
+       |    2. Keep SELL entry on book (unchanged)
        |                           |
-       |    State: 1 sell exit only (1 order on book)
+       |    State: sell exit + sell entry (2 orders)
        |                           |
-       |    --- SELL EXIT fills (ROUND TRIP) ---
+       |    --- SELL EXIT fills (ROUND TRIP at profit target) ---
        |        1. Record profit, log trade
-       |        2. BUY  = entry at market - PAIR_ENTRY_PCT        role=entry
-       |        3. SELL = entry at market + PAIR_ENTRY_PCT        role=entry
+       |        2. Cancel remaining sell entry
+       |        3. BUY  = entry at market - PAIR_ENTRY_PCT        role=entry
+       |        4. SELL = entry at market + PAIR_ENTRY_PCT        role=entry
+       |        -> Back to INITIAL
+       |                           |
+       |    --- SELL ENTRY fills (implicit close, partial profit) ---
+       |        _close_orphaned_exit() detects orphaned sell exit:
+       |        1. Book PnL: (sell_entry - buy_entry) * vol - fees
+       |        2. Cancel orphaned sell exit
+       |        3. BUY  = entry at market - PAIR_ENTRY_PCT        role=entry
+       |        4. SELL = entry at market + PAIR_ENTRY_PCT        role=entry
        |        -> Back to INITIAL
        |
        |--- SELL ENTRY fills ------.
        |                           |
-       |    1. Cancel stale buy entry
-       |    2. BUY  = exit at sell_price * (1 - PAIR_PROFIT_PCT)  role=exit
+       |    1. BUY  = exit at sell_price * (1 - PAIR_PROFIT_PCT)  role=exit
+       |    2. Keep BUY entry on book (unchanged)
        |                           |
-       |    State: 1 buy exit only (1 order on book)
+       |    State: buy exit + buy entry (2 orders)
        |                           |
-       |    --- BUY EXIT fills (ROUND TRIP) ---
+       |    --- BUY EXIT fills (ROUND TRIP at profit target) ---
        |        1. Record profit, log trade
-       |        2. BUY  = entry at market - PAIR_ENTRY_PCT        role=entry
-       |        3. SELL = entry at market + PAIR_ENTRY_PCT        role=entry
+       |        2. Cancel remaining buy entry
+       |        3. BUY  = entry at market - PAIR_ENTRY_PCT        role=entry
+       |        4. SELL = entry at market + PAIR_ENTRY_PCT        role=entry
+       |        -> Back to INITIAL
+       |                           |
+       |    --- BUY ENTRY fills (implicit close, partial profit) ---
+       |        _close_orphaned_exit() detects orphaned buy exit:
+       |        1. Book PnL: (sell_entry - buy_entry) * vol - fees
+       |        2. Cancel orphaned buy exit
+       |        3. BUY  = entry at market - PAIR_ENTRY_PCT        role=entry
+       |        4. SELL = entry at market + PAIR_ENTRY_PCT        role=entry
        |        -> Back to INITIAL
 ```
 
 ### Key Invariant
 
-Either 2 open orders (both entries, INITIAL state) or 1 open order
-(exit only, waiting for round trip). Entry fills never place a new
-same-side entry -- this eliminates the race condition where both
-entries fill and break the invariant.
+Always exactly 2 open orders. Entry fills keep the opposite-side entry
+and add an exit (2 orders: exit + entry). Exit fills cancel the
+remaining entry and place a fresh pair (2 orders: both entries).
+If the remaining entry fills before the exit (price reversal),
+`_close_orphaned_exit()` books the implicit round trip.
 
 ### Offline Fill Recovery
 
@@ -536,7 +555,6 @@ On restart, trade history shows both fills.
   3. Actual second price $0.0984 != $0.09898 -> RACE CONDITION
   4. Book PnL: ($0.0984 - $0.098) * vol - fees  (uses actual prices)
   5. Place buy exit for sell position: $0.0984 * 0.99
-  6. Place sell entry companion
 ```
 
 If the second fill IS near the expected exit, it's a **normal round trip

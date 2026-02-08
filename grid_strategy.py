@@ -1487,8 +1487,9 @@ def _build_pair_with_position(state: GridState, last_fill: dict,
                               current_price: float) -> list:
     """
     Called by build_pair when recent_fills shows an open position.
-    Ensures exactly 1 exit order on the book. Cancels any stale entries.
+    Ensures exit order is on the book. Keeps opposite-side entry if present.
     Relabels adopted exits that reconciliation misclassified.
+    Cancels same-side entries (shouldn't exist).
     """
     fill_side = last_fill["side"]
     fill_price = last_fill["price"]
@@ -1518,9 +1519,8 @@ def _build_pair_with_position(state: GridState, last_fill: dict,
             exit_found = True
             break
 
-    # Cancel any stale entries (shouldn't exist with open position)
-    _cancel_open_by_role(state, "buy", "entry")
-    _cancel_open_by_role(state, "sell", "entry")
+    # Cancel same-side entries (e.g. stale buy entry after buy fill)
+    _cancel_open_by_role(state, fill_side, "entry")
 
     if not exit_found:
         logger.warning(
@@ -1534,6 +1534,22 @@ def _build_pair_with_position(state: GridState, last_fill: dict,
         logger.info(
             "Position recovery: %s entry $%.6f -- %s exit @ $%.6f on book",
             fill_side.upper(), fill_price, exit_side.upper(), exit_price)
+
+    # Ensure opposite-side entry exists (e.g. sell entry after buy fill)
+    has_opposite_entry = any(
+        o.status == "open" and o.side == exit_side and o.order_role == "entry"
+        for o in state.grid_orders)
+    if not has_opposite_entry:
+        if exit_side == "sell":
+            entry_price = round(
+                current_price * (1 + config.PAIR_ENTRY_PCT / 100.0), 6)
+        else:
+            entry_price = round(
+                current_price * (1 - config.PAIR_ENTRY_PCT / 100.0), 6)
+        logger.info(
+            "Position recovery: placing %s entry @ $%.6f",
+            exit_side.upper(), entry_price)
+        _place_pair_order(state, exit_side, entry_price, "entry")
 
     return [o for o in state.grid_orders if o.status == "open"]
 
@@ -1706,8 +1722,10 @@ def _cancel_open_by_role(state, side, role):
 def handle_pair_fill(state: GridState, filled_orders: list,
                      current_price: float) -> list:
     """
-    Core pair state machine. For each filled order, place the appropriate
-    counter-orders. Entry fills -> exit only. Exit fills -> fresh pair of entries.
+    Core pair state machine. Entry fills -> place exit, keep opposite entry.
+    Exit fills -> cancel remaining entry, place fresh pair of entries.
+    If opposite entry fills while we hold a position, _close_orphaned_exit
+    books the implicit round trip and cancels the now-stale exit.
 
     Returns list of new GridOrder objects placed.
     """
@@ -1718,7 +1736,7 @@ def handle_pair_fill(state: GridState, filled_orders: list,
         is_exit = filled.order_role == "exit"
 
         # ---------------------------------------------------------------
-        # BUY ENTRY fills -> cancel stale sell entry, place sell exit only
+        # BUY ENTRY fills -> place sell exit, keep sell entry on book
         # ---------------------------------------------------------------
         if filled.side == "buy" and is_entry:
             logger.info(
@@ -1737,9 +1755,7 @@ def handle_pair_fill(state: GridState, filled_orders: list,
             })
             supabase_store.save_fill(state.recent_fills[-1])
 
-            # Cancel any existing sell entry (stale)
-            _cancel_open_by_role(state, "sell", "entry")
-            # Race condition: if both entries filled, close the orphaned position
+            # If both entries filled (sell entry also filled), close orphaned position
             _close_orphaned_exit(state, filled)
 
             # Place sell exit at profit target
@@ -1752,7 +1768,7 @@ def handle_pair_fill(state: GridState, filled_orders: list,
                 new_orders.append(o)
 
         # ---------------------------------------------------------------
-        # SELL EXIT fills -> round trip complete! place fresh pair of entries
+        # SELL EXIT fills -> round trip! cancel sell entry, place fresh pair
         # ---------------------------------------------------------------
         elif filled.side == "sell" and is_exit:
             buy_price = filled.matched_buy_price
@@ -1803,7 +1819,9 @@ def handle_pair_fill(state: GridState, filled_orders: list,
             })
             supabase_store.save_fill(state.recent_fills[-1])
 
-            # Round trip complete -- place fresh pair of entries
+            # Round trip complete -- cancel remaining sell entry, place fresh pair
+            _cancel_open_by_role(state, "sell", "entry")
+
             buy_entry_price = round(
                 current_price * (1 - config.PAIR_ENTRY_PCT / 100.0), 6)
             o = _place_pair_order(state, "buy", buy_entry_price, "entry")
@@ -1817,7 +1835,7 @@ def handle_pair_fill(state: GridState, filled_orders: list,
                 new_orders.append(o)
 
         # ---------------------------------------------------------------
-        # SELL ENTRY fills -> cancel stale buy entry, place buy exit only
+        # SELL ENTRY fills -> place buy exit, keep buy entry on book
         # ---------------------------------------------------------------
         elif filled.side == "sell" and is_entry:
             logger.info(
@@ -1836,9 +1854,7 @@ def handle_pair_fill(state: GridState, filled_orders: list,
             })
             supabase_store.save_fill(state.recent_fills[-1])
 
-            # Cancel any existing buy entry (stale)
-            _cancel_open_by_role(state, "buy", "entry")
-            # Race condition: if both entries filled, close the orphaned position
+            # If both entries filled (buy entry also filled), close orphaned position
             _close_orphaned_exit(state, filled)
 
             # Place buy exit at profit target
@@ -1851,7 +1867,7 @@ def handle_pair_fill(state: GridState, filled_orders: list,
                 new_orders.append(o)
 
         # ---------------------------------------------------------------
-        # BUY EXIT fills -> round trip complete! place fresh pair of entries
+        # BUY EXIT fills -> round trip! cancel buy entry, place fresh pair
         # ---------------------------------------------------------------
         elif filled.side == "buy" and is_exit:
             sell_price = filled.matched_sell_price
@@ -1902,7 +1918,9 @@ def handle_pair_fill(state: GridState, filled_orders: list,
             })
             supabase_store.save_fill(state.recent_fills[-1])
 
-            # Round trip complete -- place fresh pair of entries
+            # Round trip complete -- cancel remaining buy entry, place fresh pair
+            _cancel_open_by_role(state, "buy", "entry")
+
             buy_entry_price = round(
                 current_price * (1 - config.PAIR_ENTRY_PCT / 100.0), 6)
             o = _place_pair_order(state, "buy", buy_entry_price, "entry")
