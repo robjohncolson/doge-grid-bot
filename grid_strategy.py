@@ -1928,7 +1928,163 @@ def reconcile_pair_on_startup(state: GridState, current_price: float) -> int:
         "Pair reconciliation: %d adopted, %d orphans cancelled",
         adopted, orphans,
     )
+
+    # Check trade history for fills that happened while bot was offline
+    _reconcile_offline_fills(state, current_price)
+
     return adopted
+
+
+def _reconcile_offline_fills(state: GridState, current_price: float):
+    """
+    Check recent trade history for XDGUSD fills that happened while the
+    bot was offline.  If a buy filled but no sell exit exists on the book,
+    place one.  Same for sell fills with no buy exit.
+
+    This closes the gap where a fill between deploys was invisible because
+    startup reconciliation only looks at open orders.
+    """
+    try:
+        # Look back 6 hours of trade history
+        trades = kraken_client.get_trades_history(
+            start=time.time() - 21600)
+    except Exception as e:
+        logger.warning("Offline fill check: trade history failed: %s", e)
+        return
+
+    if not trades:
+        logger.info("Offline fill check: no recent trades")
+        return
+
+    # Filter to XDGUSD trades only
+    doge_trades = []
+    for trade_txid, info in trades.items():
+        pair = info.get("pair", "")
+        if "XDG" not in pair.upper() and "DOGE" not in pair.upper():
+            continue
+        doge_trades.append({
+            "txid": trade_txid,
+            "ordertxid": info.get("ordertxid", ""),
+            "side": info.get("type", ""),
+            "price": float(info.get("price", 0)),
+            "volume": float(info.get("vol", 0)),
+            "time": float(info.get("time", 0)),
+        })
+
+    if not doge_trades:
+        logger.info("Offline fill check: no XDGUSD trades in last 6h")
+        return
+
+    # Sort by time (oldest first)
+    doge_trades.sort(key=lambda t: t["time"])
+    logger.info(
+        "Offline fill check: found %d XDGUSD trades in last 6h",
+        len(doge_trades),
+    )
+
+    # Check what's currently on the book
+    open_orders = [o for o in state.grid_orders if o.status == "open"]
+    has_sell_exit = any(
+        o.side == "sell" and o.order_role == "exit" for o in open_orders)
+    has_buy_exit = any(
+        o.side == "buy" and o.order_role == "exit" for o in open_orders)
+
+    # Find the most recent buy and sell trades
+    last_buy = None
+    last_sell = None
+    for t in doge_trades:
+        if t["side"] == "buy":
+            last_buy = t
+        elif t["side"] == "sell":
+            last_sell = t
+
+    placed = 0
+
+    # If there's a recent buy fill but no sell exit on the book, place one
+    if last_buy and not has_sell_exit:
+        buy_price = last_buy["price"]
+        exit_price = round(buy_price * (1 + config.PAIR_PROFIT_PCT / 100.0), 6)
+        logger.warning(
+            "OFFLINE FILL RECOVERY: Buy filled @ $%.6f (%.2f DOGE) at %s "
+            "-- placing sell exit @ $%.6f",
+            buy_price, last_buy["volume"],
+            datetime.fromtimestamp(last_buy["time"], timezone.utc)
+                .strftime("%Y-%m-%d %H:%M UTC"),
+            exit_price,
+        )
+        # Cancel any stale sell entry first (we need the sell slot for exit)
+        _cancel_open_by_role(state, "sell", "entry")
+        o = _place_pair_order(
+            state, "sell", exit_price, "exit", matched_buy=buy_price)
+        if o:
+            placed += 1
+            # Track the buy fill fee
+            buy_fee = buy_price * last_buy["volume"] * config.MAKER_FEE_PCT / 100.0
+            state.total_fees_usd += buy_fee
+            state.today_fees_usd += buy_fee
+            state.recent_fills.append({
+                "time": last_buy["time"], "side": "buy",
+                "price": buy_price, "volume": last_buy["volume"],
+                "profit": 0, "fees": buy_fee,
+            })
+            supabase_store.save_fill(state.recent_fills[-1])
+
+        # Also place a new sell entry if we don't have one
+        has_sell_entry = any(
+            o.side == "sell" and o.order_role == "entry"
+            for o in state.grid_orders if o.status == "open")
+        if not has_sell_entry:
+            entry_price = round(
+                current_price * (1 + config.PAIR_ENTRY_PCT / 100.0), 6)
+            o = _place_pair_order(state, "sell", entry_price, "entry")
+            if o:
+                placed += 1
+
+    # If there's a recent sell fill but no buy exit on the book, place one
+    if last_sell and not has_buy_exit:
+        sell_price = last_sell["price"]
+        exit_price = round(
+            sell_price * (1 - config.PAIR_PROFIT_PCT / 100.0), 6)
+        logger.warning(
+            "OFFLINE FILL RECOVERY: Sell filled @ $%.6f (%.2f DOGE) at %s "
+            "-- placing buy exit @ $%.6f",
+            sell_price, last_sell["volume"],
+            datetime.fromtimestamp(last_sell["time"], timezone.utc)
+                .strftime("%Y-%m-%d %H:%M UTC"),
+            exit_price,
+        )
+        # Cancel any stale buy entry first
+        _cancel_open_by_role(state, "buy", "entry")
+        o = _place_pair_order(
+            state, "buy", exit_price, "exit", matched_sell=sell_price)
+        if o:
+            placed += 1
+            # Track the sell fill fee
+            sell_fee = sell_price * last_sell["volume"] * config.MAKER_FEE_PCT / 100.0
+            state.total_fees_usd += sell_fee
+            state.today_fees_usd += sell_fee
+            state.recent_fills.append({
+                "time": last_sell["time"], "side": "sell",
+                "price": sell_price, "volume": last_sell["volume"],
+                "profit": 0, "fees": sell_fee,
+            })
+            supabase_store.save_fill(state.recent_fills[-1])
+
+        # Also place a new buy entry if we don't have one
+        has_buy_entry = any(
+            o.side == "buy" and o.order_role == "entry"
+            for o in state.grid_orders if o.status == "open")
+        if not has_buy_entry:
+            entry_price = round(
+                current_price * (1 - config.PAIR_ENTRY_PCT / 100.0), 6)
+            o = _place_pair_order(state, "buy", entry_price, "entry")
+            if o:
+                placed += 1
+
+    if placed:
+        logger.info("Offline fill recovery: placed %d orders", placed)
+    else:
+        logger.info("Offline fill check: no unhandled fills found")
 
 
 def get_status_summary(state: GridState, current_price: float) -> str:

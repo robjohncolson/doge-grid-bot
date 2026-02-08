@@ -305,6 +305,27 @@ orders silently disappear from the response.
    as covered
            │
            ▼
+┌──────────────────────────────┐
+│  OFFLINE FILL RECOVERY       │  (pair mode only)
+│  get_trades_history(6h)      │
+└──────────┬───────────────────┘
+           │
+     for XDGUSD trades:
+           │
+    ┌──────┴────────┐
+    │               │
+    ▼               ▼
+ buy filled,     sell filled,
+ no sell exit    no buy exit
+ on book         on book
+    │               │
+    ▼               ▼
+ cancel sell     cancel buy
+ entry, place    entry, place
+ sell EXIT at    buy EXIT at
+ buy*(1+PCT)     sell*(1-PCT)
+           │
+           ▼
 ┌──────────────────────┐
 │  build_grid()        │  only places orders for uncovered levels
 └──────────────────────┘
