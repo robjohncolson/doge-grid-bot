@@ -384,3 +384,76 @@ When that sell fills at $0.0900:
 | MAIN_LOOP | DRIFT_RESET | price drift >= 5% | cancel + rebuild |
 | MAIN_LOOP | RATIO_REBUILD | trend ratio shift >= 0.2 | cancel + rebuild |
 | SHUTDOWN | EXIT | always | save, cancel orders, notify |
+
+## 9. Pair Strategy State Machine (`STRATEGY_MODE=pair`)
+
+In pair mode the bot maintains exactly 2 open orders (1 buy + 1 sell).
+Each order has an `order_role`: **entry** (flanking market price) or
+**exit** (profit target for a filled entry).
+
+### Config Parameters
+
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| `PAIR_ENTRY_PCT` | 0.2% | Distance from market for entry orders |
+| `PAIR_PROFIT_PCT` | 1.0% | Profit target distance from fill price |
+| `PAIR_REFRESH_PCT` | 1.0% | Max drift before stale entry is refreshed |
+
+### Initial State (no position)
+
+```
+  market price
+       |
+  SELL entry  = market * (1 + PAIR_ENTRY_PCT)     role=entry
+  BUY  entry  = market * (1 - PAIR_ENTRY_PCT)     role=entry
+```
+
+### State Transitions
+
+```
+INITIAL (2 entries flanking market)
+       |
+       |--- BUY ENTRY fills -------.
+       |                           |
+       |    1. Cancel stale sell entry
+       |    2. SELL = exit at buy_price * (1 + PAIR_PROFIT_PCT)   role=exit
+       |    3. BUY  = entry at market - PAIR_ENTRY_PCT            role=entry
+       |                           |
+       |    State: 1 buy entry + 1 sell exit
+       |                           |
+       |    --- SELL EXIT fills (ROUND TRIP) ---
+       |        1. Record profit, log trade
+       |        2. SELL = entry at market + PAIR_ENTRY_PCT        role=entry
+       |        3. Refresh BUY entry if stale (> PAIR_REFRESH_PCT from market)
+       |        -> Back to INITIAL
+       |
+       |--- SELL ENTRY fills ------.
+       |                           |
+       |    1. Cancel stale buy entry
+       |    2. BUY  = exit at sell_price * (1 - PAIR_PROFIT_PCT)  role=exit
+       |    3. SELL = entry at market + PAIR_ENTRY_PCT             role=entry
+       |                           |
+       |    State: 1 sell entry + 1 buy exit
+       |                           |
+       |    --- BUY EXIT fills (ROUND TRIP) ---
+       |        1. Record profit, log trade
+       |        2. BUY  = entry at market - PAIR_ENTRY_PCT        role=entry
+       |        3. Refresh SELL entry if stale (> PAIR_REFRESH_PCT from market)
+       |        -> Back to INITIAL
+```
+
+### Key Invariant
+
+Always exactly 2 open orders. Entry orders refresh when they drift
+more than `PAIR_REFRESH_PCT` from market. Exit orders never move
+(profit target is fixed at the fill price).
+
+### Pair vs Grid Comparison
+
+| Aspect | Grid Mode | Pair Mode |
+|--------|-----------|-----------|
+| Open orders | 20-40 | exactly 2 |
+| Max exposure | ~$35 (all buys) | ~$3.50 (1 order) |
+| Order roles | implicit (level-based) | explicit (entry/exit) |
+| Trend ratio | adjusts buy/sell split | N/A |
+| Dashboard UI | Grid Ladder, Trend Ratio, Spacing | Active Orders, Role column, Profit target |
