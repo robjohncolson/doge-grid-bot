@@ -326,19 +326,28 @@ orders silently disappear from the response.
     │   buy*(1+PCT)     sell*(1-PCT)
     │
     ▼
- DUAL-FILL DETECTION
+ STEP 1: FILTER ALREADY-PROCESSED
+    │   skip trades matching recent_fills (price+time)
     │
-    ├── 2nd price near 1st's profit target?
+    ▼
+ STEP 2: CLASSIFY EXIT vs ENTRY
+    │   match fill price against known positions
+    │   in recent_fills (e.g. buy at sell*0.99 = exit)
+    │
+    ├── fill matches known position exit?
     │      │
-    │     YES ──► OFFLINE ROUND TRIP
-    │              book PnL from actual fill prices
-    │              place fresh entry pair (position flat)
+    │     YES ──► OFFLINE EXIT + ENTRY
+    │              book round trip for exit fill
+    │              place exit order for new entry fill
     │      │
-    │      NO ──► OFFLINE RACE CONDITION
-    │              2nd entry closed 1st's position
-    │              book PnL: (sell_price - buy_price) * vol
-    │              place exit for LATER fill's position only
-    │              place companion entry
+    │      NO ──► DUAL-FILL DETECTION
+    │              │
+    │              ├── 2nd near 1st's profit target?
+    │              │     YES ──► OFFLINE ROUND TRIP
+    │              │              book PnL, place fresh pair
+    │              │     NO  ──► OFFLINE RACE CONDITION
+    │              │              book implicit close
+    │              │              exit for later fill only
            │
            ▼
 ┌──────────────────────┐
