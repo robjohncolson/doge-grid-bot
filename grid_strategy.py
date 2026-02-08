@@ -1396,7 +1396,7 @@ def validate_pair_config(current_price: float) -> bool:
     if doge_per_order < ORDERMIN_DOGE:
         msg = (
             "ORDER_SIZE_USD $%.2f = %.1f DOGE at $%.6f -- below Kraken min %d DOGE "
-            "(adapt_grid_params will fix this)" % (
+            "(will be floored at build time)" % (
                 config.ORDER_SIZE_USD, doge_per_order, current_price, ORDERMIN_DOGE))
         logger.warning(msg)
         warnings.append(msg)
@@ -1419,8 +1419,10 @@ def build_pair(state: GridState, current_price: float) -> list:
 
     Returns the list of placed GridOrder objects (up to 2).
     """
-    # Reuse adaptive sizing for ORDER_SIZE_USD
-    adapt_grid_params(state, current_price)
+    # Pair mode: keep user's ORDER_SIZE_USD but floor at Kraken minimums.
+    # No grid-level capital budgeting (only 2 orders, not 40).
+    min_by_volume = ORDERMIN_DOGE * current_price * 1.2
+    config.ORDER_SIZE_USD = max(config.ORDER_SIZE_USD, min_by_volume, COSTMIN_USD)
 
     state.center_price = current_price
 
@@ -1503,6 +1505,116 @@ def _place_pair_order(state, side, price, role, matched_buy=None,
         return None
 
 
+def _close_orphaned_exit(state, filled_entry):
+    """
+    Race condition: both entries filled before the bot could cancel one.
+    The second entry implicitly closes the position opened by the first.
+
+    Example: buy entry fills, places sell exit. Before bot cancels the sell
+    entry, it also fills. Now there's an orphaned sell exit for a long
+    position that was effectively closed by the sell entry fill.
+
+    This function finds the orphan, books the implicit round trip PnL,
+    marks the original entry closed out, logs the trade, and cancels
+    the now-unnecessary exit order.
+
+    The orphaned exit is always on the SAME side as the entry that just
+    filled (sell entry -> orphaned sell exit, buy entry -> orphaned buy exit).
+    """
+    # Look for an orphaned exit on the same side as this entry
+    orphan = None
+    for o in state.grid_orders:
+        if (o.status == "open" and o.side == filled_entry.side
+                and o.order_role == "exit"):
+            orphan = o
+            break
+
+    if orphan is None:
+        return  # No race condition -- normal case
+
+    # Determine cost basis from the orphaned exit's pairing info
+    if filled_entry.side == "sell":
+        # Sell entry closed a long. Orphan (sell exit) has matched_buy_price.
+        cost_basis = orphan.matched_buy_price
+        original_entry_side = "buy"
+    else:
+        # Buy entry closed a short. Orphan (buy exit) has matched_sell_price.
+        cost_basis = orphan.matched_sell_price
+        original_entry_side = "sell"
+
+    if cost_basis is None:
+        logger.warning(
+            "Orphaned %s exit @ $%.6f has no cost basis -- cancelling unbooked",
+            filled_entry.side.upper(), orphan.price,
+        )
+        _cancel_open_by_role(state, filled_entry.side, "exit")
+        return
+
+    # Find original entry fill volume from recent_fills
+    close_vol = None
+    for rf in reversed(state.recent_fills):
+        if (rf["side"] == original_entry_side
+                and rf.get("profit", 0) == 0
+                and abs(rf["price"] - cost_basis) < 1e-6):
+            close_vol = rf["volume"]
+            break
+    if close_vol is None:
+        close_vol = min(filled_entry.volume, orphan.volume)
+
+    # Compute PnL (same formula as normal round trip)
+    if filled_entry.side == "sell":
+        # Long closed: bought at cost_basis, sold at fill price
+        buy_p, sell_p = cost_basis, filled_entry.price
+    else:
+        # Short closed: sold at cost_basis, bought at fill price
+        buy_p, sell_p = filled_entry.price, cost_basis
+
+    gross = (sell_p - buy_p) * close_vol
+    fees = (buy_p * close_vol + sell_p * close_vol) * config.MAKER_FEE_PCT / 100.0
+    net_profit = gross - fees
+
+    # Book the round trip
+    state.total_profit_usd += net_profit
+    state.today_profit_usd += net_profit
+    state.total_round_trips += 1
+    state.round_trips_today += 1
+    # Don't add to fee totals -- both entry fills already tracked their leg fees
+    if net_profit < 0:
+        state.today_loss_usd += abs(net_profit)
+
+    # Mark the original entry as closed out
+    for o2 in state.grid_orders:
+        if (o2.side == original_entry_side and o2.status == "filled"
+                and not o2.closed_out
+                and abs(o2.price - cost_basis) < 1e-9):
+            o2.closed_out = True
+            break
+
+    logger.warning(
+        "RACE CLOSE: %s entry $%.6f implicitly closed %s "
+        "(cost $%.6f, %.2f DOGE) -> net $%.4f "
+        "(intended exit $%.6f cancelled)",
+        filled_entry.side.upper(), filled_entry.price,
+        "long" if filled_entry.side == "sell" else "short",
+        cost_basis, close_vol, net_profit, orphan.price,
+    )
+
+    # Log trade and fill record for the implicit close
+    _log_trade(filled_entry, net_profit, fees)
+    state.recent_fills.append({
+        "time": time.time(),
+        "side": filled_entry.side,
+        "price": filled_entry.price,
+        "volume": close_vol,
+        "profit": net_profit,
+        "fees": fees,
+    })
+    supabase_store.save_fill(state.recent_fills[-1])
+
+    # Cancel the orphaned exit order
+    _cancel_open_by_role(state, filled_entry.side, "exit")
+
+
 def _cancel_open_by_role(state, side, role):
     """Cancel all open orders matching side+role. Returns count cancelled."""
     cancelled = 0
@@ -1561,6 +1673,8 @@ def handle_pair_fill(state: GridState, filled_orders: list,
 
             # Cancel any existing sell entry (stale)
             _cancel_open_by_role(state, "sell", "entry")
+            # Race condition: if both entries filled, close the orphaned position
+            _close_orphaned_exit(state, filled)
 
             # Place sell exit at profit target
             exit_price = round(
@@ -1660,6 +1774,8 @@ def handle_pair_fill(state: GridState, filled_orders: list,
 
             # Cancel any existing buy entry (stale)
             _cancel_open_by_role(state, "buy", "entry")
+            # Race condition: if both entries filled, close the orphaned position
+            _close_orphaned_exit(state, filled)
 
             # Place buy exit at profit target
             exit_price = round(

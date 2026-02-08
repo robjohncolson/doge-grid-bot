@@ -196,10 +196,11 @@ def _t_critical(df):
 
 _GREEN = {
     "significant_profit", "symmetric", "contained", "normal", "mean_reverting",
+    "well_tuned", "fast",
 }
 _RED = {
     "significant_loss", "trend_detected", "high_risk", "high_vol",
-    "low_vol", "momentum",
+    "low_vol", "momentum", "high_volatility", "low_volatility", "slow",
 }
 # everything else -> yellow
 
@@ -312,10 +313,17 @@ def analyze_fill_asymmetry(recent_fills, window_seconds=43200):
     ci_hi = min(1, center + margin)
 
     if p_value < 0.05:
-        direction = "buys (price falling)" if buys > sells else "sells (price rising)"
         verdict = "trend_detected"
         conf = "high" if p_value < 0.01 else "medium"
-        summary = f"Asymmetric: {buys}B/{sells}S ({p_hat:.0%} buy), p={p_value:.3f} -- skewed toward {direction}"
+        if config.STRATEGY_MODE == "pair":
+            if buys > sells:
+                direction = "Buy entries filling more often -- price trending down"
+            else:
+                direction = "Sell entries filling more often -- price trending up"
+            summary = f"Asymmetric: {buys}B/{sells}S ({p_hat:.0%} buy), p={p_value:.3f} -- {direction}"
+        else:
+            direction = "buys (price falling)" if buys > sells else "sells (price rising)"
+            summary = f"Asymmetric: {buys}B/{sells}S ({p_hat:.0%} buy), p={p_value:.3f} -- skewed toward {direction}"
     else:
         verdict = "symmetric"
         conf = "medium" if n >= 20 else "low"
@@ -403,6 +411,76 @@ def analyze_grid_exceedance(grid_orders, ohlc_data):
         "exceedance_pct": round(pct, 1), "worst_breach_pct": round(worst, 2),
         "grid_low": round(grid_lo, 6), "grid_high": round(grid_hi, 6),
         "above": above, "below": below,
+    })
+
+
+# ============================================================================
+# Analyzer 3b: Volatility vs targets (pair mode replacement for exceedance)
+# ============================================================================
+
+def analyze_volatility_vs_targets(ohlc_data):
+    """
+    Pair mode: compare OHLC candle ranges to PAIR_ENTRY_PCT and PAIR_PROFIT_PCT.
+    Answers: is current volatility right for my entry/exit targets?
+    """
+    if not ohlc_data:
+        return _result("volatility_targets", "no_data", "none",
+                        "No OHLC data available", {})
+
+    entry_pct = config.PAIR_ENTRY_PCT
+    profit_pct = config.PAIR_PROFIT_PCT
+    ranges = []
+
+    for candle in ohlc_data:
+        try:
+            high = float(candle[2])
+            low = float(candle[3])
+        except (IndexError, ValueError, TypeError):
+            continue
+        if low > 0:
+            ranges.append((high - low) / low * 100)
+
+    if len(ranges) < 10:
+        return _result("volatility_targets", "no_data", "none",
+                        f"Need >= 10 candles (have {len(ranges)})", {})
+
+    ranges.sort()
+    n = len(ranges)
+    median = ranges[n // 2] if n % 2 else (ranges[n // 2 - 1] + ranges[n // 2]) / 2
+    mean_range = sum(ranges) / n
+
+    entry_reachable = sum(1 for r in ranges if r >= entry_pct)
+    exit_reachable = sum(1 for r in ranges if r >= profit_pct)
+    entry_reach_pct = entry_reachable / n * 100
+    exit_reach_pct = exit_reachable / n * 100
+
+    if median < entry_pct:
+        verdict = "low_volatility"
+        conf = "high" if n >= 50 else "medium"
+        summary = (f"Low vol: median candle range {median:.3f}% < entry target "
+                   f"{entry_pct:.2f}% -- entries won't fill often "
+                   f"({entry_reach_pct:.0f}% of candles reach entry)")
+    elif median > profit_pct:
+        verdict = "high_volatility"
+        conf = "high" if n >= 50 else "medium"
+        summary = (f"High vol: median candle range {median:.3f}% > profit target "
+                   f"{profit_pct:.2f}% -- profits at risk of reversal "
+                   f"({exit_reach_pct:.0f}% of candles reach exit)")
+    else:
+        verdict = "well_tuned"
+        conf = "high" if n >= 50 else "medium"
+        summary = (f"Well tuned: median range {median:.3f}% fits between "
+                   f"entry {entry_pct:.2f}% and profit {profit_pct:.2f}% "
+                   f"({entry_reach_pct:.0f}% reach entry, {exit_reach_pct:.0f}% reach exit)")
+
+    return _result("volatility_targets", verdict, conf, summary, {
+        "median_range_pct": round(median, 4),
+        "mean_range_pct": round(mean_range, 4),
+        "entry_pct": entry_pct,
+        "profit_pct": profit_pct,
+        "entry_reachable_pct": round(entry_reach_pct, 1),
+        "exit_reachable_pct": round(exit_reach_pct, 1),
+        "total_candles": n,
     })
 
 
@@ -566,6 +644,83 @@ def analyze_random_walk(recent_fills, center_price, spacing_pct, max_levels):
 
 
 # ============================================================================
+# Analyzer 5b: Round trip duration (pair mode replacement for random walk)
+# ============================================================================
+
+def analyze_round_trip_duration(recent_fills):
+    """
+    Pair mode: measure time between entry fill and exit fill for completed
+    round trips. Entry = profit==0, exit = profit!=0.
+    """
+    # Pair round trips: entry (profit=0) followed by exit (profit!=0)
+    # Walk fills chronologically, match entries to their next exit
+    fills_chrono = sorted(
+        [f for f in recent_fills if f.get("time", 0) > 0],
+        key=lambda f: f["time"],
+    )
+
+    durations = []
+    pending_entry = None
+
+    for f in fills_chrono:
+        profit = f.get("profit", 0)
+        if profit == 0:
+            # This is an entry fill -- start a new potential round trip
+            pending_entry = f
+        elif pending_entry is not None:
+            # This is an exit fill -- complete the round trip
+            dt = f["time"] - pending_entry["time"]
+            if dt > 0:
+                durations.append(dt)
+            pending_entry = None
+
+    n = len(durations)
+    if n < 3:
+        return _result("round_trip_duration", "insufficient_data", "none",
+                        f"Need >= 3 completed round trips (have {n})",
+                        {"n": n, "min_needed": 3})
+
+    durations.sort()
+    mean_dur = sum(durations) / n
+    median_dur = durations[n // 2] if n % 2 else (durations[n // 2 - 1] + durations[n // 2]) / 2
+    min_dur = durations[0]
+    max_dur = durations[-1]
+
+    # Convert to minutes for display
+    mean_min = mean_dur / 60
+    median_min = median_dur / 60
+    min_min = min_dur / 60
+    max_min = max_dur / 60
+
+    if median_min < 5:
+        verdict = "fast"
+        conf = "high" if n >= 10 else "medium"
+        summary = (f"Fast: median {median_min:.1f} min/trip "
+                   f"(mean {mean_min:.1f}, range {min_min:.1f}-{max_min:.1f}) "
+                   f"-- high activity, {n} trips")
+    elif median_min <= 60:
+        verdict = "normal"
+        conf = "high" if n >= 10 else "medium"
+        summary = (f"Normal: median {median_min:.1f} min/trip "
+                   f"(mean {mean_min:.1f}, range {min_min:.1f}-{max_min:.1f}) "
+                   f"-- expected pace, {n} trips")
+    else:
+        verdict = "slow"
+        conf = "high" if n >= 10 else "medium"
+        summary = (f"Slow: median {median_min:.1f} min/trip "
+                   f"(mean {mean_min:.1f}, range {min_min:.1f}-{max_min:.1f}) "
+                   f"-- consider tightening targets, {n} trips")
+
+    return _result("round_trip_duration", verdict, conf, summary, {
+        "n": n,
+        "mean_minutes": round(mean_min, 1),
+        "median_minutes": round(median_min, 1),
+        "min_minutes": round(min_min, 1),
+        "max_minutes": round(max_min, 1),
+    })
+
+
+# ============================================================================
 # Overall strategy health
 # ============================================================================
 
@@ -573,22 +728,47 @@ def _compute_health(results):
     """Derive an overall verdict from the 5 analyzers."""
     v = {r["name"]: r["verdict"] for r in results.values() if isinstance(r, dict) and "name" in r}
 
-    if v.get("random_walk") == "momentum":
-        return {"verdict": "unfavorable", "color": "red",
-                "summary": "Momentum market -- grid strategy disadvantaged"}
-    if v.get("fill_rate") in ("high_vol",) and v.get("fill_asymmetry") == "trend_detected":
-        return {"verdict": "dangerous", "color": "red",
-                "summary": "High volatility + trending -- consider pausing"}
-    if v.get("grid_exceedance") == "high_risk":
-        return {"verdict": "exposed", "color": "red",
-                "summary": "Price regularly escaping grid range -- widen grid or increase levels"}
-    if v.get("random_walk") == "mean_reverting":
-        return {"verdict": "favorable", "color": "green",
-                "summary": "Mean-reverting market -- grid strategy has statistical edge"}
+    is_pair = config.STRATEGY_MODE == "pair"
+
+    if is_pair:
+        # Pair mode health: use pair-specific analyzer names
+        if v.get("round_trip_duration") == "slow":
+            return {"verdict": "unfavorable", "color": "red",
+                    "summary": "Round trips are slow -- consider tightening entry or profit targets"}
+        if v.get("fill_rate") in ("high_vol",) and v.get("fill_asymmetry") == "trend_detected":
+            return {"verdict": "dangerous", "color": "red",
+                    "summary": "High volatility + trending -- consider pausing"}
+        if v.get("volatility_targets") == "high_volatility":
+            return {"verdict": "exposed", "color": "red",
+                    "summary": "Volatility exceeds profit target -- profits at risk of reversal"}
+        if v.get("volatility_targets") == "low_volatility":
+            return {"verdict": "unfavorable", "color": "red",
+                    "summary": "Volatility below entry distance -- entries won't fill often"}
+        if v.get("round_trip_duration") == "fast":
+            return {"verdict": "favorable", "color": "green",
+                    "summary": "Fast round trips -- pair strategy is performing well"}
+        if v.get("volatility_targets") == "well_tuned":
+            return {"verdict": "favorable", "color": "green",
+                    "summary": "Volatility matches entry/exit targets -- well configured"}
+    else:
+        # Grid mode health: original logic
+        if v.get("random_walk") == "momentum":
+            return {"verdict": "unfavorable", "color": "red",
+                    "summary": "Momentum market -- grid strategy disadvantaged"}
+        if v.get("fill_rate") in ("high_vol",) and v.get("fill_asymmetry") == "trend_detected":
+            return {"verdict": "dangerous", "color": "red",
+                    "summary": "High volatility + trending -- consider pausing"}
+        if v.get("grid_exceedance") == "high_risk":
+            return {"verdict": "exposed", "color": "red",
+                    "summary": "Price regularly escaping grid range -- widen grid or increase levels"}
+        if v.get("random_walk") == "mean_reverting":
+            return {"verdict": "favorable", "color": "green",
+                    "summary": "Mean-reverting market -- grid strategy has statistical edge"}
+
     if v.get("profitability") == "significant_profit":
         return {"verdict": "profitable", "color": "green",
                 "summary": "Statistically significant profits confirmed"}
-    if all(v.get(k) == "insufficient_data" for k in v):
+    if all(v.get(k) in ("insufficient_data", "no_data") for k in v):
         return {"verdict": "calibrating", "color": "yellow",
                 "summary": "Collecting data -- need more fills for analysis"}
     return {"verdict": "neutral", "color": "yellow",
@@ -603,8 +783,10 @@ def run_all(state, current_price, ohlc_data=None):
     """
     Run all 5 analyzers and return a dict of results.
     Called periodically from the main loop (every 60s).
+    Pair mode swaps analyzers 3 and 5 for pair-specific versions.
     """
     results = {}
+    is_pair = config.STRATEGY_MODE == "pair"
 
     try:
         results["profitability"] = analyze_profitability(state.recent_fills)
@@ -618,12 +800,20 @@ def run_all(state, current_price, ohlc_data=None):
         logger.debug("Analyzer fill_asymmetry error: %s", e)
         results["fill_asymmetry"] = _result("fill_asymmetry", "error", "none", str(e), {})
 
-    try:
-        results["grid_exceedance"] = analyze_grid_exceedance(
-            state.grid_orders, ohlc_data)
-    except Exception as e:
-        logger.debug("Analyzer grid_exceedance error: %s", e)
-        results["grid_exceedance"] = _result("grid_exceedance", "error", "none", str(e), {})
+    # Analyzer 3: pair mode uses volatility_vs_targets, grid mode uses grid_exceedance
+    if is_pair:
+        try:
+            results["volatility_targets"] = analyze_volatility_vs_targets(ohlc_data)
+        except Exception as e:
+            logger.debug("Analyzer volatility_targets error: %s", e)
+            results["volatility_targets"] = _result("volatility_targets", "error", "none", str(e), {})
+    else:
+        try:
+            results["grid_exceedance"] = analyze_grid_exceedance(
+                state.grid_orders, ohlc_data)
+        except Exception as e:
+            logger.debug("Analyzer grid_exceedance error: %s", e)
+            results["grid_exceedance"] = _result("grid_exceedance", "error", "none", str(e), {})
 
     try:
         results["fill_rate"] = analyze_fill_rate(state.recent_fills)
@@ -631,13 +821,21 @@ def run_all(state, current_price, ohlc_data=None):
         logger.debug("Analyzer fill_rate error: %s", e)
         results["fill_rate"] = _result("fill_rate", "error", "none", str(e), {})
 
-    try:
-        results["random_walk"] = analyze_random_walk(
-            state.recent_fills, state.center_price,
-            config.GRID_SPACING_PCT, config.GRID_LEVELS)
-    except Exception as e:
-        logger.debug("Analyzer random_walk error: %s", e)
-        results["random_walk"] = _result("random_walk", "error", "none", str(e), {})
+    # Analyzer 5: pair mode uses round_trip_duration, grid mode uses random_walk
+    if is_pair:
+        try:
+            results["round_trip_duration"] = analyze_round_trip_duration(state.recent_fills)
+        except Exception as e:
+            logger.debug("Analyzer round_trip_duration error: %s", e)
+            results["round_trip_duration"] = _result("round_trip_duration", "error", "none", str(e), {})
+    else:
+        try:
+            results["random_walk"] = analyze_random_walk(
+                state.recent_fills, state.center_price,
+                config.GRID_SPACING_PCT, config.GRID_LEVELS)
+        except Exception as e:
+            logger.debug("Analyzer random_walk error: %s", e)
+            results["random_walk"] = _result("random_walk", "error", "none", str(e), {})
 
     results["overall_health"] = _compute_health(results)
 
@@ -650,8 +848,10 @@ def format_for_ai(results):
         return ""
 
     lines = ["STATISTICAL ANALYSIS (from bot's own fill data):"]
+    # Include whichever analyzers are present (mode-dependent)
     for name in ("profitability", "fill_asymmetry", "grid_exceedance",
-                 "fill_rate", "random_walk"):
+                 "volatility_targets", "fill_rate", "random_walk",
+                 "round_trip_duration"):
         r = results.get(name)
         if r:
             lines.append(f"- {r['summary']}")

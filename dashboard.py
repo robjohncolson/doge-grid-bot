@@ -565,8 +565,10 @@ const ANALYZER_LABELS = {
   profitability: 'Profitability Test',
   fill_asymmetry: 'Fill Asymmetry',
   grid_exceedance: 'Hidden Risk',
+  volatility_targets: 'Volatility vs Targets',
   fill_rate: 'Volatility Regime',
   random_walk: 'Market Type',
+  round_trip_duration: 'Round Trip Duration',
 };
 
 // === Modal System ===
@@ -892,6 +894,88 @@ Sums the deviations from expected for the innermost third of grid levels. Positi
 <p>After Cochran's bin merging, at least 2 bins must remain. This is the <b>hardest analyzer to satisfy</b> because it needs both <i>volume</i> (&#8805; 10 fills) and <i>diversity</i> (fills at multiple price levels, requiring price to oscillate across the grid).</p>
 `;
 
+MODAL.volatility_targets = `
+<h3>Volatility vs Targets</h3>
+<h4>Method: OHLC Candle Range Analysis</h4>
+<p>Pair mode replacement for Grid Exceedance. Instead of asking "did price escape the grid?", this asks: <b>"Is current volatility right for my entry and exit targets?"</b></p>
+
+<h4>Setup</h4>
+<p>Using Kraken's 5-minute OHLC candles, the bot measures each candle's price range:</p>
+<div class="formula">
+candle_range% = (high - low) / low &times; 100
+<div class="explain">
+This captures the intra-candle price swing as a percentage. The <b>median</b> candle range is compared to the pair strategy's two key parameters:<br><br>
+&emsp;&bull; <b>PAIR_ENTRY_PCT</b> -- how far from market the entry order sits<br>
+&emsp;&bull; <b>PAIR_PROFIT_PCT</b> -- the profit target distance from entry fill
+</div>
+</div>
+
+<h4>Reachability Metrics</h4>
+<div class="formula">
+entry_reachable% = (candles with range &ge; PAIR_ENTRY_PCT) / total &times; 100<br><br>
+exit_reachable% = (candles with range &ge; PAIR_PROFIT_PCT) / total &times; 100
+<div class="explain">
+Entry reachability tells you what fraction of 5-minute windows have enough price movement to potentially fill your entry order. Exit reachability shows how often price swings are large enough to complete a full round trip within a single candle.
+</div>
+</div>
+
+<h4>Verdict Logic</h4>
+<table class="vtable">
+<tr><th>Verdict</th><th>Condition</th><th>Meaning</th></tr>
+<tr><td class="vr">LOW VOLATILITY</td><td>median range &lt; PAIR_ENTRY_PCT</td><td>Most candles don't swing enough to reach your entry orders. Entries will fill rarely. Consider tightening entry distance.</td></tr>
+<tr><td class="vg">WELL TUNED</td><td>PAIR_ENTRY_PCT &le; median &le; PAIR_PROFIT_PCT</td><td>Volatility sits between your entry and exit distances. Entries fill regularly; exits require accumulation of several candle swings -- ideal for pair mode.</td></tr>
+<tr><td class="vr">HIGH VOLATILITY</td><td>median range &gt; PAIR_PROFIT_PCT</td><td>Typical candle swings exceed your profit target. Price may fill your entry and then blow past your exit in the wrong direction before it triggers. Consider widening profit target or pausing.</td></tr>
+</table>
+
+<h4>Why Not a Hypothesis Test?</h4>
+<p>Like Grid Exceedance in grid mode, this is a <b>descriptive metric</b> rather than a formal hypothesis test. The candle range directly measures the market characteristic we care about (volatility relative to our targets), and the thresholds are the actual strategy parameters -- no statistical abstraction needed.</p>
+
+<h4>Data Requirements</h4>
+<p><b>No fills needed.</b> Uses OHLC candle data from Kraken's public API. Produces results within ~60 seconds of bot start. Examines up to 720 candles (60 hours of 5-minute data).</p>
+`;
+
+MODAL.round_trip_duration = `
+<h3>Round Trip Duration</h3>
+<h4>Method: Duration Descriptive Statistics</h4>
+<p>Pair mode replacement for the Random Walk chi-squared test. Measures the time between an entry fill and its corresponding exit fill for completed round trips.</p>
+
+<h4>Setup</h4>
+<p>In pair mode, each round trip consists of:</p>
+<ul>
+<li><b>Entry fill</b> (profit = 0): a buy or sell entry order fills, establishing a position</li>
+<li><b>Exit fill</b> (profit &ne; 0): the corresponding profit-target order fills, completing the cycle</li>
+</ul>
+
+<div class="formula">
+duration = exit_fill_time - entry_fill_time
+<div class="explain">
+The bot walks through fills chronologically, pairing each entry (profit = 0) with the next exit (profit &ne; 0) to measure the round-trip duration. This reflects the actual time capital is locked in a position.
+</div>
+</div>
+
+<h4>Statistics Reported</h4>
+<div class="formula">
+median, mean, min, max duration (in minutes)
+<div class="explain">
+The <b>median</b> is used for the verdict because it's robust to outliers. A single slow round trip (e.g., price moved away and took hours to return) doesn't skew the assessment of typical behavior.
+</div>
+</div>
+
+<h4>Verdict Logic</h4>
+<table class="vtable">
+<tr><th>Verdict</th><th>Condition</th><th>Meaning</th></tr>
+<tr><td class="vg">FAST</td><td>median &lt; 5 min</td><td>Round trips completing quickly. High fill activity, capital turning over rapidly -- ideal for pair mode.</td></tr>
+<tr><td class="vy">NORMAL</td><td>5 min &le; median &le; 60 min</td><td>Expected pace for pair mode. Entries and exits filling at a reasonable rate.</td></tr>
+<tr><td class="vr">SLOW</td><td>median &gt; 60 min</td><td>Positions are staying open too long. Consider tightening entry distance (more fills) or reducing profit target (faster exits).</td></tr>
+</table>
+
+<h4>Why Replace Random Walk?</h4>
+<p>The chi-squared random walk test bins fills by grid level distance. In pair mode, there are only 1-2 price levels (entry and exit), so the test always returns "insufficient data" (needs &ge; 3 distinct levels). Round trip duration directly measures what pair mode cares about: <b>how fast is capital cycling?</b></p>
+
+<h4>Data Requirements</h4>
+<p><b>Minimum:</b> 3 completed round trips. This is the same threshold as the profitability t-test. With fewer than 3, the median is unreliable and the analyzer reports "insufficient data".</p>
+`;
+
 MODAL.timeline = `
 <h3>Data Sufficiency Timeline & Methodology</h3>
 <p>The Statistical Advisory Board runs 5 independent analyzers, each using a different inferential technique from your AP Statistics toolkit. Each activates when it has enough data to produce meaningful results.</p>
@@ -935,24 +1019,24 @@ MODAL.timeline = `
 <tr><th>Analyzer</th><th>Statistical Method</th><th>AP Stats Topic</th><th>Minimum Data</th></tr>
 <tr><td>Profitability</td><td>One-sample <i>t</i>-test</td><td>Inference for means</td><td>3 round trips</td></tr>
 <tr><td>Fill Asymmetry</td><td>Exact binomial test</td><td>Inference for proportions</td><td>5 fills in 12h</td></tr>
-<tr><td>Grid Exceedance</td><td>Proportion metric</td><td>Descriptive statistics</td><td>OHLC candles (no fills)</td></tr>
+<tr><td>Grid: Hidden Risk<br>Pair: Volatility vs Targets</td><td>Grid: OHLC boundary proportion<br>Pair: candle range vs targets</td><td>Descriptive statistics</td><td>OHLC candles (no fills)</td></tr>
 <tr><td>Fill Rate</td><td>Poisson <i>z</i>-test</td><td>Sampling distributions</td><td>5 fills + 1hr history</td></tr>
-<tr><td>Random Walk</td><td>&#967;&#178; goodness-of-fit</td><td>Chi-squared tests</td><td>10 fills across 3+ levels</td></tr>
+<tr><td>Grid: Market Type<br>Pair: Round Trip Duration</td><td>Grid: &#967;&#178; goodness-of-fit<br>Pair: duration descriptives</td><td>Grid: Chi-squared tests<br>Pair: Descriptive stats</td><td>Grid: 10 fills across 3+ levels<br>Pair: 3 round trips</td></tr>
 </table>
 
 <h4>Overall Health Verdict Logic</h4>
-<p>The banner verdict is derived from all 5 analyzers with this priority ordering (red conditions override green ones):</p>
+<p>The banner verdict is derived from all 5 analyzers with this priority ordering (red conditions override green ones). In <b>pair mode</b>, the grid-specific analyzers are swapped for pair-specific ones:</p>
 <table class="vtable">
-<tr><th>Verdict</th><th>Color</th><th>Trigger Condition</th></tr>
-<tr><td class="vr">DANGEROUS</td><td>Red</td><td>High volatility AND trending detected simultaneously</td></tr>
-<tr><td class="vr">UNFAVORABLE</td><td>Red</td><td>Random walk test shows momentum market</td></tr>
-<tr><td class="vr">EXPOSED</td><td>Red</td><td>Grid exceedance is HIGH RISK (&gt; 20% of candles)</td></tr>
-<tr><td class="vg">FAVORABLE</td><td>Green</td><td>Random walk test shows mean-reverting market</td></tr>
-<tr><td class="vg">PROFITABLE</td><td>Green</td><td>Profitability <i>t</i>-test is statistically significant</td></tr>
-<tr><td class="vy">CALIBRATING</td><td>Yellow</td><td>All analyzers still have insufficient data</td></tr>
-<tr><td class="vy">NEUTRAL</td><td>Yellow</td><td>Mixed or inconclusive signals</td></tr>
+<tr><th>Verdict</th><th>Color</th><th>Grid Mode Trigger</th><th>Pair Mode Trigger</th></tr>
+<tr><td class="vr">DANGEROUS</td><td>Red</td><td>High vol + trending</td><td>High vol + trending</td></tr>
+<tr><td class="vr">UNFAVORABLE</td><td>Red</td><td>Random walk: momentum</td><td>Round trips slow OR low volatility</td></tr>
+<tr><td class="vr">EXPOSED</td><td>Red</td><td>Grid exceedance &gt; 20%</td><td>Volatility &gt; profit target</td></tr>
+<tr><td class="vg">FAVORABLE</td><td>Green</td><td>Random walk: mean-reverting</td><td>Fast round trips OR well-tuned volatility</td></tr>
+<tr><td class="vg">PROFITABLE</td><td>Green</td><td colspan="2">Profitability <i>t</i>-test is statistically significant</td></tr>
+<tr><td class="vy">CALIBRATING</td><td>Yellow</td><td colspan="2">All analyzers still have insufficient data</td></tr>
+<tr><td class="vy">NEUTRAL</td><td>Yellow</td><td colspan="2">Mixed or inconclusive signals</td></tr>
 </table>
-<p>Red takes priority over green: even if the <i>t</i>-test confirms significant profits, a momentum detection overrides because it warns of <i>structural</i> risk that past profits may not predict.</p>
+<p>Red takes priority over green: even if the <i>t</i>-test confirms significant profits, a structural risk detection overrides because it warns of conditions that past profits may not predict.</p>
 
 <h4>Implementation Notes</h4>
 <ul>
@@ -994,7 +1078,10 @@ function renderAdvisory(stats) {
 
   // Cards (clickable with info hint)
   let html = '';
-  const order = ['profitability', 'fill_asymmetry', 'grid_exceedance', 'fill_rate', 'random_walk'];
+  const isPairMode = stats.volatility_targets || stats.round_trip_duration;
+  const order = isPairMode
+    ? ['profitability', 'fill_asymmetry', 'volatility_targets', 'fill_rate', 'round_trip_duration']
+    : ['profitability', 'fill_asymmetry', 'grid_exceedance', 'fill_rate', 'random_walk'];
   for (const name of order) {
     const r = stats[name];
     if (!r) continue;
