@@ -418,17 +418,24 @@ def analyze_grid_exceedance(grid_orders, ohlc_data):
 # Analyzer 3b: Volatility vs targets (pair mode replacement for exceedance)
 # ============================================================================
 
-def analyze_volatility_vs_targets(ohlc_data):
+def analyze_volatility_vs_targets(ohlc_data, entry_pct=None, profit_pct=None):
     """
-    Pair mode: compare OHLC candle ranges to PAIR_ENTRY_PCT and PAIR_PROFIT_PCT.
+    Pair mode: compare OHLC candle ranges to entry/profit targets.
     Answers: is current volatility right for my entry/exit targets?
+
+    Args:
+        ohlc_data: OHLC candle data from Kraken.
+        entry_pct: Per-pair entry distance; falls back to global config.
+        profit_pct: Per-pair profit target; falls back to global config.
     """
     if not ohlc_data:
         return _result("volatility_targets", "no_data", "none",
                         "No OHLC data available", {})
 
-    entry_pct = config.PAIR_ENTRY_PCT
-    profit_pct = config.PAIR_PROFIT_PCT
+    if entry_pct is None:
+        entry_pct = config.PAIR_ENTRY_PCT
+    if profit_pct is None:
+        profit_pct = config.PAIR_PROFIT_PCT
     ranges = []
 
     for candle in ohlc_data:
@@ -803,7 +810,10 @@ def run_all(state, current_price, ohlc_data=None):
     # Analyzer 3: pair mode uses volatility_vs_targets, grid mode uses grid_exceedance
     if is_pair:
         try:
-            results["volatility_targets"] = analyze_volatility_vs_targets(ohlc_data)
+            results["volatility_targets"] = analyze_volatility_vs_targets(
+                ohlc_data,
+                entry_pct=getattr(state, 'entry_pct', None),
+                profit_pct=getattr(state, 'profit_pct', None))
         except Exception as e:
             logger.debug("Analyzer volatility_targets error: %s", e)
             results["volatility_targets"] = _result("volatility_targets", "error", "none", str(e), {})

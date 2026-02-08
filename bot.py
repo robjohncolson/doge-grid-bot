@@ -564,9 +564,9 @@ def _apply_web_config(state: grid_strategy.GridState, current_price: float):
     # Apply spacing
     if "spacing" in pending:
         if config.STRATEGY_MODE == "pair":
-            old = config.PAIR_PROFIT_PCT
-            config.PAIR_PROFIT_PCT = pending["spacing"]
-            logger.info("Web dashboard: profit target %.2f%% -> %.2f%%", old, config.PAIR_PROFIT_PCT)
+            old = state.profit_pct
+            state.profit_pct = pending["spacing"]
+            logger.info("Web dashboard: profit target %.2f%% -> %.2f%%", old, state.profit_pct)
         else:
             old = config.GRID_SPACING_PCT
             config.GRID_SPACING_PCT = pending["spacing"]
@@ -589,9 +589,9 @@ def _apply_web_config(state: grid_strategy.GridState, current_price: float):
 
     # Apply entry_pct (pair mode)
     if "entry_pct" in pending:
-        old = config.PAIR_ENTRY_PCT
-        config.PAIR_ENTRY_PCT = pending["entry_pct"]
-        logger.info("Web dashboard: entry distance %.2f%% -> %.2f%%", old, config.PAIR_ENTRY_PCT)
+        old = state.entry_pct
+        state.entry_pct = pending["entry_pct"]
+        logger.info("Web dashboard: entry distance %.2f%% -> %.2f%%", old, state.entry_pct)
         needs_rebuild = True
 
     # Apply AI interval (no rebuild needed)
@@ -749,13 +749,13 @@ def _execute_approved_action(state: grid_strategy.GridState, action: str,
     """
     if action == "widen_spacing":
         if config.STRATEGY_MODE == "pair":
-            old = config.PAIR_PROFIT_PCT
-            config.PAIR_PROFIT_PCT = round(old + SPACING_STEP_PCT, 4)
-            logger.info("Profit target widened: %.2f%% -> %.2f%%", old, config.PAIR_PROFIT_PCT)
+            old = state.profit_pct
+            state.profit_pct = round(old + SPACING_STEP_PCT, 4)
+            logger.info("Profit target widened: %.2f%% -> %.2f%%", old, state.profit_pct)
             grid_strategy.cancel_grid(state)
             orders = grid_strategy.build_grid(state, current_price)
             notifier._send_message(
-                f"Profit target widened: {old:.2f}% -> {config.PAIR_PROFIT_PCT:.2f}%\n"
+                f"Profit target widened: {old:.2f}% -> {state.profit_pct:.2f}%\n"
                 f"Pair rebuilt: {len(orders)} orders around ${current_price:.6f}"
             )
         else:
@@ -772,7 +772,7 @@ def _execute_approved_action(state: grid_strategy.GridState, action: str,
     elif action == "tighten_spacing":
         floor = config.ROUND_TRIP_FEE_PCT + 0.1
         if config.STRATEGY_MODE == "pair":
-            old = config.PAIR_PROFIT_PCT
+            old = state.profit_pct
             new_val = round(old - SPACING_STEP_PCT, 4)
             if new_val < floor:
                 logger.warning(
@@ -784,7 +784,7 @@ def _execute_approved_action(state: grid_strategy.GridState, action: str,
                     f"(round-trip fees + 0.1%%). Current: {old:.2f}%"
                 )
                 return
-            config.PAIR_PROFIT_PCT = new_val
+            state.profit_pct = new_val
             logger.info("Profit target tightened: %.2f%% -> %.2f%%", old, new_val)
             grid_strategy.cancel_grid(state)
             orders = grid_strategy.build_grid(state, current_price)
@@ -821,18 +821,18 @@ def _execute_approved_action(state: grid_strategy.GridState, action: str,
         notifier.notify_risk_event("pause", "Paused by approved AI recommendation")
 
     elif action == "widen_entry":
-        old = config.PAIR_ENTRY_PCT
-        config.PAIR_ENTRY_PCT = round(old + ENTRY_STEP_PCT, 4)
-        logger.info("Entry distance widened: %.2f%% -> %.2f%%", old, config.PAIR_ENTRY_PCT)
+        old = state.entry_pct
+        state.entry_pct = round(old + ENTRY_STEP_PCT, 4)
+        logger.info("Entry distance widened: %.2f%% -> %.2f%%", old, state.entry_pct)
         grid_strategy.cancel_grid(state)
         orders = grid_strategy.build_grid(state, current_price)
         notifier._send_message(
-            f"Entry distance widened: {old:.2f}% -> {config.PAIR_ENTRY_PCT:.2f}%\n"
+            f"Entry distance widened: {old:.2f}% -> {state.entry_pct:.2f}%\n"
             f"Pair rebuilt: {len(orders)} orders around ${current_price:.6f}"
         )
 
     elif action == "tighten_entry":
-        old = config.PAIR_ENTRY_PCT
+        old = state.entry_pct
         new_val = round(old - ENTRY_STEP_PCT, 4)
         floor = 0.05
         if new_val < floor:
@@ -844,7 +844,7 @@ def _execute_approved_action(state: grid_strategy.GridState, action: str,
                 f"Cannot tighten entry below {floor:.2f}%. Current: {old:.2f}%"
             )
             return
-        config.PAIR_ENTRY_PCT = new_val
+        state.entry_pct = new_val
         logger.info("Entry distance tightened: %.2f%% -> %.2f%%", old, new_val)
         grid_strategy.cancel_grid(state)
         orders = grid_strategy.build_grid(state, current_price)
@@ -1095,7 +1095,7 @@ def _handle_menu_nav(state: grid_strategy.GridState, current_price: float,
     elif screen == "stats":
         text, keyboard = telegram_menu.build_stats_screen(state)
     elif screen == "settings":
-        text, keyboard = telegram_menu.build_settings_screen()
+        text, keyboard = telegram_menu.build_settings_screen(state)
     else:
         notifier.answer_callback(callback_id, "Unknown screen")
         return
@@ -1114,10 +1114,10 @@ def _handle_menu_action(state: grid_strategy.GridState, current_price: float,
     """Execute a settings action from the menu, then refresh the settings screen."""
     if action == "spacing_up":
         if config.STRATEGY_MODE == "pair":
-            old = config.PAIR_PROFIT_PCT
-            config.PAIR_PROFIT_PCT = round(old + SPACING_STEP_PCT, 4)
-            notifier.answer_callback(callback_id, f"Profit: {old:.2f}% -> {config.PAIR_PROFIT_PCT:.2f}%")
-            logger.info("Menu: profit target widened %.2f%% -> %.2f%%", old, config.PAIR_PROFIT_PCT)
+            old = state.profit_pct
+            state.profit_pct = round(old + SPACING_STEP_PCT, 4)
+            notifier.answer_callback(callback_id, f"Profit: {old:.2f}% -> {state.profit_pct:.2f}%")
+            logger.info("Menu: profit target widened %.2f%% -> %.2f%%", old, state.profit_pct)
         else:
             old = config.GRID_SPACING_PCT
             config.GRID_SPACING_PCT = round(old + SPACING_STEP_PCT, 4)
@@ -1129,12 +1129,12 @@ def _handle_menu_action(state: grid_strategy.GridState, current_price: float,
     elif action == "spacing_down":
         floor = config.ROUND_TRIP_FEE_PCT + 0.1
         if config.STRATEGY_MODE == "pair":
-            old = config.PAIR_PROFIT_PCT
+            old = state.profit_pct
             new_val = round(old - SPACING_STEP_PCT, 4)
             if new_val < floor:
                 notifier.answer_callback(callback_id, f"Can't go below {floor:.2f}%")
                 return
-            config.PAIR_PROFIT_PCT = new_val
+            state.profit_pct = new_val
             notifier.answer_callback(callback_id, f"Profit: {old:.2f}% -> {new_val:.2f}%")
             logger.info("Menu: profit target tightened %.2f%% -> %.2f%%", old, new_val)
         else:
@@ -1158,21 +1158,21 @@ def _handle_menu_action(state: grid_strategy.GridState, current_price: float,
         grid_strategy.build_grid(state, current_price)
 
     elif action == "entry_up":
-        old = config.PAIR_ENTRY_PCT
-        config.PAIR_ENTRY_PCT = round(old + ENTRY_STEP_PCT, 4)
-        notifier.answer_callback(callback_id, f"Entry: {old:.2f}% -> {config.PAIR_ENTRY_PCT:.2f}%")
-        logger.info("Menu: entry distance widened %.2f%% -> %.2f%%", old, config.PAIR_ENTRY_PCT)
+        old = state.entry_pct
+        state.entry_pct = round(old + ENTRY_STEP_PCT, 4)
+        notifier.answer_callback(callback_id, f"Entry: {old:.2f}% -> {state.entry_pct:.2f}%")
+        logger.info("Menu: entry distance widened %.2f%% -> %.2f%%", old, state.entry_pct)
         grid_strategy.cancel_grid(state)
         grid_strategy.build_grid(state, current_price)
 
     elif action == "entry_down":
-        old = config.PAIR_ENTRY_PCT
+        old = state.entry_pct
         new_val = round(old - ENTRY_STEP_PCT, 4)
         floor = 0.05
         if new_val < floor:
             notifier.answer_callback(callback_id, f"Can't go below {floor:.2f}%")
             return
-        config.PAIR_ENTRY_PCT = new_val
+        state.entry_pct = new_val
         notifier.answer_callback(callback_id, f"Entry: {old:.2f}% -> {new_val:.2f}%")
         logger.info("Menu: entry distance tightened %.2f%% -> %.2f%%", old, new_val)
         grid_strategy.cancel_grid(state)
@@ -1188,7 +1188,7 @@ def _handle_menu_action(state: grid_strategy.GridState, current_price: float,
         return
 
     # Refresh settings screen
-    text, keyboard = telegram_menu.build_settings_screen()
+    text, keyboard = telegram_menu.build_settings_screen(state)
     reply_markup = {"inline_keyboard": [
         [{"text": b["text"], "callback_data": b["callback_data"]} for b in row]
         for row in keyboard
@@ -1289,7 +1289,7 @@ def run():
         if sb_fills:
             state.recent_fills = sb_fills
             logger.info("[%s] Restored %d fills from Supabase", pair_name, len(sb_fills))
-        sb_prices = supabase_store.load_price_history(since=time.time() - 86400)
+        sb_prices = supabase_store.load_price_history(since=time.time() - 86400, pair=pair_name)
         if sb_prices:
             state.price_history = sb_prices
             logger.info("[%s] Restored %d price samples from Supabase", pair_name, len(sb_prices))
@@ -1545,7 +1545,7 @@ def run():
                     market_data["total_round_trips"] = ai_state.total_round_trips
                     market_data["entry_pct"] = ai_state.entry_pct
                     market_data["profit_pct"] = ai_state.profit_pct
-                    market_data["daily_loss_limit"] = config.DAILY_LOSS_LIMIT
+                    market_data["daily_loss_limit"] = ai_state.daily_loss_limit
 
                 stats_context = stats_engine.format_for_ai(ai_state.stats_results)
                 recommendation = ai_advisor.get_recommendation(market_data, stats_context)

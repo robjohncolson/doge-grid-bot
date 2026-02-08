@@ -65,8 +65,8 @@ def build_grid_screen(state: grid_strategy.GridState, current_price: float):
             f"Price: ${current_price:.6f} (drift {drift_pct:+.2f}%)\n"
             f"Orders: {len(open_buys)}B + {len(open_sells)}S ({len(entry_orders)} entry, {len(exit_orders)} exit)\n"
             f"Range: ${low:.6f} -- ${high:.6f}\n"
-            f"Entry: {config.PAIR_ENTRY_PCT:.2f}% | Profit: {config.PAIR_PROFIT_PCT:.2f}%\n"
-            f"Order size: ${config.ORDER_SIZE_USD:.2f}"
+            f"Entry: {state.entry_pct:.2f}% | Profit: {state.profit_pct:.2f}%\n"
+            f"Order size: ${state.order_size_usd:.2f}"
         )
     else:
         text = (
@@ -112,17 +112,21 @@ def build_stats_screen(state: grid_strategy.GridState):
     return text, keyboard
 
 
-def build_settings_screen():
+def build_settings_screen(state: grid_strategy.GridState = None):
     """Current params + action buttons + Back."""
     floor = config.ROUND_TRIP_FEE_PCT + 0.1
 
     if config.STRATEGY_MODE == "pair":
+        entry_pct = state.entry_pct if state else config.PAIR_ENTRY_PCT
+        profit_pct = state.profit_pct if state else config.PAIR_PROFIT_PCT
+        refresh_pct = state.refresh_pct if state else config.PAIR_REFRESH_PCT
+        order_size = state.order_size_usd if state else config.ORDER_SIZE_USD
         text = (
             f"<b>Settings</b> [pair mode]\n\n"
-            f"Profit target: {config.PAIR_PROFIT_PCT:.2f}% (min {floor:.2f}%)\n"
-            f"Entry distance: {config.PAIR_ENTRY_PCT:.2f}% (min 0.05%)\n"
-            f"Refresh drift: {config.PAIR_REFRESH_PCT:.2f}%\n"
-            f"Order size: ${config.ORDER_SIZE_USD:.2f}\n"
+            f"Profit target: {profit_pct:.2f}% (min {floor:.2f}%)\n"
+            f"Entry distance: {entry_pct:.2f}% (min 0.05%)\n"
+            f"Refresh drift: {refresh_pct:.2f}%\n"
+            f"Order size: ${order_size:.2f}\n"
             f"AI interval: {config.AI_ADVISOR_INTERVAL}s ({config.AI_ADVISOR_INTERVAL // 60} min)\n"
             f"Mode: {'DRY RUN' if config.DRY_RUN else 'LIVE'}"
         )

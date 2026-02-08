@@ -121,7 +121,8 @@ def _build_prompt(market_data: dict, stats_context: str = "") -> str:
     The AI gets: current price, recent changes, spread, fill count,
     and optionally the output of the statistical analyzers.
     """
-    prompt = f"""You are a crypto grid trading advisor. Analyze this DOGE/USD market data and give a brief recommendation.
+    pair_display = market_data.get('pair_display', 'DOGE/USD')
+    prompt = f"""You are a crypto grid trading advisor. Analyze this {pair_display} market data and give a brief recommendation.
 
 Current price: ${market_data.get('price', 0):.6f}
 1h change: {market_data.get('change_1h', 0):.2f}%
@@ -169,7 +170,7 @@ REASON: [One sentence explanation]"""
 # API call (parameterized for each panelist)
 # ---------------------------------------------------------------------------
 
-def _call_panelist(prompt: str, panelist: dict) -> tuple:
+def _call_panelist(prompt: str, panelist: dict, pair_display: str = "DOGE/USD") -> tuple:
     """
     Call a single AI panelist and return the raw response text.
 
@@ -186,7 +187,7 @@ def _call_panelist(prompt: str, panelist: dict) -> tuple:
     if config.STRATEGY_MODE == "pair":
         system_content = (
             "You are a concise crypto market analyst advising a single-pair "
-            "market-making bot on DOGE/USD. The bot maintains exactly two limit "
+            f"market-making bot on {pair_display}. The bot maintains exactly two limit "
             "orders: one buy and one sell. Each order is either an 'entry' "
             "(flanking the market price) or an 'exit' (profit target from a "
             "filled entry). Entry distance controls how far entries sit from "
@@ -200,7 +201,7 @@ def _call_panelist(prompt: str, panelist: dict) -> tuple:
     else:
         system_content = (
             "You are a concise crypto market analyst. "
-            "Give structured recommendations for a DOGE/USD grid trading bot. "
+            f"Give structured recommendations for a {pair_display} grid trading bot. "
             "Be direct and specific. Never recommend buying or selling -- "
             "only recommend grid parameter adjustments."
         )
@@ -461,11 +462,12 @@ def get_recommendation(market_data: dict, stats_context: str = "") -> dict:
     logger.info("Running AI council (%d panelists)...", len(panel))
 
     prompt = _build_prompt(market_data, stats_context)
+    pair_display = market_data.get("pair_display", "DOGE/USD")
     votes = []
 
     for i, panelist in enumerate(panel):
         try:
-            response, err = _call_panelist(prompt, panelist)
+            response, err = _call_panelist(prompt, panelist, pair_display=pair_display)
             if response:
                 parsed = _parse_response(response)
                 parsed["name"] = panelist["name"]

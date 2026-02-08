@@ -187,6 +187,31 @@ class GridState:
             return self.pair_config.price_decimals
         return 6
 
+    @property
+    def order_size_usd(self) -> float:
+        if self.pair_config:
+            return self.pair_config.order_size_usd
+        return config.ORDER_SIZE_USD
+
+    @order_size_usd.setter
+    def order_size_usd(self, val):
+        if self.pair_config:
+            self.pair_config.order_size_usd = val
+        else:
+            config.ORDER_SIZE_USD = val
+
+    @property
+    def daily_loss_limit(self) -> float:
+        if self.pair_config:
+            return self.pair_config.daily_loss_limit
+        return config.DAILY_LOSS_LIMIT
+
+    @property
+    def stop_floor(self) -> float:
+        if self.pair_config:
+            return self.pair_config.stop_floor
+        return config.STOP_FLOOR
+
 
 # ---------------------------------------------------------------------------
 # State persistence
@@ -505,20 +530,21 @@ def adapt_grid_params(state: GridState, current_price: float):
 
 def calculate_volume_for_price(price: float, state: GridState = None) -> float:
     """
-    Calculate how many DOGE to buy/sell at a given price to match ORDER_SIZE_USD.
-    Enforces Kraken's minimum volume -- if ORDER_SIZE_USD is too small at
+    Calculate volume at a given price to match the per-pair order size.
+    Enforces Kraken's minimum volume -- if order size is too small at
     the current price, volume is floored to the minimum (order costs more).
 
     Args:
         price: Limit price in USD.
-        state: Optional GridState; if set, uses state.min_volume for the floor.
+        state: Optional GridState; if set, uses per-pair order_size_usd and min_volume.
 
-    Example: at $0.09/DOGE with ORDER_SIZE_USD=$5:
+    Example: at $0.09/DOGE with order_size_usd=$5:
       volume = $5 / $0.09 = 55.56 DOGE
     """
     if price <= 0:
         return 0.0
-    volume = config.ORDER_SIZE_USD / price
+    size_usd = state.order_size_usd if state else config.ORDER_SIZE_USD
+    volume = size_usd / price
     min_vol = state.min_volume if state and state.pair_config else ORDERMIN_DOGE
     if volume < min_vol:
         volume = float(min_vol)
@@ -679,7 +705,7 @@ def build_grid(state: GridState, current_price: float) -> list:
             logger.debug("  Grid L%+d: skipped (already adopted)", level_idx)
             continue
 
-        volume = calculate_volume_for_price(price)
+        volume = calculate_volume_for_price(price, state)
 
         order = GridOrder(level=level_idx, side=side, price=price, volume=volume)
 
@@ -688,6 +714,7 @@ def build_grid(state: GridState, current_price: float) -> list:
                 side=side,
                 volume=volume,
                 price=price,
+                pair=state.pair_name,
             )
             order.txid = txid
             order.status = "open"
@@ -1218,9 +1245,9 @@ def check_risk_limits(state: GridState, current_price: float) -> tuple:
     should_stop:  True -> cancel everything and shut down (stop floor breached)
     should_pause: True -> pause trading for rest of day (daily loss limit)
     """
-    # Check daily loss limit
-    if state.today_loss_usd >= config.DAILY_LOSS_LIMIT:
-        return (False, True, f"Daily loss limit hit: ${state.today_loss_usd:.2f} >= ${config.DAILY_LOSS_LIMIT:.2f}")
+    # Check daily loss limit (per-pair if configured)
+    if state.today_loss_usd >= state.daily_loss_limit:
+        return (False, True, f"Daily loss limit hit: ${state.today_loss_usd:.2f} >= ${state.daily_loss_limit:.2f}")
 
     # Check stop floor
     # Estimate portfolio value: cash + value of any DOGE held
@@ -1237,8 +1264,8 @@ def check_risk_limits(state: GridState, current_price: float) -> tuple:
 
     estimated_value = config.STARTING_CAPITAL + state.total_profit_usd - max(0, unrealized_loss)
 
-    if estimated_value < config.STOP_FLOOR:
-        return (True, False, f"Stop floor breached: estimated value ${estimated_value:.2f} < ${config.STOP_FLOOR:.2f}")
+    if estimated_value < state.stop_floor:
+        return (True, False, f"Stop floor breached: estimated value ${estimated_value:.2f} < ${state.stop_floor:.2f}")
 
     # Check consecutive errors
     if state.consecutive_errors >= config.MAX_CONSECUTIVE_ERRORS:
@@ -1448,15 +1475,15 @@ def _log_daily_summary(state: GridState):
             writer.writerow([
                 state.today_date,
                 state.round_trips_today,
-                f"{state.today_profit_usd + state.total_fees_usd:.4f}",
-                f"{state.total_fees_usd:.4f}",
+                f"{state.today_profit_usd + state.today_fees_usd:.4f}",
+                f"{state.today_fees_usd:.4f}",
                 f"{state.today_profit_usd:.4f}",
                 f"{state.doge_accumulated:.2f}",
             ])
     except Exception as e:
         logger.error("Failed to write daily summary: %s", e)
 
-    supabase_store.save_daily_summary(state)
+    supabase_store.save_daily_summary(state, pair=state.pair_name)
 
 
 # ---------------------------------------------------------------------------
@@ -1518,11 +1545,12 @@ def build_pair(state: GridState, current_price: float) -> list:
 
     Returns the list of open GridOrder objects.
     """
-    # Pair mode: keep user's ORDER_SIZE_USD but floor at Kraken minimums.
+    # Pair mode: keep user's order_size_usd but floor at Kraken minimums.
     # No grid-level capital budgeting (only 2 orders, not 40).
+    # Use state property (per-pair) instead of mutating global config.
     min_vol = state.min_volume if state.pair_config else ORDERMIN_DOGE
     min_by_volume = min_vol * current_price * 1.2
-    config.ORDER_SIZE_USD = max(config.ORDER_SIZE_USD, min_by_volume, COSTMIN_USD)
+    state.order_size_usd = max(state.order_size_usd, min_by_volume, COSTMIN_USD)
 
     state.center_price = current_price
 

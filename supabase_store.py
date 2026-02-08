@@ -168,12 +168,13 @@ def save_trade(order, net_profit: float, fees: float, pair: str = "XDGUSD"):
     }))
 
 
-def save_daily_summary(state):
+def save_daily_summary(state, pair: str = "XDGUSD"):
     """Queue a daily summary record (mirrors daily_summary.csv)."""
     if not _enabled():
         return
     _write_queue.append(("daily_summaries", {
         "date": state.today_date,
+        "pair": pair,
         "trades_count": state.round_trips_today,
         "gross_profit": f"{state.today_profit_usd + state.today_fees_usd:.4f}",
         "fees_paid": f"{state.today_fees_usd:.4f}",
@@ -346,12 +347,12 @@ def _flush_queue():
             if result is None:
                 logger.debug("Supabase: bot_state upsert failed")
         elif table == "daily_summaries":
-            # Upsert on date to avoid duplicates
+            # Upsert on (date, pair) to avoid duplicates across pairs
             for row in rows:
                 _request(
                     "POST", f"/rest/v1/{table}",
                     body=row,
-                    params={"on_conflict": "date"},
+                    params={"on_conflict": "date,pair"},
                     upsert=True,
                 )
         else:

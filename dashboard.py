@@ -136,7 +136,7 @@ def serialize_state(state: grid_strategy.GridState, current_price: float) -> dic
         },
         "config": {
             "strategy_mode": config.STRATEGY_MODE,
-            "order_size": state.pair_config.order_size_usd if state.pair_config else config.ORDER_SIZE_USD,
+            "order_size": state.order_size_usd,
             "grid_levels": config.GRID_LEVELS,
             "spacing_pct": state.profit_pct if is_pair_mode else config.GRID_SPACING_PCT,
             "effective_capital": round(effective_capital, 2),
