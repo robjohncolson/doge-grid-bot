@@ -271,6 +271,39 @@ def load_fills(limit: int = 500, pair: str = "XDGUSD") -> list:
     fills = list(reversed(result))
     logger.info("Supabase: loaded %d fills", len(fills))
     neg_profit_count = sum(1 for f in fills if f.get("profit", 0) < 0)
+    if config.STRATEGY_MODE == "pair" and neg_profit_count > 0:
+        for f in fills:
+            if f.get("profit", 0) < 0:
+                f["profit"] = 0
+        logger.warning(
+            "Supabase: sanitized %d negative profits for pair mode",
+            neg_profit_count,
+        )
+        # region agent log
+        try:
+            _payload = {
+                "runId": "pre",
+                "hypothesisId": "H6",
+                "location": "supabase_store.py:load_fills",
+                "message": "supabase_negative_profit_sanitized",
+                "data": {
+                    "sanitized_count": neg_profit_count,
+                },
+                "timestamp": int(time.time() * 1000),
+            }
+            _payload_json = json.dumps(_payload)
+            try:
+                with open(r"c:\Users\ColsonR\grid-bot\doge-grid-bot\.cursor\debug.log", "a", encoding="utf-8") as _dbg_f:
+                    _dbg_f.write(_payload_json + "\n")
+            except Exception:
+                pass
+            try:
+                logger.info("DEBUG_LOG %s", _payload_json)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        # endregion agent log
     # region agent log
     try:
         _payload = {

@@ -2380,7 +2380,7 @@ def refresh_stale_entries(state: GridState, current_price: float) -> bool:
 def reconcile_pair_on_startup(state: GridState, current_price: float) -> int:
     """
     Simplified reconciliation for pair mode.
-    Adopt up to 2 open orders (1 buy, 1 sell). Cancel extras.
+    Adopt up to 2 open orders (exit-first, then entry). Cancel extras.
     """
     if config.DRY_RUN:
         logger.info("[DRY RUN] Skipping pair reconciliation")
@@ -2402,9 +2402,8 @@ def reconcile_pair_on_startup(state: GridState, current_price: float) -> int:
     else:
         filter_strings = ["XDG", "DOGE"]
 
-    # Classify orders by side
-    our_buys = []
-    our_sells = []
+    # Collect and classify orders (entry vs exit based on market)
+    our_orders = []
 
     for txid, info in open_orders.items():
         descr = info.get("descr", {})
@@ -2419,56 +2418,90 @@ def reconcile_pair_on_startup(state: GridState, current_price: float) -> int:
         if not side or order_price <= 0:
             continue
 
-        entry = (txid, side, order_price, order_vol)
-        if side == "buy":
-            our_buys.append(entry)
+        # Determine if it's an entry or exit based on position relative to market
+        if side == "buy" and order_price < current_price:
+            role = "entry"
+        elif side == "buy" and order_price >= current_price:
+            role = "exit"
+        elif side == "sell" and order_price > current_price:
+            role = "entry"
         else:
-            our_sells.append(entry)
+            role = "exit"
+        our_orders.append({
+            "txid": txid,
+            "side": side,
+            "price": order_price,
+            "volume": order_vol,
+            "role": role,
+        })
 
-    # Adopt at most 1 buy and 1 sell (closest to market)
+    if not our_orders:
+        logger.info("Pair reconciliation: no matching orders for %s", state.pair_display)
+        return 0
+
+    def _dist(o):
+        return abs(o["price"] - current_price)
+
+    exits = [o for o in our_orders if o["role"] == "exit"]
+    entries = [o for o in our_orders if o["role"] == "entry"]
+    keep = []
+
+    # Prefer exits: keep up to one buy exit and one sell exit (closest per side)
+    for side in ("buy", "sell"):
+        candidates = [o for o in exits if o["side"] == side]
+        if candidates:
+            candidates.sort(key=_dist)
+            keep.append(candidates[0])
+
+    # If only one exit, keep an entry on the SAME side if present
+    if len(keep) == 1:
+        exit_side = keep[0]["side"]
+        same_side_entries = [o for o in entries if o["side"] == exit_side]
+        if same_side_entries:
+            same_side_entries.sort(key=_dist)
+            keep.append(same_side_entries[0])
+
+    # If no exits, keep closest entry per side (buy+sell if possible)
+    if not keep:
+        for side in ("buy", "sell"):
+            candidates = [o for o in entries if o["side"] == side]
+            if candidates:
+                candidates.sort(key=_dist)
+                keep.append(candidates[0])
+        if not keep and entries:
+            entries.sort(key=_dist)
+            keep.append(entries[0])
+
+    # Cap to 2 orders total
+    keep = keep[:2]
+
     adopted = 0
     orphans = 0
+    keep_txids = {o["txid"] for o in keep}
 
-    for side_list, side_name in [(our_buys, "buy"), (our_sells, "sell")]:
-        if not side_list:
-            continue
-
-        # Sort by distance from current price, adopt the closest
-        side_list.sort(key=lambda x: abs(x[2] - current_price))
-        best = side_list[0]
-        txid, side, price, vol = best
-
-        # Determine if it's an entry or exit based on position relative to market
-        if side == "buy" and price < current_price:
-            role = "entry"
-        elif side == "buy" and price >= current_price:
-            role = "exit"
-        elif side == "sell" and price > current_price:
-            role = "entry"
-        else:
-            role = "exit"
-
-        order = GridOrder(level=-1 if side == "buy" else +1,
-                          side=side, price=price, volume=vol)
-        order.txid = txid
+    for o in keep:
+        order = GridOrder(level=-1 if o["side"] == "buy" else +1,
+                          side=o["side"], price=o["price"], volume=o["volume"])
+        order.txid = o["txid"]
         order.status = "open"
         order.placed_at = time.time()
-        order.order_role = role
+        order.order_role = o["role"]
         state.grid_orders.append(order)
         adopted += 1
         logger.info(
             "Pair reconcile: adopted %s %s %.2f DOGE @ $%.6f -> %s",
-            side.upper(), role, vol, price, txid,
+            o["side"].upper(), o["role"], o["volume"], o["price"], o["txid"],
         )
 
-        # Cancel the rest of this side
-        for extra in side_list[1:]:
-            logger.warning(
-                "Pair reconcile: cancelling extra %s @ $%.6f -> %s",
-                side_name.upper(), extra[2], extra[0],
-            )
-            kraken_client.cancel_order(extra[0])
-            orphans += 1
+    for o in our_orders:
+        if o["txid"] in keep_txids:
+            continue
+        logger.warning(
+            "Pair reconcile: cancelling extra %s %s @ $%.6f -> %s",
+            o["side"].upper(), o["role"], o["price"], o["txid"],
+        )
+        kraken_client.cancel_order(o["txid"])
+        orphans += 1
 
     logger.info(
         "Pair reconciliation: %d adopted, %d orphans cancelled",
