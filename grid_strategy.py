@@ -1713,8 +1713,10 @@ def handle_pair_fill(state: GridState, filled_orders: list,
 
             state.total_profit_usd += net_profit
             state.today_profit_usd += net_profit
-            state.total_fees_usd += fees
-            state.today_fees_usd += fees
+            # Only track sell leg fee here (buy leg was tracked when buy entry filled)
+            sell_leg_fee = filled.price * filled.volume * config.MAKER_FEE_PCT / 100.0
+            state.total_fees_usd += sell_leg_fee
+            state.today_fees_usd += sell_leg_fee
             if net_profit < 0:
                 state.today_loss_usd += abs(net_profit)
 
@@ -1814,8 +1816,10 @@ def handle_pair_fill(state: GridState, filled_orders: list,
 
             state.total_profit_usd += net_profit
             state.today_profit_usd += net_profit
-            state.total_fees_usd += fees
-            state.today_fees_usd += fees
+            # Only track buy leg fee here (sell leg was tracked when sell entry filled)
+            buy_leg_fee = filled.price * filled.volume * config.MAKER_FEE_PCT / 100.0
+            state.total_fees_usd += buy_leg_fee
+            state.today_fees_usd += buy_leg_fee
             if net_profit < 0:
                 state.today_loss_usd += abs(net_profit)
 
