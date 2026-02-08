@@ -312,18 +312,33 @@ orders silently disappear from the response.
            │
      for XDGUSD trades:
            │
-    ┌──────┴────────┐
-    │               │
-    ▼               ▼
- buy filled,     sell filled,
- no sell exit    no buy exit
- on book         on book
-    │               │
-    ▼               ▼
- cancel sell     cancel buy
- entry, place    entry, place
- sell EXIT at    buy EXIT at
- buy*(1+PCT)     sell*(1-PCT)
+    ┌──────┼────────────────┐
+    │      │                │
+    ▼      ▼                ▼
+  BOTH   buy only,       sell only,
+  filled  no sell exit    no buy exit
+    │      on book         on book
+    │      │               │
+    │      ▼               ▼
+    │   cancel sell     cancel buy
+    │   entry, place    entry, place
+    │   sell EXIT at    buy EXIT at
+    │   buy*(1+PCT)     sell*(1-PCT)
+    │
+    ▼
+ DUAL-FILL DETECTION
+    │
+    ├── 2nd price near 1st's profit target?
+    │      │
+    │     YES ──► OFFLINE ROUND TRIP
+    │              book PnL from actual fill prices
+    │              place fresh entry pair (position flat)
+    │      │
+    │      NO ──► OFFLINE RACE CONDITION
+    │              2nd entry closed 1st's position
+    │              book PnL: (sell_price - buy_price) * vol
+    │              place exit for LATER fill's position only
+    │              place companion entry
            │
            ▼
 ┌──────────────────────┐
@@ -498,6 +513,47 @@ INITIAL (2 entries flanking market)
 Always exactly 2 open orders. Entry orders refresh when they drift
 more than `PAIR_REFRESH_PCT` from market. Exit orders never move
 (profit target is fixed at the fill price).
+
+### Race Condition: Both Entries Fill (Live)
+
+If both entries fill within the 30s poll gap before the bot can cancel one,
+the second entry implicitly closes the position opened by the first.
+
+```
+BUY entry fills -> bot places SELL exit
+                -> before bot cancels SELL entry, it also fills
+
+Now: orphaned SELL exit exists for an already-closed long position.
+
+_close_orphaned_exit() detects this:
+  1. Find orphaned exit (same side as filled entry, role=exit)
+  2. Look up cost basis from orphan's matched_buy_price
+  3. Book PnL: (sell_entry_price - buy_entry_price) * vol - fees
+  4. Cancel orphaned exit
+  5. Log as RACE CLOSE
+```
+
+Same logic applies in reverse (sell entry fills first, then buy entry).
+
+### Race Condition: Both Entries Fill (Offline)
+
+If both entries fill while the bot is offline (between deploys),
+`_reconcile_offline_fills()` detects the dual fill on startup.
+
+```
+Offline: BUY entry @ $0.098 fills, then SELL entry @ $0.0984 fills.
+
+On restart, trade history shows both fills.
+  1. Sort chronologically (first=buy, second=sell)
+  2. Expected exit = $0.098 * 1.01 = $0.09898
+  3. Actual second price $0.0984 != $0.09898 -> RACE CONDITION
+  4. Book PnL: ($0.0984 - $0.098) * vol - fees  (uses actual prices)
+  5. Place buy exit for sell position: $0.0984 * 0.99
+  6. Place sell entry companion
+```
+
+If the second fill IS near the expected exit, it's a **normal round trip
+completed offline**: book the PnL and place a fresh entry pair.
 
 ### Entry Refresh Safety
 
