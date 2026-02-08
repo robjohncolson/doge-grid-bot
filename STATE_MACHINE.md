@@ -495,20 +495,14 @@ INITIAL (2 entries flanking market)
        |                           |
        |    State: sell exit + sell entry (2 orders)
        |                           |
-       |    --- SELL EXIT fills (ROUND TRIP at profit target) ---
-       |        1. Record profit, log trade
-       |        2. Cancel remaining sell entry
-       |        3. BUY  = entry at market - PAIR_ENTRY_PCT        role=entry
-       |        4. SELL = entry at market + PAIR_ENTRY_PCT        role=entry
-       |        -> Back to INITIAL
+       |    --- SELL ENTRY fills (before SELL EXIT) ---
+       |        1. BUY = exit at sell_price * (1 - PAIR_PROFIT_PCT)  role=exit
+       |        2. State: buy exit + sell exit (2 orders, both exits)
        |                           |
-       |    --- SELL ENTRY fills (implicit close, partial profit) ---
-       |        _close_orphaned_exit() detects orphaned sell exit:
-       |        1. Book PnL: (sell_entry - buy_entry) * vol - fees
-       |        2. Cancel orphaned sell exit
-       |        3. BUY  = entry at market - PAIR_ENTRY_PCT        role=entry
-       |        4. SELL = entry at market + PAIR_ENTRY_PCT        role=entry
-       |        -> Back to INITIAL
+       |    --- SELL EXIT fills (round trip completes BUY leg) ---
+       |        1. Record profit, log trade
+       |        2. BUY  = entry at market - PAIR_ENTRY_PCT        role=entry
+       |        3. Keep other-side order unchanged
        |
        |--- SELL ENTRY fills ------.
        |                           |
@@ -517,29 +511,23 @@ INITIAL (2 entries flanking market)
        |                           |
        |    State: buy exit + buy entry (2 orders)
        |                           |
-       |    --- BUY EXIT fills (ROUND TRIP at profit target) ---
-       |        1. Record profit, log trade
-       |        2. Cancel remaining buy entry
-       |        3. BUY  = entry at market - PAIR_ENTRY_PCT        role=entry
-       |        4. SELL = entry at market + PAIR_ENTRY_PCT        role=entry
-       |        -> Back to INITIAL
+       |    --- BUY ENTRY fills (before BUY EXIT) ---
+       |        1. SELL = exit at buy_price * (1 + PAIR_PROFIT_PCT)  role=exit
+       |        2. State: buy exit + sell exit (2 orders, both exits)
        |                           |
-       |    --- BUY ENTRY fills (implicit close, partial profit) ---
-       |        _close_orphaned_exit() detects orphaned buy exit:
-       |        1. Book PnL: (sell_entry - buy_entry) * vol - fees
-       |        2. Cancel orphaned buy exit
-       |        3. BUY  = entry at market - PAIR_ENTRY_PCT        role=entry
-       |        4. SELL = entry at market + PAIR_ENTRY_PCT        role=entry
-       |        -> Back to INITIAL
+       |    --- BUY EXIT fills (round trip completes SELL leg) ---
+       |        1. Record profit, log trade
+       |        2. SELL = entry at market + PAIR_ENTRY_PCT        role=entry
+       |        3. Keep other-side order unchanged
 ```
 
 ### Key Invariant
 
-Always exactly 2 open orders. Entry fills keep the opposite-side entry
-and add an exit (2 orders: exit + entry). Exit fills cancel the
-remaining entry and place a fresh pair (2 orders: both entries).
-If the remaining entry fills before the exit (price reversal),
-`_close_orphaned_exit()` books the implicit round trip.
+Always exactly 2 open orders. Entry fills keep the opposite-side order
+and add an exit (2 orders: exit + entry). Exit fills only replace the
+completed side's entry; the other side is never cancelled. If both
+entries fill before either exit, both exits are kept and profits are
+booked only when the exits fill.
 
 ### Offline Fill Recovery
 
@@ -552,13 +540,15 @@ Offline: BUY entry @ $0.098 fills, then SELL entry @ $0.0984 fills.
 On restart, trade history shows both fills.
   1. Sort chronologically (first=buy, second=sell)
   2. Expected exit = $0.098 * 1.01 = $0.09898
-  3. Actual second price $0.0984 != $0.09898 -> RACE CONDITION
-  4. Book PnL: ($0.0984 - $0.098) * vol - fees  (uses actual prices)
-  5. Place buy exit for sell position: $0.0984 * 0.99
+  3. Actual second price $0.0984 != $0.09898 -> DUAL ENTRY
+  4. Record both entries (profit = 0, fees tracked)
+  5. Place sell exit for buy position: $0.098 * 1.01
+  6. Place buy exit for sell position: $0.0984 * 0.99
 ```
 
 If the second fill IS near the expected exit, it's a **normal round trip
-completed offline**: book the PnL and place a fresh entry pair.
+completed offline**: book the PnL and place a new entry only for the
+completed side (the other side remains unchanged).
 
 ### Entry Refresh Safety
 
