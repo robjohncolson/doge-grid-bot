@@ -783,6 +783,154 @@ def _compute_health(results):
 
 
 # ============================================================================
+# PairStats -- aggregate statistics from CompletedCycle records
+# ============================================================================
+
+class PairStats:
+    """Aggregate statistics computed from CompletedCycle records."""
+    __slots__ = (
+        "n_total", "n_trade_a", "n_trade_b",
+        "total_net", "mean_net", "stdev_net", "median_net",
+        "win_count", "loss_count", "win_rate", "profit_factor",
+        "mean_duration_sec", "median_duration_sec",
+        "max_drawdown", "current_drawdown",
+        "ci_95_lower", "ci_95_upper",
+        "entries_placed", "entries_filled", "fill_rate",
+    )
+
+    def __init__(self):
+        # Integer counters default to 0
+        self.n_total = 0
+        self.n_trade_a = 0
+        self.n_trade_b = 0
+        self.win_count = 0
+        self.loss_count = 0
+        self.entries_placed = 0
+        self.entries_filled = 0
+        # Computed stats default to None (no data yet)
+        self.total_net = 0.0
+        self.mean_net = None
+        self.stdev_net = None
+        self.median_net = None
+        self.win_rate = None
+        self.profit_factor = None
+        self.mean_duration_sec = None
+        self.median_duration_sec = None
+        self.max_drawdown = None
+        self.current_drawdown = None
+        self.ci_95_lower = None
+        self.ci_95_upper = None
+        self.fill_rate = None
+
+    def to_dict(self) -> dict:
+        return {attr: getattr(self, attr) for attr in self.__slots__}
+
+
+def compute_pair_stats(completed_cycles, state=None) -> PairStats:
+    """
+    Compute aggregate pair statistics from CompletedCycle records.
+    Pure Python: mean, stdev, median, CI, max drawdown, profit factor.
+
+    Returns None for fields that are statistically meaningless at current n.
+    """
+    ps = PairStats()
+    if not completed_cycles:
+        return ps
+
+    nets = [c.net_profit for c in completed_cycles]
+    n = len(nets)
+    ps.n_total = n
+    ps.n_trade_a = sum(1 for c in completed_cycles if c.trade_id == "A")
+    ps.n_trade_b = sum(1 for c in completed_cycles if c.trade_id == "B")
+    ps.total_net = sum(nets)
+
+    # Mean
+    ps.mean_net = ps.total_net / n
+
+    # Stdev (sample) — None when n < 2
+    if n >= 2:
+        var = sum((x - ps.mean_net) ** 2 for x in nets) / (n - 1)
+        ps.stdev_net = math.sqrt(var) if var > 0 else 0.0
+    else:
+        ps.stdev_net = None
+
+    # Median
+    sorted_nets = sorted(nets)
+    if n % 2 == 1:
+        ps.median_net = sorted_nets[n // 2]
+    else:
+        ps.median_net = (sorted_nets[n // 2 - 1] + sorted_nets[n // 2]) / 2.0
+
+    # Win/loss — None when n == 0
+    ps.win_count = sum(1 for x in nets if x > 0)
+    ps.loss_count = sum(1 for x in nets if x <= 0)
+    ps.win_rate = ps.win_count / n if n > 0 else None
+
+    # Profit factor — None when no losses (not inf)
+    gross_wins = sum(x for x in nets if x > 0)
+    gross_losses = abs(sum(x for x in nets if x < 0))
+    ps.profit_factor = (gross_wins / gross_losses) if gross_losses > 0 else None
+
+    # Duration stats (only for cycles with valid times)
+    durations = []
+    for c in completed_cycles:
+        if c.exit_time > 0 and c.entry_time > 0:
+            dt = c.exit_time - c.entry_time
+            if dt > 0:
+                durations.append(dt)
+
+    if durations:
+        ps.mean_duration_sec = sum(durations) / len(durations)
+        sorted_dur = sorted(durations)
+        nd = len(sorted_dur)
+        if nd % 2 == 1:
+            ps.median_duration_sec = sorted_dur[nd // 2]
+        else:
+            ps.median_duration_sec = (sorted_dur[nd // 2 - 1] + sorted_dur[nd // 2]) / 2.0
+
+    # Max drawdown: walk cumulative P&L, track peak-to-trough
+    cum = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for x in nets:
+        cum += x
+        if cum > peak:
+            peak = cum
+        dd = peak - cum
+        if dd > max_dd:
+            max_dd = dd
+    ps.max_drawdown = max_dd
+    ps.current_drawdown = peak - cum
+
+    # 95% CI for mean — require n >= 3 (n=2 gives t=12.7, meaninglessly wide)
+    if n >= 3 and ps.stdev_net is not None and ps.stdev_net > 0:
+        se = ps.stdev_net / math.sqrt(n)
+        tc = _t_critical(n - 1)
+        ps.ci_95_lower = round(ps.mean_net - tc * se, 6)
+        ps.ci_95_upper = round(ps.mean_net + tc * se, 6)
+    else:
+        ps.ci_95_lower = None
+        ps.ci_95_upper = None
+
+    # Fill rate from state counters
+    if state is not None:
+        ps.entries_placed = getattr(state, "total_entries_placed", 0)
+        ps.entries_filled = getattr(state, "total_entries_filled", 0)
+        ps.fill_rate = (ps.entries_filled / ps.entries_placed
+                        if ps.entries_placed > 0 else None)
+
+    # Round float fields (skip None values)
+    for attr in ("total_net", "mean_net", "stdev_net", "median_net",
+                 "win_rate", "profit_factor", "mean_duration_sec",
+                 "median_duration_sec", "max_drawdown", "current_drawdown"):
+        val = getattr(ps, attr)
+        if val is not None:
+            setattr(ps, attr, round(val, 6))
+
+    return ps
+
+
+# ============================================================================
 # Public API
 # ============================================================================
 
@@ -848,6 +996,17 @@ def run_all(state, current_price, ohlc_data=None):
             results["random_walk"] = _result("random_walk", "error", "none", str(e), {})
 
     results["overall_health"] = _compute_health(results)
+
+    # Compute PairStats when in pair mode
+    if is_pair:
+        try:
+            cycles = getattr(state, "completed_cycles", [])
+            ps = compute_pair_stats(cycles, state=state)
+            results["pair_stats"] = ps.to_dict()
+            state.pair_stats = ps
+        except Exception as e:
+            logger.debug("PairStats computation error: %s", e)
+            state.pair_stats = None
 
     return results
 

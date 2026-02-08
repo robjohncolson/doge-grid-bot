@@ -128,7 +128,7 @@ def serialize_state(state: grid_strategy.GridState, current_price: float) -> dic
             "doge_accumulated": round(state.doge_accumulated, 2),
         },
         "grid": orders,
-        "trend": {
+        "trend": None if is_pair_mode else {
             "ratio": round(state.trend_ratio, 2),
             "source": ratio_source,
             "buy_pct": round(state.trend_ratio * 100),
@@ -168,6 +168,14 @@ def serialize_state(state: grid_strategy.GridState, current_price: float) -> dic
         "completed_cycles": [
             c.to_dict() for c in getattr(state, "completed_cycles", [])[-50:]
         ],
+        # Unrealized P&L (pair mode)
+        "unrealized_pnl": grid_strategy.compute_unrealized_pnl(state, current_price)
+            if is_pair_mode else None,
+        # AI council result
+        "ai_council": getattr(state, "_last_ai_result", None),
+        # Pair stats
+        "pair_stats": state.pair_stats.to_dict()
+            if is_pair_mode and getattr(state, "pair_stats", None) else None,
         # New: chart data
         "charts": {
             "price": price_chart,
@@ -287,6 +295,46 @@ a{color:#58a6ff}
 .cycles .trade-a-tag{color:#f85149;font-weight:700}
 .cycles .trade-b-tag{color:#3fb950;font-weight:700}
 
+/* Unrealized P&L card */
+.card-unreal .value{font-size:16px}
+.card-unreal .sub-a{color:#f85149;font-size:11px}
+.card-unreal .sub-b{color:#3fb950;font-size:11px}
+
+/* Pair stats panel */
+.pair-stats-panel{display:none;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin-bottom:20px}
+.pair-stats-panel h2{font-size:14px;color:#f0f6fc;margin-bottom:12px;border-bottom:1px solid #30363d;padding-bottom:8px}
+.ps-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:0}
+@media(max-width:700px){.ps-grid{grid-template-columns:1fr}}
+.ps-col{padding:0 12px;border-right:1px solid #30363d}
+.ps-col:last-child{border-right:none}
+.ps-col-head{font-size:12px;font-weight:700;margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid #21262d}
+.ps-col-head.col-a{color:#f85149}
+.ps-col-head.col-b{color:#3fb950}
+.ps-col-head.col-c{color:#58a6ff}
+.ps-row{display:flex;justify-content:space-between;font-size:11px;padding:3px 0}
+.ps-row .ps-k{color:#8b949e}
+.ps-row .ps-v{color:#f0f6fc;font-weight:600}
+
+/* AI council panel */
+.ai-council-panel{display:none;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin-bottom:20px}
+.ai-council-panel h2{font-size:14px;color:#f0f6fc;margin-bottom:12px;border-bottom:1px solid #30363d;padding-bottom:8px}
+.ai-verdict-row{display:flex;align-items:center;gap:12px;margin-bottom:12px}
+.ai-verdict-label{font-size:18px;font-weight:700}
+.ai-verdict-label.v-hold{color:#e3b341}
+.ai-verdict-label.v-adjust{color:#58a6ff}
+.ai-verdict-label.v-pause{color:#f85149}
+.ai-verdict-label.v-resume{color:#3fb950}
+.ai-next{font-size:11px;color:#484f58}
+.ai-panelists{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px;margin-top:8px}
+.ai-panelist{background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:10px;border-left:3px solid #30363d}
+.ai-panelist.ap-hold{border-left-color:#e3b341}
+.ai-panelist.ap-adjust{border-left-color:#58a6ff}
+.ai-panelist.ap-pause{border-left-color:#f85149}
+.ai-panelist.ap-skip{border-left-color:#484f58}
+.ai-panelist .ap-name{font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:0.5px}
+.ai-panelist .ap-vote{font-size:12px;font-weight:700;margin:2px 0}
+.ai-panelist .ap-reason{font-size:11px;color:#8b949e;line-height:1.4}
+
 /* Charts row */
 .charts-row{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:20px}
 @media(max-width:900px){.charts-row{grid-template-columns:1fr}}
@@ -372,6 +420,7 @@ a{color:#58a6ff}
   <div class="card"><div class="label">Total P&amp;L</div><div class="value" id="c-total">--</div><div class="sub" id="c-total-sub">--</div></div>
   <div class="card"><div class="label">Round Trips</div><div class="value" id="c-trips">--</div><div class="sub" id="c-trips-sub">--</div></div>
   <div class="card"><div class="label">DOGE Accumulated</div><div class="value" id="c-doge">--</div><div class="sub" id="c-doge-sub">&nbsp;</div></div>
+  <div class="card card-unreal" id="c-unreal-card" style="display:none"><div class="label">Unrealized P&amp;L</div><div class="value" id="c-unreal">--</div><div class="sub-a" id="c-unreal-a">&nbsp;</div><div class="sub-b" id="c-unreal-b">&nbsp;</div></div>
 </div>
 
 <!-- Pair State Machine (pair mode only) -->
@@ -386,19 +435,53 @@ a{color:#58a6ff}
   <div class="pair-panel trade-a">
     <div class="pp-title">Trade A (Short)</div>
     <div class="pp-row"><span class="pp-label">Cycle</span><span class="pp-val" id="pp-a-cycle">--</span></div>
+    <div class="pp-row"><span class="pp-label">Leg</span><span class="pp-val" id="pp-a-leg">--</span></div>
+    <div class="pp-row"><span class="pp-label">Entry price</span><span class="pp-val" id="pp-a-entry">--</span></div>
+    <div class="pp-row"><span class="pp-label">Target</span><span class="pp-val" id="pp-a-target">--</span></div>
+    <div class="pp-row"><span class="pp-label">Distance</span><span class="pp-val" id="pp-a-dist">--</span></div>
+    <div class="pp-row"><span class="pp-label">Est P&amp;L</span><span class="pp-val" id="pp-a-est">--</span></div>
     <div class="pp-row"><span class="pp-label">Completed</span><span class="pp-val" id="pp-a-completed">--</span></div>
     <div class="pp-row"><span class="pp-label">Net P&amp;L</span><span class="pp-val" id="pp-a-pnl">--</span></div>
     <div class="pp-row"><span class="pp-label">Avg profit</span><span class="pp-val" id="pp-a-avg">--</span></div>
-    <div class="pp-row"><span class="pp-label">Status</span><span class="pp-val" id="pp-a-status">--</span></div>
   </div>
   <div class="pair-panel trade-b">
     <div class="pp-title">Trade B (Long)</div>
     <div class="pp-row"><span class="pp-label">Cycle</span><span class="pp-val" id="pp-b-cycle">--</span></div>
+    <div class="pp-row"><span class="pp-label">Leg</span><span class="pp-val" id="pp-b-leg">--</span></div>
+    <div class="pp-row"><span class="pp-label">Entry price</span><span class="pp-val" id="pp-b-entry">--</span></div>
+    <div class="pp-row"><span class="pp-label">Target</span><span class="pp-val" id="pp-b-target">--</span></div>
+    <div class="pp-row"><span class="pp-label">Distance</span><span class="pp-val" id="pp-b-dist">--</span></div>
+    <div class="pp-row"><span class="pp-label">Est P&amp;L</span><span class="pp-val" id="pp-b-est">--</span></div>
     <div class="pp-row"><span class="pp-label">Completed</span><span class="pp-val" id="pp-b-completed">--</span></div>
     <div class="pp-row"><span class="pp-label">Net P&amp;L</span><span class="pp-val" id="pp-b-pnl">--</span></div>
     <div class="pp-row"><span class="pp-label">Avg profit</span><span class="pp-val" id="pp-b-avg">--</span></div>
-    <div class="pp-row"><span class="pp-label">Status</span><span class="pp-val" id="pp-b-status">--</span></div>
   </div>
+</div>
+
+<!-- Pair Stats Panel (pair mode only) -->
+<div class="pair-stats-panel" id="pair-stats-panel">
+  <h2>Pair Statistics</h2>
+  <div class="ps-grid">
+    <div class="ps-col" id="ps-col-a">
+      <div class="ps-col-head col-a">Trade A (Short)</div>
+    </div>
+    <div class="ps-col" id="ps-col-b">
+      <div class="ps-col-head col-b">Trade B (Long)</div>
+    </div>
+    <div class="ps-col" id="ps-col-c">
+      <div class="ps-col-head col-c">Combined</div>
+    </div>
+  </div>
+</div>
+
+<!-- AI Council Panel (pair mode only) -->
+<div class="ai-council-panel" id="ai-council-panel">
+  <h2>AI Council</h2>
+  <div class="ai-verdict-row">
+    <div class="ai-verdict-label" id="ai-verdict">--</div>
+    <div class="ai-next" id="ai-next"></div>
+  </div>
+  <div class="ai-panelists" id="ai-panelists"></div>
 </div>
 
 <!-- Charts -->
@@ -485,7 +568,7 @@ a{color:#58a6ff}
   <div class="section" style="grid-column:1/-1">
     <h2>Completed Cycles (recent)</h2>
     <div class="cycles" id="cycles-wrap">
-      <table><thead><tr><th>Time</th><th>Trade</th><th>Cycle</th><th>Entry</th><th>Exit</th><th>Volume</th><th>Net P&amp;L</th></tr></thead>
+      <table><thead><tr><th>Time</th><th>Trade</th><th>Cycle</th><th>Entry</th><th>Exit</th><th>Volume</th><th>Duration</th><th>Net P&amp;L</th></tr></thead>
       <tbody id="cycles-body"></tbody></table>
     </div>
   </div>
@@ -538,6 +621,15 @@ function fmtUptime(s) {
   const sec = Math.floor(s % 60);
   return h + 'h ' + m + 'm ' + sec + 's';
 }
+function fmtDuration(sec) {
+  if (sec == null || sec <= 0) return '\u2014';
+  if (sec < 60) return Math.round(sec) + 's';
+  if (sec < 3600) return Math.floor(sec/60) + 'm ' + Math.round(sec%60) + 's';
+  return Math.floor(sec/3600) + 'h ' + Math.floor((sec%3600)/60) + 'm';
+}
+function fmtPct(n) { return n != null ? n.toFixed(1) + '%' : '\u2014'; }
+function fmtStatUSD(n) { return n != null ? fmtUSD(n) : '\u2014'; }
+function fmtStatNum(n, d) { return n != null ? n.toFixed(d) : '\u2014'; }
 // Local uptime ticker -- set base once, tick locally, resync only on bot restart
 let _lastServerUptime = 0;
 let _lastServerUptimeAt = 0;
@@ -1252,48 +1344,164 @@ function update(data) {
     const bNet = bCyc.reduce((s,c) => s + c.net_profit, 0);
     const aAvg = aCyc.length > 0 ? aNet / aCyc.length : 0;
     const bAvg = bCyc.length > 0 ? bNet / bCyc.length : 0;
-    // Derive per-trade status from open orders
+    // Derive per-trade details from open orders
     const openOrders = data.grid.filter(o => o.status === 'open');
     const aOrders = openOrders.filter(o => o.trade_id === 'A');
     const bOrders = openOrders.filter(o => o.trade_id === 'B');
-    const aStatus = aOrders.length > 0 ? aOrders.map(o => o.role || o.side).join(', ') : 'idle';
-    const bStatus = bOrders.length > 0 ? bOrders.map(o => o.role || o.side).join(', ') : 'idle';
+    // Trade A panel: current leg, entry price, target, distance, est P&L
+    const aOrder = aOrders.length > 0 ? aOrders[0] : null;
+    const aLeg = aOrder ? (aOrder.role || aOrder.side) : 'idle';
+    const aEntry = aOrder && aOrder.matched_sell_price ? aOrder.matched_sell_price : null;
+    const aTarget = aOrder ? aOrder.price : null;
+    const aDist = (aTarget && p.current > 0) ? ((aTarget - p.current) / p.current * 100) : null;
+    const aEst = (aEntry && aTarget && aOrder.volume) ? (aEntry - aTarget) * aOrder.volume : null;
 
     document.getElementById('pp-a-cycle').textContent = '#' + (data.cycle_a || 1);
+    document.getElementById('pp-a-leg').textContent = aLeg;
+    document.getElementById('pp-a-entry').textContent = aEntry ? '$' + fmt(aEntry, 6) : '--';
+    document.getElementById('pp-a-target').textContent = aTarget ? '$' + fmt(aTarget, 6) : '--';
+    document.getElementById('pp-a-dist').textContent = aDist != null ? fmt(aDist, 2) + '%' : '--';
+    document.getElementById('pp-a-est').textContent = aEst != null ? fmtUSD(aEst) : '--';
     document.getElementById('pp-a-completed').textContent = aCyc.length + ' cycles';
     document.getElementById('pp-a-pnl').textContent = fmtUSD(aNet);
     document.getElementById('pp-a-pnl').style.color = aNet >= 0 ? '#3fb950' : '#f85149';
     document.getElementById('pp-a-avg').textContent = fmtUSD(aAvg);
-    document.getElementById('pp-a-status').textContent = aStatus;
+
+    // Trade B panel
+    const bOrder = bOrders.length > 0 ? bOrders[0] : null;
+    const bLeg = bOrder ? (bOrder.role || bOrder.side) : 'idle';
+    const bEntry = bOrder && bOrder.matched_buy_price ? bOrder.matched_buy_price : null;
+    const bTarget = bOrder ? bOrder.price : null;
+    const bDist = (bTarget && p.current > 0) ? ((bTarget - p.current) / p.current * 100) : null;
+    const bEst = (bEntry && bTarget && bOrder.volume) ? (bTarget - bEntry) * bOrder.volume : null;
 
     document.getElementById('pp-b-cycle').textContent = '#' + (data.cycle_b || 1);
+    document.getElementById('pp-b-leg').textContent = bLeg;
+    document.getElementById('pp-b-entry').textContent = bEntry ? '$' + fmt(bEntry, 6) : '--';
+    document.getElementById('pp-b-target').textContent = bTarget ? '$' + fmt(bTarget, 6) : '--';
+    document.getElementById('pp-b-dist').textContent = bDist != null ? fmt(bDist, 2) + '%' : '--';
+    document.getElementById('pp-b-est').textContent = bEst != null ? fmtUSD(bEst) : '--';
     document.getElementById('pp-b-completed').textContent = bCyc.length + ' cycles';
     document.getElementById('pp-b-pnl').textContent = fmtUSD(bNet);
     document.getElementById('pp-b-pnl').style.color = bNet >= 0 ? '#3fb950' : '#f85149';
     document.getElementById('pp-b-avg').textContent = fmtUSD(bAvg);
-    document.getElementById('pp-b-status').textContent = bStatus;
 
-    // Completed cycles table
+    // Unrealized P&L card
+    const uCard = document.getElementById('c-unreal-card');
+    const upnl = data.unrealized_pnl;
+    if (upnl) {
+      uCard.style.display = '';
+      const tot = upnl.total_unrealized || 0;
+      document.getElementById('c-unreal').textContent = fmtUSD(tot);
+      document.getElementById('c-unreal').style.color = tot >= 0 ? '#3fb950' : '#f85149';
+      document.getElementById('c-unreal-a').textContent = 'A: ' + fmtUSD(upnl.a_unrealized || 0);
+      document.getElementById('c-unreal-b').textContent = 'B: ' + fmtUSD(upnl.b_unrealized || 0);
+    } else {
+      uCard.style.display = 'none';
+    }
+
+    // Pair stats panel
+    const psPanel = document.getElementById('pair-stats-panel');
+    const pst = data.pair_stats;
+    if (pst) {
+      psPanel.style.display = '';
+      function psRows(colId, stats) {
+        const col = document.getElementById(colId);
+        // Keep header, replace rows
+        const head = col.querySelector('.ps-col-head').outerHTML;
+        let h = head;
+        const rows = [
+          ['Cycles', (stats.n != null ? stats.n : (stats.n_total != null ? stats.n_total : '\u2014'))],
+          ['Mean P&L', fmtStatUSD(stats.mean_net)],
+          ['Win rate', fmtPct(stats.win_rate)],
+          ['Profit factor', fmtStatNum(stats.profit_factor, 2)],
+          ['Max drawdown', fmtStatUSD(stats.max_drawdown)],
+          ['95% CI', (stats.ci_95_lower != null && stats.ci_95_upper != null) ? fmtUSD(stats.ci_95_lower) + ' .. ' + fmtUSD(stats.ci_95_upper) : '\u2014'],
+          ['Avg duration', fmtDuration(stats.mean_duration_sec)],
+          ['Fill rate', fmtPct(stats.fill_rate)],
+        ];
+        for (const [k,v] of rows) {
+          h += '<div class="ps-row"><span class="ps-k">' + k + '</span><span class="ps-v">' + v + '</span></div>';
+        }
+        col.innerHTML = h;
+      }
+      // Build per-trade stats from completed cycles
+      const aStats = {n: aCyc.length, mean_net: aAvg, win_rate: aCyc.length > 0 ? aCyc.filter(c=>c.net_profit>0).length/aCyc.length*100 : null,
+        profit_factor: null, max_drawdown: null, ci_95_lower: null, ci_95_upper: null, mean_duration_sec: null, fill_rate: null};
+      const bStats = {n: bCyc.length, mean_net: bAvg, win_rate: bCyc.length > 0 ? bCyc.filter(c=>c.net_profit>0).length/bCyc.length*100 : null,
+        profit_factor: null, max_drawdown: null, ci_95_lower: null, ci_95_upper: null, mean_duration_sec: null, fill_rate: null};
+      // Compute per-trade durations
+      if (aCyc.length > 0) {
+        const aDurs = aCyc.filter(c=>c.entry_time&&c.exit_time).map(c=>c.exit_time-c.entry_time);
+        if (aDurs.length > 0) aStats.mean_duration_sec = aDurs.reduce((a,b)=>a+b,0)/aDurs.length;
+      }
+      if (bCyc.length > 0) {
+        const bDurs = bCyc.filter(c=>c.entry_time&&c.exit_time).map(c=>c.exit_time-c.entry_time);
+        if (bDurs.length > 0) bStats.mean_duration_sec = bDurs.reduce((a,b)=>a+b,0)/bDurs.length;
+      }
+      psRows('ps-col-a', aStats);
+      psRows('ps-col-b', bStats);
+      // Combined stats: normalize win_rate from 0-1 to 0-100 for display
+      const pstDisplay = Object.assign({}, pst, {n: pst.n_total, win_rate: pst.win_rate != null ? pst.win_rate * 100 : null});
+      psRows('ps-col-c', pstDisplay);
+    } else {
+      psPanel.style.display = 'none';
+    }
+
+    // AI council panel
+    const aiPanel = document.getElementById('ai-council-panel');
+    const aic = data.ai_council;
+    if (aic && aic.action) {
+      aiPanel.style.display = '';
+      const vLabel = document.getElementById('ai-verdict');
+      vLabel.textContent = (aic.action || '').toUpperCase();
+      const aCls = (aic.action || '').toLowerCase().replace(/_.*/, '');
+      vLabel.className = 'ai-verdict-label v-' + aCls;
+      // Panelists
+      const pDiv = document.getElementById('ai-panelists');
+      let phtml = '';
+      const votes = aic.panel_votes || aic.votes || [];
+      for (const v of votes) {
+        const cond = v.condition || '';
+        const isSkip = cond === 'skipped' || cond === 'error' || cond === 'timeout';
+        const vCls = isSkip ? 'ap-skip' : 'ap-' + (v.action || 'hold').toLowerCase().replace(/_.*/, '');
+        phtml += '<div class="ai-panelist ' + vCls + '">';
+        phtml += '<div class="ap-name">' + (v.name || v.model || 'panelist') + '</div>';
+        phtml += '<div class="ap-vote">' + (isSkip ? cond.toUpperCase() : (v.action || '--').toUpperCase()) + '</div>';
+        phtml += '<div class="ap-reason">' + (v.reason || '') + '</div>';
+        phtml += '</div>';
+      }
+      pDiv.innerHTML = phtml;
+    } else {
+      aiPanel.style.display = 'none';
+    }
+
+    // Completed cycles table (last 20, with duration, color-coded P&L)
     cycSec.style.display = '';
     const cb = document.getElementById('cycles-body');
     let crows = '';
     const sortedCycles = cycles.slice().reverse();
-    for (const c of sortedCycles.slice(0, 30)) {
+    for (const c of sortedCycles.slice(0, 20)) {
       const tag = c.trade_id === 'A' ? 'trade-a-tag' : 'trade-b-tag';
       const pcls = c.net_profit > 0 ? 'profit-pos' : (c.net_profit < 0 ? 'profit-neg' : '');
+      const dur = (c.entry_time && c.exit_time) ? fmtDuration(c.exit_time - c.entry_time) : '--';
       crows += '<tr><td>' + fmtTime(c.exit_time) + '</td>'
              + '<td class="' + tag + '">' + c.trade_id + '</td>'
              + '<td>' + c.cycle + '</td>'
              + '<td>$' + fmt(c.entry_price, 6) + '</td>'
              + '<td>$' + fmt(c.exit_price, 6) + '</td>'
              + '<td>' + fmt(c.volume, 2) + '</td>'
+             + '<td>' + dur + '</td>'
              + '<td class="' + pcls + '">' + fmtUSD(c.net_profit) + '</td></tr>';
     }
-    cb.innerHTML = crows || '<tr><td colspan="7" style="text-align:center;color:#8b949e">No completed cycles yet</td></tr>';
+    cb.innerHTML = crows || '<tr><td colspan="8" style="text-align:center;color:#8b949e">No completed cycles yet</td></tr>';
   } else {
     psBar.style.display = 'none';
     ppDiv.style.display = 'none';
     cycSec.style.display = 'none';
+    document.getElementById('c-unreal-card').style.display = 'none';
+    document.getElementById('pair-stats-panel').style.display = 'none';
+    document.getElementById('ai-council-panel').style.display = 'none';
   }
 
   // Stats advisory board

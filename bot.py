@@ -1218,8 +1218,9 @@ def _restore_from_supabase(state: grid_strategy.GridState):
     state.total_fees_usd = sb_state.get("total_fees_usd", 0.0)
     state.doge_accumulated = sb_state.get("doge_accumulated", 0.0)
     state.last_accumulation = sb_state.get("last_accumulation", 0.0)
-    state.trend_ratio = sb_state.get("trend_ratio", 0.5)
-    state.trend_ratio_override = sb_state.get("trend_ratio_override", None)
+    if config.STRATEGY_MODE != "pair":
+        state.trend_ratio = sb_state.get("trend_ratio", 0.5)
+        state.trend_ratio_override = sb_state.get("trend_ratio_override", None)
     # Restore pair mode identity fields
     state.pair_state = sb_state.get("pair_state", "S0")
     state.cycle_a = sb_state.get("cycle_a", 1)
@@ -1230,14 +1231,16 @@ def _restore_from_supabase(state: grid_strategy.GridState):
     state.completed_cycles = [
         grid_strategy.CompletedCycle.from_dict(c) for c in saved_cycles
     ]
+    state._pnl_migrated = sb_state.get("pnl_migrated", False)
     # Restore runtime config overrides
-    saved_spacing = sb_state.get("grid_spacing_pct")
-    if saved_spacing and saved_spacing != config.GRID_SPACING_PCT:
-        logger.info(
-            "[%s] Restoring spacing from Supabase: %.2f%% -> %.2f%%",
-            pair_name, config.GRID_SPACING_PCT, saved_spacing,
-        )
-        config.GRID_SPACING_PCT = saved_spacing
+    if config.STRATEGY_MODE != "pair":
+        saved_spacing = sb_state.get("grid_spacing_pct")
+        if saved_spacing and saved_spacing != config.GRID_SPACING_PCT:
+            logger.info(
+                "[%s] Restoring spacing from Supabase: %.2f%% -> %.2f%%",
+                pair_name, config.GRID_SPACING_PCT, saved_spacing,
+            )
+            config.GRID_SPACING_PCT = saved_spacing
     saved_entry_pct = sb_state.get("pair_entry_pct")
     if saved_entry_pct and saved_entry_pct != state.entry_pct:
         logger.info(
@@ -1303,6 +1306,10 @@ def run():
         if sb_prices:
             state.price_history = sb_prices
             logger.info("[%s] Restored %d price samples from Supabase", pair_name, len(sb_prices))
+        # Retroactive P&L reconstruction from fills (once per state)
+        if config.STRATEGY_MODE == "pair" and not state._pnl_migrated:
+            grid_strategy.migrate_pnl_from_fills(state)
+            grid_strategy.save_state(state)
 
     # Start health check server (Railway expects a listening port)
     health_server = start_health_server()
@@ -1535,41 +1542,72 @@ def run():
                     if f.get("time", 0) > hour_ago
                 ])
 
-                market_data = {
-                    "price": ai_price,
-                    "pair_display": ai_state.pair_display,
-                    "change_1h": price_changes["1h"],
-                    "change_4h": price_changes["4h"],
-                    "change_24h": price_changes["24h"],
-                    "spread_pct": spread_pct,
-                    "recent_fills": recent_count,
-                    "grid_center": ai_state.center_price,
-                }
-
                 if config.STRATEGY_MODE == "pair":
-                    market_data["position_state"] = grid_strategy.get_position_state(ai_state)
-                    market_data["pair_state"] = ai_state.pair_state
-                    market_data["cycle_a"] = ai_state.cycle_a
-                    market_data["cycle_b"] = ai_state.cycle_b
-                    market_data["today_profit"] = ai_state.today_profit_usd
-                    market_data["total_profit"] = ai_state.total_profit_usd
-                    market_data["today_loss"] = ai_state.today_loss_usd
-                    market_data["round_trips_today"] = ai_state.round_trips_today
-                    market_data["total_round_trips"] = ai_state.total_round_trips
-                    market_data["entry_pct"] = ai_state.entry_pct
-                    market_data["profit_pct"] = ai_state.profit_pct
-                    market_data["daily_loss_limit"] = ai_state.daily_loss_limit
-                    # Per-trade stats from completed cycles
-                    a_cycles = [c for c in ai_state.completed_cycles if c.trade_id == "A"]
-                    b_cycles = [c for c in ai_state.completed_cycles if c.trade_id == "B"]
-                    market_data["trade_a_cycles"] = len(a_cycles)
-                    market_data["trade_a_net"] = sum(c.net_profit for c in a_cycles)
-                    market_data["trade_b_cycles"] = len(b_cycles)
-                    market_data["trade_b_net"] = sum(c.net_profit for c in b_cycles)
+                    def _serialize_trade(trade_id, st):
+                        orders = [o for o in st.grid_orders
+                                  if getattr(o, 'trade_id', None) == trade_id and o.status == "open"]
+                        cyc_attr = f"cycle_{trade_id.lower()}"
+                        if not orders:
+                            return {"cycle": getattr(st, cyc_attr, 1), "leg": "idle"}
+                        o = orders[0]
+                        return {
+                            "cycle": o.cycle,
+                            "leg": o.order_role,
+                            "side": o.side,
+                            "price": o.price,
+                        }
+
+                    upnl = grid_strategy.compute_unrealized_pnl(ai_state, ai_price)
+                    ps = getattr(ai_state, "pair_stats", None)
+                    market_data = {
+                        "market": {
+                            "price": ai_price,
+                            "pair_display": ai_state.pair_display,
+                            "change_1h_pct": price_changes["1h"],
+                            "change_4h_pct": price_changes["4h"],
+                            "change_24h_pct": price_changes["24h"],
+                            "spread_pct": spread_pct,
+                            "fills_last_hour": recent_count,
+                        },
+                        "strategy": {
+                            "entry_pct": ai_state.entry_pct,
+                            "profit_pct": ai_state.profit_pct,
+                            "refresh_pct": ai_state.refresh_pct,
+                            "order_size_usd": ai_state.order_size_usd,
+                        },
+                        "state": {
+                            "pair_state": ai_state.pair_state,
+                            "trade_a": _serialize_trade("A", ai_state),
+                            "trade_b": _serialize_trade("B", ai_state),
+                        },
+                        "performance": ps.to_dict() if ps else {},
+                        "risk": {
+                            "capital": config.STARTING_CAPITAL,
+                            "stop_floor": ai_state.stop_floor,
+                            "daily_loss_limit": ai_state.daily_loss_limit,
+                            "today_loss_usd": ai_state.today_loss_usd,
+                            "today_profit_usd": ai_state.today_profit_usd,
+                            "total_profit_usd": ai_state.total_profit_usd,
+                            "unrealized_pnl_usd": upnl["total_unrealized"],
+                        },
+                    }
+                    logger.debug("AI council payload: %s", json.dumps(market_data, default=str))
+                else:
+                    market_data = {
+                        "price": ai_price,
+                        "pair_display": ai_state.pair_display,
+                        "change_1h": price_changes["1h"],
+                        "change_4h": price_changes["4h"],
+                        "change_24h": price_changes["24h"],
+                        "spread_pct": spread_pct,
+                        "recent_fills": recent_count,
+                        "grid_center": ai_state.center_price,
+                    }
 
                 stats_context = stats_engine.format_for_ai(ai_state.stats_results)
                 recommendation = ai_advisor.get_recommendation(market_data, stats_context)
                 ai_state.ai_recommendation = ai_advisor.format_recommendation(recommendation)
+                ai_state._last_ai_result = recommendation
 
                 msg_id = notifier.notify_ai_recommendation(recommendation, ai_price)
                 action = recommendation.get("action", "continue")

@@ -193,6 +193,7 @@ class GridState:
         # AI advisor
         self.last_ai_check = 0.0         # Timestamp of last AI analysis
         self.ai_recommendation = ""      # Latest AI recommendation
+        self._last_ai_result = None      # Full AI council result dict for dashboard
 
         # Price tracking for AI context
         self.price_history: list = []    # List of (timestamp, price) tuples
@@ -206,6 +207,7 @@ class GridState:
         # Statistical analysis
         self.stats_results = {}          # Latest stats_engine.run_all() output
         self.stats_last_run = 0.0        # Timestamp of last stats run
+        self.pair_stats = None           # Latest PairStats object (pair mode)
 
         # Pair mode: explicit state machine and cycle counters
         # States: "S0" (both entries), "S1a" (A exit + B entry),
@@ -216,6 +218,21 @@ class GridState:
 
         # Completed round-trip records (most recent N kept for dashboard/stats)
         self.completed_cycles: list = []  # List of CompletedCycle objects
+
+        # P&L migration flag (set True after retroactive reconstruction)
+        self._pnl_migrated = False
+
+        # Entry placement/fill counters (for fill rate stat)
+        self.total_entries_placed = 0
+        self.total_entries_filled = 0
+
+        # Anti-chase: prevent rapid same-direction refreshes during trends
+        self.consecutive_refreshes_a = 0
+        self.consecutive_refreshes_b = 0
+        self.last_refresh_direction_a = None  # "up" or "down"
+        self.last_refresh_direction_b = None
+        self.refresh_cooldown_until_a = 0.0
+        self.refresh_cooldown_until_b = 0.0
 
     # -- Per-pair property accessors (fall back to global config) --
 
@@ -346,8 +363,9 @@ def save_state(state: GridState):
         "total_fees_usd": state.total_fees_usd,
         "doge_accumulated": state.doge_accumulated,
         "last_accumulation": state.last_accumulation,
-        "trend_ratio": state.trend_ratio,
-        "trend_ratio_override": state.trend_ratio_override,
+        **({"trend_ratio": state.trend_ratio,
+            "trend_ratio_override": state.trend_ratio_override}
+           if config.STRATEGY_MODE != "pair" else {}),
         "open_txids": [o.txid for o in state.grid_orders
                        if o.status == "open" and o.txid],
         "open_orders": open_order_details,
@@ -355,6 +373,15 @@ def save_state(state: GridState):
         "cycle_a": state.cycle_a,
         "cycle_b": state.cycle_b,
         "completed_cycles": [c.to_dict() for c in state.completed_cycles],
+        "pnl_migrated": state._pnl_migrated,
+        "total_entries_placed": state.total_entries_placed,
+        "total_entries_filled": state.total_entries_filled,
+        "consecutive_refreshes_a": state.consecutive_refreshes_a,
+        "consecutive_refreshes_b": state.consecutive_refreshes_b,
+        "last_refresh_direction_a": state.last_refresh_direction_a,
+        "last_refresh_direction_b": state.last_refresh_direction_b,
+        "refresh_cooldown_until_a": state.refresh_cooldown_until_a,
+        "refresh_cooldown_until_b": state.refresh_cooldown_until_b,
         "saved_at": time.time(),
         "strategy_mode": config.STRATEGY_MODE,
         # Runtime config overrides (survive deploys via Supabase)
@@ -408,8 +435,9 @@ def load_state(state: GridState) -> bool:
     state.total_fees_usd = snapshot.get("total_fees_usd", 0.0)
     state.doge_accumulated = snapshot.get("doge_accumulated", 0.0)
     state.last_accumulation = snapshot.get("last_accumulation", 0.0)
-    state.trend_ratio = snapshot.get("trend_ratio", 0.5)
-    state.trend_ratio_override = snapshot.get("trend_ratio_override", None)
+    if config.STRATEGY_MODE != "pair":
+        state.trend_ratio = snapshot.get("trend_ratio", 0.5)
+        state.trend_ratio_override = snapshot.get("trend_ratio_override", None)
 
     # Restore pair mode identity fields
     state.pair_state = snapshot.get("pair_state", "S0")
@@ -421,6 +449,17 @@ def load_state(state: GridState) -> bool:
     # Restore completed cycles history
     saved_cycles = snapshot.get("completed_cycles", [])
     state.completed_cycles = [CompletedCycle.from_dict(c) for c in saved_cycles]
+    state._pnl_migrated = snapshot.get("pnl_migrated", False)
+    state.total_entries_placed = snapshot.get("total_entries_placed", 0)
+    state.total_entries_filled = snapshot.get("total_entries_filled", 0)
+
+    # Restore anti-chase state
+    state.consecutive_refreshes_a = snapshot.get("consecutive_refreshes_a", 0)
+    state.consecutive_refreshes_b = snapshot.get("consecutive_refreshes_b", 0)
+    state.last_refresh_direction_a = snapshot.get("last_refresh_direction_a", None)
+    state.last_refresh_direction_b = snapshot.get("last_refresh_direction_b", None)
+    state.refresh_cooldown_until_a = snapshot.get("refresh_cooldown_until_a", 0.0)
+    state.refresh_cooldown_until_b = snapshot.get("refresh_cooldown_until_b", 0.0)
 
     # Restore pair_entry_pct runtime override
     saved_entry_pct = snapshot.get("pair_entry_pct")
@@ -446,11 +485,136 @@ def load_state(state: GridState) -> bool:
     return True
 
 
+def migrate_pnl_from_fills(state: GridState):
+    """
+    Retroactively reconstruct CompletedCycle records from recent_fills.
+
+    Pairs fills by price matching (not by stored profit field, which may
+    have been sanitized to zero by old code):
+      - Trade A: sell (entry) followed by buy (exit) at sell × (1 - π)
+      - Trade B: buy (entry) followed by sell (exit) at buy × (1 + π)
+
+    P&L is always computed as (sell_price - buy_price) × volume - fees.
+    Only runs once (sets _pnl_migrated flag).
+    """
+    if getattr(state, "_pnl_migrated", False):
+        return
+
+    fills = sorted(
+        [f for f in state.recent_fills if f.get("time", 0) > 0],
+        key=lambda f: f["time"],
+    )
+
+    if len(fills) < 2:
+        state._pnl_migrated = True
+        return
+
+    # Separate into sells and buys (preserving original list indices)
+    sells = [(i, f) for i, f in enumerate(fills) if f.get("side") == "sell"]
+    buys = [(i, f) for i, f in enumerate(fills) if f.get("side") == "buy"]
+
+    completed = []
+    used_sells = set()
+    used_buys = set()
+
+    profit_pct = state.profit_pct / 100.0  # e.g. 0.01
+    tolerance = 0.005  # 0.5% price matching tolerance
+
+    # Trade A pairs: sell (entry) followed by buy (exit)
+    # Expected exit price ≈ sell_price × (1 - π)
+    for si, (s_idx, s) in enumerate(sells):
+        if s_idx in used_sells:
+            continue
+        expected_exit = s["price"] * (1 - profit_pct)
+        for bi, (b_idx, b) in enumerate(buys):
+            if b_idx in used_buys:
+                continue
+            if b.get("time", 0) <= s.get("time", 0):
+                continue  # exit must come after entry
+            if expected_exit > 0 and abs(b["price"] - expected_exit) / expected_exit < tolerance:
+                vol = min(s.get("volume", 0), b.get("volume", 0))
+                gross = (s["price"] - b["price"]) * vol
+                fee_entry = s.get("fees", vol * s["price"] * 0.0026)
+                fee_exit = b.get("fees", vol * b["price"] * 0.0026)
+                net = gross - fee_entry - fee_exit
+                cycle_num = len([c for c in completed if c.trade_id == "A"]) + 1
+                completed.append(CompletedCycle(
+                    trade_id="A", cycle=cycle_num,
+                    entry_side="sell",
+                    entry_price=s["price"], exit_price=b["price"],
+                    volume=vol, gross_profit=gross,
+                    fees=fee_entry + fee_exit, net_profit=net,
+                    entry_time=s.get("time", 0), exit_time=b.get("time", 0),
+                ))
+                used_sells.add(s_idx)
+                used_buys.add(b_idx)
+                break
+
+    # Trade B pairs: buy (entry) followed by sell (exit)
+    # Expected exit price ≈ buy_price × (1 + π)
+    for bi, (b_idx, b) in enumerate(buys):
+        if b_idx in used_buys:
+            continue
+        expected_exit = b["price"] * (1 + profit_pct)
+        for si, (s_idx, s) in enumerate(sells):
+            if s_idx in used_sells:
+                continue
+            if s.get("time", 0) <= b.get("time", 0):
+                continue  # exit must come after entry
+            if expected_exit > 0 and abs(s["price"] - expected_exit) / expected_exit < tolerance:
+                vol = min(b.get("volume", 0), s.get("volume", 0))
+                gross = (s["price"] - b["price"]) * vol
+                fee_entry = b.get("fees", vol * b["price"] * 0.0026)
+                fee_exit = s.get("fees", vol * s["price"] * 0.0026)
+                net = gross - fee_entry - fee_exit
+                cycle_num = len([c for c in completed if c.trade_id == "B"]) + 1
+                completed.append(CompletedCycle(
+                    trade_id="B", cycle=cycle_num,
+                    entry_side="buy",
+                    entry_price=b["price"], exit_price=s["price"],
+                    volume=vol, gross_profit=gross,
+                    fees=fee_entry + fee_exit, net_profit=net,
+                    entry_time=b.get("time", 0), exit_time=s.get("time", 0),
+                ))
+                used_sells.add(s_idx)
+                used_buys.add(b_idx)
+                break
+
+    if completed:
+        completed.sort(key=lambda c: c.exit_time)
+        if not state.completed_cycles:
+            state.completed_cycles = completed
+        else:
+            # Merge: add only cycles not already present (by exit_time)
+            existing_times = {c.exit_time for c in state.completed_cycles}
+            for rc in completed:
+                if rc.exit_time not in existing_times:
+                    state.completed_cycles.append(rc)
+
+        _trim_completed_cycles(state)
+        # Update accumulators from reconstructed data
+        state.total_profit_usd = sum(c.net_profit for c in state.completed_cycles)
+        state.total_round_trips = len(state.completed_cycles)
+        logger.info(
+            "P&L migration: reconstructed %d cycles, total_profit=$%.4f "
+            "(A: %d, B: %d)",
+            len(completed), state.total_profit_usd,
+            sum(1 for c in completed if c.trade_id == "A"),
+            sum(1 for c in completed if c.trade_id == "B"),
+        )
+
+    state._pnl_migrated = True
+
+
 # ---------------------------------------------------------------------------
 # Trend ratio (asymmetric grid)
 # ---------------------------------------------------------------------------
 
 TREND_WINDOW_SECONDS = 43200  # 12 hours
+
+# Anti-chase constants
+MAX_CONSECUTIVE_REFRESHES = 3   # refreshes in same direction before cooldown
+REFRESH_COOLDOWN_SEC = 300      # seconds to pause refreshes after chase detected
 
 def update_trend_ratio(state: GridState):
     """
@@ -1312,7 +1476,10 @@ def check_grid_drift(state: GridState, current_price: float) -> bool:
     Returns True if a reset is needed.
     """
     if config.STRATEGY_MODE == "pair":
-        return refresh_stale_entries(state, current_price)
+        # Pair mode refreshes entries in-place (no full rebuild needed).
+        # Always return False so bot.py doesn't cancel_grid + build_grid.
+        refresh_stale_entries(state, current_price)
+        return False
 
     if state.center_price <= 0:
         return False
@@ -1372,19 +1539,17 @@ def check_risk_limits(state: GridState, current_price: float) -> tuple:
         return (False, True, f"Daily loss limit hit: ${state.today_loss_usd:.2f} >= ${state.daily_loss_limit:.2f}")
 
     # Check stop floor
-    # Estimate portfolio value: cash + value of any DOGE held
-    # In a grid bot, our max exposure is GRID_LEVELS * ORDER_SIZE_USD on each side
-    # Simple approximation: starting capital - max possible loss from open buys
-    # Only count filled buys that haven't been closed out by a paired sell
-    filled_buys = [o for o in state.grid_orders
-                   if o.side == "buy" and o.status == "filled" and not o.closed_out]
-
-    # Worst case: all un-closed filled buys are now worth less
-    unrealized_loss = 0.0
-    for order in filled_buys:
-        unrealized_loss += (order.price - current_price) * order.volume
-
-    estimated_value = config.STARTING_CAPITAL + state.total_profit_usd - max(0, unrealized_loss)
+    if config.STRATEGY_MODE == "pair":
+        # Pair mode: use signed unrealized P&L (positive = in the money)
+        upnl = compute_unrealized_pnl(state, current_price)
+        estimated_value = config.STARTING_CAPITAL + state.total_profit_usd + upnl["total_unrealized"]
+    else:
+        # Grid mode: estimate from filled-but-unclosed buys
+        unrealized_loss = 0.0
+        for order in state.grid_orders:
+            if order.side == "buy" and order.status == "filled" and not order.closed_out:
+                unrealized_loss += max(0, (order.price - current_price) * order.volume)
+        estimated_value = config.STARTING_CAPITAL + state.total_profit_usd - unrealized_loss
 
     if estimated_value < state.stop_floor:
         return (True, False, f"Stop floor breached: estimated value ${estimated_value:.2f} < ${state.stop_floor:.2f}")
@@ -1866,6 +2031,8 @@ def _place_pair_order(state, side, price, role, matched_buy=None,
         order.status = "open"
         order.placed_at = time.time()
         state.grid_orders.append(order)
+        if role == "entry":
+            state.total_entries_placed += 1
         logger.info(
             "  Pair %s %s [%s.%d]: %.2f DOGE @ $%.6f -> %s",
             side.upper(), role, trade_id or "?", cycle or 0,
@@ -2037,6 +2204,38 @@ def _pair_exit_price(entry_fill: float, current_price: float,
         return round(min(from_entry, from_market), decimals)
 
 
+def compute_unrealized_pnl(state: GridState, current_price: float) -> dict:
+    """
+    Compute mark-to-market unrealized P&L for open exit orders.
+
+    For each open exit order, calculate what profit would be if closed
+    at the current market price instead of the limit exit price:
+      Trade A (buy exit): unrealized = (matched_sell_price - current_price) * volume
+      Trade B (sell exit): unrealized = (current_price - matched_buy_price) * volume
+
+    Returns dict: {a_unrealized, b_unrealized, total_unrealized}
+    """
+    a_unreal = 0.0
+    b_unreal = 0.0
+
+    for o in state.grid_orders:
+        if o.status != "open" or o.order_role != "exit":
+            continue
+
+        if o.side == "buy" and o.matched_sell_price is not None:
+            # Trade A exit (buy-back): we sold at matched_sell_price
+            a_unreal += (o.matched_sell_price - current_price) * o.volume
+        elif o.side == "sell" and o.matched_buy_price is not None:
+            # Trade B exit (sell): we bought at matched_buy_price
+            b_unreal += (current_price - o.matched_buy_price) * o.volume
+
+    return {
+        "a_unrealized": round(a_unreal, 6),
+        "b_unrealized": round(b_unreal, 6),
+        "total_unrealized": round(a_unreal + b_unreal, 6),
+    }
+
+
 MAX_COMPLETED_CYCLES = 200  # Keep most recent N completed cycles
 
 
@@ -2088,6 +2287,7 @@ def handle_pair_fill(state: GridState, filled_orders: list,
         # ---------------------------------------------------------------
         if filled.side == "buy" and is_entry:
             tid = tid or "B"
+            state.total_entries_filled += 1
             logger.info(
                 "PAIR [%s.%d]: Buy entry filled @ $%.6f (%.2f DOGE)",
                 tid, cyc, filled.price, filled.volume,
@@ -2208,6 +2408,7 @@ def handle_pair_fill(state: GridState, filled_orders: list,
         # ---------------------------------------------------------------
         elif filled.side == "sell" and is_entry:
             tid = tid or "A"
+            state.total_entries_filled += 1
             logger.info(
                 "PAIR [%s.%d]: Sell entry filled @ $%.6f (%.2f DOGE)",
                 tid, cyc, filled.price, filled.volume,
@@ -2325,7 +2526,18 @@ def handle_pair_fill(state: GridState, filled_orders: list,
     # Recompute and log state transitions
     new_state = _compute_pair_state(state)
     if new_state != old_state:
-        logger.info("PAIR STATE: %s -> %s", old_state, new_state)
+        # Include trigger info from last processed fill
+        if filled_orders:
+            last = filled_orders[-1]
+            trigger_tid = getattr(last, "trade_id", "?")
+            trigger_cyc = getattr(last, "cycle", 0)
+            logger.info(
+                "PAIR STATE: %s -> %s (trigger: %s %s [%s.%d] filled)",
+                old_state, new_state,
+                last.side, last.order_role, trigger_tid, trigger_cyc,
+            )
+        else:
+            logger.info("PAIR STATE: %s -> %s", old_state, new_state)
     state.pair_state = new_state
 
     return new_orders
@@ -2390,11 +2602,16 @@ def refresh_stale_entries(state: GridState, current_price: float) -> bool:
     For each open entry order, check if it has drifted too far from market.
     Exit orders are NEVER refreshed (fixed profit target).
 
+    Anti-chase: tracks consecutive same-direction refreshes per trade.
+    After MAX_CONSECUTIVE_REFRESHES in the same direction, enters a
+    cooldown period (REFRESH_COOLDOWN_SEC) to avoid chasing trends.
+
     Returns True if any entries were refreshed (triggers rebuild notification).
     """
     refresh_pct = state.refresh_pct
     entry_pct = state.entry_pct
     decimals = state.price_decimals
+    now = time.time()
 
     refreshed = False
     for o in list(state.grid_orders):
@@ -2402,6 +2619,31 @@ def refresh_stale_entries(state: GridState, current_price: float) -> bool:
             continue
         distance_pct = abs(o.price - current_price) / current_price * 100.0
         if distance_pct > refresh_pct:
+            # Determine which trade this is for anti-chase tracking
+            tid = getattr(o, "trade_id", None)
+            is_a = (tid == "A")
+
+            # Check anti-chase cooldown
+            cooldown_until = state.refresh_cooldown_until_a if is_a else state.refresh_cooldown_until_b
+            consec = state.consecutive_refreshes_a if is_a else state.consecutive_refreshes_b
+            if now < cooldown_until:
+                remaining = int(cooldown_until - now)
+                logger.info(
+                    "Anti-chase: %s entry [%s] refresh blocked (cooldown, %ds remaining)",
+                    o.side.upper(), tid or "?", remaining,
+                )
+                continue
+            # If cooldown just expired and counter is still at/above threshold,
+            # reset so the next refresh is allowed (counts as 1, not re-trigger)
+            if consec >= MAX_CONSECUTIVE_REFRESHES and cooldown_until > 0:
+                consec = 0  # Will become 1 after direction check below
+                if is_a:
+                    state.consecutive_refreshes_a = 0
+                    state.refresh_cooldown_until_a = 0.0
+                else:
+                    state.consecutive_refreshes_b = 0
+                    state.refresh_cooldown_until_b = 0.0
+
             # Check if this order already filled before we cancel it
             if not config.DRY_RUN:
                 try:
@@ -2415,15 +2657,53 @@ def refresh_stale_entries(state: GridState, current_price: float) -> bool:
                 except Exception:
                     pass  # If query fails, proceed with cancel
 
+            # Determine refresh direction (price moved up or down since entry)
+            if o.side == "buy":
+                direction = "down" if current_price < o.price else "up"
+            else:
+                direction = "up" if current_price > o.price else "down"
+
+            # Anti-chase: track consecutive same-direction refreshes
+            last_dir = state.last_refresh_direction_a if is_a else state.last_refresh_direction_b
+            consec = state.consecutive_refreshes_a if is_a else state.consecutive_refreshes_b
+
+            if direction == last_dir:
+                consec += 1
+            else:
+                consec = 1  # New direction, reset
+
+            # Update tracking
+            if is_a:
+                state.consecutive_refreshes_a = consec
+                state.last_refresh_direction_a = direction
+            else:
+                state.consecutive_refreshes_b = consec
+                state.last_refresh_direction_b = direction
+
+            # Check if chase threshold exceeded
+            if consec >= MAX_CONSECUTIVE_REFRESHES:
+                if is_a:
+                    state.refresh_cooldown_until_a = now + REFRESH_COOLDOWN_SEC
+                else:
+                    state.refresh_cooldown_until_b = now + REFRESH_COOLDOWN_SEC
+                logger.warning(
+                    "Anti-chase: %s entry [%s] hit %d consecutive %s refreshes "
+                    "-- cooldown %ds",
+                    o.side.upper(), tid or "?", consec, direction,
+                    REFRESH_COOLDOWN_SEC,
+                )
+                continue
+
             # Preserve trade identity from the order being replaced
-            stale_tid = getattr(o, "trade_id", None)
+            stale_tid = tid
             stale_cyc = getattr(o, "cycle", 0)
             logger.info(
                 "Pair drift: %s entry [%s.%d] $%.6f is %.2f%% from market $%.6f "
-                "(threshold: %.1f%%)",
+                "(threshold: %.1f%%, chase: %d/%d %s)",
                 o.side.upper(), stale_tid or "?", stale_cyc,
                 o.price, distance_pct,
                 current_price, state.refresh_pct,
+                consec, MAX_CONSECUTIVE_REFRESHES, direction,
             )
             if config.DRY_RUN:
                 o.status = "cancelled"
@@ -2443,13 +2723,99 @@ def refresh_stale_entries(state: GridState, current_price: float) -> bool:
 
     if refreshed:
         state.center_price = current_price
-    return False  # Return False to avoid triggering a full rebuild in bot.py
+    return refreshed
+
+
+def _identify_order_3tier(order_info: dict, state: GridState,
+                          saved_by_txid: dict, current_price: float) -> dict:
+    """
+    3-tier identity resolution for reconciliation.
+
+    Returns dict with keys: trade_id, cycle, order_role,
+    matched_buy_price, matched_sell_price, method.
+
+    Tier 1 (saved_txid):  Match against _saved_open_orders by txid.
+    Tier 2 (price_match): Match price against recent_fills to detect exits.
+    Tier 3 (side_convention): Deterministic fallback from side.
+    """
+    txid = order_info["txid"]
+    side = order_info["side"]
+    price = order_info["price"]
+    profit_pct = state.profit_pct
+
+    # --- Tier 1: Saved txid match (most reliable) ---
+    saved = saved_by_txid.get(txid)
+    if saved and saved.get("trade_id"):
+        return {
+            "trade_id": saved["trade_id"],
+            "cycle": saved.get("cycle", 0),
+            "order_role": saved.get("order_role", "entry"),
+            "matched_buy_price": saved.get("matched_buy_price"),
+            "matched_sell_price": saved.get("matched_sell_price"),
+            "method": "saved_txid",
+        }
+
+    # --- Tier 2: Price matching against recent_fills ---
+    # If a buy order's price matches a recent sell fill × (1 - profit_pct/100)
+    # within 0.5% tolerance, it's Trade A's exit (buy-back after sell entry).
+    # Vice versa for sell orders matching buy fills.
+    tol = 0.005  # 0.5% tolerance
+    if side == "buy":
+        # Could be Trade A exit: buy exit price ≈ sell_entry × (1 - profit_pct/100)
+        for rf in reversed(state.recent_fills):
+            if rf["side"] == "sell" and rf.get("profit", 0) == 0:
+                expected_exit = rf["price"] * (1 - profit_pct / 100.0)
+                if expected_exit > 0 and abs(price - expected_exit) / expected_exit < tol:
+                    return {
+                        "trade_id": "A",
+                        "cycle": state.cycle_a,
+                        "order_role": "exit",
+                        "matched_buy_price": None,
+                        "matched_sell_price": rf["price"],
+                        "method": "price_match",
+                    }
+    elif side == "sell":
+        # Could be Trade B exit: sell exit price ≈ buy_entry × (1 + profit_pct/100)
+        for rf in reversed(state.recent_fills):
+            if rf["side"] == "buy" and rf.get("profit", 0) == 0:
+                expected_exit = rf["price"] * (1 + profit_pct / 100.0)
+                if expected_exit > 0 and abs(price - expected_exit) / expected_exit < tol:
+                    return {
+                        "trade_id": "B",
+                        "cycle": state.cycle_b,
+                        "order_role": "exit",
+                        "matched_buy_price": rf["price"],
+                        "matched_sell_price": None,
+                        "method": "price_match",
+                    }
+
+    # --- Tier 3: Side convention fallback ---
+    # sell -> A entry, buy -> B entry
+    if side == "sell":
+        return {
+            "trade_id": "A",
+            "cycle": state.cycle_a,
+            "order_role": "entry",
+            "matched_buy_price": None,
+            "matched_sell_price": None,
+            "method": "side_convention",
+        }
+    else:
+        return {
+            "trade_id": "B",
+            "cycle": state.cycle_b,
+            "order_role": "entry",
+            "matched_buy_price": None,
+            "matched_sell_price": None,
+            "method": "side_convention",
+        }
 
 
 def reconcile_pair_on_startup(state: GridState, current_price: float) -> int:
     """
     Simplified reconciliation for pair mode.
     Adopt up to 2 open orders (exit-first, then entry). Cancel extras.
+    Uses 3-tier identity resolution (saved_txid > price_match > side_convention).
     """
     if config.DRY_RUN:
         logger.info("[DRY RUN] Skipping pair reconciliation")
@@ -2471,7 +2837,13 @@ def reconcile_pair_on_startup(state: GridState, current_price: float) -> int:
     else:
         filter_strings = ["XDG", "DOGE"]
 
-    # Collect and classify orders (entry vs exit based on market)
+    # Build saved-state lookup for Tier 1
+    saved_by_txid = {}
+    for so in getattr(state, "_saved_open_orders", []):
+        if so.get("txid"):
+            saved_by_txid[so["txid"]] = so
+
+    # Collect orders (without pre-assigning role)
     our_orders = []
 
     for txid, info in open_orders.items():
@@ -2487,22 +2859,19 @@ def reconcile_pair_on_startup(state: GridState, current_price: float) -> int:
         if not side or order_price <= 0:
             continue
 
-        # Determine if it's an entry or exit based on position relative to market
-        if side == "buy" and order_price < current_price:
-            role = "entry"
-        elif side == "buy" and order_price >= current_price:
-            role = "exit"
-        elif side == "sell" and order_price > current_price:
-            role = "entry"
-        else:
-            role = "exit"
-        our_orders.append({
+        order_info = {
             "txid": txid,
             "side": side,
             "price": order_price,
             "volume": order_vol,
-            "role": role,
-        })
+        }
+
+        # Resolve identity via 3-tier function
+        identity = _identify_order_3tier(
+            order_info, state, saved_by_txid, current_price)
+        order_info["role"] = identity["order_role"]
+        order_info["identity"] = identity
+        our_orders.append(order_info)
 
     if not our_orders:
         logger.info("Pair reconciliation: no matching orders for %s", state.pair_display)
@@ -2548,51 +2917,32 @@ def reconcile_pair_on_startup(state: GridState, current_price: float) -> int:
     orphans = 0
     keep_txids = {o["txid"] for o in keep}
 
-    # Build lookup from saved state for identity restoration
-    saved_by_txid = {}
-    for so in getattr(state, "_saved_open_orders", []):
-        if so.get("txid"):
-            saved_by_txid[so["txid"]] = so
-
     for o in keep:
+        identity = o["identity"]
         order = GridOrder(level=-1 if o["side"] == "buy" else +1,
                           side=o["side"], price=o["price"], volume=o["volume"])
         order.txid = o["txid"]
         order.status = "open"
         order.placed_at = time.time()
-        order.order_role = o["role"]
-
-        # Restore identity from saved state if txid matches
-        saved = saved_by_txid.get(o["txid"])
-        if saved and saved.get("trade_id"):
-            order.trade_id = saved["trade_id"]
-            order.cycle = saved.get("cycle", 0)
-            order.order_role = saved.get("order_role", o["role"])
-            order.matched_buy_price = saved.get("matched_buy_price")
-            order.matched_sell_price = saved.get("matched_sell_price")
-        else:
-            # Fallback: assign identity from side convention
-            # A = sell-side (short), B = buy-side (long)
-            if o["side"] == "sell":
-                order.trade_id = "A"
-                order.cycle = state.cycle_a
-            else:
-                order.trade_id = "B"
-                order.cycle = state.cycle_b
+        order.order_role = identity["order_role"]
+        order.trade_id = identity["trade_id"]
+        order.cycle = identity["cycle"]
+        order.matched_buy_price = identity["matched_buy_price"]
+        order.matched_sell_price = identity["matched_sell_price"]
 
         state.grid_orders.append(order)
         adopted += 1
         logger.info(
-            "Pair reconcile: adopted %s %s [%s.%d] %.2f DOGE @ $%.6f -> %s",
+            "Pair reconcile: adopted %s %s [%s.%d] %.2f DOGE @ $%.6f -> %s (id: %s)",
             o["side"].upper(), order.order_role, order.trade_id, order.cycle,
-            o["volume"], o["price"], o["txid"],
+            o["volume"], o["price"], o["txid"], identity["method"],
         )
 
     for o in our_orders:
         if o["txid"] in keep_txids:
             continue
         logger.warning(
-            "Pair reconcile: cancelling extra %s %s @ $%.6f -> %s",
+            "Pair reconcile: cancelling extra %s %s [orphan] @ $%.6f -> %s",
             o["side"].upper(), o["role"], o["price"], o["txid"],
         )
         kraken_client.cancel_order(o["txid"])
@@ -3173,6 +3523,13 @@ def get_status_summary(state: GridState, current_price: float) -> str:
             f"Fees paid: ${state.total_fees_usd:.4f}",
             f"DOGE accumulated: {state.doge_accumulated:.2f}",
         ]
+        # Add unrealized P&L
+        upnl = compute_unrealized_pnl(state, current_price)
+        if upnl["total_unrealized"] != 0:
+            lines.append(
+                f"Unrealized: ${upnl['total_unrealized']:.4f} "
+                f"(A: ${upnl['a_unrealized']:.4f}, B: ${upnl['b_unrealized']:.4f})"
+            )
     else:
         # Trend ratio display
         ratio = state.trend_ratio

@@ -117,7 +117,7 @@ CHECK_FILLS (runs BEFORE drift check to avoid cancel-before-detect race)
 CHECK_DRIFT
   │
   ├── [grid mode] drift >= GRID_DRIFT_RESET_PCT ──► CANCEL_GRID ──► BUILD_GRID
-  ├── [pair mode] stale entries refreshed via refresh_stale_entries() (no full rebuild)
+  ├── [pair mode] stale entries refreshed via refresh_stale_entries() (anti-chase protected)
   │
   ▼ no drift
 AI_COUNCIL (if interval elapsed)
@@ -316,7 +316,20 @@ orders silently disappear from the response.
 ### Pair Mode
 
 Pair mode uses a different reconciliation strategy: adopt exits first
-(they carry position risk), then restore identity from saved state.
+(they carry position risk), then restore identity via 3-tier resolution.
+
+#### 3-Tier Identity Resolution (`_identify_order_3tier`)
+
+Each Kraken order is identified using the first matching tier:
+
+| Tier | Method | Reliability | How |
+|------|--------|-------------|-----|
+| **1** | `saved_txid` | Highest | Match txid against `_saved_open_orders` from state.json |
+| **2** | `price_match` | Medium | Match price against `recent_fills`: buy exit ≈ sell_entry × (1 - π) within 0.5% tolerance |
+| **3** | `side_convention` | Fallback | sell → A entry, buy → B entry |
+
+Tier 2 catches orders placed as exits where the bot restarted before
+saving txid to state (e.g. crash between placement and save).
 
 ```
 ┌──────────────────────┐
@@ -330,17 +343,24 @@ Pair mode uses a different reconciliation strategy: adopt exits first
            │
      for each order:
            │
-    ┌──────┴───────────────┐
-    │                      │
-    ▼                      ▼
-  matches saved         no match in
-  txid from state?      saved open_orders
-    │                      │
-    ▼                      ▼
-  ADOPT with           ADOPT with
-  saved identity       side convention:
-  (trade_id, cycle,    sell → A entry
-   order_role)         buy  → B entry
+           ▼
+  ┌──────────────────────────────────┐
+  │  _identify_order_3tier()         │
+  │                                  │
+  │  Tier 1: saved txid match?      │
+  │    YES → use saved identity     │
+  │    NO  ↓                        │
+  │  Tier 2: price matches fill?    │
+  │    YES → infer exit identity    │
+  │    NO  ↓                        │
+  │  Tier 3: side convention        │
+  │    sell → A entry               │
+  │    buy  → B entry               │
+  └──────────┬───────────────────────┘
+             │
+             ▼
+  ADOPT with resolved identity
+  (trade_id, cycle, order_role, method)
            │
            ▼
 ┌──────────────────────────────┐
@@ -443,14 +463,23 @@ Pair mode uses a different reconciliation strategy: adopt exits first
 | `total_fees_usd` | Lifetime fees paid |
 | `doge_accumulated` | Total DOGE swept |
 | `last_accumulation` | Timestamp of last sweep |
-| `trend_ratio` | Current buy/sell asymmetry |
-| `trend_ratio_override` | Manual ratio (null = auto) |
+| `trend_ratio` | Current buy/sell asymmetry (excluded in pair mode — saved as 0.5) |
+| `trend_ratio_override` | Manual ratio (null = auto, excluded in pair mode — saved as null) |
 | `open_txids` | Kraken order IDs to reconcile |
 | `pair_state` | Current state machine state (S0/S1a/S1b/S2) |
 | `cycle_a` | Trade A current cycle number |
 | `cycle_b` | Trade B current cycle number |
 | `completed_cycles` | List of CompletedCycle dicts (max 200) |
 | `open_orders` | Order details for identity restoration on restart |
+| `pnl_migrated` | Flag: historical P&L reconstruction complete (prevents re-run) |
+| `consecutive_refreshes_a` | Anti-chase: same-direction refresh count for Trade A |
+| `consecutive_refreshes_b` | Anti-chase: same-direction refresh count for Trade B |
+| `last_refresh_direction_a` | Anti-chase: last refresh direction ("up"/"down") for Trade A |
+| `last_refresh_direction_b` | Anti-chase: last refresh direction ("up"/"down") for Trade B |
+| `refresh_cooldown_until_a` | Anti-chase: cooldown expiry timestamp for Trade A |
+| `refresh_cooldown_until_b` | Anti-chase: cooldown expiry timestamp for Trade B |
+| `total_entries_placed` | Lifetime entry orders placed (for fill rate) |
+| `total_entries_filled` | Lifetime entry orders filled (for fill rate) |
 
 ## 7. Fill Pair Cycling (The Profit Engine)
 
@@ -674,6 +703,18 @@ already pruned from the deque (e.g. after a long-running cycle).
   authoritative for lifetime stats; `completed_cycles` provides per-trade
   breakdowns
 
+### P&L Migration (`migrate_pnl_from_fills`)
+
+On first startup after the refactor, `migrate_pnl_from_fills()` reconstructs
+`CompletedCycle` records from `recent_fills`. It does NOT trust the stored
+`profit` field (which may have been sanitized by old code). Instead it:
+
+1. Separates fills into buy/sell lists
+2. Matches exits to entries by expected price: `sell × (1 - π) ≈ buy` (Trade A)
+   or `buy × (1 + π) ≈ sell` (Trade B), within 0.5% tolerance
+3. Computes P&L as `(sell_price - buy_price) × volume - fees`
+4. Sets `pnl_migrated = True` to prevent re-running
+
 ### Key Invariants
 
 1. Exactly 2 open orders under normal operation (may transiently have
@@ -691,8 +732,8 @@ already pruned from the deque (e.g. after a long-running cycle).
 
 If fills happen while the bot is offline (between deploys),
 `_reconcile_offline_fills()` detects them on startup via trade history.
-Identity is restored by matching saved txids from state.json; unmatched
-orders fall back to side convention (sell→A, buy→B).
+Identity is restored by `_identify_order_3tier()` (see Section 5):
+saved txid → price match against fills → side convention fallback.
 
 ```
 Offline: BUY entry @ $0.098 fills, then SELL entry @ $0.0984 fills.
@@ -722,6 +763,59 @@ the order status via `query_orders()`. If the order is already
 the race where drift-cancel runs right after a fill but before
 fill detection.
 
+### Anti-Chase Mechanism
+
+During sustained trends, the bot may repeatedly refresh entries in
+the same direction (always chasing price up or down). The anti-chase
+mechanism prevents this:
+
+```
+refresh_stale_entries() called
+        │
+        ├── trade in cooldown? ──── YES → skip refresh, log warning
+        │
+        ▼ NO
+  determine refresh direction (up/down) from price movement
+        │
+        ├── same direction as last refresh?
+        │       YES → increment consecutive count
+        │       NO  → reset count to 1
+        │
+        ├── count >= MAX_CONSECUTIVE_REFRESHES (3)?
+        │       YES → enter cooldown (REFRESH_COOLDOWN_SEC = 300s)
+        │              log warning, skip refresh
+        │       NO  → proceed with normal refresh
+        │
+  On next call, if cooldown expired AND count >= threshold:
+        │       → reset count to 0, clear cooldown, allow refresh
+        │
+        ▼
+  cancel stale entry, place new entry at current market distance
+```
+
+Per-trade tracking (A/B independent): `consecutive_refreshes_a/b`,
+`last_refresh_direction_a/b`, `refresh_cooldown_until_a/b`.
+
+### Unrealized P&L
+
+`compute_unrealized_pnl(state, current_price)` calculates mark-to-market
+P&L for open exit orders:
+
+```
+Trade A (buy exit): unrealized = (matched_sell_price - current_price) × volume
+Trade B (sell exit): unrealized = (current_price - matched_buy_price) × volume
+```
+
+Returns `{a_unrealized, b_unrealized, total_unrealized}`.
+
+Returns signed values (positive = in profit, negative = in loss).
+
+Used in:
+- `check_risk_limits()`: stop floor uses signed unrealized in pair mode:
+  `estimated_value = STARTING_CAPITAL + total_profit_usd + total_unrealized`
+- `get_status_summary()`: displays unrealized P&L line
+- Dashboard: unrealized P&L card in top metrics
+
 ### Pair vs Grid Comparison
 
 | Aspect | Grid Mode | Pair Mode |
@@ -733,4 +827,141 @@ fill detection.
 | Trend ratio | adjusts buy/sell split | N/A |
 | State machine | none | S0/S1a/S1b/S2 |
 | Round-trip tracking | scalar counters | CompletedCycle history |
-| Dashboard UI | Grid Ladder, Trend Ratio | State banner, A/B panels, Cycles table |
+| Anti-chase | N/A | 3 consecutive same-direction → 5min cooldown |
+| Unrealized P&L | N/A | mark-to-market from open exits |
+| Statistics | stats_engine analyzers | PairStats + stats_engine |
+| Dashboard UI | Grid Ladder, Trend Ratio | State banner, A/B panels, Stats, AI council, Cycles |
+
+## 10. PairStats (Pair Mode Statistical Engine)
+
+`compute_pair_stats()` in `stats_engine.py` produces aggregate statistics
+from `CompletedCycle` records. Pure Python, zero external dependencies.
+
+### Schema
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `n_total` | int | Total completed cycles |
+| `n_trade_a` | int | Trade A cycles |
+| `n_trade_b` | int | Trade B cycles |
+| `total_net` | float | Sum of net profits |
+| `mean_net` | float | Mean net profit per cycle |
+| `stdev_net` | float | Sample standard deviation |
+| `median_net` | float | Median net profit |
+| `win_count` | int | Cycles with net > 0 |
+| `loss_count` | int | Cycles with net ≤ 0 |
+| `win_rate` | float | win_count / n_total (0-1) |
+| `profit_factor` | float | sum(wins) / abs(sum(losses)) |
+| `mean_duration_sec` | float | Average cycle duration in seconds |
+| `median_duration_sec` | float | Median cycle duration |
+| `max_drawdown` | float | Peak-to-trough of cumulative P&L series |
+| `current_drawdown` | float | Current distance from cumulative peak |
+| `ci_95_lower` | float | 95% CI lower bound for mean |
+| `ci_95_upper` | float | 95% CI upper bound for mean |
+| `entries_placed` | int | Entries placed (for fill rate) |
+| `entries_filled` | int | Entries that filled |
+| `fill_rate` | float | entries_filled / entries_placed |
+
+### Computation
+
+- **95% CI**: `mean ± t*(df, 0.025) × stdev / √n` using `_t_critical()`
+  lookup table (same as stats_engine profitability test). Requires n ≥ 3.
+- **Max drawdown**: Walk cumulative P&L series, track running peak and
+  largest peak-to-current difference
+- **Profit factor**: Sum of winning trades / abs(sum of losing trades);
+  None if no losses, 0 if no wins
+- **Fill rate**: `total_entries_filled / total_entries_placed` from GridState
+  counters (incremented in `_place_pair_order` and `handle_pair_fill`)
+
+### None Handling
+
+Computed stats are `None` (not 0.0) when meaningless:
+- `win_rate`, `mean_net`, `median_net` → None when n = 0
+- `stdev_net` → None when n < 2
+- `ci_95_lower/upper` → None when n < 3
+- `profit_factor` → None when no losses
+- `fill_rate` → None when no entries placed
+
+Dashboard renders None as "—" (em dash).
+
+### Integration
+
+- Computed in `stats_engine.run_all()` when `STRATEGY_MODE == "pair"`
+- Stored on `state.pair_stats` (PairStats object)
+- Exposed to dashboard via `serialize_state()` → `pair_stats` dict
+- Exposed to AI council via `market_data.performance.pair_stats`
+- Per-trade breakdown (A/B columns) computed client-side in dashboard JS
+
+## 11. AI Council Payload & Quorum
+
+### Quorum Rules
+
+Three panelists vote independently. Majority (>50%) required for action.
+
+```
+3/3 agree  →  action passes (unanimous)
+2/3 agree  →  action passes (majority)
+1/3 agree  →  "continue" (no action, suppresses spam)
+0/3 agree  →  "continue" (all error/timeout)
+```
+
+`_aggregate_votes()` filters out error/timeout votes (`action="" or "unknown"`)
+before counting. With 2 responding and agreeing, majority passes (2 > 1.0).
+
+### Timeout Skip Mechanism
+
+Per-panelist consecutive failure tracking prevents slow models from
+blocking the council:
+
+```
+panelist call
+    │
+    ├── success → reset consecutive_fails to 0
+    │
+    ├── error/timeout → increment consecutive_fails
+    │       │
+    │       ├── < SKIP_THRESHOLD (3) → normal retry next cycle
+    │       │
+    │       └── >= SKIP_THRESHOLD → set skip_until = now + SKIP_COOLDOWN (3600s)
+    │                                panelist skipped until cooldown expires
+    │                                vote recorded as condition="skipped"
+    │
+    ▼ (next council cycle)
+    ├── skip_until > now? → skip panelist, vote as "skipped"
+    └── skip_until expired → try panelist again
+```
+
+### Payload Schema (`market_data`)
+
+```json
+{
+  "market": {
+    "price": 0.09,
+    "center_price": 0.09,
+    "drift_pct": 0.5
+  },
+  "strategy": {
+    "mode": "pair",
+    "pair_profit_pct": 1.0,
+    "pair_entry_pct": 0.2,
+    "pair_refresh_pct": 1.0
+  },
+  "state": {
+    "pair_state": "S0",
+    "cycle_a": 5,
+    "cycle_b": 4,
+    "trade_a_order": {"side": "sell", "price": 0.0902, "role": "entry", "volume": 35},
+    "trade_b_order": {"side": "buy", "price": 0.0898, "role": "entry", "volume": 35}
+  },
+  "performance": {
+    "total_profit": 0.15,
+    "today_profit": 0.02,
+    "total_round_trips": 8,
+    "pair_stats": { ... PairStats.to_dict() ... }
+  },
+  "risk": {
+    "daily_loss": 0.01,
+    "daily_loss_limit": 2.0,
+    "stop_floor": -10.0
+  }
+}

@@ -60,6 +60,12 @@ NVIDIA_PANELISTS = [
 _REASONING_MAX_TOKENS = 2048
 _INSTRUCT_MAX_TOKENS = 200
 
+# Panelist timeout skip tracking
+_panelist_consecutive_fails: dict = {}   # name -> int
+_panelist_skip_until: dict = {}          # name -> timestamp
+SKIP_THRESHOLD = 3        # consecutive failures before skipping
+SKIP_COOLDOWN = 3600      # seconds to skip a panelist (1 hour)
+
 
 def _build_panel() -> list:
     """
@@ -121,8 +127,33 @@ def _build_prompt(market_data: dict, stats_context: str = "") -> str:
     The AI gets: current price, recent changes, spread, fill count,
     and optionally the output of the statistical analyzers.
     """
-    pair_display = market_data.get('pair_display', 'DOGE/USD')
-    prompt = f"""You are a crypto grid trading advisor. Analyze this {pair_display} market data and give a brief recommendation.
+    if config.STRATEGY_MODE == "pair":
+        import json as _json
+        pair_display = market_data.get("market", {}).get("pair_display", "DOGE/USD")
+        prompt = f"""You are a crypto pair-trading advisor analyzing a {pair_display} bot.
+
+DATA:
+{_json.dumps(market_data, indent=2, default=str)}
+
+The bot runs two trades flanking market price:
+- Trade A (short): sell entry above market -> buy exit below
+- Trade B (long): buy entry below market -> sell exit above
+
+AVAILABLE ACTIONS (pick exactly one):
+- continue: no changes needed
+- tighten_entry: reduce entry distance (more fills, more whipsaw risk)
+- widen_entry: increase entry distance (fewer fills, better entries)
+- tighten_profit: reduce profit target (faster exits, less profit per cycle)
+- widen_profit: increase profit target (slower exits, more profit per cycle)
+- pause: stop trading temporarily (high risk detected)
+"""
+        if stats_context:
+            prompt += f"\n{stats_context}\n"
+        prompt += """
+Answer with JSON only: {"regime": "<ranging|trending|volatile>", "action": "<action>", "reason": "<1-2 sentences>"}"""
+    else:
+        pair_display = market_data.get('pair_display', 'DOGE/USD')
+        prompt = f"""You are a crypto grid trading advisor. Analyze this {pair_display} market data and give a brief recommendation.
 
 Current price: ${market_data.get('price', 0):.6f}
 1h change: {market_data.get('change_1h', 0):.2f}%
@@ -131,33 +162,9 @@ Current price: ${market_data.get('price', 0):.6f}
 Bid-ask spread: {market_data.get('spread_pct', 0):.3f}%
 Grid fills (last hour): {market_data.get('recent_fills', 0)}
 Grid center: ${market_data.get('grid_center', 0):.6f}
-"""
-    if config.STRATEGY_MODE == "pair":
-        prompt += f"""Strategy: single-pair (Trade A = short-side, Trade B = long-side)
-Entry distance: {market_data.get('entry_pct', config.PAIR_ENTRY_PCT)}%
-Profit target: {market_data.get('profit_pct', config.PAIR_PROFIT_PCT)}%
-State machine: {market_data.get('pair_state', 'S0')} (S0=both entries, S1a=A exit+B entry, S1b=A entry+B exit, S2=both exits)
-Position: {market_data.get('position_state', 'flat')}
-Trade A (short): {market_data.get('trade_a_cycles', 0)} cycles, ${market_data.get('trade_a_net', 0):.4f} net (cycle #{market_data.get('cycle_a', 1)})
-Trade B (long): {market_data.get('trade_b_cycles', 0)} cycles, ${market_data.get('trade_b_net', 0):.4f} net (cycle #{market_data.get('cycle_b', 1)})
-Today P&L: ${market_data.get('today_profit', 0):.4f} profit, ${market_data.get('today_loss', 0):.4f} loss
-Daily loss limit: ${market_data.get('daily_loss_limit', 0):.2f}
-Round trips: {market_data.get('round_trips_today', 0)} today, {market_data.get('total_round_trips', 0)} lifetime
-Total profit: ${market_data.get('total_profit', 0):.4f}"""
-    else:
-        prompt += f"Grid spacing: {config.GRID_SPACING_PCT}%"
-
-    if stats_context:
-        prompt += f"\n\n{stats_context}"
-
-    if config.STRATEGY_MODE == "pair":
-        prompt += """
-
-Answer in exactly this format (3 lines only):
-CONDITION: [ranging/trending_up/trending_down/volatile/low_volume]
-ACTION: [continue/pause/widen_spacing/tighten_spacing/widen_entry/tighten_entry/reset_grid]
-REASON: [One sentence explanation]"""
-    else:
+Grid spacing: {config.GRID_SPACING_PCT}%"""
+        if stats_context:
+            prompt += f"\n\n{stats_context}"
         prompt += """
 
 Answer in exactly this format (3 lines only):
@@ -266,10 +273,9 @@ def _parse_response(response: str) -> dict:
     """
     Parse the structured AI response into a dict.
 
-    Expected format:
-      CONDITION: ranging
-      ACTION: continue
-      REASON: Price is oscillating within 2% range, ideal for grid trading.
+    Supports two formats:
+      1. Line-based: CONDITION: / ACTION: / REASON: (grid mode)
+      2. JSON: {"regime": ..., "action": ..., "reason": ...} (pair mode)
 
     Returns dict with keys: condition, action, reason, raw.
     """
@@ -283,7 +289,24 @@ def _parse_response(response: str) -> dict:
     if not response:
         return result
 
-    for line in response.strip().split("\n"):
+    # Try JSON parse first (pair mode format)
+    stripped = response.strip()
+    # Find JSON object in response (may be wrapped in markdown code block)
+    json_start = stripped.find("{")
+    json_end = stripped.rfind("}")
+    if json_start >= 0 and json_end > json_start:
+        try:
+            import json as _json
+            parsed = _json.loads(stripped[json_start:json_end + 1])
+            if "action" in parsed:
+                result["action"] = str(parsed["action"]).strip().lower()
+                result["condition"] = str(parsed.get("regime", parsed.get("condition", "unknown"))).strip().lower()
+                result["reason"] = str(parsed.get("reason", "")).strip()
+                return result
+        except (ValueError, KeyError):
+            pass  # Fall through to line-based parsing
+
+    for line in stripped.split("\n"):
         line = line.strip()
         if line.upper().startswith("CONDITION:"):
             result["condition"] = line.split(":", 1)[1].strip().lower()
@@ -465,41 +488,77 @@ def get_recommendation(market_data: dict, stats_context: str = "") -> dict:
     logger.info("Running AI council (%d panelists)...", len(panel))
 
     prompt = _build_prompt(market_data, stats_context)
-    pair_display = market_data.get("pair_display", "DOGE/USD")
+    if config.STRATEGY_MODE == "pair":
+        pair_display = market_data.get("market", {}).get("pair_display", "DOGE/USD")
+    else:
+        pair_display = market_data.get("pair_display", "DOGE/USD")
     votes = []
 
+    now = time.time()
+
     for i, panelist in enumerate(panel):
+        name = panelist["name"]
+
+        # Check if this panelist is in cooldown from consecutive failures
+        skip_until = _panelist_skip_until.get(name, 0)
+        if now < skip_until:
+            remaining = int(skip_until - now)
+            votes.append({
+                "name": name,
+                "condition": "skipped",
+                "action": "",
+                "reason": f"Skipped (cooldown, {remaining}s remaining)",
+                "raw": "",
+            })
+            logger.info("  %s: skipped (cooldown, %ds remaining)", name, remaining)
+            continue
+
         try:
             response, err = _call_panelist(prompt, panelist, pair_display=pair_display)
             if response:
                 parsed = _parse_response(response)
-                parsed["name"] = panelist["name"]
+                parsed["name"] = name
                 votes.append(parsed)
                 logger.info(
                     "  %s: %s / %s -- %s",
-                    panelist["name"], parsed["condition"],
+                    name, parsed["condition"],
                     parsed["action"], parsed["reason"],
                 )
+                # Reset consecutive fail counter on success
+                _panelist_consecutive_fails[name] = 0
             else:
                 error_reason = err or "No response"
                 votes.append({
-                    "name": panelist["name"],
+                    "name": name,
                     "condition": "error",
                     "action": "",
                     "reason": error_reason,
                     "raw": "",
                 })
-                logger.warning("  %s: %s", panelist["name"], error_reason)
+                logger.warning("  %s: %s", name, error_reason)
+                # Track consecutive failure
+                fails = _panelist_consecutive_fails.get(name, 0) + 1
+                _panelist_consecutive_fails[name] = fails
+                if fails >= SKIP_THRESHOLD:
+                    _panelist_skip_until[name] = now + SKIP_COOLDOWN
+                    logger.warning(
+                        "  %s: %d consecutive failures -- skipping for %ds",
+                        name, fails, SKIP_COOLDOWN,
+                    )
 
         except Exception as e:
             votes.append({
-                "name": panelist["name"],
+                "name": name,
                 "condition": "error",
                 "action": "",
                 "reason": str(e),
                 "raw": "",
             })
-            logger.warning("  %s: error -- %s", panelist["name"], e)
+            logger.warning("  %s: error -- %s", name, e)
+            fails = _panelist_consecutive_fails.get(name, 0) + 1
+            _panelist_consecutive_fails[name] = fails
+            if fails >= SKIP_THRESHOLD:
+                _panelist_skip_until[name] = now + SKIP_COOLDOWN
 
         # Brief pause between panelists to respect rate limits
         if i < len(panel) - 1:
