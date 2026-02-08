@@ -37,6 +37,26 @@ import urllib.parse
 import config
 
 logger = logging.getLogger(__name__)
+# ---------------------------------------------------------------------------
+# Pair column compatibility
+# ---------------------------------------------------------------------------
+
+def _note_pair_column(err_body: str):
+    """Set pair-column support flag if Supabase reports missing column."""
+    global _pair_column_supported
+    if _pair_column_supported is False:
+        return
+    if "pair" in err_body and "does not exist" in err_body:
+        _pair_column_supported = False
+
+
+def _strip_pair_if_needed(row: dict) -> dict:
+    """Remove pair column for legacy schemas without pair support."""
+    if _pair_column_supported is False and "pair" in row:
+        row = dict(row)
+        row.pop("pair", None)
+    return row
+
 
 # ---------------------------------------------------------------------------
 # Queue and buffers
@@ -51,6 +71,9 @@ _write_queue: collections.deque = collections.deque(maxlen=MAX_QUEUE_SIZE)
 # Price buffer: accumulates (time, price) tuples, flushed every 5 min
 _price_buffer: list = []
 _price_buffer_lock = threading.Lock()
+
+# Pair column support (older schemas may not have it)
+_pair_column_supported = None  # None=unknown, True/False after detection
 
 # Writer thread state
 _writer_thread: threading.Thread = None
@@ -125,6 +148,7 @@ def _request(method: str, path: str, body: dict = None,
             return {}
     except urllib.error.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")[:200]
+        _note_pair_column(err_body)
         logger.warning("Supabase %s %s HTTP %d: %s", method, path, e.code, err_body)
         return None
     except Exception as e:
@@ -140,7 +164,7 @@ def save_fill(fill: dict, pair: str = "XDGUSD"):
     """Queue a fill record for persistence."""
     if not _enabled():
         return
-    _write_queue.append(("fills", {
+    row = {
         "time": fill.get("time", time.time()),
         "side": fill["side"],
         "price": fill["price"],
@@ -148,7 +172,8 @@ def save_fill(fill: dict, pair: str = "XDGUSD"):
         "profit": fill.get("profit", 0),
         "fees": fill.get("fees", 0),
         "pair": pair,
-    }))
+    }
+    _write_queue.append(("fills", _strip_pair_if_needed(row)))
 
 
 def save_trade(order, net_profit: float, fees: float, pair: str = "XDGUSD"):
@@ -156,7 +181,7 @@ def save_trade(order, net_profit: float, fees: float, pair: str = "XDGUSD"):
     if not _enabled():
         return
     from datetime import datetime, timezone
-    _write_queue.append(("trades", {
+    row = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "side": order.side,
         "price": f"{order.price:.6f}",
@@ -165,14 +190,15 @@ def save_trade(order, net_profit: float, fees: float, pair: str = "XDGUSD"):
         "profit": f"{net_profit:.4f}",
         "grid_level": order.level,
         "pair": pair,
-    }))
+    }
+    _write_queue.append(("trades", _strip_pair_if_needed(row)))
 
 
 def save_daily_summary(state, pair: str = "XDGUSD"):
     """Queue a daily summary record (mirrors daily_summary.csv)."""
     if not _enabled():
         return
-    _write_queue.append(("daily_summaries", {
+    row = {
         "date": state.today_date,
         "pair": pair,
         "trades_count": state.round_trips_today,
@@ -180,7 +206,8 @@ def save_daily_summary(state, pair: str = "XDGUSD"):
         "fees_paid": f"{state.today_fees_usd:.4f}",
         "net_profit": f"{state.today_profit_usd:.4f}",
         "doge_accumulated": f"{state.doge_accumulated:.2f}",
-    }))
+    }
+    _write_queue.append(("daily_summaries", _strip_pair_if_needed(row)))
 
 
 def save_state(snapshot: dict, pair: str = "XDGUSD"):
@@ -198,7 +225,8 @@ def queue_price_point(timestamp: float, price: float, pair: str = "XDGUSD"):
     if not _enabled():
         return
     with _price_buffer_lock:
-        _price_buffer.append({"time": timestamp, "price": price, "pair": pair})
+        row = {"time": timestamp, "price": price, "pair": pair}
+        _price_buffer.append(_strip_pair_if_needed(row))
 
 
 # ---------------------------------------------------------------------------
@@ -223,10 +251,14 @@ def load_fills(limit: int = 500, pair: str = "XDGUSD") -> list:
         "order": "time.desc",
         "limit": str(limit),
     }
-    # Filter by pair if column exists (backward compatible with old schemas)
-    params["pair"] = f"eq.{pair}"
+    if _pair_column_supported is not False:
+        params["pair"] = f"eq.{pair}"
 
     result = _request("GET", "/rest/v1/fills", params=params)
+    if result is None and _pair_column_supported is False:
+        # Retry without pair filter for legacy schemas
+        params.pop("pair", None)
+        result = _request("GET", "/rest/v1/fills", params=params)
 
     if result is None:
         logger.warning("Supabase: failed to load fills -- starting fresh")
@@ -285,12 +317,16 @@ def load_price_history(since: float = None, pair: str = "XDGUSD") -> list:
         "select": "time,price",
         "order": "time.asc",
         "limit": "3000",
-        "pair": f"eq.{pair}",
     }
+    if _pair_column_supported is not False:
+        params["pair"] = f"eq.{pair}"
     if since is not None:
         params["time"] = f"gt.{since}"
 
     result = _request("GET", "/rest/v1/price_history", params=params)
+    if result is None and _pair_column_supported is False:
+        params.pop("pair", None)
+        result = _request("GET", "/rest/v1/price_history", params=params)
 
     if result is None:
         logger.warning("Supabase: failed to load price history -- starting fresh")

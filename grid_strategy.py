@@ -1554,6 +1554,42 @@ def build_pair(state: GridState, current_price: float) -> list:
 
     state.center_price = current_price
 
+    # If both exits are already on the book, keep them (dual-position state).
+    open_orders = [o for o in state.grid_orders if o.status == "open"]
+    has_buy_exit = any(o.side == "buy" and o.order_role == "exit" for o in open_orders)
+    has_sell_exit = any(o.side == "sell" and o.order_role == "exit" for o in open_orders)
+    if has_buy_exit and has_sell_exit:
+        # region agent log
+        try:
+            _payload = {
+                "runId": "pre",
+                "hypothesisId": "H5",
+                "location": "grid_strategy.py:build_pair:dual_exits",
+                "message": "pair_dual_exits_detected",
+                "data": {
+                    "open_count": len(open_orders),
+                    "has_buy_exit": has_buy_exit,
+                    "has_sell_exit": has_sell_exit,
+                },
+                "timestamp": int(time.time() * 1000),
+            }
+            _payload_json = json.dumps(_payload)
+            try:
+                with open(r"c:\Users\ColsonR\grid-bot\doge-grid-bot\.cursor\debug.log", "a", encoding="utf-8") as _dbg_f:
+                    _dbg_f.write(_payload_json + "\n")
+            except Exception:
+                pass
+            try:
+                logger.info("DEBUG_LOG %s", _payload_json)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        # endregion agent log
+        logger.info("Pair build: dual exits on book; skipping entry placement")
+        state.grid_orders = open_orders
+        return open_orders
+
     # --- Position recovery: if last fill was an entry, we have a position ---
     if state.recent_fills:
         last_fill = state.recent_fills[-1]
