@@ -1415,9 +1415,13 @@ def validate_pair_config(current_price: float) -> bool:
 
 def build_pair(state: GridState, current_price: float) -> list:
     """
-    Build a fresh pair: 1 buy entry + 1 sell entry flanking market.
+    Build pair orders appropriate to current position state.
 
-    Returns the list of placed GridOrder objects (up to 2).
+    If recent_fills shows an open position (last fill was an entry),
+    ensure only the exit order is on the book. Otherwise place fresh
+    entries flanking market.
+
+    Returns the list of open GridOrder objects.
     """
     # Pair mode: keep user's ORDER_SIZE_USD but floor at Kraken minimums.
     # No grid-level capital budgeting (only 2 orders, not 40).
@@ -1426,6 +1430,13 @@ def build_pair(state: GridState, current_price: float) -> list:
 
     state.center_price = current_price
 
+    # --- Position recovery: if last fill was an entry, we have a position ---
+    if state.recent_fills:
+        last_fill = state.recent_fills[-1]
+        if last_fill.get("profit", 0) == 0 and last_fill.get("side") in ("buy", "sell"):
+            return _build_pair_with_position(state, last_fill, current_price)
+
+    # --- No position: place fresh entries flanking market ---
     # Identify any adopted orders (from reconciliation) to skip
     adopted_sides = set()
     for o in state.grid_orders:
@@ -1470,6 +1481,61 @@ def build_pair(state: GridState, current_price: float) -> list:
 
     state.grid_orders = placed
     return placed
+
+
+def _build_pair_with_position(state: GridState, last_fill: dict,
+                              current_price: float) -> list:
+    """
+    Called by build_pair when recent_fills shows an open position.
+    Ensures exactly 1 exit order on the book. Cancels any stale entries.
+    Relabels adopted exits that reconciliation misclassified.
+    """
+    fill_side = last_fill["side"]
+    fill_price = last_fill["price"]
+
+    if fill_side == "buy":
+        exit_side = "sell"
+        exit_price = round(fill_price * (1 + config.PAIR_PROFIT_PCT / 100.0), 6)
+    else:
+        exit_side = "buy"
+        exit_price = round(fill_price * (1 - config.PAIR_PROFIT_PCT / 100.0), 6)
+
+    # Look for an adopted order at the exit price (may be mislabeled as entry)
+    tol = exit_price * 0.005  # 0.5% tolerance
+    exit_found = False
+    for o in state.grid_orders:
+        if (o.status == "open" and o.side == exit_side
+                and abs(o.price - exit_price) < tol):
+            if o.order_role != "exit":
+                logger.info(
+                    "Position recovery: relabeled %s @ $%.6f as exit (was %s)",
+                    exit_side.upper(), o.price, o.order_role)
+                o.order_role = "exit"
+            if fill_side == "buy":
+                o.matched_buy_price = fill_price
+            else:
+                o.matched_sell_price = fill_price
+            exit_found = True
+            break
+
+    # Cancel any stale entries (shouldn't exist with open position)
+    _cancel_open_by_role(state, "buy", "entry")
+    _cancel_open_by_role(state, "sell", "entry")
+
+    if not exit_found:
+        logger.warning(
+            "Position recovery: %s entry $%.6f -- placing %s exit @ $%.6f",
+            fill_side.upper(), fill_price, exit_side.upper(), exit_price)
+        _place_pair_order(
+            state, exit_side, exit_price, "exit",
+            matched_buy=fill_price if fill_side == "buy" else None,
+            matched_sell=fill_price if fill_side == "sell" else None)
+    else:
+        logger.info(
+            "Position recovery: %s entry $%.6f -- %s exit @ $%.6f on book",
+            fill_side.upper(), fill_price, exit_side.upper(), exit_price)
+
+    return [o for o in state.grid_orders if o.status == "open"]
 
 
 def _place_pair_order(state, side, price, role, matched_buy=None,
@@ -2231,9 +2297,9 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                 })
                 supabase_store.save_fill(state.recent_fills[-1])
 
-            # Handle remaining entry fill(s) -- place exit + companion
+            # Handle remaining entry fill(s) -- place exit only
             if buy_is_exit and not sell_is_exit:
-                # Sell is a new entry -> place buy exit + companion sell entry
+                # Sell is a new entry -> place buy exit only
                 sp = last_sell["price"]
                 exit_price = round(
                     sp * (1 - config.PAIR_PROFIT_PCT / 100.0), 6)
@@ -2250,17 +2316,12 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                     "profit": 0, "fees": sell_fee,
                 })
                 supabase_store.save_fill(state.recent_fills[-1])
-                sell_entry = round(
-                    current_price * (1 + config.PAIR_ENTRY_PCT / 100.0), 6)
-                o = _place_pair_order(state, "sell", sell_entry, "entry")
-                if o:
-                    placed += 1
                 logger.info(
                     "Offline exit+entry: buy exit booked, "
-                    "placed %d orders for sell entry position", placed)
+                    "placed %d exit order for sell entry position", placed)
 
             elif sell_is_exit and not buy_is_exit:
-                # Buy is a new entry -> place sell exit + companion buy entry
+                # Buy is a new entry -> place sell exit only
                 bp = last_buy["price"]
                 exit_price = round(
                     bp * (1 + config.PAIR_PROFIT_PCT / 100.0), 6)
@@ -2277,14 +2338,9 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                     "profit": 0, "fees": buy_fee,
                 })
                 supabase_store.save_fill(state.recent_fills[-1])
-                buy_entry = round(
-                    current_price * (1 - config.PAIR_ENTRY_PCT / 100.0), 6)
-                o = _place_pair_order(state, "buy", buy_entry, "entry")
-                if o:
-                    placed += 1
                 logger.info(
                     "Offline exit+entry: sell exit booked, "
-                    "placed %d orders for buy entry position", placed)
+                    "placed %d exit order for buy entry position", placed)
 
             else:
                 # Both exits -- position is flat, place fresh entry pair
@@ -2397,22 +2453,12 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                     matched_sell=second["price"])
                 if o:
                     placed += 1
-                sell_entry = round(
-                    current_price * (1 + config.PAIR_ENTRY_PCT / 100.0), 6)
-                o = _place_pair_order(state, "sell", sell_entry, "entry")
-                if o:
-                    placed += 1
             else:
                 exit_price = round(
                     second["price"] * (1 + config.PAIR_PROFIT_PCT / 100.0), 6)
                 o = _place_pair_order(
                     state, "sell", exit_price, "exit",
                     matched_buy=second["price"])
-                if o:
-                    placed += 1
-                buy_entry = round(
-                    current_price * (1 - config.PAIR_ENTRY_PCT / 100.0), 6)
-                o = _place_pair_order(state, "buy", buy_entry, "entry")
                 if o:
                     placed += 1
             logger.info(
@@ -2450,16 +2496,6 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
             })
             supabase_store.save_fill(state.recent_fills[-1])
 
-        has_sell_entry = any(
-            o.side == "sell" and o.order_role == "entry"
-            for o in state.grid_orders if o.status == "open")
-        if not has_sell_entry:
-            entry_price = round(
-                current_price * (1 + config.PAIR_ENTRY_PCT / 100.0), 6)
-            o = _place_pair_order(state, "sell", entry_price, "entry")
-            if o:
-                placed += 1
-
     # If there's a recent sell fill but no buy exit on the book, place one
     if last_sell and not has_buy_exit:
         sell_price = last_sell["price"]
@@ -2487,16 +2523,6 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                 "profit": 0, "fees": sell_fee,
             })
             supabase_store.save_fill(state.recent_fills[-1])
-
-        has_buy_entry = any(
-            o.side == "buy" and o.order_role == "entry"
-            for o in state.grid_orders if o.status == "open")
-        if not has_buy_entry:
-            entry_price = round(
-                current_price * (1 - config.PAIR_ENTRY_PCT / 100.0), 6)
-            o = _place_pair_order(state, "buy", entry_price, "entry")
-            if o:
-                placed += 1
 
     if placed:
         logger.info("Offline fill recovery: placed %d orders", placed)
