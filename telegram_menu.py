@@ -51,15 +51,28 @@ def build_grid_screen(state: grid_strategy.GridState, current_price: float):
     if state.center_price > 0:
         drift_pct = (current_price - state.center_price) / state.center_price * 100
 
-    text = (
-        f"<b>Grid Info</b>\n\n"
-        f"Center: ${state.center_price:.6f}\n"
-        f"Price: ${current_price:.6f} (drift {drift_pct:+.2f}%)\n"
-        f"Orders: {len(open_buys)}B + {len(open_sells)}S = {len(open_orders)}\n"
-        f"Range: ${low:.6f} -- ${high:.6f}\n"
-        f"Spacing: {config.GRID_SPACING_PCT:.2f}%\n"
-        f"Order size: ${config.ORDER_SIZE_USD:.2f}"
-    )
+    if config.STRATEGY_MODE == "pair":
+        entry_orders = [o for o in open_orders if o.order_role == "entry"]
+        exit_orders = [o for o in open_orders if o.order_role == "exit"]
+        text = (
+            f"<b>Pair Info</b>\n\n"
+            f"Center: ${state.center_price:.6f}\n"
+            f"Price: ${current_price:.6f} (drift {drift_pct:+.2f}%)\n"
+            f"Orders: {len(open_buys)}B + {len(open_sells)}S ({len(entry_orders)} entry, {len(exit_orders)} exit)\n"
+            f"Range: ${low:.6f} -- ${high:.6f}\n"
+            f"Entry: {config.PAIR_ENTRY_PCT:.2f}% | Profit: {config.PAIR_PROFIT_PCT:.2f}%\n"
+            f"Order size: ${config.ORDER_SIZE_USD:.2f}"
+        )
+    else:
+        text = (
+            f"<b>Grid Info</b>\n\n"
+            f"Center: ${state.center_price:.6f}\n"
+            f"Price: ${current_price:.6f} (drift {drift_pct:+.2f}%)\n"
+            f"Orders: {len(open_buys)}B + {len(open_sells)}S = {len(open_orders)}\n"
+            f"Range: ${low:.6f} -- ${high:.6f}\n"
+            f"Spacing: {config.GRID_SPACING_PCT:.2f}%\n"
+            f"Order size: ${config.ORDER_SIZE_USD:.2f}"
+        )
     keyboard = [[{"text": "<< Back", "callback_data": "m:main"}]]
     return text, keyboard
 
@@ -96,26 +109,46 @@ def build_stats_screen(state: grid_strategy.GridState):
 
 def build_settings_screen():
     """Current params + action buttons + Back."""
-    ratio_src = "manual" if hasattr(config, '_ratio_override') else "auto"
     floor = config.ROUND_TRIP_FEE_PCT + 0.1
 
-    text = (
-        f"<b>Settings</b>\n\n"
-        f"Spacing: {config.GRID_SPACING_PCT:.2f}% (min {floor:.2f}%)\n"
-        f"Grid levels: {config.GRID_LEVELS} per side\n"
-        f"Order size: ${config.ORDER_SIZE_USD:.2f}\n"
-        f"AI interval: {config.AI_ADVISOR_INTERVAL}s ({config.AI_ADVISOR_INTERVAL // 60} min)\n"
-        f"Mode: {'DRY RUN' if config.DRY_RUN else 'LIVE'}"
-    )
-    keyboard = [
-        [
-            {"text": "Spacing +", "callback_data": "ma:spacing_up"},
-            {"text": "Spacing -", "callback_data": "ma:spacing_down"},
-        ],
-        [
-            {"text": "Ratio Auto", "callback_data": "ma:ratio_auto"},
-            {"text": "AI Check Now", "callback_data": "ma:ai_check"},
-        ],
-        [{"text": "<< Back", "callback_data": "m:main"}],
-    ]
+    if config.STRATEGY_MODE == "pair":
+        text = (
+            f"<b>Settings</b> [pair mode]\n\n"
+            f"Profit target: {config.PAIR_PROFIT_PCT:.2f}% (min {floor:.2f}%)\n"
+            f"Entry distance: {config.PAIR_ENTRY_PCT:.2f}%\n"
+            f"Refresh drift: {config.PAIR_REFRESH_PCT:.2f}%\n"
+            f"Order size: ${config.ORDER_SIZE_USD:.2f}\n"
+            f"AI interval: {config.AI_ADVISOR_INTERVAL}s ({config.AI_ADVISOR_INTERVAL // 60} min)\n"
+            f"Mode: {'DRY RUN' if config.DRY_RUN else 'LIVE'}"
+        )
+        keyboard = [
+            [
+                {"text": "Profit +", "callback_data": "ma:spacing_up"},
+                {"text": "Profit -", "callback_data": "ma:spacing_down"},
+            ],
+            [
+                {"text": "AI Check Now", "callback_data": "ma:ai_check"},
+            ],
+            [{"text": "<< Back", "callback_data": "m:main"}],
+        ]
+    else:
+        text = (
+            f"<b>Settings</b> [grid mode]\n\n"
+            f"Spacing: {config.GRID_SPACING_PCT:.2f}% (min {floor:.2f}%)\n"
+            f"Grid levels: {config.GRID_LEVELS} per side\n"
+            f"Order size: ${config.ORDER_SIZE_USD:.2f}\n"
+            f"AI interval: {config.AI_ADVISOR_INTERVAL}s ({config.AI_ADVISOR_INTERVAL // 60} min)\n"
+            f"Mode: {'DRY RUN' if config.DRY_RUN else 'LIVE'}"
+        )
+        keyboard = [
+            [
+                {"text": "Spacing +", "callback_data": "ma:spacing_up"},
+                {"text": "Spacing -", "callback_data": "ma:spacing_down"},
+            ],
+            [
+                {"text": "Ratio Auto", "callback_data": "ma:ratio_auto"},
+                {"text": "AI Check Now", "callback_data": "ma:ai_check"},
+            ],
+            [{"text": "<< Back", "callback_data": "m:main"}],
+        ]
     return text, keyboard

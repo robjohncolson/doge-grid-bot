@@ -130,7 +130,11 @@ Current price: ${market_data.get('price', 0):.6f}
 Bid-ask spread: {market_data.get('spread_pct', 0):.3f}%
 Grid fills (last hour): {market_data.get('recent_fills', 0)}
 Grid center: ${market_data.get('grid_center', 0):.6f}
-Grid spacing: {config.GRID_SPACING_PCT}%"""
+"""
+    if config.STRATEGY_MODE == "pair":
+        prompt += f"Strategy: single-pair (2 orders)\nEntry distance: {config.PAIR_ENTRY_PCT}%\nProfit target: {config.PAIR_PROFIT_PCT}%"
+    else:
+        prompt += f"Grid spacing: {config.GRID_SPACING_PCT}%"
 
     if stats_context:
         prompt += f"\n\n{stats_context}"

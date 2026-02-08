@@ -502,9 +502,14 @@ def _apply_web_config(state: grid_strategy.GridState, current_price: float):
 
     # Apply spacing
     if "spacing" in pending:
-        old = config.GRID_SPACING_PCT
-        config.GRID_SPACING_PCT = pending["spacing"]
-        logger.info("Web dashboard: spacing %.2f%% -> %.2f%%", old, config.GRID_SPACING_PCT)
+        if config.STRATEGY_MODE == "pair":
+            old = config.PAIR_PROFIT_PCT
+            config.PAIR_PROFIT_PCT = pending["spacing"]
+            logger.info("Web dashboard: profit target %.2f%% -> %.2f%%", old, config.PAIR_PROFIT_PCT)
+        else:
+            old = config.GRID_SPACING_PCT
+            config.GRID_SPACING_PCT = pending["spacing"]
+            logger.info("Web dashboard: spacing %.2f%% -> %.2f%%", old, config.GRID_SPACING_PCT)
         needs_rebuild = True
 
     # Apply ratio
@@ -675,44 +680,71 @@ def _execute_approved_action(state: grid_strategy.GridState, action: str,
       reset_grid      -> cancel and rebuild grid at current price
     """
     if action == "widen_spacing":
-        old = config.GRID_SPACING_PCT
-        config.GRID_SPACING_PCT = round(old + SPACING_STEP_PCT, 4)
-        logger.info("Spacing widened: %.2f%% -> %.2f%%", old, config.GRID_SPACING_PCT)
-
-        grid_strategy.cancel_grid(state)
-        orders = grid_strategy.build_grid(state, current_price)
-
-        notifier._send_message(
-            f"Spacing widened: {old:.2f}% -> {config.GRID_SPACING_PCT:.2f}%\n"
-            f"Grid rebuilt: {len(orders)} orders around ${current_price:.6f}"
-        )
+        if config.STRATEGY_MODE == "pair":
+            old = config.PAIR_PROFIT_PCT
+            config.PAIR_PROFIT_PCT = round(old + SPACING_STEP_PCT, 4)
+            logger.info("Profit target widened: %.2f%% -> %.2f%%", old, config.PAIR_PROFIT_PCT)
+            grid_strategy.cancel_grid(state)
+            orders = grid_strategy.build_grid(state, current_price)
+            notifier._send_message(
+                f"Profit target widened: {old:.2f}% -> {config.PAIR_PROFIT_PCT:.2f}%\n"
+                f"Pair rebuilt: {len(orders)} orders around ${current_price:.6f}"
+            )
+        else:
+            old = config.GRID_SPACING_PCT
+            config.GRID_SPACING_PCT = round(old + SPACING_STEP_PCT, 4)
+            logger.info("Spacing widened: %.2f%% -> %.2f%%", old, config.GRID_SPACING_PCT)
+            grid_strategy.cancel_grid(state)
+            orders = grid_strategy.build_grid(state, current_price)
+            notifier._send_message(
+                f"Spacing widened: {old:.2f}% -> {config.GRID_SPACING_PCT:.2f}%\n"
+                f"Grid rebuilt: {len(orders)} orders around ${current_price:.6f}"
+            )
 
     elif action == "tighten_spacing":
-        old = config.GRID_SPACING_PCT
         floor = config.ROUND_TRIP_FEE_PCT + 0.1
-        new_spacing = round(old - SPACING_STEP_PCT, 4)
-
-        if new_spacing < floor:
-            logger.warning(
-                "Cannot tighten below %.2f%% (fees+0.1%%). Current: %.2f%%",
-                floor, old,
-            )
+        if config.STRATEGY_MODE == "pair":
+            old = config.PAIR_PROFIT_PCT
+            new_val = round(old - SPACING_STEP_PCT, 4)
+            if new_val < floor:
+                logger.warning(
+                    "Cannot tighten below %.2f%% (fees+0.1%%). Current: %.2f%%",
+                    floor, old,
+                )
+                notifier._send_message(
+                    f"Cannot tighten profit target below {floor:.2f}% "
+                    f"(round-trip fees + 0.1%%). Current: {old:.2f}%"
+                )
+                return
+            config.PAIR_PROFIT_PCT = new_val
+            logger.info("Profit target tightened: %.2f%% -> %.2f%%", old, new_val)
+            grid_strategy.cancel_grid(state)
+            orders = grid_strategy.build_grid(state, current_price)
             notifier._send_message(
-                f"Cannot tighten spacing below {floor:.2f}% "
-                f"(round-trip fees + 0.1%%). Current: {old:.2f}%"
+                f"Profit target tightened: {old:.2f}% -> {new_val:.2f}%\n"
+                f"Pair rebuilt: {len(orders)} orders around ${current_price:.6f}"
             )
-            return
-
-        config.GRID_SPACING_PCT = new_spacing
-        logger.info("Spacing tightened: %.2f%% -> %.2f%%", old, config.GRID_SPACING_PCT)
-
-        grid_strategy.cancel_grid(state)
-        orders = grid_strategy.build_grid(state, current_price)
-
-        notifier._send_message(
-            f"Spacing tightened: {old:.2f}% -> {config.GRID_SPACING_PCT:.2f}%\n"
-            f"Grid rebuilt: {len(orders)} orders around ${current_price:.6f}"
-        )
+        else:
+            old = config.GRID_SPACING_PCT
+            new_spacing = round(old - SPACING_STEP_PCT, 4)
+            if new_spacing < floor:
+                logger.warning(
+                    "Cannot tighten below %.2f%% (fees+0.1%%). Current: %.2f%%",
+                    floor, old,
+                )
+                notifier._send_message(
+                    f"Cannot tighten spacing below {floor:.2f}% "
+                    f"(round-trip fees + 0.1%%). Current: {old:.2f}%"
+                )
+                return
+            config.GRID_SPACING_PCT = new_spacing
+            logger.info("Spacing tightened: %.2f%% -> %.2f%%", old, config.GRID_SPACING_PCT)
+            grid_strategy.cancel_grid(state)
+            orders = grid_strategy.build_grid(state, current_price)
+            notifier._send_message(
+                f"Spacing tightened: {old:.2f}% -> {config.GRID_SPACING_PCT:.2f}%\n"
+                f"Grid rebuilt: {len(orders)} orders around ${current_price:.6f}"
+            )
 
     elif action == "pause":
         state.is_paused = True
@@ -980,23 +1012,39 @@ def _handle_menu_action(state: grid_strategy.GridState, current_price: float,
                         action: str, message_id: int, callback_id: str):
     """Execute a settings action from the menu, then refresh the settings screen."""
     if action == "spacing_up":
-        old = config.GRID_SPACING_PCT
-        config.GRID_SPACING_PCT = round(old + SPACING_STEP_PCT, 4)
-        notifier.answer_callback(callback_id, f"Spacing: {old:.2f}% -> {config.GRID_SPACING_PCT:.2f}%")
-        logger.info("Menu: spacing widened %.2f%% -> %.2f%%", old, config.GRID_SPACING_PCT)
+        if config.STRATEGY_MODE == "pair":
+            old = config.PAIR_PROFIT_PCT
+            config.PAIR_PROFIT_PCT = round(old + SPACING_STEP_PCT, 4)
+            notifier.answer_callback(callback_id, f"Profit: {old:.2f}% -> {config.PAIR_PROFIT_PCT:.2f}%")
+            logger.info("Menu: profit target widened %.2f%% -> %.2f%%", old, config.PAIR_PROFIT_PCT)
+        else:
+            old = config.GRID_SPACING_PCT
+            config.GRID_SPACING_PCT = round(old + SPACING_STEP_PCT, 4)
+            notifier.answer_callback(callback_id, f"Spacing: {old:.2f}% -> {config.GRID_SPACING_PCT:.2f}%")
+            logger.info("Menu: spacing widened %.2f%% -> %.2f%%", old, config.GRID_SPACING_PCT)
         grid_strategy.cancel_grid(state)
         grid_strategy.build_grid(state, current_price)
 
     elif action == "spacing_down":
-        old = config.GRID_SPACING_PCT
         floor = config.ROUND_TRIP_FEE_PCT + 0.1
-        new_val = round(old - SPACING_STEP_PCT, 4)
-        if new_val < floor:
-            notifier.answer_callback(callback_id, f"Can't go below {floor:.2f}%")
-            return
-        config.GRID_SPACING_PCT = new_val
-        notifier.answer_callback(callback_id, f"Spacing: {old:.2f}% -> {new_val:.2f}%")
-        logger.info("Menu: spacing tightened %.2f%% -> %.2f%%", old, new_val)
+        if config.STRATEGY_MODE == "pair":
+            old = config.PAIR_PROFIT_PCT
+            new_val = round(old - SPACING_STEP_PCT, 4)
+            if new_val < floor:
+                notifier.answer_callback(callback_id, f"Can't go below {floor:.2f}%")
+                return
+            config.PAIR_PROFIT_PCT = new_val
+            notifier.answer_callback(callback_id, f"Profit: {old:.2f}% -> {new_val:.2f}%")
+            logger.info("Menu: profit target tightened %.2f%% -> %.2f%%", old, new_val)
+        else:
+            old = config.GRID_SPACING_PCT
+            new_val = round(old - SPACING_STEP_PCT, 4)
+            if new_val < floor:
+                notifier.answer_callback(callback_id, f"Can't go below {floor:.2f}%")
+                return
+            config.GRID_SPACING_PCT = new_val
+            notifier.answer_callback(callback_id, f"Spacing: {old:.2f}% -> {new_val:.2f}%")
+            logger.info("Menu: spacing tightened %.2f%% -> %.2f%%", old, new_val)
         grid_strategy.cancel_grid(state)
         grid_strategy.build_grid(state, current_price)
 
@@ -1234,13 +1282,14 @@ def run():
 
             if filled:
                 logger.info("Detected %d fill(s)", len(filled))
-                new_orders = grid_strategy.handle_fills(state, filled)
+                new_orders = grid_strategy.handle_fills(state, filled, current_price)
 
-                # Update trend ratio based on fill history
-                grid_strategy.update_trend_ratio(state)
+                # Update trend ratio based on fill history (grid mode only)
+                if config.STRATEGY_MODE != "pair":
+                    grid_strategy.update_trend_ratio(state)
 
-                # Ratio-drift rebuild: if ratio shifted enough, rebuild grid
-                if abs(state.trend_ratio - state.last_build_ratio) >= 0.2:
+                # Ratio-drift rebuild: if ratio shifted enough, rebuild grid (grid mode only)
+                if config.STRATEGY_MODE != "pair" and abs(state.trend_ratio - state.last_build_ratio) >= 0.2:
                     logger.info(
                         "Trend ratio drift: %.2f -> %.2f -- rebuilding grid",
                         state.last_build_ratio, state.trend_ratio,

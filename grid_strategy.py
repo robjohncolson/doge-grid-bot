@@ -68,6 +68,9 @@ class GridOrder:
         self.placed_at = 0.0
         self.matched_buy_price = None
         self.closed_out = False
+        # Pair mode fields
+        self.order_role = "entry"          # "entry" (flank market) or "exit" (profit target)
+        self.matched_sell_price = None     # For buy exits: the sell price this buy is paired with
 
     def __repr__(self):
         return (f"GridOrder(L{self.level:+d} {self.side} "
@@ -147,8 +150,10 @@ def save_state(state: GridState):
         "open_txids": [o.txid for o in state.grid_orders
                        if o.status == "open" and o.txid],
         "saved_at": time.time(),
+        "strategy_mode": config.STRATEGY_MODE,
         # Runtime config overrides (survive deploys via Supabase)
         "grid_spacing_pct": config.GRID_SPACING_PCT,
+        "pair_profit_pct": config.PAIR_PROFIT_PCT,
         "ai_advisor_interval": config.AI_ADVISOR_INTERVAL,
     }
     tmp_path = config.STATE_FILE + ".tmp"
@@ -272,6 +277,9 @@ def validate_config(current_price: float) -> bool:
     Returns True if safe to proceed, False if a critical check fails.
     Logs warnings for non-critical issues.
     """
+    if config.STRATEGY_MODE == "pair":
+        return validate_pair_config(current_price)
+
     ok = True
     warnings = []
 
@@ -444,6 +452,9 @@ def reconcile_on_startup(state: GridState, current_price: float) -> int:
 
     Returns the number of adopted orders.
     """
+    if config.STRATEGY_MODE == "pair":
+        return reconcile_pair_on_startup(state, current_price)
+
     if config.DRY_RUN:
         logger.info("[DRY RUN] Skipping startup reconciliation")
         return 0
@@ -542,6 +553,9 @@ def build_grid(state: GridState, current_price: float) -> list:
 
     Returns the list of placed GridOrder objects.
     """
+    if config.STRATEGY_MODE == "pair":
+        return build_pair(state, current_price)
+
     # Adapt order size and level count for current price and profits
     adapt_grid_params(state, current_price)
 
@@ -786,7 +800,7 @@ def check_fills(state: GridState, current_price: float = 0.0) -> list:
 # Pair cycling -- the money-making core
 # ---------------------------------------------------------------------------
 
-def handle_fills(state: GridState, filled_orders: list) -> list:
+def handle_fills(state: GridState, filled_orders: list, current_price: float = 0.0) -> list:
     """
     For each filled order, place the opposite order one grid level away.
 
@@ -802,6 +816,9 @@ def handle_fills(state: GridState, filled_orders: list) -> list:
 
     Returns list of new GridOrder objects placed.
     """
+    if config.STRATEGY_MODE == "pair":
+        return handle_pair_fill(state, filled_orders, current_price)
+
     new_orders = []
 
     for filled in filled_orders:
@@ -952,6 +969,9 @@ def check_grid_drift(state: GridState, current_price: float) -> bool:
 
     Returns True if a reset is needed.
     """
+    if config.STRATEGY_MODE == "pair":
+        return refresh_stale_entries(state, current_price)
+
     if state.center_price <= 0:
         return False
 
@@ -1246,6 +1266,547 @@ def _log_daily_summary(state: GridState):
     supabase_store.save_daily_summary(state)
 
 
+# ---------------------------------------------------------------------------
+# Single-pair market making strategy
+# ---------------------------------------------------------------------------
+# Two orders on the book at all times: 1 buy + 1 sell.
+# Each is either an "entry" (flanking market) or an "exit" (profit target).
+# Maximum exposure = 1 order size (~$3.50) instead of the full grid's ~$35.
+# ---------------------------------------------------------------------------
+
+
+def validate_pair_config(current_price: float) -> bool:
+    """
+    Pre-flight checks for pair mode.
+    Returns True if safe to proceed, False if a critical check fails.
+    """
+    ok = True
+    warnings = []
+
+    # Critical: profit target must exceed round-trip fees
+    if config.PAIR_PROFIT_PCT <= config.ROUND_TRIP_FEE_PCT:
+        msg = (
+            "PAIR_PROFIT_PCT (%.2f%%) <= ROUND_TRIP_FEE_PCT (%.2f%%) -- "
+            "every trade is a guaranteed loss" % (
+                config.PAIR_PROFIT_PCT, config.ROUND_TRIP_FEE_PCT))
+        logger.critical(msg)
+        warnings.append(msg)
+        ok = False
+
+    # Warning: order size below Kraken minimum DOGE volume
+    doge_per_order = config.ORDER_SIZE_USD / current_price if current_price > 0 else 0
+    if doge_per_order < ORDERMIN_DOGE:
+        msg = (
+            "ORDER_SIZE_USD $%.2f = %.1f DOGE at $%.6f -- below Kraken min %d DOGE "
+            "(adapt_grid_params will fix this)" % (
+                config.ORDER_SIZE_USD, doge_per_order, current_price, ORDERMIN_DOGE))
+        logger.warning(msg)
+        warnings.append(msg)
+
+    if warnings:
+        try:
+            import notifier
+            notifier.notify_error("Pair validation:\n" + "\n".join(warnings))
+        except Exception:
+            pass
+
+    if ok:
+        logger.info("Pair mode pre-flight validation passed")
+    return ok
+
+
+def build_pair(state: GridState, current_price: float) -> list:
+    """
+    Build a fresh pair: 1 buy entry + 1 sell entry flanking market.
+
+    Returns the list of placed GridOrder objects (up to 2).
+    """
+    # Reuse adaptive sizing for ORDER_SIZE_USD
+    adapt_grid_params(state, current_price)
+
+    state.center_price = current_price
+
+    # Identify any adopted orders (from reconciliation) to skip
+    adopted_sides = set()
+    for o in state.grid_orders:
+        if o.status == "open":
+            adopted_sides.add(o.side)
+
+    buy_price = round(current_price * (1 - config.PAIR_ENTRY_PCT / 100.0), 6)
+    sell_price = round(current_price * (1 + config.PAIR_ENTRY_PCT / 100.0), 6)
+
+    logger.info(
+        "Building pair at $%.6f: buy entry $%.6f, sell entry $%.6f",
+        current_price, buy_price, sell_price,
+    )
+
+    placed = [o for o in state.grid_orders if o.status == "open"]  # Keep adopted
+
+    for side, price, level in [("buy", buy_price, -1), ("sell", sell_price, +1)]:
+        if side in adopted_sides:
+            logger.debug("  Pair %s: skipped (already adopted)", side.upper())
+            continue
+
+        volume = calculate_volume_for_price(price)
+        order = GridOrder(level=level, side=side, price=price, volume=volume)
+        order.order_role = "entry"
+
+        try:
+            txid = kraken_client.place_order(side=side, volume=volume, price=price)
+            order.txid = txid
+            order.status = "open"
+            order.placed_at = time.time()
+            placed.append(order)
+            logger.info(
+                "  Pair %s entry: %.2f DOGE @ $%.6f ($%.2f) -> %s",
+                side.upper(), volume, price, volume * price, txid,
+            )
+        except Exception as e:
+            logger.error("Failed to place pair %s entry: %s", side, e)
+            order.status = "failed"
+
+        if not config.DRY_RUN:
+            time.sleep(0.5)
+
+    state.grid_orders = placed
+    return placed
+
+
+def _place_pair_order(state, side, price, role, matched_buy=None,
+                      matched_sell=None):
+    """
+    Place a single pair order and add it to state.grid_orders.
+    Returns the GridOrder on success, None on failure.
+    """
+    volume = calculate_volume_for_price(price)
+    level = -1 if side == "buy" else +1
+    order = GridOrder(level=level, side=side, price=price, volume=volume)
+    order.order_role = role
+    if matched_buy is not None:
+        order.matched_buy_price = matched_buy
+    if matched_sell is not None:
+        order.matched_sell_price = matched_sell
+
+    try:
+        txid = kraken_client.place_order(side=side, volume=volume, price=price)
+        order.txid = txid
+        order.status = "open"
+        order.placed_at = time.time()
+        state.grid_orders.append(order)
+        logger.info(
+            "  Pair %s %s: %.2f DOGE @ $%.6f -> %s",
+            side.upper(), role, volume, price, txid,
+        )
+        return order
+    except Exception as e:
+        logger.error("Failed to place pair %s %s: %s", side, role, e)
+        order.status = "failed"
+        state.consecutive_errors += 1
+        return None
+
+
+def _cancel_open_by_role(state, side, role):
+    """Cancel all open orders matching side+role. Returns count cancelled."""
+    cancelled = 0
+    for o in state.grid_orders:
+        if o.status == "open" and o.side == side and o.order_role == role:
+            if config.DRY_RUN:
+                o.status = "cancelled"
+            else:
+                ok = kraken_client.cancel_order(o.txid)
+                if ok:
+                    o.status = "cancelled"
+                else:
+                    logger.warning("Failed to cancel %s %s %s", side, role, o.txid)
+                    continue
+            cancelled += 1
+            logger.info(
+                "  Cancelled stale %s %s @ $%.6f (%s)",
+                side.upper(), role, o.price, o.txid,
+            )
+    return cancelled
+
+
+def handle_pair_fill(state: GridState, filled_orders: list,
+                     current_price: float) -> list:
+    """
+    Core pair state machine. For each filled order, place the appropriate
+    counter-orders to maintain exactly 2 open orders.
+
+    Returns list of new GridOrder objects placed.
+    """
+    new_orders = []
+
+    for filled in filled_orders:
+        is_entry = filled.order_role == "entry"
+        is_exit = filled.order_role == "exit"
+
+        # ---------------------------------------------------------------
+        # BUY ENTRY fills -> cancel stale sell entry, place sell exit + new buy entry
+        # ---------------------------------------------------------------
+        if filled.side == "buy" and is_entry:
+            logger.info(
+                "PAIR: Buy entry filled @ $%.6f (%.2f DOGE)",
+                filled.price, filled.volume,
+            )
+
+            # Track buy fill fee
+            buy_fee = filled.price * filled.volume * config.MAKER_FEE_PCT / 100.0
+            state.total_fees_usd += buy_fee
+            state.today_fees_usd += buy_fee
+            state.recent_fills.append({
+                "time": time.time(), "side": "buy",
+                "price": filled.price, "volume": filled.volume,
+                "profit": 0, "fees": buy_fee,
+            })
+            supabase_store.save_fill(state.recent_fills[-1])
+
+            # Cancel any existing sell entry (stale)
+            _cancel_open_by_role(state, "sell", "entry")
+
+            # Place sell exit at profit target
+            exit_price = round(
+                filled.price * (1 + config.PAIR_PROFIT_PCT / 100.0), 6)
+            o = _place_pair_order(
+                state, "sell", exit_price, "exit",
+                matched_buy=filled.price)
+            if o:
+                new_orders.append(o)
+
+            # Place new buy entry flanking market
+            entry_price = round(
+                current_price * (1 - config.PAIR_ENTRY_PCT / 100.0), 6)
+            o = _place_pair_order(state, "buy", entry_price, "entry")
+            if o:
+                new_orders.append(o)
+
+        # ---------------------------------------------------------------
+        # SELL EXIT fills -> round trip complete! place sell entry, refresh buy
+        # ---------------------------------------------------------------
+        elif filled.side == "sell" and is_exit:
+            buy_price = filled.matched_buy_price
+            if buy_price is not None:
+                gross = (filled.price - buy_price) * filled.volume
+                fees = (buy_price * filled.volume * config.MAKER_FEE_PCT / 100.0 +
+                        filled.price * filled.volume * config.MAKER_FEE_PCT / 100.0)
+                net_profit = gross - fees
+                state.total_round_trips += 1
+                state.round_trips_today += 1
+            else:
+                logger.warning(
+                    "  Sell exit at $%.6f has no matched_buy_price -- booking $0",
+                    filled.price)
+                net_profit = 0.0
+                fees = filled.price * filled.volume * config.MAKER_FEE_PCT / 100.0
+
+            state.total_profit_usd += net_profit
+            state.today_profit_usd += net_profit
+            state.total_fees_usd += fees
+            state.today_fees_usd += fees
+            if net_profit < 0:
+                state.today_loss_usd += abs(net_profit)
+
+            # Mark matched buy as closed out
+            if buy_price is not None:
+                for o in state.grid_orders:
+                    if (o.side == "buy" and o.status == "filled"
+                            and not o.closed_out
+                            and abs(o.price - buy_price) < 1e-9):
+                        o.closed_out = True
+                        break
+
+            logger.info(
+                "  PAIR ROUND TRIP! Sell exit $%.6f (bought $%.6f) "
+                "-> profit: $%.4f (fees: $%.4f) | Total: $%.4f (%d trips)",
+                filled.price, buy_price or 0, net_profit, fees,
+                state.total_profit_usd, state.total_round_trips,
+            )
+
+            _log_trade(filled, net_profit, fees)
+            state.recent_fills.append({
+                "time": time.time(), "side": "sell",
+                "price": filled.price, "volume": filled.volume,
+                "profit": net_profit, "fees": fees,
+            })
+            supabase_store.save_fill(state.recent_fills[-1])
+
+            # Place new sell entry
+            entry_price = round(
+                current_price * (1 + config.PAIR_ENTRY_PCT / 100.0), 6)
+            o = _place_pair_order(state, "sell", entry_price, "entry")
+            if o:
+                new_orders.append(o)
+
+            # Refresh buy entry if stale
+            _refresh_entry_if_stale(state, "buy", current_price)
+
+        # ---------------------------------------------------------------
+        # SELL ENTRY fills -> cancel stale buy entry, place buy exit + new sell entry
+        # ---------------------------------------------------------------
+        elif filled.side == "sell" and is_entry:
+            logger.info(
+                "PAIR: Sell entry filled @ $%.6f (%.2f DOGE)",
+                filled.price, filled.volume,
+            )
+
+            # Track sell fill fee
+            sell_fee = filled.price * filled.volume * config.MAKER_FEE_PCT / 100.0
+            state.total_fees_usd += sell_fee
+            state.today_fees_usd += sell_fee
+            state.recent_fills.append({
+                "time": time.time(), "side": "sell",
+                "price": filled.price, "volume": filled.volume,
+                "profit": 0, "fees": sell_fee,
+            })
+            supabase_store.save_fill(state.recent_fills[-1])
+
+            # Cancel any existing buy entry (stale)
+            _cancel_open_by_role(state, "buy", "entry")
+
+            # Place buy exit at profit target
+            exit_price = round(
+                filled.price * (1 - config.PAIR_PROFIT_PCT / 100.0), 6)
+            o = _place_pair_order(
+                state, "buy", exit_price, "exit",
+                matched_sell=filled.price)
+            if o:
+                new_orders.append(o)
+
+            # Place new sell entry flanking market
+            entry_price = round(
+                current_price * (1 + config.PAIR_ENTRY_PCT / 100.0), 6)
+            o = _place_pair_order(state, "sell", entry_price, "entry")
+            if o:
+                new_orders.append(o)
+
+        # ---------------------------------------------------------------
+        # BUY EXIT fills -> round trip complete! place buy entry, refresh sell
+        # ---------------------------------------------------------------
+        elif filled.side == "buy" and is_exit:
+            sell_price = filled.matched_sell_price
+            if sell_price is not None:
+                gross = (sell_price - filled.price) * filled.volume
+                fees = (filled.price * filled.volume * config.MAKER_FEE_PCT / 100.0 +
+                        sell_price * filled.volume * config.MAKER_FEE_PCT / 100.0)
+                net_profit = gross - fees
+                state.total_round_trips += 1
+                state.round_trips_today += 1
+            else:
+                logger.warning(
+                    "  Buy exit at $%.6f has no matched_sell_price -- booking $0",
+                    filled.price)
+                net_profit = 0.0
+                fees = filled.price * filled.volume * config.MAKER_FEE_PCT / 100.0
+
+            state.total_profit_usd += net_profit
+            state.today_profit_usd += net_profit
+            state.total_fees_usd += fees
+            state.today_fees_usd += fees
+            if net_profit < 0:
+                state.today_loss_usd += abs(net_profit)
+
+            # Mark matched sell as closed out
+            if sell_price is not None:
+                for o in state.grid_orders:
+                    if (o.side == "sell" and o.status == "filled"
+                            and not o.closed_out
+                            and abs(o.price - sell_price) < 1e-9):
+                        o.closed_out = True
+                        break
+
+            logger.info(
+                "  PAIR ROUND TRIP! Buy exit $%.6f (sold $%.6f) "
+                "-> profit: $%.4f (fees: $%.4f) | Total: $%.4f (%d trips)",
+                filled.price, sell_price or 0, net_profit, fees,
+                state.total_profit_usd, state.total_round_trips,
+            )
+
+            _log_trade(filled, net_profit, fees)
+            state.recent_fills.append({
+                "time": time.time(), "side": "buy",
+                "price": filled.price, "volume": filled.volume,
+                "profit": net_profit, "fees": fees,
+            })
+            supabase_store.save_fill(state.recent_fills[-1])
+
+            # Place new buy entry
+            entry_price = round(
+                current_price * (1 - config.PAIR_ENTRY_PCT / 100.0), 6)
+            o = _place_pair_order(state, "buy", entry_price, "entry")
+            if o:
+                new_orders.append(o)
+
+            # Refresh sell entry if stale
+            _refresh_entry_if_stale(state, "sell", current_price)
+
+    return new_orders
+
+
+def _refresh_entry_if_stale(state, side, current_price):
+    """
+    If the entry order on the given side is too far from market, cancel and replace.
+    Exit orders are never touched.
+    """
+    for o in state.grid_orders:
+        if o.status != "open" or o.side != side or o.order_role != "entry":
+            continue
+        distance_pct = abs(o.price - current_price) / current_price * 100.0
+        if distance_pct > config.PAIR_REFRESH_PCT:
+            logger.info(
+                "  Refreshing stale %s entry: $%.6f is %.2f%% from market $%.6f",
+                side.upper(), o.price, distance_pct, current_price,
+            )
+            if config.DRY_RUN:
+                o.status = "cancelled"
+            else:
+                kraken_client.cancel_order(o.txid)
+                o.status = "cancelled"
+
+            if side == "buy":
+                new_price = round(
+                    current_price * (1 - config.PAIR_ENTRY_PCT / 100.0), 6)
+            else:
+                new_price = round(
+                    current_price * (1 + config.PAIR_ENTRY_PCT / 100.0), 6)
+            _place_pair_order(state, side, new_price, "entry")
+            return True
+    return False
+
+
+def refresh_stale_entries(state: GridState, current_price: float) -> bool:
+    """
+    Replaces check_grid_drift() for pair mode.
+    For each open entry order, check if it has drifted too far from market.
+    Exit orders are NEVER refreshed (fixed profit target).
+
+    Returns True if any entries were refreshed (triggers rebuild notification).
+    """
+    refreshed = False
+    for o in list(state.grid_orders):
+        if o.status != "open" or o.order_role != "entry":
+            continue
+        distance_pct = abs(o.price - current_price) / current_price * 100.0
+        if distance_pct > config.PAIR_REFRESH_PCT:
+            logger.info(
+                "Pair drift: %s entry $%.6f is %.2f%% from market $%.6f "
+                "(threshold: %.1f%%)",
+                o.side.upper(), o.price, distance_pct,
+                current_price, config.PAIR_REFRESH_PCT,
+            )
+            if config.DRY_RUN:
+                o.status = "cancelled"
+            else:
+                kraken_client.cancel_order(o.txid)
+                o.status = "cancelled"
+
+            if o.side == "buy":
+                new_price = round(
+                    current_price * (1 - config.PAIR_ENTRY_PCT / 100.0), 6)
+            else:
+                new_price = round(
+                    current_price * (1 + config.PAIR_ENTRY_PCT / 100.0), 6)
+            _place_pair_order(state, o.side, new_price, "entry")
+            refreshed = True
+
+    if refreshed:
+        state.center_price = current_price
+    return False  # Return False to avoid triggering a full rebuild in bot.py
+
+
+def reconcile_pair_on_startup(state: GridState, current_price: float) -> int:
+    """
+    Simplified reconciliation for pair mode.
+    Adopt up to 2 open orders (1 buy, 1 sell). Cancel extras.
+    """
+    if config.DRY_RUN:
+        logger.info("[DRY RUN] Skipping pair reconciliation")
+        return 0
+
+    try:
+        open_orders = kraken_client.get_open_orders()
+    except Exception as e:
+        logger.error("Pair reconciliation: failed to fetch open orders: %s", e)
+        return 0
+
+    if not open_orders:
+        logger.info("Pair reconciliation: no open orders found on Kraken")
+        return 0
+
+    # Classify XDGUSD orders by side
+    our_buys = []
+    our_sells = []
+
+    for txid, info in open_orders.items():
+        descr = info.get("descr", {})
+        pair = descr.get("pair", "")
+        if "XDG" not in pair.upper() and "DOGE" not in pair.upper():
+            continue
+
+        side = descr.get("type", "")
+        order_price = float(descr.get("price", 0))
+        order_vol = float(info.get("vol", 0))
+
+        if not side or order_price <= 0:
+            continue
+
+        entry = (txid, side, order_price, order_vol)
+        if side == "buy":
+            our_buys.append(entry)
+        else:
+            our_sells.append(entry)
+
+    # Adopt at most 1 buy and 1 sell (closest to market)
+    adopted = 0
+    orphans = 0
+
+    for side_list, side_name in [(our_buys, "buy"), (our_sells, "sell")]:
+        if not side_list:
+            continue
+
+        # Sort by distance from current price, adopt the closest
+        side_list.sort(key=lambda x: abs(x[2] - current_price))
+        best = side_list[0]
+        txid, side, price, vol = best
+
+        # Determine if it's an entry or exit based on position relative to market
+        if side == "buy" and price < current_price:
+            role = "entry"
+        elif side == "buy" and price >= current_price:
+            role = "exit"
+        elif side == "sell" and price > current_price:
+            role = "entry"
+        else:
+            role = "exit"
+
+        order = GridOrder(level=-1 if side == "buy" else +1,
+                          side=side, price=price, volume=vol)
+        order.txid = txid
+        order.status = "open"
+        order.placed_at = time.time()
+        order.order_role = role
+        state.grid_orders.append(order)
+        adopted += 1
+        logger.info(
+            "Pair reconcile: adopted %s %s %.2f DOGE @ $%.6f -> %s",
+            side.upper(), role, vol, price, txid,
+        )
+
+        # Cancel the rest of this side
+        for extra in side_list[1:]:
+            logger.warning(
+                "Pair reconcile: cancelling extra %s @ $%.6f -> %s",
+                side_name.upper(), extra[2], extra[0],
+            )
+            kraken_client.cancel_order(extra[0])
+            orphans += 1
+
+    logger.info(
+        "Pair reconciliation: %d adopted, %d orphans cancelled",
+        adopted, orphans,
+    )
+    return adopted
+
+
 def get_status_summary(state: GridState, current_price: float) -> str:
     """
     Generate a human-readable status summary.
@@ -1257,24 +1818,40 @@ def get_status_summary(state: GridState, current_price: float) -> str:
 
     prefix = "[DRY RUN] " if config.DRY_RUN else ""
 
-    # Trend ratio display
-    ratio = state.trend_ratio
-    total = config.GRID_LEVELS * 2
-    n_buys = max(2, min(total - 2, round(total * ratio)))
-    n_sells = total - n_buys
-    ratio_src = "manual" if state.trend_ratio_override is not None else "auto"
+    if config.STRATEGY_MODE == "pair":
+        # Show roles for pair mode
+        entry_orders = [o for o in open_orders if o.order_role == "entry"]
+        exit_orders = [o for o in open_orders if o.order_role == "exit"]
+        lines = [
+            f"{prefix}DOGE Pair Bot Status",
+            f"Price: ${current_price:.6f}",
+            f"Center: ${state.center_price:.6f}",
+            f"Open: {open_buys}B + {open_sells}S ({len(entry_orders)} entry, {len(exit_orders)} exit)",
+            f"Entry dist: {config.PAIR_ENTRY_PCT:.2f}% | Profit tgt: {config.PAIR_PROFIT_PCT:.2f}%",
+            f"Today: {state.round_trips_today} round trips, ${state.today_profit_usd:.4f} profit",
+            f"Lifetime: {state.total_round_trips} round trips, ${state.total_profit_usd:.4f} profit",
+            f"Fees paid: ${state.total_fees_usd:.4f}",
+            f"DOGE accumulated: {state.doge_accumulated:.2f}",
+        ]
+    else:
+        # Trend ratio display
+        ratio = state.trend_ratio
+        total = config.GRID_LEVELS * 2
+        n_buys = max(2, min(total - 2, round(total * ratio)))
+        n_sells = total - n_buys
+        ratio_src = "manual" if state.trend_ratio_override is not None else "auto"
 
-    lines = [
-        f"{prefix}DOGE Grid Bot Status",
-        f"Price: ${current_price:.6f}",
-        f"Grid center: ${state.center_price:.6f}",
-        f"Open orders: {open_buys} buys + {open_sells} sells = {len(open_orders)}",
-        f"Trend ratio: {ratio:.0%} buy / {1-ratio:.0%} sell (grid: {n_buys}B+{n_sells}S) [{ratio_src}]",
-        f"Today: {state.round_trips_today} round trips, ${state.today_profit_usd:.4f} profit",
-        f"Lifetime: {state.total_round_trips} round trips, ${state.total_profit_usd:.4f} profit",
-        f"Fees paid: ${state.total_fees_usd:.4f}",
-        f"DOGE accumulated: {state.doge_accumulated:.2f}",
-    ]
+        lines = [
+            f"{prefix}DOGE Grid Bot Status",
+            f"Price: ${current_price:.6f}",
+            f"Grid center: ${state.center_price:.6f}",
+            f"Open orders: {open_buys} buys + {open_sells} sells = {len(open_orders)}",
+            f"Trend ratio: {ratio:.0%} buy / {1-ratio:.0%} sell (grid: {n_buys}B+{n_sells}S) [{ratio_src}]",
+            f"Today: {state.round_trips_today} round trips, ${state.today_profit_usd:.4f} profit",
+            f"Lifetime: {state.total_round_trips} round trips, ${state.total_profit_usd:.4f} profit",
+            f"Fees paid: ${state.total_fees_usd:.4f}",
+            f"DOGE accumulated: {state.doge_accumulated:.2f}",
+        ]
 
     if state.is_paused:
         lines.append(f"PAUSED: {state.pause_reason}")

@@ -35,13 +35,16 @@ def serialize_state(state: grid_strategy.GridState, current_price: float) -> dic
     # -- Grid orders --
     orders = []
     for o in state.grid_orders:
-        orders.append({
+        order_data = {
             "level": o.level,
             "side": o.side,
             "price": round(o.price, 6),
             "volume": round(o.volume, 2),
             "status": o.status,
-        })
+        }
+        if config.STRATEGY_MODE == "pair":
+            order_data["role"] = o.order_role
+        orders.append(order_data)
     orders.sort(key=lambda x: x["price"], reverse=True)
 
     # -- Trend ratio --
@@ -127,14 +130,18 @@ def serialize_state(state: grid_strategy.GridState, current_price: float) -> dic
             "grid_sells": n_sells,
         },
         "config": {
+            "strategy_mode": config.STRATEGY_MODE,
             "order_size": config.ORDER_SIZE_USD,
             "grid_levels": config.GRID_LEVELS,
-            "spacing_pct": config.GRID_SPACING_PCT,
+            "spacing_pct": config.PAIR_PROFIT_PCT if config.STRATEGY_MODE == "pair" else config.GRID_SPACING_PCT,
             "effective_capital": round(effective_capital, 2),
             "starting_capital": config.STARTING_CAPITAL,
             "ai_interval": config.AI_ADVISOR_INTERVAL,
             "round_trip_fee_pct": config.ROUND_TRIP_FEE_PCT,
             "min_spacing": round(config.ROUND_TRIP_FEE_PCT + 0.1, 2),
+            "pair_entry_pct": config.PAIR_ENTRY_PCT,
+            "pair_profit_pct": config.PAIR_PROFIT_PCT,
+            "pair_refresh_pct": config.PAIR_REFRESH_PCT,
         },
         "recent_fills": recent,
         "ai_recommendation": state.ai_recommendation or "No recommendation yet",

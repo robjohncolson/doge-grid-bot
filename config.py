@@ -125,6 +125,28 @@ GRID_LEVELS: int = _env("GRID_LEVELS", 10, int)
 GRID_SPACING_PCT: float = _env("GRID_SPACING_PCT", 1.0, float)
 
 # ---------------------------------------------------------------------------
+# Strategy mode
+# ---------------------------------------------------------------------------
+
+# "pair" = single-pair market making (2 orders: 1 buy + 1 sell)
+# "grid" = full grid ladder (default legacy mode)
+# Pair mode caps max exposure at ~1 order size instead of GRID_LEVELS * ORDER_SIZE_USD.
+STRATEGY_MODE: str = _env("STRATEGY_MODE", "pair")
+
+# Pair strategy: how far from market to place entry orders (%)
+# At 0.2% with DOGE at $0.25, entries are $0.0005 from market.
+PAIR_ENTRY_PCT: float = _env("PAIR_ENTRY_PCT", 0.2, float)
+
+# Pair strategy: profit target distance from entry fill price (%)
+# Must be > ROUND_TRIP_FEE_PCT (0.50%) or every trade loses money.
+# At 1.0%: net ~0.50% per round trip after fees.
+PAIR_PROFIT_PCT: float = _env("PAIR_PROFIT_PCT", 1.0, float)
+
+# Pair strategy: refresh entry order when it drifts this far from market (%)
+# Exit orders (profit targets) are NEVER refreshed.
+PAIR_REFRESH_PCT: float = _env("PAIR_REFRESH_PCT", 1.0, float)
+
+# ---------------------------------------------------------------------------
 # Fee assumptions
 # ---------------------------------------------------------------------------
 
@@ -238,21 +260,37 @@ AI_MODEL: str = _env("AI_MODEL", "meta/llama-3.1-8b-instruct")
 def print_banner():
     """Print a clear summary of all active settings so you know what's running."""
     mode = "DRY RUN (simulated)" if DRY_RUN else "LIVE TRADING (real money!)"
+    strategy = "PAIR (2 orders)" if STRATEGY_MODE == "pair" else "GRID (full ladder)"
     lines = [
         "",
         "=" * 60,
         "  DOGE GRID TRADING BOT",
         "=" * 60,
         f"  Mode:            {mode}",
+        f"  Strategy:        {strategy}",
         f"  Pair:            {PAIR_DISPLAY}",
         f"  Capital:         ${STARTING_CAPITAL:.2f}",
         f"  Order size:      ${ORDER_SIZE_USD:.2f} (adaptive, min 13 DOGE)",
-        f"  Grid levels:     {GRID_LEVELS} per side (adaptive, recalc each build)",
-        f"  Grid spacing:    {GRID_SPACING_PCT:.2f}%",
-        f"  Net per cycle:   {GRID_SPACING_PCT - ROUND_TRIP_FEE_PCT:.2f}% (after {ROUND_TRIP_FEE_PCT:.2f}% fees)",
+    ]
+    if STRATEGY_MODE == "pair":
+        net_pair = PAIR_PROFIT_PCT - ROUND_TRIP_FEE_PCT
+        lines += [
+            f"  Entry distance:  {PAIR_ENTRY_PCT:.2f}%",
+            f"  Profit target:   {PAIR_PROFIT_PCT:.2f}%",
+            f"  Net per cycle:   {net_pair:.2f}% (after {ROUND_TRIP_FEE_PCT:.2f}% fees)",
+            f"  Refresh drift:   {PAIR_REFRESH_PCT:.2f}%",
+            f"  Max exposure:    ~${ORDER_SIZE_USD:.2f} (1 buy order)",
+        ]
+    else:
+        lines += [
+            f"  Grid levels:     {GRID_LEVELS} per side (adaptive, recalc each build)",
+            f"  Grid spacing:    {GRID_SPACING_PCT:.2f}%",
+            f"  Net per cycle:   {GRID_SPACING_PCT - ROUND_TRIP_FEE_PCT:.2f}% (after {ROUND_TRIP_FEE_PCT:.2f}% fees)",
+            f"  Drift reset:     {GRID_DRIFT_RESET_PCT:.1f}%",
+        ]
+    lines += [
         f"  Stop floor:      ${STOP_FLOOR:.2f}",
         f"  Daily loss limit: ${DAILY_LOSS_LIMIT:.2f}",
-        f"  Drift reset:     {GRID_DRIFT_RESET_PCT:.1f}%",
         f"  Poll interval:   {POLL_INTERVAL_SECONDS}s",
         f"  AI council:      every {AI_ADVISOR_INTERVAL // 60} min",
         f"  Health port:     {HEALTH_PORT}",
