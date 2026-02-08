@@ -1698,6 +1698,37 @@ def _place_pair_order(state, side, price, role, matched_buy=None,
         order.matched_buy_price = matched_buy
     if matched_sell is not None:
         order.matched_sell_price = matched_sell
+    if role == "exit":
+        # region agent log
+        try:
+            _payload = {
+                "runId": "pre",
+                "hypothesisId": "H4",
+                "location": "grid_strategy.py:_place_pair_order:exit",
+                "message": "pair_exit_order_placed",
+                "data": {
+                    "side": side,
+                    "price": price,
+                    "role": role,
+                    "matched_buy": matched_buy,
+                    "matched_sell": matched_sell,
+                    "volume": volume,
+                },
+                "timestamp": int(time.time() * 1000),
+            }
+            _payload_json = json.dumps(_payload)
+            try:
+                with open(r"c:\Users\ColsonR\grid-bot\doge-grid-bot\.cursor\debug.log", "a", encoding="utf-8") as _dbg_f:
+                    _dbg_f.write(_payload_json + "\n")
+            except Exception:
+                pass
+            try:
+                logger.info("DEBUG_LOG %s", _payload_json)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        # endregion agent log
 
     try:
         txid = kraken_client.place_order(
@@ -1785,6 +1816,40 @@ def _close_orphaned_exit(state, filled_entry):
     gross = (sell_p - buy_p) * close_vol
     fees = (buy_p * close_vol + sell_p * close_vol) * config.MAKER_FEE_PCT / 100.0
     net_profit = gross - fees
+    # region agent log
+    try:
+        _payload = {
+            "runId": "pre",
+            "hypothesisId": "H1",
+            "location": "grid_strategy.py:_close_orphaned_exit",
+            "message": "pair_orphaned_exit_closed",
+            "data": {
+                "filled_side": filled_entry.side,
+                "filled_price": filled_entry.price,
+                "filled_volume": filled_entry.volume,
+                "orphan_price": orphan.price,
+                "cost_basis": cost_basis,
+                "gross": gross,
+                "fees": fees,
+                "net_profit": net_profit,
+                "close_volume": close_vol,
+                "original_entry_side": original_entry_side,
+            },
+            "timestamp": int(time.time() * 1000),
+        }
+        _payload_json = json.dumps(_payload)
+        try:
+            with open(r"c:\Users\ColsonR\grid-bot\doge-grid-bot\.cursor\debug.log", "a", encoding="utf-8") as _dbg_f:
+                _dbg_f.write(_payload_json + "\n")
+        except Exception:
+            pass
+        try:
+            logger.info("DEBUG_LOG %s", _payload_json)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    # endregion agent log
 
     # Book the round trip
     state.total_profit_usd += net_profit
@@ -1868,6 +1933,62 @@ def handle_pair_fill(state: GridState, filled_orders: list,
     for filled in filled_orders:
         is_entry = filled.order_role == "entry"
         is_exit = filled.order_role == "exit"
+        open_entry_buy = sum(
+            1 for o in state.grid_orders
+            if o.status == "open" and o.side == "buy"
+            and getattr(o, "order_role", "") == "entry"
+        )
+        open_entry_sell = sum(
+            1 for o in state.grid_orders
+            if o.status == "open" and o.side == "sell"
+            and getattr(o, "order_role", "") == "entry"
+        )
+        open_exit_buy = sum(
+            1 for o in state.grid_orders
+            if o.status == "open" and o.side == "buy"
+            and getattr(o, "order_role", "") == "exit"
+        )
+        open_exit_sell = sum(
+            1 for o in state.grid_orders
+            if o.status == "open" and o.side == "sell"
+            and getattr(o, "order_role", "") == "exit"
+        )
+        # region agent log
+        try:
+            _payload = {
+                "runId": "pre",
+                "hypothesisId": "H1",
+                "location": "grid_strategy.py:handle_pair_fill:loop",
+                "message": "pair_fill_received",
+                "data": {
+                    "side": filled.side,
+                    "role": filled.order_role,
+                    "price": filled.price,
+                    "volume": filled.volume,
+                    "matched_buy_price": filled.matched_buy_price,
+                    "matched_sell_price": filled.matched_sell_price,
+                    "open_entry_buy": open_entry_buy,
+                    "open_entry_sell": open_entry_sell,
+                    "open_exit_buy": open_exit_buy,
+                    "open_exit_sell": open_exit_sell,
+                    "entry_pct": entry_pct,
+                    "profit_pct": profit_pct,
+                },
+                "timestamp": int(time.time() * 1000),
+            }
+            _payload_json = json.dumps(_payload)
+            try:
+                with open(r"c:\Users\ColsonR\grid-bot\doge-grid-bot\.cursor\debug.log", "a", encoding="utf-8") as _dbg_f:
+                    _dbg_f.write(_payload_json + "\n")
+            except Exception:
+                pass
+            try:
+                logger.info("DEBUG_LOG %s", _payload_json)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        # endregion agent log
 
         # ---------------------------------------------------------------
         # BUY ENTRY fills -> place sell exit, keep sell entry on book
@@ -1906,6 +2027,7 @@ def handle_pair_fill(state: GridState, filled_orders: list,
         # ---------------------------------------------------------------
         elif filled.side == "sell" and is_exit:
             buy_price = filled.matched_buy_price
+            gross = None
             if buy_price is not None:
                 gross = (filled.price - buy_price) * filled.volume
                 fees = (buy_price * filled.volume * config.MAKER_FEE_PCT / 100.0 +
@@ -1919,6 +2041,38 @@ def handle_pair_fill(state: GridState, filled_orders: list,
                     filled.price)
                 net_profit = 0.0
                 fees = filled.price * filled.volume * config.MAKER_FEE_PCT / 100.0
+            # region agent log
+            try:
+                _payload = {
+                    "runId": "pre",
+                    "hypothesisId": "H4",
+                    "location": "grid_strategy.py:handle_pair_fill:sell_exit",
+                    "message": "pair_exit_profit_computed",
+                    "data": {
+                        "exit_side": "sell",
+                        "filled_price": filled.price,
+                        "volume": filled.volume,
+                        "matched_buy_price": buy_price,
+                        "gross": gross,
+                        "fees": fees,
+                        "net_profit": net_profit,
+                        "has_matched_buy": buy_price is not None,
+                    },
+                    "timestamp": int(time.time() * 1000),
+                }
+                _payload_json = json.dumps(_payload)
+                try:
+                    with open(r"c:\Users\ColsonR\grid-bot\doge-grid-bot\.cursor\debug.log", "a", encoding="utf-8") as _dbg_f:
+                        _dbg_f.write(_payload_json + "\n")
+                except Exception:
+                    pass
+                try:
+                    logger.info("DEBUG_LOG %s", _payload_json)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            # endregion agent log
 
             state.total_profit_usd += net_profit
             state.today_profit_usd += net_profit
@@ -2005,6 +2159,7 @@ def handle_pair_fill(state: GridState, filled_orders: list,
         # ---------------------------------------------------------------
         elif filled.side == "buy" and is_exit:
             sell_price = filled.matched_sell_price
+            gross = None
             if sell_price is not None:
                 gross = (sell_price - filled.price) * filled.volume
                 fees = (filled.price * filled.volume * config.MAKER_FEE_PCT / 100.0 +
@@ -2018,6 +2173,38 @@ def handle_pair_fill(state: GridState, filled_orders: list,
                     filled.price)
                 net_profit = 0.0
                 fees = filled.price * filled.volume * config.MAKER_FEE_PCT / 100.0
+            # region agent log
+            try:
+                _payload = {
+                    "runId": "pre",
+                    "hypothesisId": "H4",
+                    "location": "grid_strategy.py:handle_pair_fill:buy_exit",
+                    "message": "pair_exit_profit_computed",
+                    "data": {
+                        "exit_side": "buy",
+                        "filled_price": filled.price,
+                        "volume": filled.volume,
+                        "matched_sell_price": sell_price,
+                        "gross": gross,
+                        "fees": fees,
+                        "net_profit": net_profit,
+                        "has_matched_sell": sell_price is not None,
+                    },
+                    "timestamp": int(time.time() * 1000),
+                }
+                _payload_json = json.dumps(_payload)
+                try:
+                    with open(r"c:\Users\ColsonR\grid-bot\doge-grid-bot\.cursor\debug.log", "a", encoding="utf-8") as _dbg_f:
+                        _dbg_f.write(_payload_json + "\n")
+                except Exception:
+                    pass
+                try:
+                    logger.info("DEBUG_LOG %s", _payload_json)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            # endregion agent log
 
             state.total_profit_usd += net_profit
             state.today_profit_usd += net_profit
@@ -2550,6 +2737,39 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
             expected_exit > 0
             and abs(second["price"] - expected_exit) / expected_exit < tol
         )
+        # region agent log
+        try:
+            _payload = {
+                "runId": "pre",
+                "hypothesisId": "H2",
+                "location": "grid_strategy.py:_reconcile_offline_fills:dual",
+                "message": "offline_dual_fill_classified",
+                "data": {
+                    "first_side": first["side"],
+                    "first_price": first["price"],
+                    "second_side": second["side"],
+                    "second_price": second["price"],
+                    "expected_exit": expected_exit,
+                    "is_round_trip": is_round_trip,
+                    "profit_pct": profit_pct,
+                    "entry_pct": entry_pct,
+                    "tolerance": tol,
+                },
+                "timestamp": int(time.time() * 1000),
+            }
+            _payload_json = json.dumps(_payload)
+            try:
+                with open(r"c:\Users\ColsonR\grid-bot\doge-grid-bot\.cursor\debug.log", "a", encoding="utf-8") as _dbg_f:
+                    _dbg_f.write(_payload_json + "\n")
+            except Exception:
+                pass
+            try:
+                logger.info("DEBUG_LOG %s", _payload_json)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        # endregion agent log
 
         # PnL computation
         if first["side"] == "buy":

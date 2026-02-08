@@ -238,6 +238,33 @@ def load_fills(limit: int = 500, pair: str = "XDGUSD") -> list:
     # Reverse so oldest is first (matches in-memory order)
     fills = list(reversed(result))
     logger.info("Supabase: loaded %d fills", len(fills))
+    neg_profit_count = sum(1 for f in fills if f.get("profit", 0) < 0)
+    # region agent log
+    try:
+        _payload = {
+            "runId": "pre",
+            "hypothesisId": "H3",
+            "location": "supabase_store.py:load_fills",
+            "message": "supabase_fills_loaded",
+            "data": {
+                "count": len(fills),
+                "neg_profit_count": neg_profit_count,
+            },
+            "timestamp": int(time.time() * 1000),
+        }
+        _payload_json = json.dumps(_payload)
+        try:
+            with open(r"c:\Users\ColsonR\grid-bot\doge-grid-bot\.cursor\debug.log", "a", encoding="utf-8") as _dbg_f:
+                _dbg_f.write(_payload_json + "\n")
+        except Exception:
+            pass
+        try:
+            logger.info("DEBUG_LOG %s", _payload_json)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    # endregion agent log
     return fills
 
 
