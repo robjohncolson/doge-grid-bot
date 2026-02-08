@@ -2102,6 +2102,29 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
         len(doge_trades),
     )
 
+    # --- Step 1: Filter out trades already recorded in recent_fills ---
+    new_trades = []
+    for t in doge_trades:
+        already = False
+        for rf in state.recent_fills:
+            if (rf["side"] == t["side"]
+                    and abs(rf["price"] - t["price"]) < 1e-5
+                    and abs(rf.get("time", 0) - t["time"]) < 300):
+                already = True
+                break
+        if not already:
+            new_trades.append(t)
+
+    if not new_trades:
+        logger.info("Offline fill check: all %d trades already processed",
+                     len(doge_trades))
+        return
+
+    logger.info(
+        "Offline fill check: %d new (unprocessed) trades after filtering",
+        len(new_trades),
+    )
+
     # Check what's currently on the book
     open_orders = [o for o in state.grid_orders if o.status == "open"]
     has_sell_exit = any(
@@ -2109,39 +2132,202 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
     has_buy_exit = any(
         o.side == "buy" and o.order_role == "exit" for o in open_orders)
 
-    # Find the most recent buy and sell trades
+    # Find the most recent buy and sell from NEW (unprocessed) trades only
     last_buy = None
     last_sell = None
-    for t in doge_trades:
+    for t in new_trades:
         if t["side"] == "buy":
             last_buy = t
         elif t["side"] == "sell":
             last_sell = t
 
     placed = 0
+    tol = config.PAIR_PROFIT_PCT / 200.0  # half profit pct as tolerance
 
-    # --- Dual offline fill: detect race condition vs normal round trip ---
+    # --- Step 2: Dual fill -- classify each as EXIT vs ENTRY ---
+    # Kraken trade history has no role info, so we match each fill's price
+    # against known positions in recent_fills to determine if it's an exit.
     if last_buy and last_sell:
-        # Sort chronologically
+
+        # Is last_buy an exit for a sell position in recent_fills?
+        buy_is_exit = False
+        buy_cost_basis = None
+        for rf in reversed(state.recent_fills):
+            if rf["side"] == "sell":
+                expected = rf["price"] * (1 - config.PAIR_PROFIT_PCT / 100.0)
+                if (expected > 0
+                        and abs(last_buy["price"] - expected) / expected < tol):
+                    buy_is_exit = True
+                    buy_cost_basis = rf["price"]
+                    break
+
+        # Is last_sell an exit for a buy position in recent_fills?
+        sell_is_exit = False
+        sell_cost_basis = None
+        for rf in reversed(state.recent_fills):
+            if rf["side"] == "buy":
+                expected = rf["price"] * (1 + config.PAIR_PROFIT_PCT / 100.0)
+                if (expected > 0
+                        and abs(last_sell["price"] - expected) / expected < tol):
+                    sell_is_exit = True
+                    sell_cost_basis = rf["price"]
+                    break
+
+        if buy_is_exit or sell_is_exit:
+            # --- At least one fill is an exit for a known position ---
+            # Cancel any stale orders before placing new pair
+            _cancel_open_by_role(state, "buy", "entry")
+            _cancel_open_by_role(state, "buy", "exit")
+            _cancel_open_by_role(state, "sell", "entry")
+            _cancel_open_by_role(state, "sell", "exit")
+
+            # Book exit round trip(s)
+            if buy_is_exit:
+                sell_p = buy_cost_basis
+                buy_p = last_buy["price"]
+                close_vol = last_buy["volume"]
+                gross = (sell_p - buy_p) * close_vol
+                fee_buy = buy_p * close_vol * config.MAKER_FEE_PCT / 100.0
+                fee_sell = sell_p * close_vol * config.MAKER_FEE_PCT / 100.0
+                net_profit = gross - fee_buy - fee_sell
+                state.total_profit_usd += net_profit
+                state.today_profit_usd += net_profit
+                state.total_round_trips += 1
+                state.round_trips_today += 1
+                # Only track exit leg fee (entry leg tracked previously)
+                state.total_fees_usd += fee_buy
+                state.today_fees_usd += fee_buy
+                if net_profit < 0:
+                    state.today_loss_usd += abs(net_profit)
+                logger.warning(
+                    "OFFLINE EXIT: Buy $%.6f closes short "
+                    "(sell entry $%.6f, %.2f DOGE) -> net $%.4f",
+                    buy_p, sell_p, close_vol, net_profit,
+                )
+                state.recent_fills.append({
+                    "time": last_buy["time"], "side": "buy",
+                    "price": buy_p, "volume": close_vol,
+                    "profit": net_profit, "fees": fee_buy,
+                })
+                supabase_store.save_fill(state.recent_fills[-1])
+
+            if sell_is_exit:
+                buy_p = sell_cost_basis
+                sell_p = last_sell["price"]
+                close_vol = last_sell["volume"]
+                gross = (sell_p - buy_p) * close_vol
+                fee_buy = buy_p * close_vol * config.MAKER_FEE_PCT / 100.0
+                fee_sell = sell_p * close_vol * config.MAKER_FEE_PCT / 100.0
+                net_profit = gross - fee_buy - fee_sell
+                state.total_profit_usd += net_profit
+                state.today_profit_usd += net_profit
+                state.total_round_trips += 1
+                state.round_trips_today += 1
+                state.total_fees_usd += fee_sell
+                state.today_fees_usd += fee_sell
+                if net_profit < 0:
+                    state.today_loss_usd += abs(net_profit)
+                logger.warning(
+                    "OFFLINE EXIT: Sell $%.6f closes long "
+                    "(buy entry $%.6f, %.2f DOGE) -> net $%.4f",
+                    sell_p, buy_p, close_vol, net_profit,
+                )
+                state.recent_fills.append({
+                    "time": last_sell["time"], "side": "sell",
+                    "price": sell_p, "volume": close_vol,
+                    "profit": net_profit, "fees": fee_sell,
+                })
+                supabase_store.save_fill(state.recent_fills[-1])
+
+            # Handle remaining entry fill(s) -- place exit + companion
+            if buy_is_exit and not sell_is_exit:
+                # Sell is a new entry -> place buy exit + companion sell entry
+                sp = last_sell["price"]
+                exit_price = round(
+                    sp * (1 - config.PAIR_PROFIT_PCT / 100.0), 6)
+                o = _place_pair_order(
+                    state, "buy", exit_price, "exit", matched_sell=sp)
+                if o:
+                    placed += 1
+                sell_fee = sp * last_sell["volume"] * config.MAKER_FEE_PCT / 100.0
+                state.total_fees_usd += sell_fee
+                state.today_fees_usd += sell_fee
+                state.recent_fills.append({
+                    "time": last_sell["time"], "side": "sell",
+                    "price": sp, "volume": last_sell["volume"],
+                    "profit": 0, "fees": sell_fee,
+                })
+                supabase_store.save_fill(state.recent_fills[-1])
+                sell_entry = round(
+                    current_price * (1 + config.PAIR_ENTRY_PCT / 100.0), 6)
+                o = _place_pair_order(state, "sell", sell_entry, "entry")
+                if o:
+                    placed += 1
+                logger.info(
+                    "Offline exit+entry: buy exit booked, "
+                    "placed %d orders for sell entry position", placed)
+
+            elif sell_is_exit and not buy_is_exit:
+                # Buy is a new entry -> place sell exit + companion buy entry
+                bp = last_buy["price"]
+                exit_price = round(
+                    bp * (1 + config.PAIR_PROFIT_PCT / 100.0), 6)
+                o = _place_pair_order(
+                    state, "sell", exit_price, "exit", matched_buy=bp)
+                if o:
+                    placed += 1
+                buy_fee = bp * last_buy["volume"] * config.MAKER_FEE_PCT / 100.0
+                state.total_fees_usd += buy_fee
+                state.today_fees_usd += buy_fee
+                state.recent_fills.append({
+                    "time": last_buy["time"], "side": "buy",
+                    "price": bp, "volume": last_buy["volume"],
+                    "profit": 0, "fees": buy_fee,
+                })
+                supabase_store.save_fill(state.recent_fills[-1])
+                buy_entry = round(
+                    current_price * (1 - config.PAIR_ENTRY_PCT / 100.0), 6)
+                o = _place_pair_order(state, "buy", buy_entry, "entry")
+                if o:
+                    placed += 1
+                logger.info(
+                    "Offline exit+entry: sell exit booked, "
+                    "placed %d orders for buy entry position", placed)
+
+            else:
+                # Both exits -- position is flat, place fresh entry pair
+                buy_entry = round(
+                    current_price * (1 - config.PAIR_ENTRY_PCT / 100.0), 6)
+                sell_entry = round(
+                    current_price * (1 + config.PAIR_ENTRY_PCT / 100.0), 6)
+                o1 = _place_pair_order(state, "buy", buy_entry, "entry")
+                o2 = _place_pair_order(state, "sell", sell_entry, "entry")
+                placed = (1 if o1 else 0) + (1 if o2 else 0)
+                logger.info(
+                    "Offline double exit: booked both, "
+                    "placed %d fresh entries", placed)
+
+            return
+
+        # --- Neither fill matches a known position exit ---
+        # Check if the two fills form a round trip between each other
+        # (entry + its exit) or a race condition (both entries).
         if last_buy["time"] <= last_sell["time"]:
             first, second = last_buy, last_sell
         else:
             first, second = last_sell, last_buy
 
-        # Was the second fill an exit for the first?
-        # Check if its price is near the first's profit target.
         if first["side"] == "buy":
             expected_exit = first["price"] * (1 + config.PAIR_PROFIT_PCT / 100.0)
         else:
             expected_exit = first["price"] * (1 - config.PAIR_PROFIT_PCT / 100.0)
 
-        tol = config.PAIR_PROFIT_PCT / 200.0  # half profit pct as tolerance
         is_round_trip = (
             expected_exit > 0
             and abs(second["price"] - expected_exit) / expected_exit < tol
         )
 
-        # PnL computation (same for both cases)
+        # PnL computation
         if first["side"] == "buy":
             buy_p, sell_p = first["price"], second["price"]
         else:
@@ -2179,14 +2365,13 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
         })
         supabase_store.save_fill(state.recent_fills[-1])
 
-        # Cancel any stale open orders before placing new pair
+        # Cancel stale orders
         _cancel_open_by_role(state, "buy", "entry")
         _cancel_open_by_role(state, "buy", "exit")
         _cancel_open_by_role(state, "sell", "entry")
         _cancel_open_by_role(state, "sell", "exit")
 
         if is_round_trip:
-            # ---- Normal round trip completed offline ----
             logger.warning(
                 "OFFLINE ROUND TRIP: %s entry $%.6f -> %s exit $%.6f "
                 "(%.2f DOGE) -> net $%.4f",
@@ -2194,7 +2379,6 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                 second["side"].upper(), second["price"],
                 close_vol, net_profit,
             )
-            # Position is flat -- place fresh entry pair
             buy_entry = round(
                 current_price * (1 - config.PAIR_ENTRY_PCT / 100.0), 6)
             sell_entry = round(
@@ -2206,8 +2390,6 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                 "Offline round trip recovery: placed %d fresh entries "
                 "(B $%.6f / S $%.6f)", placed, buy_entry, sell_entry)
         else:
-            # ---- Race condition: both entries filled offline ----
-            # Second entry implicitly closed first's position.
             logger.warning(
                 "OFFLINE RACE CONDITION: %s entry $%.6f + %s entry $%.6f "
                 "(%.2f DOGE) -- second closed first -> net $%.4f",
@@ -2215,9 +2397,7 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                 second["side"].upper(), second["price"],
                 close_vol, net_profit,
             )
-            # Place exit for the LATER fill's still-open position
             if second["side"] == "sell":
-                # Short from sell entry -- buy exit at profit target
                 exit_price = round(
                     second["price"] * (1 - config.PAIR_PROFIT_PCT / 100.0), 6)
                 o = _place_pair_order(
@@ -2225,14 +2405,12 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                     matched_sell=second["price"])
                 if o:
                     placed += 1
-                # Companion: sell entry
                 sell_entry = round(
                     current_price * (1 + config.PAIR_ENTRY_PCT / 100.0), 6)
                 o = _place_pair_order(state, "sell", sell_entry, "entry")
                 if o:
                     placed += 1
             else:
-                # Long from buy entry -- sell exit at profit target
                 exit_price = round(
                     second["price"] * (1 + config.PAIR_PROFIT_PCT / 100.0), 6)
                 o = _place_pair_order(
@@ -2240,7 +2418,6 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                     matched_buy=second["price"])
                 if o:
                     placed += 1
-                # Companion: buy entry
                 buy_entry = round(
                     current_price * (1 - config.PAIR_ENTRY_PCT / 100.0), 6)
                 o = _place_pair_order(state, "buy", buy_entry, "entry")
@@ -2250,7 +2427,7 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                 "Offline race recovery: placed %d orders for %s position",
                 placed, second["side"].upper())
 
-        return  # Dual-fill handled -- skip single-fill logic
+        return  # Dual-fill handled
 
     # --- Single offline fill (only buy OR only sell) ---
 
@@ -2266,13 +2443,11 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                 .strftime("%Y-%m-%d %H:%M UTC"),
             exit_price,
         )
-        # Cancel any stale sell entry first (we need the sell slot for exit)
         _cancel_open_by_role(state, "sell", "entry")
         o = _place_pair_order(
             state, "sell", exit_price, "exit", matched_buy=buy_price)
         if o:
             placed += 1
-            # Track the buy fill fee
             buy_fee = buy_price * last_buy["volume"] * config.MAKER_FEE_PCT / 100.0
             state.total_fees_usd += buy_fee
             state.today_fees_usd += buy_fee
@@ -2283,7 +2458,6 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
             })
             supabase_store.save_fill(state.recent_fills[-1])
 
-        # Also place a new sell entry if we don't have one
         has_sell_entry = any(
             o.side == "sell" and o.order_role == "entry"
             for o in state.grid_orders if o.status == "open")
@@ -2307,13 +2481,11 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                 .strftime("%Y-%m-%d %H:%M UTC"),
             exit_price,
         )
-        # Cancel any stale buy entry first
         _cancel_open_by_role(state, "buy", "entry")
         o = _place_pair_order(
             state, "buy", exit_price, "exit", matched_sell=sell_price)
         if o:
             placed += 1
-            # Track the sell fill fee
             sell_fee = sell_price * last_sell["volume"] * config.MAKER_FEE_PCT / 100.0
             state.total_fees_usd += sell_fee
             state.today_fees_usd += sell_fee
@@ -2324,7 +2496,6 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
             })
             supabase_store.save_fill(state.recent_fills[-1])
 
-        # Also place a new buy entry if we don't have one
         has_buy_entry = any(
             o.side == "buy" and o.order_role == "entry"
             for o in state.grid_orders if o.status == "open")
