@@ -3568,10 +3568,14 @@ def check_exit_drift(state: GridState, current_price: float) -> bool:
 
 def check_s1_rebalance(state: GridState, current_price: float) -> bool:
     """
-    Rebalance when S1a/S1b leaves both orders on the same side.
+    Rebalance when S1a/S1b leaves both orders on the same side AND the
+    stranded exit has drifted far enough that it's unlikely to fill soon.
 
     S1a = A exit (buy) + B entry (buy) = all buys, no upside capture.
     S1b = B exit (sell) + A entry (sell) = all sells, no downside capture.
+
+    Only triggers when the exit is more than profit_pct away from market.
+    If it's close (within profit_pct), S1 will resolve naturally via fill.
 
     Fix: orphan the stranded exit -> moves to recovery (stays on Kraken as
     lottery ticket) -> _orphan_exit() places a fresh entry on that side ->
@@ -3600,11 +3604,17 @@ def check_s1_rebalance(state: GridState, current_price: float) -> bool:
     cyc = getattr(o, "cycle", 0)
     drift_pct = abs(o.price - current_price) / current_price * 100.0
 
+    # Only rebalance if exit is beyond profit target from market.
+    # Below that threshold, S1 is expected and the exit will fill naturally.
+    threshold = state.profit_pct
+    if drift_pct <= threshold:
+        return False
+
     logger.info(
         "S1 REBALANCE [%s]: %s has both orders on same side (%s exit [%s.%d] "
-        "@ $%.6f is %.1f%% from market) -- orphaning to restore S0",
+        "@ $%.6f is %.1f%% from market, threshold %.1f%%) -- orphaning to restore S0",
         state.pair_display, state.pair_state, o.side.upper(),
-        tid, cyc, o.price, drift_pct,
+        tid, cyc, o.price, drift_pct, threshold,
     )
 
     new_entry = _orphan_exit(state, o, current_price, reason="s1_rebalance")
