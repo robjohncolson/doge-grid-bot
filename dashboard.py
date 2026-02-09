@@ -497,6 +497,7 @@ a{color:#58a6ff}
 <div class="header">
   <h1 id="bot-title">DOGE Grid Bot</h1>
   <span id="badge" class="badge badge-dry">---</span>
+  <button class="btn-browse" onclick="openScanner()" title="Browse &amp; add trading pairs">+ Pairs</button>
   <button class="audio-btn" id="audio-btn" onclick="toggleAudio()" title="Toggle audio alerts">&#x1f507;</button>
   <span class="uptime" id="uptime">--</span>
 </div>
