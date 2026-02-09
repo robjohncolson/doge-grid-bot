@@ -458,7 +458,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._send_json({"aggregate": agg, "pairs": pairs_list})
 
     def _handle_swarm_available(self):
-        """GET /api/swarm/available -- pair scanner results (top 200)."""
+        """GET /api/swarm/available -- pair scanner results (all qualifying)."""
         try:
             ranked = pair_scanner.get_ranked_pairs(min_volume_usd=1000)
         except Exception as e:
@@ -467,7 +467,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         active_set = set(_bot_states.keys())
         result = []
-        for pi in ranked[:200]:
+        for pi in ranked:
             result.append({
                 "pair": pi.pair,
                 "altname": pi.altname,

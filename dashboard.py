@@ -499,6 +499,10 @@ a{color:#58a6ff}
 .scanner-table .btn-add{background:#238636;border:1px solid #2ea043;color:#fff;border-radius:3px;padding:2px 10px;font-size:11px;cursor:pointer}
 .scanner-table .btn-add:hover{background:#2ea043}
 .scanner-table .badge-active{background:#238636;color:#fff;border-radius:3px;padding:2px 8px;font-size:10px;font-weight:700}
+.scanner-table th.sortable{cursor:pointer;user-select:none}
+.scanner-table th.sortable:hover{color:#c9d1d9}
+.scanner-table th.sort-active{color:#58a6ff}
+.sort-arrow{font-size:9px;margin-left:3px}
 .scanner-info{padding:16px 20px;color:#8b949e;font-size:12px;text-align:center}
 </style>
 </head>
@@ -1984,6 +1988,8 @@ let swarmMode = false;
 let swarmData = null;
 let scannerData = null;
 let scannerCacheTime = 0;
+let scannerSortKey = 'volatility_pct';
+let scannerSortAsc = false;
 let detailPair = null;
 
 function isMultiPair() {
@@ -2139,10 +2145,31 @@ function renderScanner(data) {
           || p.base.toUpperCase().indexOf(search) >= 0;
     });
   }
-  let html = '<table class="scanner-table"><thead><tr>'
-    + '<th>Pair</th><th>Price</th><th>Volatility</th><th>24h Vol</th><th>Spread</th><th>Fee</th><th></th>'
-    + '</tr></thead><tbody>';
-  for (const p of filtered.slice(0, 100)) {
+  const stringKeys = new Set(['display']);
+  filtered = filtered.slice().sort(function(a, b) {
+    const av = a[scannerSortKey], bv = b[scannerSortKey];
+    let cmp;
+    if (stringKeys.has(scannerSortKey)) {
+      cmp = String(av).localeCompare(String(bv));
+    } else {
+      cmp = (av || 0) - (bv || 0);
+    }
+    return scannerSortAsc ? cmp : -cmp;
+  });
+  const cols = [
+    {key:'display',label:'Pair'}, {key:'price',label:'Price'},
+    {key:'volatility_pct',label:'Volatility'}, {key:'volume_24h',label:'24h Vol'},
+    {key:'spread_pct',label:'Spread'}, {key:'fee_maker',label:'Fee'}
+  ];
+  let hdr = '';
+  for (const c of cols) {
+    const active = scannerSortKey === c.key;
+    const arrow = active ? (scannerSortAsc ? ' <span class="sort-arrow">&#9650;</span>' : ' <span class="sort-arrow">&#9660;</span>') : '';
+    hdr += '<th class="sortable' + (active ? ' sort-active' : '') + '" onclick="sortScanner(\'' + c.key + '\')">' + c.label + arrow + '</th>';
+  }
+  hdr += '<th></th>';
+  let html = '<table class="scanner-table"><thead><tr>' + hdr + '</tr></thead><tbody>';
+  for (const p of filtered) {
     html += '<tr>';
     html += '<td><b>' + p.display + '</b></td>';
     html += '<td>$' + (p.price < 1 ? p.price.toFixed(6) : p.price.toFixed(2)) + '</td>';
@@ -2162,6 +2189,17 @@ function renderScanner(data) {
     html = '<div class="scanner-info">No pairs match your search</div>';
   }
   document.getElementById('scanner-body').innerHTML = html;
+}
+
+function sortScanner(key) {
+  const stringKeys = new Set(['display']);
+  if (scannerSortKey === key) {
+    scannerSortAsc = !scannerSortAsc;
+  } else {
+    scannerSortKey = key;
+    scannerSortAsc = stringKeys.has(key);
+  }
+  if (scannerData) renderScanner(scannerData);
 }
 
 function filterScanner() {

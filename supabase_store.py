@@ -234,6 +234,13 @@ def save_state(snapshot: dict, pair: str = "XDGUSD"):
     }))
 
 
+def save_pairs(pairs_list: list):
+    """Queue a batch of scanned pair rows for persistence to the pairs table."""
+    if not _enabled():
+        return
+    _write_queue.append(("pairs", pairs_list))
+
+
 def queue_price_point(timestamp: float, price: float, pair: str = "XDGUSD"):
     """Buffer a price sample (flushed every 5 min by writer thread)."""
     if not _enabled():
@@ -405,6 +412,19 @@ def _flush_queue():
                     params={"on_conflict": "date,pair"},
                     upsert=True,
                 )
+        elif table == "pairs":
+            # Bulk upsert scanned pairs (take latest scan only)
+            pair_rows = rows[-1]
+            result = _request(
+                "POST", "/rest/v1/pairs",
+                body=pair_rows,
+                params={"on_conflict": "pair"},
+                upsert=True,
+            )
+            if result is None:
+                logger.debug("Supabase: pairs upsert failed (%d rows)", len(pair_rows))
+            else:
+                logger.debug("Supabase: upserted %d pairs", len(pair_rows))
         else:
             # Bulk insert
             result = _request("POST", f"/rest/v1/{table}", body=rows)

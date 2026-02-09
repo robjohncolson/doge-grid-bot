@@ -156,6 +156,18 @@ def scan_all_usd_pairs() -> dict:
     _pair_cache = usd_pairs
     _cache_time = time.time()
     logger.info("Scan complete: %d pairs with ticker data", len(usd_pairs))
+
+    # Persist to Supabase (best-effort, never fails the scanner)
+    try:
+        import supabase_store
+        pairs_rows = [
+            {**pi.to_dict(), "scanned_at": _cache_time}
+            for pi in usd_pairs.values()
+        ]
+        supabase_store.save_pairs(pairs_rows)
+    except Exception as e:
+        logger.debug("Supabase pairs save skipped: %s", e)
+
     return usd_pairs
 
 
