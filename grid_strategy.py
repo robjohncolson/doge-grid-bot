@@ -1234,32 +1234,35 @@ def check_fills_live(state: GridState, current_price: float = 0.0) -> list:
         _check_trade_history_fallback(state, open_orders, filled)
 
     # Replace canceled/expired orders immediately to fill grid holes
-    cancelled_orders = [o for o in open_orders if o.status == "cancelled"]
-    for order in cancelled_orders:
-        volume = calculate_volume_for_price(order.price)
-        replacement = GridOrder(
-            level=order.level, side=order.side,
-            price=order.price, volume=volume,
-        )
-        # Carry over matched_buy_price for sell replacements
-        if order.matched_buy_price is not None:
-            replacement.matched_buy_price = order.matched_buy_price
-        try:
-            txid = kraken_client.place_order(
-                side=order.side, volume=volume, price=order.price,
+    # (grid mode only -- pair mode handles replacements via refresh_stale_entries
+    # and handle_pair_fill; blind replacement would create identity-less duplicates)
+    if config.STRATEGY_MODE != "pair":
+        cancelled_orders = [o for o in open_orders if o.status == "cancelled"]
+        for order in cancelled_orders:
+            volume = calculate_volume_for_price(order.price)
+            replacement = GridOrder(
+                level=order.level, side=order.side,
+                price=order.price, volume=volume,
             )
-            replacement.txid = txid
-            replacement.status = "open"
-            replacement.placed_at = time.time()
-            state.grid_orders.append(replacement)
-            logger.info(
-                "REPLACED %s L%+d %.2f DOGE @ $%.6f -> %s",
-                order.side.upper(), order.level, volume, order.price, txid,
-            )
-        except Exception as e:
-            logger.error(
-                "Failed to replace cancelled order L%+d: %s", order.level, e,
-            )
+            # Carry over matched_buy_price for sell replacements
+            if order.matched_buy_price is not None:
+                replacement.matched_buy_price = order.matched_buy_price
+            try:
+                txid = kraken_client.place_order(
+                    side=order.side, volume=volume, price=order.price,
+                )
+                replacement.txid = txid
+                replacement.status = "open"
+                replacement.placed_at = time.time()
+                state.grid_orders.append(replacement)
+                logger.info(
+                    "REPLACED %s L%+d %.2f DOGE @ $%.6f -> %s",
+                    order.side.upper(), order.level, volume, order.price, txid,
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to replace cancelled order L%+d: %s", order.level, e,
+                )
 
     return filled
 
