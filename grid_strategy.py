@@ -3566,6 +3566,62 @@ def check_exit_drift(state: GridState, current_price: float) -> bool:
     return changed
 
 
+def check_s1_rebalance(state: GridState, current_price: float) -> bool:
+    """
+    Rebalance when S1a/S1b leaves both orders on the same side.
+
+    S1a = A exit (buy) + B entry (buy) = all buys, no upside capture.
+    S1b = B exit (sell) + A entry (sell) = all sells, no downside capture.
+
+    Fix: orphan the stranded exit -> moves to recovery (stays on Kraken as
+    lottery ticket) -> _orphan_exit() places a fresh entry on that side ->
+    state returns to S0 (one buy entry + one sell entry = balanced).
+
+    Returns True if rebalance was triggered.
+    """
+    if not config.REBALANCE_ON_S1 or not config.RECOVERY_ENABLED:
+        return False
+    if current_price <= 0:
+        return False
+    if state.pair_state not in ("S1a", "S1b"):
+        return False
+
+    # Find the stranded exit
+    # S1a: A has exit (buy), B has entry (buy) -> orphan A's exit
+    # S1b: B has exit (sell), A has entry (sell) -> orphan B's exit
+    exit_orders = [o for o in state.grid_orders
+                   if o.status == "open" and getattr(o, "order_role", "") == "exit"]
+
+    if not exit_orders:
+        return False
+
+    o = exit_orders[0]
+    tid = getattr(o, "trade_id", None) or ("A" if o.side == "buy" else "B")
+    cyc = getattr(o, "cycle", 0)
+    drift_pct = abs(o.price - current_price) / current_price * 100.0
+
+    logger.info(
+        "S1 REBALANCE [%s]: %s has both orders on same side (%s exit [%s.%d] "
+        "@ $%.6f is %.1f%% from market) -- orphaning to restore S0",
+        state.pair_display, state.pair_state, o.side.upper(),
+        tid, cyc, o.price, drift_pct,
+    )
+
+    new_entry = _orphan_exit(state, o, current_price, reason="s1_rebalance")
+    if new_entry:
+        logger.info(
+            "S1 REBALANCE [%s]: fresh %s entry [%s.%d] placed @ $%.6f -- "
+            "back to balanced (S0)",
+            state.pair_display, new_entry.side.upper(),
+            getattr(new_entry, "trade_id", "?"),
+            getattr(new_entry, "cycle", 0),
+            new_entry.price,
+        )
+
+    state.pair_state = _compute_pair_state(state)
+    return True
+
+
 def check_stale_exits(state: GridState, current_price: float) -> bool:
     """
     Section 12.2: Single-exit repricing for S1a/S1b.

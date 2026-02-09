@@ -1944,6 +1944,9 @@ def run():
                     # Exit drift check: orphan exits too far from market
                     if grid_strategy.check_exit_drift(state, current_price):
                         lifecycle_changed = True
+                    # S1 rebalance: orphan stranded exit to restore S0 balance
+                    if grid_strategy.check_s1_rebalance(state, current_price):
+                        lifecycle_changed = True
                     # Check for surprise fills on recovery orders
                     cached_info = getattr(state, "_cached_order_info", None) or {}
                     if grid_strategy.check_recovery_fills(state, cached_info):

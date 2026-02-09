@@ -298,6 +298,12 @@ S2_FALLBACK_TIMEOUT_SEC: float = _env("S2_FALLBACK_TIMEOUT_SEC", 600.0, float)
 # At 2.5%: exit at $0.092 with market at $0.096 (4.2% away) gets orphaned.
 EXIT_DRIFT_MAX_PCT: float = _env("EXIT_DRIFT_MAX_PCT", 2.5, float)
 
+# Immediately rebalance when entering S1a/S1b (both orders on same side).
+# S1a = both buys (no upside capture), S1b = both sells (no downside capture).
+# When True: orphan the stranded exit and re-enter, forcing back to S0 (balanced).
+# The orphaned exit stays on Kraken as a lottery ticket.
+REBALANCE_ON_S1: bool = _env("REBALANCE_ON_S1", True, bool)
+
 # ---------------------------------------------------------------------------
 # Entry backoff after consecutive losses
 # ---------------------------------------------------------------------------
