@@ -1869,6 +1869,27 @@ def build_pair(state: GridState, current_price: float) -> list:
         if last_fill.get("profit", 0) == 0 and last_fill.get("side") in ("buy", "sell"):
             return _build_pair_with_position(state, last_fill, current_price)
 
+    # --- Position recovery: adopted exit means we're in a position ---
+    # Even if last fill was an exit, an adopted exit on the book means
+    # that trade still has an active position (exit hasn't filled yet).
+    adopted_exit = None
+    for o in open_orders:
+        if o.order_role == "exit":
+            adopted_exit = o
+            break
+    if adopted_exit:
+        # sell exit = Trade B position (entry was buy)
+        # buy exit = Trade A position (entry was sell)
+        entry_side = "buy" if adopted_exit.side == "sell" else "sell"
+        entry_price = (adopted_exit.matched_buy_price if entry_side == "buy"
+                       else adopted_exit.matched_sell_price) or current_price
+        synth_fill = {"side": entry_side, "price": entry_price, "profit": 0}
+        logger.info(
+            "Pair build: adopted %s exit [%s.%d] -> recovering %s position @ $%.6f",
+            adopted_exit.side.upper(), adopted_exit.trade_id or "?",
+            adopted_exit.cycle or 0, entry_side.upper(), entry_price)
+        return _build_pair_with_position(state, synth_fill, current_price)
+
     # --- No position: place fresh entries flanking market ---
     # Identify any adopted orders (from reconciliation) to skip
     adopted_sides = set()
