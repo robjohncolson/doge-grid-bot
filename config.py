@@ -320,6 +320,10 @@ VOLATILITY_PROFIT_FLOOR: float = _env("VOLATILITY_PROFIT_FLOOR", 0.6, float)
 VOLATILITY_PROFIT_CEILING: float = _env("VOLATILITY_PROFIT_CEILING", 3.0, float)
 VOLATILITY_PROFIT_MIN_CHANGE: float = _env("VOLATILITY_PROFIT_MIN_CHANGE", 0.05, float)
 
+# Squeeze profit target when market is directional (trend_ratio deviates from 0.5).
+# 0.0 = disabled (no squeeze), 1.0 = full squeeze (halves target at max directionality).
+DIRECTIONAL_SQUEEZE: float = _env("DIRECTIONAL_SQUEEZE", 0.5, float)
+
 # ---------------------------------------------------------------------------
 # AI auto-execute
 # ---------------------------------------------------------------------------

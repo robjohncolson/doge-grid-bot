@@ -3422,7 +3422,15 @@ def adjust_profit_from_volatility(state: GridState, stats_results: dict) -> bool
     if not median_range or median_range <= 0:
         return False
 
-    proposed = median_range * config.VOLATILITY_PROFIT_FACTOR
+    vol_target = median_range * config.VOLATILITY_PROFIT_FACTOR
+
+    # Directional squeeze: tighten profit target when market is trending.
+    # directionality = 0.0 (ranging) to 1.0 (max directional).
+    directionality = abs(state.trend_ratio - 0.5) * 2.0
+    squeeze = config.DIRECTIONAL_SQUEEZE
+    dir_factor = 1.0 - directionality * squeeze  # 1.0 at range, (1-squeeze) at max trend
+
+    proposed = vol_target * dir_factor
     proposed = max(config.VOLATILITY_PROFIT_FLOOR,
                    min(proposed, config.VOLATILITY_PROFIT_CEILING))
 
@@ -3435,10 +3443,10 @@ def adjust_profit_from_volatility(state: GridState, stats_results: dict) -> bool
     state.last_volatility_adjust = now
 
     logger.info(
-        "VOLATILITY ADJUST [%s]: profit target %.2f%% -> %.2f%% "
-        "(median_range=%.3f%%, factor=%.1f)",
+        "PROFIT ADJUST [%s]: %.2f%% -> %.2f%% "
+        "(vol=%.3f%%, dir=%.2f, squeeze=%.2f, factor=%.2f)",
         state.pair_display, old, state.profit_pct,
-        median_range, config.VOLATILITY_PROFIT_FACTOR,
+        vol_target, directionality, squeeze, dir_factor,
     )
     return True
 
