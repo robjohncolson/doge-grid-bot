@@ -1329,6 +1329,11 @@ def run():
         orders = grid_strategy.build_grid(state, current_price)
         logger.info("[%s] Grid built: %d orders placed", state.pair_display, len(orders))
 
+        # Enforce pair invariant: cancel duplicate (side, role) orders
+        deduped = grid_strategy.enforce_pair_order_limit(state)
+        if deduped:
+            logger.info("[%s] Pair dedup: cancelled %d duplicate orders", pair_name, deduped)
+
         grid_strategy.check_daily_reset(state)
 
     # --- Phase 4: Main loop ---

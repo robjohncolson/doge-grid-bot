@@ -2252,6 +2252,65 @@ def compute_unrealized_pnl(state: GridState, current_price: float) -> dict:
     }
 
 
+def enforce_pair_order_limit(state: GridState) -> int:
+    """
+    Enforce pair-mode invariant: at most 1 open order per (side, role).
+
+    After startup reconciliation + offline fill recovery + build_grid,
+    there may be duplicates (e.g. adopted exits that were already round-
+    tripped offline, plus fresh entries placed by the recovery code).
+
+    For each (side, role) group with >1 open order, keep the one with
+    trade identity (or the newest) and cancel the rest.
+
+    Returns number of duplicates cancelled.
+    """
+    if config.STRATEGY_MODE != "pair":
+        return 0
+
+    # Find best order per (side, role)
+    best = {}   # (side, role) -> GridOrder
+    dupes = []
+    for o in state.grid_orders:
+        if o.status != "open":
+            continue
+        key = (o.side, o.order_role)
+        if key not in best:
+            best[key] = o
+        else:
+            existing = best[key]
+            # Prefer order with identity; tie-break by newest placed_at
+            if o.trade_id and not existing.trade_id:
+                dupes.append(existing)
+                best[key] = o
+            elif not o.trade_id and existing.trade_id:
+                dupes.append(o)
+            elif o.placed_at > existing.placed_at:
+                dupes.append(existing)
+                best[key] = o
+            else:
+                dupes.append(o)
+
+    for o in dupes:
+        if config.DRY_RUN:
+            o.status = "cancelled"
+        else:
+            ok = kraken_client.cancel_order(o.txid)
+            if ok:
+                o.status = "cancelled"
+            else:
+                logger.warning("Failed to cancel duplicate %s %s @ $%.6f",
+                               o.side.upper(), o.order_role, o.price)
+                continue
+        logger.warning(
+            "Pair dedup: cancelled extra %s %s @ $%.6f (txid=%s, id=%s)",
+            o.side.upper(), o.order_role, o.price, o.txid,
+            f"{o.trade_id}.{o.cycle}" if o.trade_id else "none",
+        )
+
+    return len(dupes)
+
+
 def replace_entries_at_distance(state: GridState, current_price: float):
     """User-initiated entry replacement at new entry_pct. Bypasses anti-chase."""
     entry_pct = state.entry_pct
