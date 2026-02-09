@@ -2011,6 +2011,9 @@ function showDetailView(pair) {
   document.getElementById('swarm-view').style.display = 'none';
   document.getElementById('detail-view').style.display = 'block';
   document.getElementById('btn-back').style.display = isMultiPair() ? 'inline-block' : 'none';
+  // SSE only streams the first pair -- close it and poll the selected pair immediately
+  if (evtSource) { evtSource.close(); evtSource = null; }
+  poll();
 }
 
 function renderSwarm(data) {
@@ -2243,9 +2246,10 @@ async function poll() {
   } catch(e) {}
 }
 
-// Swarm auto-refresh
+// Auto-refresh: swarm view via pollSwarm, detail view via poll (when SSE is closed)
 setInterval(function() {
   if (swarmMode) pollSwarm();
+  else if (!evtSource) poll();
 }, 5000);
 
 // Initial view setup
