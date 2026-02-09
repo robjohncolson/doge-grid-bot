@@ -429,7 +429,7 @@ def place_order(side: str, volume: float, price: float, pair: str = None) -> str
         # Generate a fake txid for dry-run tracking
         fake_txid = f"DRY-{side[0].upper()}-{int(time.time() * 1000)}"
         logger.info(
-            "[DRY RUN] Would place %s limit %s %.2f DOGE @ $%.6f ($%.2f)",
+            "[DRY RUN] Would place %s limit %s %s @ $%s ($%.4f)",
             pair, side, volume, price, volume * price,
         )
         return fake_txid
@@ -438,8 +438,8 @@ def place_order(side: str, volume: float, price: float, pair: str = None) -> str
         "pair": pair,
         "type": side,          # "buy" or "sell"
         "ordertype": "limit",
-        "price": f"{price:.6f}",
-        "volume": f"{volume:.2f}",
+        "price": f"{price:.8f}",
+        "volume": f"{volume:.8f}",
         # "oflags": "post",    # Uncomment to force post-only (maker) orders
     }
 
@@ -449,7 +449,7 @@ def place_order(side: str, volume: float, price: float, pair: str = None) -> str
     txids = result.get("txid", [])
     if txids:
         txid = txids[0]
-        logger.info("Placed %s %s %.2f DOGE @ $%.6f -> %s", pair, side, volume, price, txid)
+        logger.info("Placed %s %s %s @ $%s -> %s", pair, side, volume, price, txid)
         return txid
     else:
         raise Exception(f"Order placed but no txid returned: {result}")
