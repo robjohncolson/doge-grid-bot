@@ -980,3 +980,382 @@ panelist call
     "stop_floor": -10.0
   }
 }
+
+## 12. Exit Lifecycle Management (Stale Exits, S2 Break-Glass, Recovery)
+
+The pair strategy assumes price oscillates near market. When price trends,
+exits strand and the engine stalls. This section defines a graduated
+response system that detects stalls, reprices exits, breaks deadlocks,
+and exploits directional signals.
+
+### New Config Parameters
+
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| `EXIT_REPRICE_MULTIPLIER` | 1.5 | Reprice exit after this × `median_duration_sec` |
+| `EXIT_ORPHAN_MULTIPLIER` | 5.0 | Orphan exit after this × `median_duration_sec` |
+| `MAX_RECOVERY_SLOTS` | 2 | Max orphaned exits kept on Kraken book |
+| `S2_MAX_SPREAD_PCT` | 3.0 | Max tolerable gap between exits in S2 (%) |
+| `REPRICE_COOLDOWN_SEC` | 120 | Min seconds between reprices of same exit |
+| `MIN_CYCLES_FOR_TIMING` | 5 | Don't use timing-based logic until N cycles complete |
+| `DIRECTIONAL_ASYMMETRY` | 0.5 | Entry distance multiplier for with-trend side (0.3–0.8) |
+
+### New Persisted Fields (state.json additions)
+
+| Field | Type | Purpose |
+|-------|------|-------------|
+| `recovery_orders` | list[RecoveryOrder] | Orphaned exits still on Kraken book |
+| `s2_entered_at` | float\|null | Unix timestamp when S2 was entered |
+| `last_reprice_a` | float | Timestamp of last Trade A exit reprice |
+| `last_reprice_b` | float | Timestamp of last Trade B exit reprice |
+| `exit_reprice_count_a` | int | Times Trade A exit has been repriced this cycle |
+| `exit_reprice_count_b` | int | Times Trade B exit has been repriced this cycle |
+| `detected_trend` | str\|null | "up", "down", or null |
+| `trend_detected_at` | float\|null | When trend was detected |
+| `stdev_duration_sec` | float\|null | Added to PairStats |
+
+### RecoveryOrder Schema
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `txid` | str | Kraken order ID (still live on book) |
+| `trade_id` | str | Original trade identity ("A" or "B") |
+| `cycle` | int | Original cycle number |
+| `side` | str | "buy" or "sell" |
+| `price` | float | Order price |
+| `volume` | float | Order volume |
+| `entry_price` | float | Original entry fill price (for P&L calc) |
+| `orphaned_at` | float | Unix timestamp when orphaned |
+| `reason` | str | "timeout", "s2_break", "repriced_out" |
+
+### 12.1 Timing Thresholds
+
+All timing-based decisions require `MIN_CYCLES_FOR_TIMING` completed
+cycles (default 5). Until then, the bot operates without repricing
+or orphaning (original behavior).
+
+```
+compute_exit_thresholds(pair_stats):
+    │
+    ├── pair_stats.n_total < MIN_CYCLES_FOR_TIMING?
+    │     YES → return None (disable timing logic)
+    │
+    ├── reprice_after = median_duration_sec × EXIT_REPRICE_MULTIPLIER
+    │                   (default: median × 1.5)
+    │
+    ├── orphan_after  = median_duration_sec × EXIT_ORPHAN_MULTIPLIER
+    │                   (default: median × 5.0)
+    │
+    └── return { reprice_after, orphan_after }
+```
+
+**New PairStats field**: `stdev_duration_sec` — sample standard deviation
+of cycle durations. Computed alongside `mean_duration_sec` from
+`CompletedCycle.exit_time - CompletedCycle.entry_time`. None when n < 2.
+
+### 12.2 Single-Exit Repricing (S1a / S1b)
+
+Runs in the main loop as a new step `CHECK_STALE_EXITS` after
+`CHECK_DRIFT`, before `AI_COUNCIL`. Only active in S1a or S1b
+(one exit + one entry).
+
+```
+CHECK_STALE_EXITS (S1a or S1b only)
+    │
+    ├── thresholds = compute_exit_thresholds(pair_stats)
+    │     NULL → skip (not enough data)
+    │
+    ├── identify the open exit order
+    │     S1a: Trade A buy exit (matched_sell_price known)
+    │     S1b: Trade B sell exit (matched_buy_price known)
+    │
+    ├── exit_age = now - exit_placed_time
+    │
+    ├── exit_age < thresholds.reprice_after?
+    │     YES → skip (still in normal range)
+    │
+    ├── exit_age >= thresholds.orphan_after?
+    │     YES → jump to §12.4 ORPHAN LOGIC
+    │
+    ├── last_reprice < REPRICE_COOLDOWN_SEC ago?
+    │     YES → skip (cooldown active)
+    │
+    ▼ REPRICE ELIGIBLE
+    │
+    ├── Compute new exit price:
+    │     new_price = _pair_exit_price(entry_fill_price, market, side, state)
+    │     (reuses existing function — market guard ensures minimum profit)
+    │
+    ├── SAFETY: Is new price CLOSER to market than current?
+    │     NO  → skip (one-way ratchet: only tighten, never loosen)
+    │
+    ├── SAFETY: Would this exit still be profitable?
+    │     Trade B: new_price > matched_buy_price + estimated_fees?
+    │     Trade A: new_price < matched_sell_price - estimated_fees?
+    │     NO  → skip (don't reprice into a loss)
+    │
+    ├── SAFETY: Price improvement meaningful? (> 0.1% closer)
+    │     NO  → skip (avoid churn)
+    │
+    ▼ EXECUTE REPRICE
+    │
+    ├── cancel old exit order on Kraken
+    ├── place new exit order at new_price
+    │     (preserve trade_id, cycle, role=exit)
+    ├── increment exit_reprice_count
+    ├── set last_reprice timestamp
+    ├── log: "EXIT REPRICED: B sell $0.09950 → $0.09838 (age: 45m, profit: 0.6%→0.3%)"
+    └── save_state()
+```
+
+#### Reprice Tiering (Progressive Tightening)
+
+Rather than jumping to minimum-profit on the first reprice, the bot
+tightens gradually based on how many times this exit has been repriced:
+
+```
+reprice_count == 0 (first reprice):
+    target = midpoint(original_exit, market_guard_minimum)
+    (accept ~half the original profit target)
+
+reprice_count == 1:
+    target = market_guard_minimum
+    (accept whatever profit the market guard allows)
+
+reprice_count >= 2:
+    target = market_guard_minimum (same as count 1)
+    (if still stranded after 2 reprices → heading toward orphan threshold)
+```
+
+### 12.3 S2 Break-Glass Protocol
+
+S2 means both entries filled and both exits are on the book. The engine
+is fully stalled — no entries, no fills, no profit. This is the most
+urgent condition.
+
+```
+CHECK_S2_BREAK_GLASS (runs only when pair_state == S2)
+    │
+    ├── Record s2_entered_at (if not already set)
+    │
+    ├── thresholds = compute_exit_thresholds(pair_stats)
+    │     NULL → use fallback: S2_FALLBACK_TIMEOUT = 600s (10 min)
+    │
+    ├── s2_age = now - s2_entered_at
+    │
+    ├── PHASE 1: NATURAL RESOLUTION WINDOW
+    │     s2_age < thresholds.reprice_after?
+    │     YES → skip (give exits time to fill naturally)
+    │
+    ├── PHASE 2: EVALUATE THE SPREAD
+    │     sell_exit_price = Trade B exit price
+    │     buy_exit_price  = Trade A exit price
+    │     spread_pct = (sell_exit_price - buy_exit_price) / market × 100
+    │
+    │     spread_pct < S2_MAX_SPREAD_PCT?
+    │     YES → skip (spread is tolerable, wait longer)
+    │
+    ├── PHASE 3: IDENTIFY THE WORSE TRADE
+    │     │
+    │     ├── a_distance = abs(buy_exit_price - market) / market
+    │     ├── b_distance = abs(sell_exit_price - market) / market
+    │     │
+    │     ├── worse_trade = trade with LARGER distance from market
+    │     │   (this is the one less likely to fill)
+    │     │
+    │     ├── better_trade = the other one
+    │     │   (closer to market, more likely to fill on its own)
+    │
+    ├── PHASE 4: OPPORTUNITY COST CHECK
+    │     │
+    │     ├── mean_profit_per_sec = pair_stats.mean_net / pair_stats.mean_duration_sec
+    │     │   (expected earnings rate when engine is running)
+    │     │
+    │     ├── foregone_profit = mean_profit_per_sec × s2_age
+    │     │
+    │     ├── loss_if_close = compute loss from closing worse trade at market
+    │     │     Trade B (sell exit stranded high):
+    │     │       loss = (matched_buy_price - market) × volume + est_fees
+    │     │       (bought high, selling at current lower price)
+    │     │     Trade A (buy exit stranded low):
+    │     │       loss = (market - matched_sell_price) × volume + est_fees
+    │     │       (sold low, buying back at current higher price)
+    │     │
+    │     ├── foregone_profit > abs(loss_if_close)?
+    │     │     NO  → try REPRICE first (Phase 5)
+    │     │     YES → CLOSE the worse trade (Phase 6)
+    │
+    ├── PHASE 5: S2 REPRICE (attempt before closing)
+    │     │
+    │     ├── Reprice BOTH exits using tiered repricing (§12.2)
+    │     ├── If new spread < S2_MAX_SPREAD_PCT → done, wait for fills
+    │     ├── If still too wide → proceed to Phase 6
+    │     └── Reprice cooldown applies (won't re-enter Phase 5 for N sec)
+    │
+    ├── PHASE 6: CLOSE WORSE TRADE
+    │     │
+    │     ├── OPTION A: ORPHAN (recovery slot available)
+    │     │     len(recovery_orders) < MAX_RECOVERY_SLOTS?
+    │     │     YES →
+    │     │       1. Move worse exit to recovery_orders[]
+    │     │          (order stays on Kraken book as a recovery ticket)
+    │     │       2. Place new entry for that side at market distance
+    │     │       3. Increment cycle number for that trade
+    │     │       4. State transitions: S2 → S1a or S1b
+    │     │       5. Log
+    │     │       6. Set detected_trend (see §12.5)
+    │     │
+    │     ├── OPTION B: CLOSE AT LOSS (no recovery slots)
+    │     │     len(recovery_orders) >= MAX_RECOVERY_SLOTS?
+    │     │     YES →
+    │     │       1. Cancel worse exit on Kraken
+    │     │       2. Book the realized loss in total_profit_usd
+    │     │       3. Create CompletedCycle with negative net_profit
+    │     │       4. Place new entry for that side at market distance
+    │     │       5. Increment cycle number
+    │     │       6. State transitions: S2 → S1a or S1b
+    │     │       7. Telegram notification (loss event)
+    │
+    └── Reset s2_entered_at = null (no longer in S2)
+```
+
+### 12.4 Orphan → Recovery Pipeline
+
+When an exit is orphaned (removed from the active pair state machine
+but left on the Kraken book), it becomes a recovery order.
+
+```
+ORPHAN EXIT
+    │
+    ├── Remove order from active pair tracking
+    │
+    ├── Append to recovery_orders[]:
+    │     RecoveryOrder {
+    │       txid, trade_id, cycle, side, price, volume,
+    │       entry_price, orphaned_at, reason
+    │     }
+    │
+    ├── Place new entry for that side (engine resumes)
+    │
+    └── State recalculated by _compute_pair_state()
+```
+
+#### Recovery Order Monitoring (per main loop iteration)
+
+```
+CHECK_RECOVERY_ORDERS (runs every cycle, after CHECK_STALE_EXITS)
+    │
+    for each recovery_order in recovery_orders[]:
+    │
+    ├── STATUS: filled → RECOVERY SUCCESS
+    │     Book the original round trip P&L
+    │     Create CompletedCycle, remove from recovery_orders[]
+    │
+    ├── STATUS: cancelled/expired → Book loss, remove
+    │
+    ├── STATUS: open
+    │     └── recovery_age > MAX_RECOVERY_AGE (24h)?
+    │           YES → Cancel, book loss, remove
+    │           NO  → keep (free lottery ticket)
+    │
+    └── continue
+```
+
+### 12.5 Directional Signal Detection
+
+Which side stalls reveals trend direction. This signal feeds back into
+entry placement for the next cycle.
+
+```
+DETECT_TREND (called during orphan/reprice events)
+    │
+    ├── B sell exit orphaned/repriced → price trending DOWN
+    │     set detected_trend = "down"
+    │
+    ├── A buy exit orphaned/repriced → price trending UP
+    │     set detected_trend = "up"
+    │
+    ├── Round trip completes normally → trend weakening
+    │     if trend_age > 5 × median_duration_sec:
+    │       set detected_trend = null (expired)
+    │
+    └── Both sides cycling normally for 3+ cycles → clear trend
+```
+
+#### Asymmetric Entry Placement
+
+When a trend is detected, adjust entry distances:
+
+```
+detected_trend == "down":
+    a_entry_pct = base_entry_pct × DIRECTIONAL_ASYMMETRY  (closer sell entries)
+    b_entry_pct = base_entry_pct × (2 - DIRECTIONAL_ASYMMETRY)  (wider buy entries)
+
+detected_trend == "up":
+    a_entry_pct = base_entry_pct × (2 - DIRECTIONAL_ASYMMETRY)  (wider sell entries)
+    b_entry_pct = base_entry_pct × DIRECTIONAL_ASYMMETRY  (closer buy entries)
+```
+
+### 12.6 Main Loop Integration
+
+Updated main loop order:
+
+```
+CHECK_FILLS → CHECK_DRIFT → ★CHECK_STALE_EXITS → ★CHECK_RECOVERY_ORDERS → AI_COUNCIL → ...
+```
+
+### 12.7 Updated Transition Summary
+
+| From | To | Trigger | Action |
+|------|----|---------|--------|
+| S1a/S1b | S1a/S1b | exit age > reprice threshold | reprice exit closer to market |
+| S2 | S1a/S1b | S2 break-glass: orphan worse exit | move to recovery, restart entry |
+| S2 | S1a/S1b | S2 break-glass: close worse exit (slots full) | close at market, book loss, restart entry |
+| S1a/S1b | S0 | recovery order fills | book delayed round-trip profit |
+| S2 | S1a/S1b | S2 reprice tightens spread below threshold | repriced exits, wait for natural fill |
+
+### 12.8 Dashboard Additions
+
+| Element | Location | Content |
+|---------|----------|---------|
+| Exit age badge | A/B panels | "Exit open 45m (median: 20m)" with color: green < 1×, yellow 1-3×, red > 3× |
+| Recovery orders card | Below A/B panels | List of orphaned exits with price, age, unrealized P&L |
+| Trend indicator | Top metrics | "↓ DOWN" / "↑ UP" / "—" with timestamp |
+| S2 timer | State banner | "S2 for 47m — break-glass at 90m" with countdown |
+| Opportunity cost | S2 state banner | "Foregone: ~$0.05 \| Close cost: $0.09" |
+
+### 12.9 Pair Mode Order Count (Updated)
+
+Original invariant: "exactly 2 open orders under normal operation."
+
+New invariant: **2 active orders + 0–N recovery orders** (where N ≤ `MAX_RECOVERY_SLOTS`).
+
+Total open on Kraken: 2 + len(recovery_orders), typical 2-4, max 4.
+
+Reconciliation on startup must scan for recovery orders
+(by matching against `state.recovery_orders[].txid`).
+
+### 12.10 Risk Integration
+
+Recovery orders carry position risk. Update risk calculations:
+
+```
+compute_total_exposure(state, current_price):
+    active_exposure = existing pair unrealized P&L
+    recovery_exposure = sum of recovery order mark-to-market
+    total_exposure = active_exposure + recovery_exposure
+    estimated_value = STARTING_CAPITAL + total_profit_usd + total_exposure
+```
+
+### 12.11 Edge Cases
+
+| Scenario | Handling |
+|----------|----------|
+| Bot restarts with recovery orders | Reconcile: match txids against Kraken. Filled → book profit. Cancelled → book loss. |
+| Recovery order partially fills | Treat as filled (Kraken doesn't partial-fill limits at this size) |
+| S2 entered but no PairStats yet | Use fallback timeout (600s) |
+| Both exits reprice to same price | Impossible — A exits are buys (below market), B exits are sells (above market) |
+| Trend flips during recovery | `detected_trend` updates on next event. Old recovery orders stay (benefit from reversal) |
+| Recovery order fills WHILE in S2 | Book profit, free slot. Proceed with break-glass as normal |
+| Price flash-crashes through all exits | Both exits fill → normal resolution. Recovery orders also fill. Best case. |
+| `MAX_RECOVERY_SLOTS = 0` | Disables orphaning. S2 break-glass goes straight to close-at-market. |

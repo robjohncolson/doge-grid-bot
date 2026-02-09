@@ -120,7 +120,8 @@ class RecoveryOrder:
     Only cancelled when evicted from recovery slots.
     """
     def __init__(self, txid, side, price, volume, trade_id, cycle,
-                 entry_price, created_at=0.0, entry_filled_at=0.0):
+                 entry_price, orphaned_at=0.0, entry_filled_at=0.0,
+                 reason="timeout"):
         self.txid = txid
         self.side = side              # "buy" or "sell" (exit side)
         self.price = price            # exit limit price
@@ -128,8 +129,9 @@ class RecoveryOrder:
         self.trade_id = trade_id      # "A" or "B"
         self.cycle = cycle
         self.entry_price = entry_price
-        self.created_at = created_at or time.time()
+        self.orphaned_at = orphaned_at or time.time()
         self.entry_filled_at = entry_filled_at
+        self.reason = reason          # "timeout", "s2_break", "repriced_out"
 
     def to_dict(self) -> dict:
         return {
@@ -140,8 +142,9 @@ class RecoveryOrder:
             "trade_id": self.trade_id,
             "cycle": self.cycle,
             "entry_price": self.entry_price,
-            "created_at": self.created_at,
+            "orphaned_at": self.orphaned_at,
             "entry_filled_at": self.entry_filled_at,
+            "reason": self.reason,
         }
 
     @staticmethod
@@ -154,8 +157,9 @@ class RecoveryOrder:
             trade_id=d.get("trade_id", "?"),
             cycle=d.get("cycle", 0),
             entry_price=d.get("entry_price", 0.0),
-            created_at=d.get("created_at", 0.0),
+            orphaned_at=d.get("orphaned_at", d.get("created_at", 0.0)),
             entry_filled_at=d.get("entry_filled_at", 0.0),
+            reason=d.get("reason", "timeout"),
         )
 
     def unrealized_pnl(self, current_price: float) -> float:
@@ -170,7 +174,7 @@ class RecoveryOrder:
     def __repr__(self):
         return (f"RecoveryOrder({self.trade_id}.{self.cycle} "
                 f"{self.side} exit @ ${self.price:.6f} "
-                f"entry=${self.entry_price:.6f} txid={self.txid})")
+                f"entry=${self.entry_price:.6f} [{self.reason}] txid={self.txid})")
 
 
 class GridOrder:
@@ -299,6 +303,15 @@ class GridState:
         self.recovery_orders: list = []      # List[RecoveryOrder]
         self.total_recovery_losses = 0       # Count of cancelled/expired recovery orders
         self.total_recovery_wins = 0.0       # Net profit from surprise recovery fills
+
+        # Exit lifecycle: repricing + S2 break-glass + directional signal
+        self.s2_entered_at = None            # Unix timestamp when S2 was entered
+        self.last_reprice_a = 0.0            # Timestamp of last Trade A exit reprice
+        self.last_reprice_b = 0.0            # Timestamp of last Trade B exit reprice
+        self.exit_reprice_count_a = 0        # Times Trade A exit repriced this cycle
+        self.exit_reprice_count_b = 0        # Times Trade B exit repriced this cycle
+        self.detected_trend = None           # "up", "down", or None
+        self.trend_detected_at = None        # When trend was detected
 
     # -- Per-pair property accessors (fall back to global config) --
 
@@ -476,6 +489,13 @@ def save_state(state: GridState):
         "recovery_orders": [r.to_dict() for r in state.recovery_orders],
         "total_recovery_losses": state.total_recovery_losses,
         "total_recovery_wins": state.total_recovery_wins,
+        "s2_entered_at": state.s2_entered_at,
+        "last_reprice_a": state.last_reprice_a,
+        "last_reprice_b": state.last_reprice_b,
+        "exit_reprice_count_a": state.exit_reprice_count_a,
+        "exit_reprice_count_b": state.exit_reprice_count_b,
+        "detected_trend": state.detected_trend,
+        "trend_detected_at": state.trend_detected_at,
     }
     state_path = _state_file_path(state)
     tmp_path = state_path + ".tmp"
@@ -555,6 +575,15 @@ def load_state(state: GridState) -> bool:
     state.total_recovery_wins = snapshot.get("total_recovery_wins", 0.0)
     if state.recovery_orders:
         logger.info("Restored %d recovery orders", len(state.recovery_orders))
+
+    # Restore exit lifecycle state
+    state.s2_entered_at = snapshot.get("s2_entered_at")
+    state.last_reprice_a = snapshot.get("last_reprice_a", 0.0)
+    state.last_reprice_b = snapshot.get("last_reprice_b", 0.0)
+    state.exit_reprice_count_a = snapshot.get("exit_reprice_count_a", 0)
+    state.exit_reprice_count_b = snapshot.get("exit_reprice_count_b", 0)
+    state.detected_trend = snapshot.get("detected_trend")
+    state.trend_detected_at = snapshot.get("trend_detected_at")
 
     # Restore entry multiplier
     saved_mult = snapshot.get("next_entry_multiplier", 1.0)
@@ -2379,10 +2408,19 @@ def compute_unrealized_pnl(state: GridState, current_price: float) -> dict:
             # Trade B exit (sell): we bought at matched_buy_price
             b_unreal += (current_price - o.matched_buy_price) * o.volume
 
+    # Include recovery order exposure
+    recovery_unreal = 0.0
+    for r in state.recovery_orders:
+        if r.side == "sell":
+            recovery_unreal += (current_price - r.entry_price) * r.volume
+        else:
+            recovery_unreal += (r.entry_price - current_price) * r.volume
+
     return {
         "a_unrealized": round(a_unreal, 6),
         "b_unrealized": round(b_unreal, 6),
-        "total_unrealized": round(a_unreal + b_unreal, 6),
+        "recovery_unrealized": round(recovery_unreal, 6),
+        "total_unrealized": round(a_unreal + b_unreal + recovery_unreal, 6),
     }
 
 
@@ -2633,10 +2671,14 @@ def handle_pair_fill(state: GridState, filled_orders: list,
             ))
             _trim_completed_cycles(state)
 
-            # Increment Trade B cycle
+            # Increment Trade B cycle, reset reprice counter
             new_cyc = cyc + 1
             if tid == "B":
                 state.cycle_b = new_cyc
+                state.exit_reprice_count_b = 0
+
+            # Clear trend if normal cycling resumes
+            _clear_trend_if_expired(state)
 
             # Round trip complete -- reopen buy entry for this side only
             _cancel_open_by_role(state, "buy", "entry")
@@ -2763,10 +2805,14 @@ def handle_pair_fill(state: GridState, filled_orders: list,
             ))
             _trim_completed_cycles(state)
 
-            # Increment Trade A cycle
+            # Increment Trade A cycle, reset reprice counter
             new_cyc = cyc + 1
             if tid == "A":
                 state.cycle_a = new_cyc
+                state.exit_reprice_count_a = 0
+
+            # Clear trend if normal cycling resumes
+            _clear_trend_if_expired(state)
 
             # Round trip complete -- reopen sell entry for this side only
             _cancel_open_by_role(state, "sell", "entry")
@@ -2984,8 +3030,8 @@ def refresh_stale_entries(state: GridState, current_price: float) -> bool:
 # Recovery orders -- cascading trades for stranded exits
 # ---------------------------------------------------------------------------
 
-def _cancel_oldest_recovery(state: GridState):
-    """Cancel the oldest recovery order on Kraken and remove from list."""
+def _cancel_oldest_recovery(state: GridState, current_price: float = 0.0):
+    """Cancel the oldest recovery order on Kraken, book the loss, remove."""
     if not state.recovery_orders:
         return
     oldest = state.recovery_orders[0]
@@ -2999,6 +3045,32 @@ def _cancel_oldest_recovery(state: GridState):
         except Exception as e:
             logger.warning("Recovery: failed to cancel evicted order %s: %s",
                            oldest.txid, e)
+    # Book the estimated loss
+    if current_price > 0 and oldest.entry_price > 0:
+        if oldest.side == "sell":
+            loss = (oldest.entry_price - current_price) * oldest.volume
+        else:
+            loss = (current_price - oldest.entry_price) * oldest.volume
+        fees = current_price * oldest.volume * config.MAKER_FEE_PCT / 100.0 * 2
+        net = -abs(loss) - fees
+        state.total_profit_usd += net
+        state.today_profit_usd += net
+        state.today_loss_usd += abs(net)
+        state.total_fees_usd += fees
+        state.today_fees_usd += fees
+        state.completed_cycles.append(CompletedCycle(
+            trade_id=oldest.trade_id, cycle=oldest.cycle,
+            entry_side="buy" if oldest.side == "sell" else "sell",
+            entry_price=oldest.entry_price, exit_price=current_price,
+            volume=oldest.volume, gross_profit=-abs(loss),
+            fees=fees, net_profit=net,
+            entry_time=oldest.entry_filled_at, exit_time=time.time(),
+        ))
+        _trim_completed_cycles(state)
+        logger.info(
+            "RECOVERY EVICTED [%s.%d]: booked loss $%.4f",
+            oldest.trade_id, oldest.cycle, net,
+        )
     state.total_recovery_losses += 1
     state.recovery_orders.pop(0)
 
@@ -3113,16 +3185,459 @@ def _log_trade_from_recovery(r, net_profit, fees):
         logger.debug("Failed to log recovery trade: %s", e)
 
 
+def compute_exit_thresholds(pair_stats):
+    """
+    Compute reprice and orphan thresholds from pair statistics.
+    Returns dict with reprice_after and orphan_after in seconds,
+    or None if not enough data.
+    """
+    if not pair_stats or pair_stats.n_total < config.MIN_CYCLES_FOR_TIMING:
+        return None
+    median = pair_stats.median_duration_sec
+    if not median or median <= 0:
+        return None
+    return {
+        "reprice_after": median * config.EXIT_REPRICE_MULTIPLIER,
+        "orphan_after": median * config.EXIT_ORPHAN_MULTIPLIER,
+    }
+
+
+def _repriced_exit(entry_price, market, side, state, reprice_count):
+    """
+    Compute a repriced exit price with progressive tightening.
+    Tier 0: midpoint(original target, breakeven+fees)
+    Tier 1+: breakeven+fees
+    """
+    minimum = _pair_exit_price(entry_price, market, side, state)
+    profit_pct = state.profit_pct / 100.0
+    fee_margin = 0.003  # 0.3% covers round-trip fees
+
+    if side == "sell":
+        original = entry_price * (1 + profit_pct)
+        breakeven_plus = entry_price * (1 + fee_margin)
+        if reprice_count == 0:
+            target = (original + breakeven_plus) / 2
+        else:
+            target = breakeven_plus
+        return round(max(target, minimum), state.price_decimals)
+    else:
+        original = entry_price * (1 - profit_pct)
+        breakeven_plus = entry_price * (1 - fee_margin)
+        if reprice_count == 0:
+            target = (original + breakeven_plus) / 2
+        else:
+            target = breakeven_plus
+        return round(min(target, minimum), state.price_decimals)
+
+
+def _detect_trend(state, side_orphaned):
+    """
+    Set directional signal when an exit is orphaned or repriced.
+    B sell exit stranded -> price trending DOWN.
+    A buy exit stranded -> price trending UP.
+    """
+    if side_orphaned == "sell":
+        state.detected_trend = "down"
+    else:
+        state.detected_trend = "up"
+    state.trend_detected_at = time.time()
+    logger.info("TREND DETECTED: %s (from %s exit stall)",
+                state.detected_trend.upper(), side_orphaned)
+
+
+def _clear_trend_if_expired(state):
+    """Clear trend signal if it's expired (5× median duration)."""
+    if not state.detected_trend or not state.trend_detected_at:
+        return
+    ps = state.pair_stats
+    if ps and ps.median_duration_sec and ps.median_duration_sec > 0:
+        expiry = ps.median_duration_sec * 5
+    else:
+        expiry = config.RECOVERY_FALLBACK_TIMEOUT_SEC
+    if time.time() - state.trend_detected_at > expiry:
+        logger.info("TREND EXPIRED: %s (age > %.0fs)",
+                     state.detected_trend, expiry)
+        state.detected_trend = None
+        state.trend_detected_at = None
+
+
+def compute_entry_distances(state):
+    """
+    Compute asymmetric entry distances based on detected trend.
+    Returns (a_entry_pct, b_entry_pct).
+    """
+    base = state.entry_pct
+    trend = state.detected_trend
+    if not trend:
+        return base, base
+    asym = config.DIRECTIONAL_ASYMMETRY
+    if trend == "down":
+        # Sell entries closer (fill easier), buy entries wider
+        return base * asym, base * (2 - asym)
+    else:  # "up"
+        # Buy entries closer, sell entries wider
+        return base * (2 - asym), base * asym
+
+
+def _orphan_exit(state, o, current_price, reason="timeout"):
+    """
+    Move an exit order to recovery and place a fresh entry.
+    Returns the new entry GridOrder on success, None on failure.
+    """
+    now = time.time()
+    tid = getattr(o, "trade_id", None) or ("A" if o.side == "buy" else "B")
+    cyc = getattr(o, "cycle", 0)
+    entry_price = o.matched_sell_price if o.side == "buy" else o.matched_buy_price
+    decimals = state.price_decimals
+    a_pct, b_pct = compute_entry_distances(state)
+
+    # Enforce recovery slot cap
+    if len(state.recovery_orders) >= config.MAX_RECOVERY_SLOTS:
+        _cancel_oldest_recovery(state, current_price)
+
+    # Create recovery order (order stays on Kraken book)
+    recovery = RecoveryOrder(
+        txid=o.txid, side=o.side, price=o.price, volume=o.volume,
+        trade_id=tid, cycle=cyc,
+        entry_price=entry_price or 0.0,
+        orphaned_at=now, entry_filled_at=o.entry_filled_at,
+        reason=reason,
+    )
+    state.recovery_orders.append(recovery)
+
+    # Remove exit from grid_orders (do NOT cancel on Kraken)
+    state.grid_orders.remove(o)
+
+    # Detect directional trend
+    _detect_trend(state, o.side)
+
+    # Place fresh entry on that side
+    if o.side == "sell":
+        new_entry_price = round(
+            current_price * (1 - b_pct / 100.0), decimals)
+        new_cyc = cyc + 1
+        if tid == "B":
+            state.cycle_b = new_cyc
+        new_o = _place_pair_order(
+            state, "buy", new_entry_price, "entry",
+            trade_id=tid, cycle=new_cyc)
+    else:
+        new_entry_price = round(
+            current_price * (1 + a_pct / 100.0), decimals)
+        new_cyc = cyc + 1
+        if tid == "A":
+            state.cycle_a = new_cyc
+        new_o = _place_pair_order(
+            state, "sell", new_entry_price, "entry",
+            trade_id=tid, cycle=new_cyc)
+
+    # Reset anti-chase and reprice counters for this side
+    if tid == "A":
+        state.consecutive_refreshes_a = 0
+        state.last_refresh_direction_a = None
+        state.refresh_cooldown_until_a = 0.0
+        state.exit_reprice_count_a = 0
+    else:
+        state.consecutive_refreshes_b = 0
+        state.last_refresh_direction_b = None
+        state.refresh_cooldown_until_b = 0.0
+        state.exit_reprice_count_b = 0
+
+    return new_o
+
+
+def check_stale_exits(state: GridState, current_price: float) -> bool:
+    """
+    Section 12.2: Single-exit repricing for S1a/S1b.
+    Tightens stale exits progressively, then orphans if still stranded.
+    Returns True if any changes were made (caller should save state).
+    """
+    if not config.RECOVERY_ENABLED:
+        return False
+    if state.pair_state not in ("S1a", "S1b"):
+        return False
+
+    thresholds = compute_exit_thresholds(state.pair_stats)
+    if thresholds is None:
+        return False
+
+    now = time.time()
+    changed = False
+
+    for o in list(state.grid_orders):
+        if o.status != "open" or o.order_role != "exit":
+            continue
+        if o.entry_filled_at <= 0:
+            continue
+
+        exit_age = now - o.entry_filled_at
+        tid = getattr(o, "trade_id", None) or ("A" if o.side == "buy" else "B")
+        cyc = getattr(o, "cycle", 0)
+        is_a = (tid == "A")
+
+        # Check orphan threshold first
+        if exit_age >= thresholds["orphan_after"]:
+            logger.info(
+                "EXIT ORPHAN [%s.%d]: %s exit @ $%.6f open %.0fs (threshold %.0fs)",
+                tid, cyc, o.side, o.price, exit_age, thresholds["orphan_after"],
+            )
+            new_o = _orphan_exit(state, o, current_price, reason="timeout")
+            if new_o:
+                state.pair_state = _compute_pair_state(state)
+            changed = True
+            continue
+
+        # Check reprice threshold
+        if exit_age < thresholds["reprice_after"]:
+            continue
+
+        # Reprice cooldown
+        last_reprice = state.last_reprice_a if is_a else state.last_reprice_b
+        if now - last_reprice < config.REPRICE_COOLDOWN_SEC:
+            continue
+
+        # Compute repriced price
+        reprice_count = state.exit_reprice_count_a if is_a else state.exit_reprice_count_b
+        entry_price = o.matched_sell_price if o.side == "buy" else o.matched_buy_price
+        if not entry_price:
+            continue
+
+        new_price = _repriced_exit(
+            entry_price, current_price, o.side, state, reprice_count)
+
+        # Safety: must be closer to market (one-way ratchet)
+        if o.side == "sell":
+            if new_price >= o.price:
+                continue  # Not tighter
+            # Must still be profitable
+            est_fee = entry_price * o.volume * config.MAKER_FEE_PCT / 100.0 * 2
+            if new_price * o.volume <= entry_price * o.volume + est_fee:
+                continue
+        else:
+            if new_price <= o.price:
+                continue  # Not tighter
+            est_fee = entry_price * o.volume * config.MAKER_FEE_PCT / 100.0 * 2
+            if entry_price * o.volume <= new_price * o.volume + est_fee:
+                continue
+
+        # Meaningful improvement? (> 0.1%)
+        improvement = abs(new_price - o.price) / o.price
+        if improvement < 0.001:
+            continue
+
+        old_price = o.price
+        old_profit_pct = abs(old_price - entry_price) / entry_price * 100
+        new_profit_pct = abs(new_price - entry_price) / entry_price * 100
+
+        logger.info(
+            "EXIT REPRICED [%s.%d]: %s $%.6f -> $%.6f (age: %.0fm, profit: %.1f%% -> %.1f%%)",
+            tid, cyc, o.side, old_price, new_price,
+            exit_age / 60, old_profit_pct, new_profit_pct,
+        )
+
+        # Execute reprice: cancel old, place new
+        if not config.DRY_RUN:
+            try:
+                kraken_client.cancel_order(o.txid)
+            except Exception as e:
+                logger.error("Failed to cancel exit for reprice: %s", e)
+                continue
+        o.status = "cancelled"
+
+        new_o = _place_pair_order(
+            state, o.side, new_price, "exit",
+            matched_buy=o.matched_buy_price,
+            matched_sell=o.matched_sell_price,
+            trade_id=tid, cycle=cyc)
+        if new_o:
+            new_o.entry_filled_at = o.entry_filled_at  # Preserve original time
+
+        # Update reprice tracking
+        if is_a:
+            state.last_reprice_a = now
+            state.exit_reprice_count_a += 1
+        else:
+            state.last_reprice_b = now
+            state.exit_reprice_count_b += 1
+
+        _detect_trend(state, o.side)
+        changed = True
+
+    return changed
+
+
+def check_s2_break_glass(state: GridState, current_price: float) -> bool:
+    """
+    Section 12.3: S2 break-glass protocol.
+    When both exits are on the book, evaluate spread, opportunity cost,
+    and either reprice or orphan/close the worse trade.
+    Returns True if any changes were made.
+    """
+    if not config.RECOVERY_ENABLED:
+        return False
+    if state.pair_state != "S2":
+        # Clear S2 timer when leaving S2
+        if state.s2_entered_at is not None:
+            state.s2_entered_at = None
+        return False
+
+    now = time.time()
+
+    # Record S2 entry time
+    if state.s2_entered_at is None:
+        state.s2_entered_at = now
+        logger.info("S2 entered -- starting break-glass timer")
+        return False
+
+    s2_age = now - state.s2_entered_at
+
+    # Compute thresholds (or use fallback)
+    thresholds = compute_exit_thresholds(state.pair_stats)
+    if thresholds:
+        reprice_threshold = thresholds["reprice_after"]
+    else:
+        reprice_threshold = config.S2_FALLBACK_TIMEOUT_SEC
+
+    # Phase 1: Natural resolution window
+    if s2_age < reprice_threshold:
+        return False
+
+    # Find both exits
+    buy_exit = None
+    sell_exit = None
+    for o in state.grid_orders:
+        if o.status != "open" or o.order_role != "exit":
+            continue
+        if o.side == "buy":
+            buy_exit = o
+        elif o.side == "sell":
+            sell_exit = o
+
+    if not buy_exit or not sell_exit:
+        return False
+
+    # Phase 2: Evaluate spread
+    spread_pct = (sell_exit.price - buy_exit.price) / current_price * 100
+    if spread_pct < config.S2_MAX_SPREAD_PCT:
+        return False  # Spread tolerable
+
+    # Phase 3: Identify worse trade (further from market)
+    a_dist = abs(buy_exit.price - current_price) / current_price
+    b_dist = abs(sell_exit.price - current_price) / current_price
+
+    if b_dist >= a_dist:
+        worse = sell_exit
+        worse_tid = getattr(worse, "trade_id", "B")
+    else:
+        worse = buy_exit
+        worse_tid = getattr(worse, "trade_id", "A")
+
+    # Phase 4: Opportunity cost check
+    ps = state.pair_stats
+    do_close = False
+    if (ps and ps.mean_net and ps.mean_duration_sec
+            and ps.mean_duration_sec > 0):
+        profit_per_sec = ps.mean_net / ps.mean_duration_sec
+        foregone = profit_per_sec * s2_age
+
+        # Compute loss if we close worse at market
+        if worse.side == "sell":
+            buy_price = worse.matched_buy_price or 0
+            loss = (buy_price - current_price) * worse.volume
+        else:
+            sell_price = worse.matched_sell_price or 0
+            loss = (current_price - sell_price) * worse.volume
+        est_fee = current_price * worse.volume * config.MAKER_FEE_PCT / 100.0 * 2
+        loss_total = abs(loss) + est_fee
+
+        if foregone > loss_total:
+            do_close = True
+            logger.info(
+                "S2 BREAK-GLASS: foregone $%.4f > close cost $%.4f after %.0fm "
+                "-> closing %s (worse trade)",
+                foregone, loss_total, s2_age / 60, worse_tid,
+            )
+
+    # Phase 5: Try S2 reprice (if not closing yet)
+    if not do_close:
+        is_a_worse = (worse.side == "buy")
+        reprice_count = state.exit_reprice_count_a if is_a_worse else state.exit_reprice_count_b
+        last_rp = state.last_reprice_a if is_a_worse else state.last_reprice_b
+
+        if now - last_rp >= config.REPRICE_COOLDOWN_SEC:
+            entry_price = (worse.matched_sell_price if worse.side == "buy"
+                           else worse.matched_buy_price)
+            if entry_price:
+                new_price = _repriced_exit(
+                    entry_price, current_price, worse.side, state, reprice_count)
+                improvement = abs(new_price - worse.price) / worse.price
+                if improvement >= 0.001:
+                    # Check if closer to market
+                    ok = (worse.side == "sell" and new_price < worse.price) or \
+                         (worse.side == "buy" and new_price > worse.price)
+                    if ok:
+                        logger.info(
+                            "S2 REPRICE [%s]: %s $%.6f -> $%.6f",
+                            worse_tid, worse.side, worse.price, new_price,
+                        )
+                        if not config.DRY_RUN:
+                            try:
+                                kraken_client.cancel_order(worse.txid)
+                            except Exception as e:
+                                logger.error("S2 reprice cancel failed: %s", e)
+                                return False
+                        worse.status = "cancelled"
+
+                        new_o = _place_pair_order(
+                            state, worse.side, new_price, "exit",
+                            matched_buy=worse.matched_buy_price,
+                            matched_sell=worse.matched_sell_price,
+                            trade_id=worse_tid,
+                            cycle=getattr(worse, "cycle", 0))
+                        if new_o:
+                            new_o.entry_filled_at = worse.entry_filled_at
+
+                        if is_a_worse:
+                            state.last_reprice_a = now
+                            state.exit_reprice_count_a += 1
+                        else:
+                            state.last_reprice_b = now
+                            state.exit_reprice_count_b += 1
+
+                        # Check if spread now tolerable
+                        new_spread = (sell_exit.price - buy_exit.price) / current_price * 100
+                        if worse.side == "sell" and new_o:
+                            new_spread = (new_price - buy_exit.price) / current_price * 100
+                        elif worse.side == "buy" and new_o:
+                            new_spread = (sell_exit.price - new_price) / current_price * 100
+                        if new_spread < config.S2_MAX_SPREAD_PCT:
+                            return True  # Spread resolved via reprice
+                        # Spread still too wide -- fall through to close
+                        do_close = True
+
+        if not do_close:
+            return False  # Cooldown active, wait
+
+    # Phase 6: Close worse trade (orphan or close at loss)
+    logger.info(
+        "S2 BREAK-GLASS [%s.%d]: orphaning %s exit @ $%.6f (spread %.1f%%, age %.0fm)",
+        worse_tid, getattr(worse, "cycle", 0), worse.side, worse.price,
+        spread_pct, s2_age / 60,
+    )
+
+    if worse.status == "open":
+        _orphan_exit(state, worse, current_price, reason="s2_break")
+    state.pair_state = _compute_pair_state(state)
+    state.s2_entered_at = None  # No longer in S2
+    return True
+
+
 def check_recovery_timeout(state: GridState, current_price: float) -> list:
     """
-    Check if any open exit orders have been waiting longer than statistically
-    expected.  If so, move them to recovery and place a fresh entry.
-
-    Timeout thresholds (tiered by data availability):
-      - >=10 cycles + stdev: mean + 2*stdev
-      - >=5 cycles:          median * RECOVERY_TIMEOUT_MULTIPLIER
-      - <5 cycles:           RECOVERY_FALLBACK_TIMEOUT_SEC
-
+    Legacy timeout check for exits that exceed the orphan threshold.
+    Uses compute_exit_thresholds, falls back to RECOVERY_FALLBACK_TIMEOUT_SEC.
+    Only fires for exits NOT already handled by check_stale_exits (S1) or
+    check_s2_break_glass (S2) -- acts as a safety net.
     Returns list of new entry orders placed.
     """
     if not config.RECOVERY_ENABLED:
@@ -3131,98 +3646,34 @@ def check_recovery_timeout(state: GridState, current_price: float) -> list:
     now = time.time()
     new_orders = []
 
-    # Compute timeout threshold
-    ps = state.pair_stats
-    min_dp = config.RECOVERY_MIN_DATA_POINTS
-    if (ps and ps.n_total >= 10
-            and ps.stdev_duration_sec is not None
-            and ps.mean_duration_sec is not None
-            and ps.stdev_duration_sec > 0):
-        timeout = ps.mean_duration_sec + 2 * ps.stdev_duration_sec
-    elif (ps and ps.n_total >= min_dp
-            and ps.median_duration_sec is not None
-            and ps.median_duration_sec > 0):
-        timeout = ps.median_duration_sec * config.RECOVERY_TIMEOUT_MULTIPLIER
+    thresholds = compute_exit_thresholds(state.pair_stats)
+    if thresholds:
+        timeout = thresholds["orphan_after"]
     else:
         timeout = config.RECOVERY_FALLBACK_TIMEOUT_SEC
-
-    entry_pct = state.entry_pct
-    decimals = state.price_decimals
 
     for o in list(state.grid_orders):
         if o.status != "open" or o.order_role != "exit":
             continue
         if o.entry_filled_at <= 0:
-            continue  # Unknown age -- skip (backward compat)
+            continue
         exit_age = now - o.entry_filled_at
         if exit_age < timeout:
             continue
 
         tid = getattr(o, "trade_id", None) or ("A" if o.side == "buy" else "B")
         cyc = getattr(o, "cycle", 0)
-        entry_price = o.matched_sell_price if o.side == "buy" else o.matched_buy_price
 
         logger.info(
-            "RECOVERY TIMEOUT [%s.%d]: %s exit @ $%.6f open %.0fs (threshold %.0fs) "
-            "-> moving to recovery, placing fresh entry",
+            "RECOVERY TIMEOUT [%s.%d]: %s exit @ $%.6f open %.0fs (threshold %.0fs)",
             tid, cyc, o.side, o.price, exit_age, timeout,
         )
-
-        # Enforce recovery slot cap
-        if len(state.recovery_orders) >= config.MAX_RECOVERY_SLOTS:
-            _cancel_oldest_recovery(state)
-
-        # Create recovery order (order stays on Kraken book)
-        recovery = RecoveryOrder(
-            txid=o.txid, side=o.side, price=o.price, volume=o.volume,
-            trade_id=tid, cycle=cyc,
-            entry_price=entry_price or 0.0,
-            created_at=now, entry_filled_at=o.entry_filled_at,
-        )
-        state.recovery_orders.append(recovery)
-
-        # Remove exit from grid_orders (do NOT cancel on Kraken)
-        state.grid_orders.remove(o)
-
-        # Place fresh entry on that side
-        if o.side == "sell":
-            # Was Trade B's sell exit -> place new buy entry
-            new_entry_price = round(
-                current_price * (1 - entry_pct / 100.0), decimals)
-            new_cyc = cyc + 1
-            if tid == "B":
-                state.cycle_b = new_cyc
-            new_o = _place_pair_order(
-                state, "buy", new_entry_price, "entry",
-                trade_id=tid, cycle=new_cyc)
-        else:
-            # Was Trade A's buy exit -> place new sell entry
-            new_entry_price = round(
-                current_price * (1 + entry_pct / 100.0), decimals)
-            new_cyc = cyc + 1
-            if tid == "A":
-                state.cycle_a = new_cyc
-            new_o = _place_pair_order(
-                state, "sell", new_entry_price, "entry",
-                trade_id=tid, cycle=new_cyc)
-
+        new_o = _orphan_exit(state, o, current_price, reason="timeout")
         if new_o:
             new_orders.append(new_o)
 
-        # Reset anti-chase counters for this side
-        if tid == "A":
-            state.consecutive_refreshes_a = 0
-            state.last_refresh_direction_a = None
-            state.refresh_cooldown_until_a = 0.0
-        else:
-            state.consecutive_refreshes_b = 0
-            state.last_refresh_direction_b = None
-            state.refresh_cooldown_until_b = 0.0
-
-    # Recompute pair state after changes
     if new_orders:
         state.pair_state = _compute_pair_state(state)
-
     return new_orders
 
 

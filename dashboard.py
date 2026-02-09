@@ -48,6 +48,7 @@ def serialize_state(state: grid_strategy.GridState, current_price: float) -> dic
             order_data["cycle"] = getattr(o, "cycle", 0)
             order_data["matched_buy_price"] = getattr(o, "matched_buy_price", None)
             order_data["matched_sell_price"] = getattr(o, "matched_sell_price", None)
+            order_data["entry_filled_at"] = getattr(o, "entry_filled_at", 0.0)
         orders.append(order_data)
     orders.sort(key=lambda x: x["price"], reverse=True)
 
@@ -116,7 +117,8 @@ def serialize_state(state: grid_strategy.GridState, current_price: float) -> dic
         for f in state.recent_fills if f.get("profit", 0) != 0
     ]
 
-    return {
+    result = {
+        "server_time": round(now, 1),
         "price": {
             "current": round(current_price, 6),
             "center": round(state.center_price, 6),
@@ -197,8 +199,8 @@ def serialize_state(state: grid_strategy.GridState, current_price: float) -> dic
                 "trade_id": r.trade_id,
                 "cycle": r.cycle,
                 "entry_price": round(r.entry_price, 6),
-                "age_minutes": round((time.time() - r.created_at) / 60, 1)
-                    if r.created_at > 0 else 0,
+                "age_minutes": round((time.time() - r.orphaned_at) / 60, 1)
+                    if r.orphaned_at > 0 else 0,
                 "unrealized_pnl": round(r.unrealized_pnl(current_price), 4),
             }
             for r in getattr(state, "recovery_orders", [])
@@ -209,7 +211,22 @@ def serialize_state(state: grid_strategy.GridState, current_price: float) -> dic
             "total_losses": getattr(state, "total_recovery_losses", 0),
             "total_wins": round(getattr(state, "total_recovery_wins", 0.0), 4),
         } if is_pair_mode else None,
+        # Exit lifecycle (Section 12)
+        "detected_trend": getattr(state, "detected_trend", None),
+        "s2_entered_at": getattr(state, "s2_entered_at", None),
+        "s2_age_minutes": round((time.time() - state.s2_entered_at) / 60, 1)
+            if is_pair_mode and getattr(state, "s2_entered_at", None) else None,
+        "exit_thresholds": None,
     }
+    # Compute exit thresholds for dashboard display
+    if is_pair_mode and getattr(state, "pair_stats", None):
+        th = grid_strategy.compute_exit_thresholds(state.pair_stats)
+        if th:
+            result["exit_thresholds"] = {
+                "reprice_min": round(th["reprice_after"] / 60, 1),
+                "orphan_min": round(th["orphan_after"] / 60, 1),
+            }
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +315,12 @@ a{color:#58a6ff}
 .pair-state-bar.ps-S1a{border-color:#9e6a03} .pair-state-bar.ps-S1a .ps-state{color:#e3b341}
 .pair-state-bar.ps-S1b{border-color:#9e6a03} .pair-state-bar.ps-S1b .ps-state{color:#e3b341}
 .pair-state-bar.ps-S2{border-color:#da3633} .pair-state-bar.ps-S2 .ps-state{color:#f85149}
+.ps-trend{font-size:12px;margin-top:4px;font-weight:600}
+.ps-s2-timer{font-size:11px;color:#8b949e;margin-top:4px}
+.exit-age-badge{display:inline-block;font-size:10px;padding:1px 6px;border-radius:3px;margin-left:6px;font-weight:600}
+.exit-age-badge.ok{background:#238636;color:#3fb950}
+.exit-age-badge.warn{background:#9e6a03;color:#e3b341}
+.exit-age-badge.danger{background:#da3633;color:#f85149}
 .recovery-panel{background:#161b22;border:2px solid #9e6a03;border-radius:8px;padding:14px 20px;margin-bottom:20px}
 .recovery-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
 .recovery-title{font-size:14px;font-weight:700;color:#e3b341}
@@ -546,6 +569,8 @@ a{color:#58a6ff}
   <div class="ps-label">State Machine</div>
   <div class="ps-state" id="ps-state">S0</div>
   <div class="ps-desc" id="ps-desc">Both entries open</div>
+  <div class="ps-trend" id="ps-trend" style="display:none"></div>
+  <div class="ps-s2-timer" id="ps-s2-timer" style="display:none"></div>
 </div>
 
 <!-- Recovery Orders Panel (pair mode, conditional) -->
@@ -766,6 +791,26 @@ function fmtDuration(sec) {
 function fmtPct(n) { return n != null ? n.toFixed(1) + '%' : '\u2014'; }
 function fmtStatUSD(n) { return n != null ? fmtUSD(n) : '\u2014'; }
 function fmtStatNum(n, d) { return n != null ? n.toFixed(d) : '\u2014'; }
+function _exitAgeBadge(order, data) {
+  if (!order || !order.entry_filled_at || order.entry_filled_at === 0) return null;
+  const role = order.role || '';
+  if (role !== 'exit') return null;
+  const ageSec = (data.server_time || Date.now()/1000) - order.entry_filled_at;
+  if (ageSec <= 0) return null;
+  const ageMin = ageSec / 60;
+  const th = data.exit_thresholds;
+  let cls = 'ok';
+  if (th) {
+    if (ageMin >= th.orphan_min) cls = 'danger';
+    else if (ageMin >= th.reprice_min) cls = 'warn';
+  } else if (ageMin >= 120) cls = 'danger';
+  else if (ageMin >= 60) cls = 'warn';
+  const txt = ageMin < 60 ? fmt(ageMin,0) + 'm' : fmt(ageMin/60,1) + 'h';
+  const badge = document.createElement('span');
+  badge.className = 'exit-age-badge ' + cls;
+  badge.textContent = txt;
+  return badge;
+}
 // Local uptime ticker -- set base once, tick locally, resync only on bot restart
 let _lastServerUptime = 0;
 let _lastServerUptimeAt = 0;
@@ -1471,6 +1516,36 @@ function update(data) {
     document.getElementById('ps-state').textContent = ps;
     document.getElementById('ps-desc').textContent = psDesc;
 
+    // Trend indicator
+    const trendEl = document.getElementById('ps-trend');
+    const trend = data.detected_trend;
+    if (trend) {
+      trendEl.style.display = '';
+      const arrow = trend === 'up' ? '\u2191' : '\u2193';
+      trendEl.textContent = arrow + ' ' + trend.toUpperCase() + ' trend detected';
+      trendEl.style.color = trend === 'up' ? '#3fb950' : '#f85149';
+    } else {
+      trendEl.style.display = 'none';
+    }
+
+    // S2 timer
+    const s2Timer = document.getElementById('ps-s2-timer');
+    if (ps === 'S2' && data.s2_age_minutes != null) {
+      s2Timer.style.display = '';
+      const ageM = data.s2_age_minutes;
+      const th = data.exit_thresholds;
+      const ageTxt = ageM < 60 ? fmt(ageM, 0) + 'm' : fmt(ageM / 60, 1) + 'h';
+      let timerTxt = 'S2 for ' + ageTxt;
+      if (th && th.orphan_min) {
+        const remain = th.orphan_min - ageM;
+        if (remain > 0) timerTxt += ' \u2014 break-glass in ' + fmt(remain, 0) + 'm';
+        else timerTxt += ' \u2014 break-glass active';
+      }
+      s2Timer.textContent = timerTxt;
+    } else {
+      s2Timer.style.display = 'none';
+    }
+
     // Trade A/B panels
     ppDiv.style.display = 'grid';
     const cycles = data.completed_cycles || [];
@@ -1494,6 +1569,12 @@ function update(data) {
 
     document.getElementById('pp-a-cycle').textContent = '#' + (data.cycle_a || 1);
     document.getElementById('pp-a-leg').textContent = aLeg;
+    // Exit age badge for Trade A
+    const aLegEl = document.getElementById('pp-a-leg');
+    const aExitAge = _exitAgeBadge(aOrder, data);
+    const oldBadgeA = aLegEl.parentElement.querySelector('.exit-age-badge');
+    if (oldBadgeA) oldBadgeA.remove();
+    if (aExitAge) aLegEl.parentElement.appendChild(aExitAge);
     document.getElementById('pp-a-entry').textContent = aEntry ? '$' + fmt(aEntry, 6) : '--';
     document.getElementById('pp-a-target').textContent = aTarget ? '$' + fmt(aTarget, 6) : '--';
     document.getElementById('pp-a-dist').textContent = aDist != null ? fmt(aDist, 2) + '%' : '--';
@@ -1513,6 +1594,12 @@ function update(data) {
 
     document.getElementById('pp-b-cycle').textContent = '#' + (data.cycle_b || 1);
     document.getElementById('pp-b-leg').textContent = bLeg;
+    // Exit age badge for Trade B
+    const bLegEl = document.getElementById('pp-b-leg');
+    const bExitAge = _exitAgeBadge(bOrder, data);
+    const oldBadgeB = bLegEl.parentElement.querySelector('.exit-age-badge');
+    if (oldBadgeB) oldBadgeB.remove();
+    if (bExitAge) bLegEl.parentElement.appendChild(bExitAge);
     document.getElementById('pp-b-entry').textContent = bEntry ? '$' + fmt(bEntry, 6) : '--';
     document.getElementById('pp-b-target').textContent = bTarget ? '$' + fmt(bTarget, 6) : '--';
     document.getElementById('pp-b-dist').textContent = bDist != null ? fmt(bDist, 2) + '%' : '--';

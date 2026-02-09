@@ -1855,19 +1855,23 @@ def run():
                     grid_strategy.prune_completed_orders(state)
                     grid_strategy.save_state(state)
 
-                # --- 4d2: Recovery order checks ---
+                # --- 4d2: Exit lifecycle + recovery (Section 12) ---
                 if config.STRATEGY_MODE == "pair" and config.RECOVERY_ENABLED:
-                    recovery_changed = False
+                    lifecycle_changed = False
                     # Check for surprise fills on recovery orders
                     cached_info = getattr(state, "_cached_order_info", None) or {}
                     if grid_strategy.check_recovery_fills(state, cached_info):
-                        recovery_changed = True
-                    # Check for timed-out exits to move to recovery
-                    new_recovery_entries = grid_strategy.check_recovery_timeout(
-                        state, current_price)
-                    if new_recovery_entries:
-                        recovery_changed = True
-                    if recovery_changed:
+                        lifecycle_changed = True
+                    # S1a/S1b: reprice stale exits (Section 12.2)
+                    if grid_strategy.check_stale_exits(state, current_price):
+                        lifecycle_changed = True
+                    # S2: break-glass protocol (Section 12.3)
+                    if grid_strategy.check_s2_break_glass(state, current_price):
+                        lifecycle_changed = True
+                    # Fallback: orphan exits past orphan threshold
+                    if grid_strategy.check_recovery_timeout(state, current_price):
+                        lifecycle_changed = True
+                    if lifecycle_changed:
                         grid_strategy.save_state(state)
 
                 # --- 4e: Check grid drift ---

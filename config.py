@@ -258,24 +258,39 @@ AI_API_URL: str = _env("AI_API_URL", "https://integrate.api.nvidia.com/v1/chat/c
 AI_MODEL: str = _env("AI_MODEL", "meta/llama-3.1-8b-instruct")
 
 # ---------------------------------------------------------------------------
-# Recovery orders (cascading trades for stranded exits)
+# Exit lifecycle management (Section 12: repricing, S2 break-glass, recovery)
 # ---------------------------------------------------------------------------
 
-# Enable/disable recovery system.  When disabled, stranded exits stay as-is.
+# Enable/disable the exit lifecycle system. When disabled, exits stay as-is.
 RECOVERY_ENABLED: bool = _env("RECOVERY_ENABLED", True, bool)
 
-# Max recovery orders kept per pair.  Oldest is cancelled when cap is hit.
+# Max orphaned exits kept on Kraken book per pair.
 MAX_RECOVERY_SLOTS: int = _env("MAX_RECOVERY_SLOTS", 2, int)
 
-# Timeout multiplier: timeout = median_duration * this (when <10 cycles)
-RECOVERY_TIMEOUT_MULTIPLIER: float = _env("RECOVERY_TIMEOUT_MULTIPLIER", 3.0, float)
+# Reprice exit after this × median_duration_sec.
+EXIT_REPRICE_MULTIPLIER: float = _env("EXIT_REPRICE_MULTIPLIER", 1.5, float)
 
-# Fallback timeout (seconds) when fewer than RECOVERY_MIN_DATA_POINTS cycles.
-# 7200 = 2 hours.
+# Orphan exit after this × median_duration_sec.
+EXIT_ORPHAN_MULTIPLIER: float = _env("EXIT_ORPHAN_MULTIPLIER", 5.0, float)
+
+# Max tolerable spread between exits in S2 (%) before break-glass triggers.
+S2_MAX_SPREAD_PCT: float = _env("S2_MAX_SPREAD_PCT", 3.0, float)
+
+# Min seconds between reprices of the same exit.
+REPRICE_COOLDOWN_SEC: float = _env("REPRICE_COOLDOWN_SEC", 120.0, float)
+
+# Min completed cycles before timing-based logic activates.
+MIN_CYCLES_FOR_TIMING: int = _env("MIN_CYCLES_FOR_TIMING", 5, int)
+
+# Entry distance multiplier for with-trend side (0.3-0.8).
+# Closer to 0 = more aggressive trend-following.
+DIRECTIONAL_ASYMMETRY: float = _env("DIRECTIONAL_ASYMMETRY", 0.5, float)
+
+# Fallback timeout (seconds) when fewer than MIN_CYCLES_FOR_TIMING cycles.
 RECOVERY_FALLBACK_TIMEOUT_SEC: float = _env("RECOVERY_FALLBACK_TIMEOUT_SEC", 7200.0, float)
 
-# Minimum completed cycles before using statistical timeout instead of fallback.
-RECOVERY_MIN_DATA_POINTS: int = _env("RECOVERY_MIN_DATA_POINTS", 5, int)
+# S2 fallback timeout (seconds) when no PairStats yet.
+S2_FALLBACK_TIMEOUT_SEC: float = _env("S2_FALLBACK_TIMEOUT_SEC", 600.0, float)
 
 # ---------------------------------------------------------------------------
 # Multi-pair configuration
