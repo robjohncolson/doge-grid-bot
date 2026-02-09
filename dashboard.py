@@ -187,6 +187,28 @@ def serialize_state(state: grid_strategy.GridState, current_price: float) -> dic
         },
         # New: stats results
         "stats": state.stats_results if state.stats_results else {},
+        # Recovery orders
+        "recovery_orders": [
+            {
+                "txid": r.txid,
+                "side": r.side,
+                "price": round(r.price, 6),
+                "volume": round(r.volume, 2),
+                "trade_id": r.trade_id,
+                "cycle": r.cycle,
+                "entry_price": round(r.entry_price, 6),
+                "age_minutes": round((time.time() - r.created_at) / 60, 1)
+                    if r.created_at > 0 else 0,
+                "unrealized_pnl": round(r.unrealized_pnl(current_price), 4),
+            }
+            for r in getattr(state, "recovery_orders", [])
+        ] if is_pair_mode else [],
+        "recovery_stats": {
+            "active_count": len(getattr(state, "recovery_orders", [])),
+            "max_slots": config.MAX_RECOVERY_SLOTS,
+            "total_losses": getattr(state, "total_recovery_losses", 0),
+            "total_wins": round(getattr(state, "total_recovery_wins", 0.0), 4),
+        } if is_pair_mode else None,
     }
 
 
@@ -276,6 +298,13 @@ a{color:#58a6ff}
 .pair-state-bar.ps-S1a{border-color:#9e6a03} .pair-state-bar.ps-S1a .ps-state{color:#e3b341}
 .pair-state-bar.ps-S1b{border-color:#9e6a03} .pair-state-bar.ps-S1b .ps-state{color:#e3b341}
 .pair-state-bar.ps-S2{border-color:#da3633} .pair-state-bar.ps-S2 .ps-state{color:#f85149}
+.recovery-panel{background:#161b22;border:2px solid #9e6a03;border-radius:8px;padding:14px 20px;margin-bottom:20px}
+.recovery-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.recovery-title{font-size:14px;font-weight:700;color:#e3b341}
+.recovery-stats{font-size:11px;color:#8b949e}
+.recovery-table{width:100%;border-collapse:collapse;font-size:12px}
+.recovery-table th{color:#8b949e;text-align:left;padding:4px 8px;border-bottom:1px solid #30363d;font-weight:400;text-transform:uppercase;font-size:10px;letter-spacing:1px}
+.recovery-table td{padding:4px 8px;border-bottom:1px solid #21262d;color:#c9d1d9}
 
 /* Trade A/B panels */
 .pair-panels{display:none;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px}
@@ -517,6 +546,18 @@ a{color:#58a6ff}
   <div class="ps-label">State Machine</div>
   <div class="ps-state" id="ps-state">S0</div>
   <div class="ps-desc" id="ps-desc">Both entries open</div>
+</div>
+
+<!-- Recovery Orders Panel (pair mode, conditional) -->
+<div class="recovery-panel" id="recovery-panel" style="display:none">
+  <div class="recovery-header">
+    <span class="recovery-title" id="recovery-title">Recovery Orders (0/2 slots)</span>
+    <span class="recovery-stats" id="recovery-stats"></span>
+  </div>
+  <table class="recovery-table">
+    <thead><tr><th>Trade</th><th>Side</th><th>Exit Price</th><th>Entry Price</th><th>Age</th><th>Unrealized P&amp;L</th></tr></thead>
+    <tbody id="recovery-body"></tbody>
+  </table>
 </div>
 
 <!-- Trade A/B Panels (pair mode only) -->
@@ -1480,6 +1521,35 @@ function update(data) {
     document.getElementById('pp-b-pnl').textContent = fmtUSD(bNet);
     document.getElementById('pp-b-pnl').style.color = bNet >= 0 ? '#3fb950' : '#f85149';
     document.getElementById('pp-b-avg').textContent = fmtUSD(bAvg);
+
+    // Recovery orders panel
+    const recPanel = document.getElementById('recovery-panel');
+    const recOrders = data.recovery_orders || [];
+    const recStats = data.recovery_stats || {};
+    if (recOrders.length > 0) {
+      recPanel.style.display = 'block';
+      document.getElementById('recovery-title').textContent =
+        'Recovery Orders (' + recStats.active_count + '/' + recStats.max_slots + ' slots)';
+      const statsText = (recStats.total_wins ? 'Recovered: ' + fmtUSD(recStats.total_wins) + '  ' : '') +
+                         (recStats.total_losses ? 'Evicted: ' + recStats.total_losses : '');
+      document.getElementById('recovery-stats').textContent = statsText;
+      let rrows = '';
+      for (const r of recOrders) {
+        const pnlColor = r.unrealized_pnl >= 0 ? '#3fb950' : '#f85149';
+        const ageTxt = r.age_minutes < 60 ? fmt(r.age_minutes,0) + 'm' : fmt(r.age_minutes/60,1) + 'h';
+        rrows += '<tr>';
+        rrows += '<td>' + r.trade_id + '.' + r.cycle + '</td>';
+        rrows += '<td>' + r.side.toUpperCase() + '</td>';
+        rrows += '<td>$' + fmt(r.price, 6) + '</td>';
+        rrows += '<td>$' + fmt(r.entry_price, 6) + '</td>';
+        rrows += '<td>' + ageTxt + '</td>';
+        rrows += '<td style="color:' + pnlColor + '">' + fmtUSD(r.unrealized_pnl) + '</td>';
+        rrows += '</tr>';
+      }
+      document.getElementById('recovery-body').innerHTML = rrows;
+    } else {
+      recPanel.style.display = 'none';
+    }
 
     // Unrealized P&L card
     const uCard = document.getElementById('c-unreal-card');

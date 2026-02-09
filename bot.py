@@ -1738,6 +1738,10 @@ def run():
                     for o in st.grid_orders:
                         if o.status == "open" and o.txid:
                             all_txids[o.txid] = pn
+                    # Include recovery order txids for fill detection
+                    for r in st.recovery_orders:
+                        if r.txid:
+                            all_txids[r.txid] = pn
                 if all_txids:
                     try:
                         batch_order_info = kraken_client.query_orders_batched(list(all_txids.keys()))
@@ -1850,6 +1854,21 @@ def run():
 
                     grid_strategy.prune_completed_orders(state)
                     grid_strategy.save_state(state)
+
+                # --- 4d2: Recovery order checks ---
+                if config.STRATEGY_MODE == "pair" and config.RECOVERY_ENABLED:
+                    recovery_changed = False
+                    # Check for surprise fills on recovery orders
+                    cached_info = getattr(state, "_cached_order_info", None) or {}
+                    if grid_strategy.check_recovery_fills(state, cached_info):
+                        recovery_changed = True
+                    # Check for timed-out exits to move to recovery
+                    new_recovery_entries = grid_strategy.check_recovery_timeout(
+                        state, current_price)
+                    if new_recovery_entries:
+                        recovery_changed = True
+                    if recovery_changed:
+                        grid_strategy.save_state(state)
 
                 # --- 4e: Check grid drift ---
                 if grid_strategy.check_grid_drift(state, current_price):

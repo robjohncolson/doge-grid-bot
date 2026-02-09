@@ -258,6 +258,26 @@ AI_API_URL: str = _env("AI_API_URL", "https://integrate.api.nvidia.com/v1/chat/c
 AI_MODEL: str = _env("AI_MODEL", "meta/llama-3.1-8b-instruct")
 
 # ---------------------------------------------------------------------------
+# Recovery orders (cascading trades for stranded exits)
+# ---------------------------------------------------------------------------
+
+# Enable/disable recovery system.  When disabled, stranded exits stay as-is.
+RECOVERY_ENABLED: bool = _env("RECOVERY_ENABLED", True, bool)
+
+# Max recovery orders kept per pair.  Oldest is cancelled when cap is hit.
+MAX_RECOVERY_SLOTS: int = _env("MAX_RECOVERY_SLOTS", 2, int)
+
+# Timeout multiplier: timeout = median_duration * this (when <10 cycles)
+RECOVERY_TIMEOUT_MULTIPLIER: float = _env("RECOVERY_TIMEOUT_MULTIPLIER", 3.0, float)
+
+# Fallback timeout (seconds) when fewer than RECOVERY_MIN_DATA_POINTS cycles.
+# 7200 = 2 hours.
+RECOVERY_FALLBACK_TIMEOUT_SEC: float = _env("RECOVERY_FALLBACK_TIMEOUT_SEC", 7200.0, float)
+
+# Minimum completed cycles before using statistical timeout instead of fallback.
+RECOVERY_MIN_DATA_POINTS: int = _env("RECOVERY_MIN_DATA_POINTS", 5, int)
+
+# ---------------------------------------------------------------------------
 # Multi-pair configuration
 # ---------------------------------------------------------------------------
 

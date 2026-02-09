@@ -792,7 +792,7 @@ class PairStats:
         "n_total", "n_trade_a", "n_trade_b",
         "total_net", "mean_net", "stdev_net", "median_net",
         "win_count", "loss_count", "win_rate", "profit_factor",
-        "mean_duration_sec", "median_duration_sec",
+        "mean_duration_sec", "median_duration_sec", "stdev_duration_sec",
         "max_drawdown", "current_drawdown",
         "ci_95_lower", "ci_95_upper",
         "entries_placed", "entries_filled", "fill_rate",
@@ -816,6 +816,7 @@ class PairStats:
         self.profit_factor = None
         self.mean_duration_sec = None
         self.median_duration_sec = None
+        self.stdev_duration_sec = None
         self.max_drawdown = None
         self.current_drawdown = None
         self.ci_95_lower = None
@@ -887,6 +888,9 @@ def compute_pair_stats(completed_cycles, state=None) -> PairStats:
             ps.median_duration_sec = sorted_dur[nd // 2]
         else:
             ps.median_duration_sec = (sorted_dur[nd // 2 - 1] + sorted_dur[nd // 2]) / 2.0
+        if len(sorted_dur) >= 2:
+            dur_var = sum((d - ps.mean_duration_sec) ** 2 for d in sorted_dur) / (len(sorted_dur) - 1)
+            ps.stdev_duration_sec = math.sqrt(dur_var) if dur_var > 0 else 0.0
 
     # Max drawdown: walk cumulative P&L, track peak-to-trough
     cum = 0.0
@@ -922,7 +926,8 @@ def compute_pair_stats(completed_cycles, state=None) -> PairStats:
     # Round float fields (skip None values)
     for attr in ("total_net", "mean_net", "stdev_net", "median_net",
                  "win_rate", "profit_factor", "mean_duration_sec",
-                 "median_duration_sec", "max_drawdown", "current_drawdown"):
+                 "median_duration_sec", "stdev_duration_sec",
+                 "max_drawdown", "current_drawdown"):
         val = getattr(ps, attr)
         if val is not None:
             setattr(ps, attr, round(val, 6))

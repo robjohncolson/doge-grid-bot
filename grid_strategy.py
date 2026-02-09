@@ -113,6 +113,66 @@ class CompletedCycle:
                 f"${self.exit_price:.6f} net=${self.net_profit:.4f})")
 
 
+class RecoveryOrder:
+    """
+    A stranded exit order moved off the pair state machine.
+    The order stays on Kraken's book as a lottery ticket.
+    Only cancelled when evicted from recovery slots.
+    """
+    def __init__(self, txid, side, price, volume, trade_id, cycle,
+                 entry_price, created_at=0.0, entry_filled_at=0.0):
+        self.txid = txid
+        self.side = side              # "buy" or "sell" (exit side)
+        self.price = price            # exit limit price
+        self.volume = volume
+        self.trade_id = trade_id      # "A" or "B"
+        self.cycle = cycle
+        self.entry_price = entry_price
+        self.created_at = created_at or time.time()
+        self.entry_filled_at = entry_filled_at
+
+    def to_dict(self) -> dict:
+        return {
+            "txid": self.txid,
+            "side": self.side,
+            "price": self.price,
+            "volume": self.volume,
+            "trade_id": self.trade_id,
+            "cycle": self.cycle,
+            "entry_price": self.entry_price,
+            "created_at": self.created_at,
+            "entry_filled_at": self.entry_filled_at,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "RecoveryOrder":
+        return RecoveryOrder(
+            txid=d.get("txid"),
+            side=d.get("side", ""),
+            price=d.get("price", 0.0),
+            volume=d.get("volume", 0.0),
+            trade_id=d.get("trade_id", "?"),
+            cycle=d.get("cycle", 0),
+            entry_price=d.get("entry_price", 0.0),
+            created_at=d.get("created_at", 0.0),
+            entry_filled_at=d.get("entry_filled_at", 0.0),
+        )
+
+    def unrealized_pnl(self, current_price: float) -> float:
+        """Unrealized P&L if exit were to fill at its limit price."""
+        if self.side == "sell":
+            # Trade B recovery: bought at entry_price, selling at self.price
+            return (self.price - self.entry_price) * self.volume
+        else:
+            # Trade A recovery: sold at entry_price, buying at self.price
+            return (self.entry_price - self.price) * self.volume
+
+    def __repr__(self):
+        return (f"RecoveryOrder({self.trade_id}.{self.cycle} "
+                f"{self.side} exit @ ${self.price:.6f} "
+                f"entry=${self.entry_price:.6f} txid={self.txid})")
+
+
 class GridOrder:
     """
     Represents one order in the grid.
@@ -147,6 +207,7 @@ class GridOrder:
         self.matched_sell_price = None     # For buy exits: the sell price this buy is paired with
         self.trade_id = None               # "A" (short/sell-entry) or "B" (long/buy-entry)
         self.cycle = 0                     # Increments each completed round trip
+        self.entry_filled_at = 0.0         # When the entry fill created this exit (for recovery timeout)
 
     def __repr__(self):
         tid = f" {self.trade_id}.{self.cycle}" if self.trade_id else ""
@@ -233,6 +294,11 @@ class GridState:
         self.last_refresh_direction_b = None
         self.refresh_cooldown_until_a = 0.0
         self.refresh_cooldown_until_b = 0.0
+
+        # Recovery orders: stranded exits moved off the state machine
+        self.recovery_orders: list = []      # List[RecoveryOrder]
+        self.total_recovery_losses = 0       # Count of cancelled/expired recovery orders
+        self.total_recovery_wins = 0.0       # Net profit from surprise recovery fills
 
     # -- Per-pair property accessors (fall back to global config) --
 
@@ -366,6 +432,7 @@ def save_state(state: GridState):
                 "cycle": getattr(o, "cycle", 0),
                 "matched_buy_price": o.matched_buy_price,
                 "matched_sell_price": getattr(o, "matched_sell_price", None),
+                "entry_filled_at": getattr(o, "entry_filled_at", 0.0),
             })
 
     snapshot = {
@@ -406,6 +473,9 @@ def save_state(state: GridState):
         "pair_profit_pct": state.profit_pct,
         "pair_entry_pct": state.entry_pct,
         "next_entry_multiplier": state.next_entry_multiplier,
+        "recovery_orders": [r.to_dict() for r in state.recovery_orders],
+        "total_recovery_losses": state.total_recovery_losses,
+        "total_recovery_wins": state.total_recovery_wins,
     }
     state_path = _state_file_path(state)
     tmp_path = state_path + ".tmp"
@@ -477,6 +547,14 @@ def load_state(state: GridState) -> bool:
     state.last_refresh_direction_b = snapshot.get("last_refresh_direction_b", None)
     state.refresh_cooldown_until_a = snapshot.get("refresh_cooldown_until_a", 0.0)
     state.refresh_cooldown_until_b = snapshot.get("refresh_cooldown_until_b", 0.0)
+
+    # Restore recovery orders
+    saved_recovery = snapshot.get("recovery_orders", [])
+    state.recovery_orders = [RecoveryOrder.from_dict(r) for r in saved_recovery]
+    state.total_recovery_losses = snapshot.get("total_recovery_losses", 0)
+    state.total_recovery_wins = snapshot.get("total_recovery_wins", 0.0)
+    if state.recovery_orders:
+        logger.info("Restored %d recovery orders", len(state.recovery_orders))
 
     # Restore entry multiplier
     saved_mult = snapshot.get("next_entry_multiplier", 1.0)
@@ -2477,6 +2555,7 @@ def handle_pair_fill(state: GridState, filled_orders: list,
                 matched_buy=filled.price,
                 trade_id=tid, cycle=cyc)
             if o:
+                o.entry_filled_at = time.time()
                 new_orders.append(o)
 
         # ---------------------------------------------------------------
@@ -2606,6 +2685,7 @@ def handle_pair_fill(state: GridState, filled_orders: list,
                 matched_sell=filled.price,
                 trade_id=tid, cycle=cyc)
             if o:
+                o.entry_filled_at = time.time()
                 new_orders.append(o)
 
         # ---------------------------------------------------------------
@@ -2900,6 +2980,276 @@ def refresh_stale_entries(state: GridState, current_price: float) -> bool:
     return refreshed
 
 
+# ---------------------------------------------------------------------------
+# Recovery orders -- cascading trades for stranded exits
+# ---------------------------------------------------------------------------
+
+def _cancel_oldest_recovery(state: GridState):
+    """Cancel the oldest recovery order on Kraken and remove from list."""
+    if not state.recovery_orders:
+        return
+    oldest = state.recovery_orders[0]
+    logger.info(
+        "Recovery: evicting oldest [%s.%d] %s @ $%.6f (txid=%s)",
+        oldest.trade_id, oldest.cycle, oldest.side, oldest.price, oldest.txid,
+    )
+    if not config.DRY_RUN:
+        try:
+            kraken_client.cancel_order(oldest.txid)
+        except Exception as e:
+            logger.warning("Recovery: failed to cancel evicted order %s: %s",
+                           oldest.txid, e)
+    state.total_recovery_losses += 1
+    state.recovery_orders.pop(0)
+
+
+def check_recovery_fills(state: GridState, order_info: dict) -> bool:
+    """
+    Check recovery orders against batch order query results.
+    Processes surprise fills (closed) and external cancellations.
+    Returns True if any recovery orders changed (caller should save state).
+    """
+    if not state.recovery_orders or not order_info:
+        return False
+
+    changed = False
+    keep = []
+    for r in state.recovery_orders:
+        info = order_info.get(r.txid)
+        if info is None:
+            # Not in batch results -- keep it (might be queried next cycle)
+            keep.append(r)
+            continue
+
+        status = info.get("status", "")
+        if status == "closed":
+            # Surprise fill!  Book the round-trip P&L.
+            fill_price = float(info.get("price", r.price))
+            fill_vol = float(info.get("vol_exec", r.volume))
+            if r.side == "sell":
+                # Trade B recovery: bought at entry_price, sold at fill_price
+                gross = (fill_price - r.entry_price) * fill_vol
+            else:
+                # Trade A recovery: sold at entry_price, bought at fill_price
+                gross = (r.entry_price - fill_price) * fill_vol
+            fees = (r.entry_price * fill_vol * config.MAKER_FEE_PCT / 100.0 +
+                    fill_price * fill_vol * config.MAKER_FEE_PCT / 100.0)
+            net = gross - fees
+            state.total_profit_usd += net
+            state.today_profit_usd += net
+            state.total_fees_usd += fees
+            state.today_fees_usd += fees
+            state.total_round_trips += 1
+            state.round_trips_today += 1
+            state.total_recovery_wins += net
+            if net < 0:
+                state.today_loss_usd += abs(net)
+
+            logger.info(
+                "RECOVERY FILL [%s.%d]! %s @ $%.6f (entry $%.6f) "
+                "-> net $%.4f | Total: $%.4f",
+                r.trade_id, r.cycle, r.side, fill_price, r.entry_price,
+                net, state.total_profit_usd,
+            )
+
+            # Record as completed cycle
+            entry_side = "buy" if r.side == "sell" else "sell"
+            state.completed_cycles.append(CompletedCycle(
+                trade_id=r.trade_id, cycle=r.cycle, entry_side=entry_side,
+                entry_price=r.entry_price, exit_price=fill_price,
+                volume=fill_vol, gross_profit=gross, fees=fees,
+                net_profit=net,
+                entry_time=r.entry_filled_at, exit_time=time.time(),
+            ))
+            _trim_completed_cycles(state)
+
+            # Log fill
+            state.recent_fills.append({
+                "time": time.time(), "side": r.side,
+                "price": fill_price, "volume": fill_vol,
+                "profit": net, "fees": fees,
+                "trade_id": r.trade_id, "cycle": r.cycle,
+                "order_role": "exit", "entry_price": r.entry_price,
+                "recovery": True,
+            })
+            supabase_store.save_fill(state.recent_fills[-1], pair=state.pair_name,
+                                     trade_id=r.trade_id, cycle=r.cycle)
+            _log_trade_from_recovery(r, net, fees)
+            changed = True
+
+        elif status in ("canceled", "expired"):
+            logger.warning(
+                "Recovery: [%s.%d] %s @ $%.6f was %s externally (txid=%s)",
+                r.trade_id, r.cycle, r.side, r.price, status, r.txid,
+            )
+            state.total_recovery_losses += 1
+            changed = True
+
+        else:
+            # Still open -- keep it
+            keep.append(r)
+
+    state.recovery_orders = keep
+    return changed
+
+
+def _log_trade_from_recovery(r, net_profit, fees):
+    """Log a recovery fill to the trade CSV."""
+    _ensure_log_dir()
+    try:
+        log_path = os.path.join(config.LOG_DIR, "trades.csv")
+        file_exists = os.path.exists(log_path)
+        with open(log_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(["time", "side", "price", "volume",
+                                 "net_profit", "fees", "type"])
+            writer.writerow([
+                datetime.now(timezone.utc).isoformat(),
+                r.side, f"{r.price:.6f}", f"{r.volume:.2f}",
+                f"{net_profit:.6f}", f"{fees:.6f}", "recovery",
+            ])
+    except Exception as e:
+        logger.debug("Failed to log recovery trade: %s", e)
+
+
+def check_recovery_timeout(state: GridState, current_price: float) -> list:
+    """
+    Check if any open exit orders have been waiting longer than statistically
+    expected.  If so, move them to recovery and place a fresh entry.
+
+    Timeout thresholds (tiered by data availability):
+      - >=10 cycles + stdev: mean + 2*stdev
+      - >=5 cycles:          median * RECOVERY_TIMEOUT_MULTIPLIER
+      - <5 cycles:           RECOVERY_FALLBACK_TIMEOUT_SEC
+
+    Returns list of new entry orders placed.
+    """
+    if not config.RECOVERY_ENABLED:
+        return []
+
+    now = time.time()
+    new_orders = []
+
+    # Compute timeout threshold
+    ps = state.pair_stats
+    min_dp = config.RECOVERY_MIN_DATA_POINTS
+    if (ps and ps.n_total >= 10
+            and ps.stdev_duration_sec is not None
+            and ps.mean_duration_sec is not None
+            and ps.stdev_duration_sec > 0):
+        timeout = ps.mean_duration_sec + 2 * ps.stdev_duration_sec
+    elif (ps and ps.n_total >= min_dp
+            and ps.median_duration_sec is not None
+            and ps.median_duration_sec > 0):
+        timeout = ps.median_duration_sec * config.RECOVERY_TIMEOUT_MULTIPLIER
+    else:
+        timeout = config.RECOVERY_FALLBACK_TIMEOUT_SEC
+
+    entry_pct = state.entry_pct
+    decimals = state.price_decimals
+
+    for o in list(state.grid_orders):
+        if o.status != "open" or o.order_role != "exit":
+            continue
+        if o.entry_filled_at <= 0:
+            continue  # Unknown age -- skip (backward compat)
+        exit_age = now - o.entry_filled_at
+        if exit_age < timeout:
+            continue
+
+        tid = getattr(o, "trade_id", None) or ("A" if o.side == "buy" else "B")
+        cyc = getattr(o, "cycle", 0)
+        entry_price = o.matched_sell_price if o.side == "buy" else o.matched_buy_price
+
+        logger.info(
+            "RECOVERY TIMEOUT [%s.%d]: %s exit @ $%.6f open %.0fs (threshold %.0fs) "
+            "-> moving to recovery, placing fresh entry",
+            tid, cyc, o.side, o.price, exit_age, timeout,
+        )
+
+        # Enforce recovery slot cap
+        if len(state.recovery_orders) >= config.MAX_RECOVERY_SLOTS:
+            _cancel_oldest_recovery(state)
+
+        # Create recovery order (order stays on Kraken book)
+        recovery = RecoveryOrder(
+            txid=o.txid, side=o.side, price=o.price, volume=o.volume,
+            trade_id=tid, cycle=cyc,
+            entry_price=entry_price or 0.0,
+            created_at=now, entry_filled_at=o.entry_filled_at,
+        )
+        state.recovery_orders.append(recovery)
+
+        # Remove exit from grid_orders (do NOT cancel on Kraken)
+        state.grid_orders.remove(o)
+
+        # Place fresh entry on that side
+        if o.side == "sell":
+            # Was Trade B's sell exit -> place new buy entry
+            new_entry_price = round(
+                current_price * (1 - entry_pct / 100.0), decimals)
+            new_cyc = cyc + 1
+            if tid == "B":
+                state.cycle_b = new_cyc
+            new_o = _place_pair_order(
+                state, "buy", new_entry_price, "entry",
+                trade_id=tid, cycle=new_cyc)
+        else:
+            # Was Trade A's buy exit -> place new sell entry
+            new_entry_price = round(
+                current_price * (1 + entry_pct / 100.0), decimals)
+            new_cyc = cyc + 1
+            if tid == "A":
+                state.cycle_a = new_cyc
+            new_o = _place_pair_order(
+                state, "sell", new_entry_price, "entry",
+                trade_id=tid, cycle=new_cyc)
+
+        if new_o:
+            new_orders.append(new_o)
+
+        # Reset anti-chase counters for this side
+        if tid == "A":
+            state.consecutive_refreshes_a = 0
+            state.last_refresh_direction_a = None
+            state.refresh_cooldown_until_a = 0.0
+        else:
+            state.consecutive_refreshes_b = 0
+            state.last_refresh_direction_b = None
+            state.refresh_cooldown_until_b = 0.0
+
+    # Recompute pair state after changes
+    if new_orders:
+        state.pair_state = _compute_pair_state(state)
+
+    return new_orders
+
+
+def _reconcile_recovery_orders(state: GridState):
+    """
+    Validate recovery orders against Kraken on startup.
+    Process fills, remove cancelled/expired, keep open.
+    """
+    if not state.recovery_orders:
+        return
+    if config.DRY_RUN:
+        return
+
+    logger.info("Reconciling %d recovery orders...", len(state.recovery_orders))
+    txids = [r.txid for r in state.recovery_orders if r.txid]
+    if not txids:
+        return
+
+    try:
+        order_info = kraken_client.query_orders_batched(txids)
+    except Exception as e:
+        logger.warning("Recovery reconciliation: query failed: %s", e)
+        return
+
+    check_recovery_fills(state, order_info)
+
+
 def _identify_order_3tier(order_info: dict, state: GridState,
                           saved_by_txid: dict, current_price: float) -> dict:
     """
@@ -3103,6 +3453,9 @@ def reconcile_pair_on_startup(state: GridState, current_price: float) -> int:
         order.cycle = identity["cycle"]
         order.matched_buy_price = identity["matched_buy_price"]
         order.matched_sell_price = identity["matched_sell_price"]
+        # Restore entry_filled_at from saved state (for recovery timeout tracking)
+        saved = saved_by_txid.get(o["txid"], {})
+        order.entry_filled_at = saved.get("entry_filled_at", 0.0)
 
         state.grid_orders.append(order)
         adopted += 1
@@ -3112,8 +3465,17 @@ def reconcile_pair_on_startup(state: GridState, current_price: float) -> int:
             o["volume"], o["price"], o["txid"], identity["method"],
         )
 
+    # Build set of recovery txids to protect from orphan cancellation
+    recovery_txids = {r.txid for r in state.recovery_orders if r.txid}
+
     for o in our_orders:
         if o["txid"] in keep_txids:
+            continue
+        if o["txid"] in recovery_txids:
+            logger.info(
+                "Pair reconcile: skipping recovery order %s %s @ $%.6f -> %s",
+                o["side"].upper(), o["role"], o["price"], o["txid"],
+            )
             continue
         logger.warning(
             "Pair reconcile: cancelling extra %s %s [orphan] @ $%.6f -> %s",
@@ -3129,6 +3491,9 @@ def reconcile_pair_on_startup(state: GridState, current_price: float) -> int:
 
     # Check trade history for fills that happened while bot was offline
     _reconcile_offline_fills(state, current_price)
+
+    # Validate recovery orders against Kraken (process offline fills/cancels)
+    _reconcile_recovery_orders(state)
 
     return adopted
 
