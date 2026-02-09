@@ -394,7 +394,6 @@ def save_state(state: GridState):
         "grid_spacing_pct": config.GRID_SPACING_PCT,
         "pair_profit_pct": state.profit_pct,
         "pair_entry_pct": state.entry_pct,
-        "ai_advisor_interval": config.AI_ADVISOR_INTERVAL,
     }
     state_path = _state_file_path(state)
     tmp_path = state_path + ".tmp"

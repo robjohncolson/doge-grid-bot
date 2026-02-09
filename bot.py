@@ -1229,13 +1229,7 @@ def _restore_from_supabase(state: grid_strategy.GridState):
             pair_name, state.entry_pct, saved_entry_pct,
         )
         state.entry_pct = saved_entry_pct
-    saved_ai_interval = sb_state.get("ai_advisor_interval")
-    if saved_ai_interval and saved_ai_interval != config.AI_ADVISOR_INTERVAL:
-        logger.info(
-            "[%s] Restoring AI interval from Supabase: %ds -> %ds",
-            pair_name, config.AI_ADVISOR_INTERVAL, saved_ai_interval,
-        )
-        config.AI_ADVISOR_INTERVAL = saved_ai_interval
+    # AI interval no longer restored (AI is manual-only now)
     logger.info(
         "[%s] State restored from Supabase: $%.4f profit, %d round trips",
         pair_name, state.total_profit_usd, state.total_round_trips,

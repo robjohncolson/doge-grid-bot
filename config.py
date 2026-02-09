@@ -381,7 +381,7 @@ def print_banner():
         f"  Stop floor:      ${STOP_FLOOR:.2f}",
         f"  Daily loss limit: ${DAILY_LOSS_LIMIT:.2f}",
         f"  Poll interval:   {POLL_INTERVAL_SECONDS}s",
-        f"  AI council:      every {AI_ADVISOR_INTERVAL // 60} min",
+        f"  AI council:      manual (/check or dashboard)",
         f"  Health port:     {HEALTH_PORT}",
         f"  Log level:       {LOG_LEVEL}",
         f"  Kraken key:      {'configured' if KRAKEN_API_KEY else 'NOT SET'}",
