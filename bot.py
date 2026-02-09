@@ -2224,9 +2224,16 @@ def run():
 
     for pair_name, state in _bot_states.items():
         grid_strategy.save_state(state)
-        logger.info("[%s] Cancelling open orders...", pair_name)
-        cancelled = grid_strategy.cancel_grid(state)
-        logger.info("[%s] Cancelled %d orders", pair_name, cancelled)
+        if not _shutdown_requested:
+            # Only cancel orders on error-limit shutdown (no restart expected).
+            # On SIGTERM (deploy/restart), leave orders on Kraken -- the new
+            # instance will re-adopt them via reconciliation.
+            logger.info("[%s] Cancelling open orders (error shutdown)...", pair_name)
+            cancelled = grid_strategy.cancel_grid(state)
+            logger.info("[%s] Cancelled %d orders", pair_name, cancelled)
+        else:
+            logger.info("[%s] Signal shutdown -- leaving orders on Kraken for re-adopt",
+                        pair_name)
         total_profit += state.total_profit_usd
         total_trips += state.total_round_trips
         total_fees += state.total_fees_usd
