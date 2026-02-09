@@ -3513,6 +3513,51 @@ def _orphan_exit(state, o, current_price, reason="timeout"):
     return new_o
 
 
+def check_exit_drift(state: GridState, current_price: float) -> bool:
+    """
+    Orphan any exit that has drifted too far from current market price.
+
+    If an exit is more than EXIT_DRIFT_MAX_PCT from price, it's dead money.
+    Cancel it (move to recovery) and place a fresh entry around the current price.
+    Returns True if any changes were made.
+    """
+    if not config.RECOVERY_ENABLED or current_price <= 0:
+        return False
+    max_drift = config.EXIT_DRIFT_MAX_PCT
+    if max_drift <= 0:
+        return False
+
+    changed = False
+    exit_orders = [o for o in state.grid_orders
+                   if o.status == "open" and getattr(o, "order_role", "") == "exit"]
+
+    for o in exit_orders:
+        drift_pct = abs(o.price - current_price) / current_price * 100.0
+        if drift_pct > max_drift:
+            tid = getattr(o, "trade_id", None) or ("A" if o.side == "buy" else "B")
+            cyc = getattr(o, "cycle", 0)
+            logger.info(
+                "EXIT DRIFT [%s]: %s exit [%s.%d] @ $%.6f is %.1f%% from market $%.6f "
+                "(max %.1f%%) -- orphaning and re-entering",
+                state.pair_display, o.side.upper(), tid, cyc,
+                o.price, drift_pct, current_price, max_drift,
+            )
+            new_entry = _orphan_exit(state, o, current_price, reason="drift")
+            if new_entry:
+                logger.info(
+                    "EXIT DRIFT [%s]: fresh %s entry [%s.%d] placed @ $%.6f",
+                    state.pair_display, new_entry.side.upper(),
+                    getattr(new_entry, "trade_id", "?"),
+                    getattr(new_entry, "cycle", 0),
+                    new_entry.price,
+                )
+            changed = True
+
+    if changed:
+        state.pair_state = _compute_pair_state(state)
+    return changed
+
+
 def check_stale_exits(state: GridState, current_price: float) -> bool:
     """
     Section 12.2: Single-exit repricing for S1a/S1b.

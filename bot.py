@@ -1934,6 +1934,16 @@ def run():
                 # --- 4d2: Exit lifecycle + recovery (Section 12) ---
                 if config.STRATEGY_MODE == "pair" and config.RECOVERY_ENABLED:
                     lifecycle_changed = False
+                    # Recompute pair_state from live orders (fixes stale state after restart)
+                    fresh_state = grid_strategy._compute_pair_state(state)
+                    if fresh_state != state.pair_state:
+                        logger.info("[%s] pair_state corrected: %s -> %s",
+                                    pair_name, state.pair_state, fresh_state)
+                        state.pair_state = fresh_state
+                        lifecycle_changed = True
+                    # Exit drift check: orphan exits too far from market
+                    if grid_strategy.check_exit_drift(state, current_price):
+                        lifecycle_changed = True
                     # Check for surprise fills on recovery orders
                     cached_info = getattr(state, "_cached_order_info", None) or {}
                     if grid_strategy.check_recovery_fills(state, cached_info):

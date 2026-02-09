@@ -292,6 +292,12 @@ RECOVERY_FALLBACK_TIMEOUT_SEC: float = _env("RECOVERY_FALLBACK_TIMEOUT_SEC", 720
 # S2 fallback timeout (seconds) when no PairStats yet.
 S2_FALLBACK_TIMEOUT_SEC: float = _env("S2_FALLBACK_TIMEOUT_SEC", 600.0, float)
 
+# Max distance (%) an exit can drift from market price before being orphaned.
+# If an exit is farther than this from current price, cancel it and re-enter.
+# This prevents capital from sitting dead in exits that will never fill.
+# At 2.5%: exit at $0.092 with market at $0.096 (4.2% away) gets orphaned.
+EXIT_DRIFT_MAX_PCT: float = _env("EXIT_DRIFT_MAX_PCT", 2.5, float)
+
 # ---------------------------------------------------------------------------
 # Entry backoff after consecutive losses
 # ---------------------------------------------------------------------------
