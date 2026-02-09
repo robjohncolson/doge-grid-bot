@@ -250,6 +250,52 @@ def serialize_factory_state(bot_states: dict, current_prices: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Diff computation (minimize SSE bandwidth)
+# ---------------------------------------------------------------------------
+
+def compute_diff(prev: dict, curr: dict) -> dict:
+    """
+    Compare two factory snapshots and return only changed machine states.
+    Returns a compact diff or None if nothing changed.
+    """
+    if not prev or not curr:
+        return curr
+
+    diff_pairs = []
+    prev_map = {p["pair_name"]: p for p in prev.get("pairs", [])}
+
+    for cp in curr.get("pairs", []):
+        pn = cp["pair_name"]
+        pp = prev_map.get(pn)
+        if not pp:
+            # New pair -- send full
+            diff_pairs.append(cp)
+            continue
+
+        changed_machines = {}
+        for mid, mdata in cp["machines"].items():
+            prev_mdata = pp["machines"].get(mid)
+            if mdata != prev_mdata:
+                changed_machines[mid] = mdata
+
+        if changed_machines or cp["price"] != pp["price"]:
+            diff_pairs.append({
+                "pair_name": pn,
+                "pair_display": cp["pair_display"],
+                "price": cp["price"],
+                "machines": changed_machines,
+                "orders": cp["orders"],
+                "trend": cp["trend"],
+                "thresholds": cp["thresholds"],
+            })
+
+    if not diff_pairs:
+        return None
+
+    return {"pairs": diff_pairs, "server_time": curr["server_time"], "is_diff": True}
+
+
+# ---------------------------------------------------------------------------
 # Factory HTML (Canvas visualization)
 # ---------------------------------------------------------------------------
 
@@ -393,10 +439,10 @@ const MACHINE_REG = {
 };
 
 // ─── Layout constants ──────────────────────────────────────────
-const MW = 130, MH = 60;  // machine size
-const BELT_GAP = 60;      // gap between machines (belt length)
-const ROW_GAP = 100;      // gap between rows
-const MARGIN = 80;        // layout margin
+const MW = 170, MH = 80;  // machine size
+const BELT_GAP = 70;      // gap between machines (belt length)
+const ROW_GAP = 120;      // gap between rows
+const MARGIN = 100;       // layout margin
 
 // ─── Factory layout definition (x,y in grid units) ────────────
 // Row 1 (main production line) - left to right
@@ -753,13 +799,13 @@ function drawMachine(node, t) {
 
     // State label
     ctx.fillStyle = C.label;
-    ctx.font = "bold 16px 'Cascadia Mono','Fira Code',monospace";
+    ctx.font = "bold 20px 'Cascadia Mono','Fira Code',monospace";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     ctx.fillText(ps, cx, cy);
 
     // Cycle labels
-    ctx.font = "9px 'Cascadia Mono','Fira Code',monospace";
+    ctx.font = "11px 'Cascadia Mono','Fira Code',monospace";
     ctx.fillStyle = C.sublabel;
     ctx.fillText("A:" + (data.cycle_a||1), cx - 20, cy + dh/2 + 12);
     ctx.fillText("B:" + (data.cycle_b||1), cx + 20, cy + dh/2 + 12);
@@ -808,21 +854,21 @@ function drawMachine(node, t) {
 
     // Label
     ctx.fillStyle = C.label;
-    ctx.font = "bold 11px 'Cascadia Mono','Fira Code',monospace";
+    ctx.font = "bold 14px 'Cascadia Mono','Fira Code',monospace";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     const displayLabel = isChest ? "Profit Chest" : label;
-    ctx.fillText(displayLabel, x + w/2, y + h/2 - 8);
+    ctx.fillText(displayLabel, x + w/2, y + h/2 - 10);
 
     // Sublabel (value or source ref)
-    ctx.font = "9px 'Cascadia Mono','Fira Code',monospace";
+    ctx.font = "12px 'Cascadia Mono','Fira Code',monospace";
     ctx.fillStyle = C.sublabel;
     let subText = _machineSubtext(node);
-    ctx.fillText(subText, x + w/2, y + h/2 + 8);
+    ctx.fillText(subText, x + w/2, y + h/2 + 10);
 
     // Chest: show profit value below
     if (isChest && data) {
-      ctx.font = "bold 10px 'Cascadia Mono','Fira Code',monospace";
+      ctx.font = "bold 13px 'Cascadia Mono','Fira Code',monospace";
       ctx.fillStyle = (data.total_profit||0) >= 0 ? C.itemFill : C.blocked;
       ctx.fillText("$" + (data.total_profit||0).toFixed(2), x + w/2, y + h + 12);
     }
@@ -1361,10 +1407,10 @@ function render(timestamp) {
       ctx.lineWidth = 1;
       ctx.stroke();
       // Pair label top-left
-      ctx.font = "bold 14px 'Cascadia Mono','Fira Code',monospace";
+      ctx.font = "bold 16px 'Cascadia Mono','Fira Code',monospace";
       ctx.fillStyle = C.sublabel;
       ctx.textAlign = "left";
-      ctx.fillText(pl.pair_display + "  $" + (pl.price||0).toFixed(6), pl.ox, pl.oy - 28);
+      ctx.fillText(pl.pair_display + "  $" + (pl.price||0).toFixed(6), pl.ox, pl.oy - 30);
     });
 
     // Belts (behind machines)
@@ -1417,28 +1463,49 @@ function updateHUD() {
 // ─── SSE data connection ───────────────────────────────────────
 let evtSource = null;
 
+function handleFullState(data) {
+  if (nodes.length === 0) {
+    buildScene(data);
+    if (pairLayouts.length === 1) zoomToPair(pairLayouts[0]);
+    else if (pairLayouts.length > 1) zoomToWorld();
+  } else {
+    updateSceneData(data);
+  }
+}
+
+function handleDiff(data) {
+  // Diff only contains changed machines -- merge into existing factoryData
+  if (!factoryData || nodes.length === 0) { handleFullState(data); return; }
+  updateSceneData(data);  // updateSceneData already handles partial machine updates
+}
+
 function connectSSE() {
   if (evtSource) { try { evtSource.close(); } catch(e) {} }
   evtSource = new EventSource("/api/factory/stream");
+
+  // Named events: "full" = complete state, "diff" = only changes
+  evtSource.addEventListener("full", function(e) {
+    try {
+      const data = JSON.parse(e.data);
+      if (!data.error) handleFullState(data);
+    } catch(err) { console.error("SSE full parse error:", err); }
+  });
+
+  evtSource.addEventListener("diff", function(e) {
+    try {
+      const data = JSON.parse(e.data);
+      if (!data.error) handleDiff(data);
+    } catch(err) { console.error("SSE diff parse error:", err); }
+  });
+
+  // Fallback for unnamed events (backwards compat)
   evtSource.onmessage = function(e) {
     try {
       const data = JSON.parse(e.data);
-      if (data.error) return;
-      if (nodes.length === 0) {
-        buildScene(data);
-        // Auto-fit on first data
-        if (pairLayouts.length === 1) {
-          zoomToPair(pairLayouts[0]);
-        } else if (pairLayouts.length > 1) {
-          zoomToWorld();
-        }
-      } else {
-        updateSceneData(data);
-      }
-    } catch(err) {
-      console.error("SSE parse error:", err);
-    }
+      if (!data.error) handleFullState(data);
+    } catch(err) {}
   };
+
   evtSource.onerror = function() {
     setTimeout(connectSSE, 5000);
   };

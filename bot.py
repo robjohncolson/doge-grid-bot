@@ -313,7 +313,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._send_json(factory_viz.serialize_factory_state(_bot_states, _current_prices))
 
     def _handle_factory_sse(self):
-        """GET /api/factory/stream -- SSE stream for factory viz (3s interval)."""
+        """GET /api/factory/stream -- SSE with diffs (5s interval)."""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -321,17 +321,33 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
+        prev_snapshot = None
         try:
             while True:
                 if not _bot_states:
                     data = json.dumps({"error": "bot not initialized"})
+                    self.wfile.write(f"data: {data}\n\n".encode("utf-8"))
                 else:
-                    data = json.dumps(
-                        factory_viz.serialize_factory_state(_bot_states, _current_prices)
+                    snapshot = factory_viz.serialize_factory_state(
+                        _bot_states, _current_prices
                     )
-                self.wfile.write(f"data: {data}\n\n".encode("utf-8"))
+                    if prev_snapshot is None:
+                        # First tick: send full state
+                        self.wfile.write(
+                            f"event: full\ndata: {json.dumps(snapshot)}\n\n"
+                            .encode("utf-8")
+                        )
+                    else:
+                        # Subsequent ticks: send only changed machine states
+                        diff = factory_viz.compute_diff(prev_snapshot, snapshot)
+                        if diff:
+                            self.wfile.write(
+                                f"event: diff\ndata: {json.dumps(diff)}\n\n"
+                                .encode("utf-8")
+                            )
+                    prev_snapshot = snapshot
                 self.wfile.flush()
-                time.sleep(3)
+                time.sleep(5)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
             pass
 
