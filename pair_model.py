@@ -173,6 +173,9 @@ class PairState:
     # Entry multiplier
     next_entry_multiplier: float = 1.0
 
+    # Long-only mode (no sell entries -- spot pairs without inventory)
+    long_only: bool = False
+
 
 def derive_phase(state: PairState) -> Phase:
     """Derive phase from open orders. Maps to _compute_pair_state()."""
@@ -199,21 +202,24 @@ def _compute_volume(price: float, cfg: ModelConfig, multiplier: float = 1.0) -> 
     return vol
 
 
-def make_initial_state(market_price: float, now: float, cfg: ModelConfig) -> PairState:
-    """Create S0 state with two entry orders flanking the market."""
+def make_initial_state(market_price: float, now: float, cfg: ModelConfig,
+                       long_only: bool = False) -> PairState:
+    """Create S0 state with entry orders flanking the market.
+    In long-only mode, only the buy entry is placed (no sell entry)."""
     a_pct, b_pct = cfg.entry_pct, cfg.entry_pct
-    sell_price = round(market_price * (1 + a_pct / 100), cfg.price_decimals)
     buy_price = round(market_price * (1 - b_pct / 100), cfg.price_decimals)
-    sell_vol = _compute_volume(sell_price, cfg, cfg.next_entry_multiplier)
     buy_vol = _compute_volume(buy_price, cfg, cfg.next_entry_multiplier)
+    orders = [OrderState(Side.BUY, Role.ENTRY, buy_price, buy_vol, "B", 1)]
+    if not long_only:
+        sell_price = round(market_price * (1 + a_pct / 100), cfg.price_decimals)
+        sell_vol = _compute_volume(sell_price, cfg, cfg.next_entry_multiplier)
+        orders.insert(0, OrderState(Side.SELL, Role.ENTRY, sell_price, sell_vol, "A", 1))
     return PairState(
         market_price=market_price,
         now=now,
-        orders=(
-            OrderState(Side.SELL, Role.ENTRY, sell_price, sell_vol, "A", 1),
-            OrderState(Side.BUY, Role.ENTRY, buy_price, buy_vol, "B", 1),
-        ),
+        orders=tuple(orders),
         next_entry_multiplier=cfg.next_entry_multiplier,
+        long_only=long_only,
     )
 
 
@@ -516,24 +522,26 @@ def _complete_round_trip_a(state: PairState, buy_exit: OrderState,
             new_trend = None
             new_trend_at = None
 
-    # Cancel existing sell entry, place fresh one
+    # Cancel existing sell entry, place fresh one (skip in long-only mode)
     sell_entry = _find_order(state, Side.SELL, Role.ENTRY)
     orders = _remove_order(state.orders, buy_exit)
     if sell_entry:
         orders = _remove_order(orders, sell_entry)
         actions.append(CancelOrder(sell_entry, "round-trip complete, refresh entry"))
 
-    a_pct, _ = _entry_distances(
-        replace(state, detected_trend=new_trend, trend_detected_at=new_trend_at), cfg)
-    new_sell_price = round(state.market_price * (1 + a_pct / 100), cfg.price_decimals)
-    new_sell_vol = _compute_volume(new_sell_price, cfg, state.next_entry_multiplier)
     new_cycle_a = buy_exit.cycle + 1
 
-    new_entry = OrderState(Side.SELL, Role.ENTRY, new_sell_price, new_sell_vol,
-                           "A", new_cycle_a)
-    orders = orders + (new_entry,)
-    actions.append(PlaceOrder(Side.SELL, Role.ENTRY, new_sell_price, new_sell_vol,
-                              "A", new_cycle_a))
+    if not state.long_only:
+        a_pct, _ = _entry_distances(
+            replace(state, detected_trend=new_trend, trend_detected_at=new_trend_at), cfg)
+        new_sell_price = round(state.market_price * (1 + a_pct / 100), cfg.price_decimals)
+        new_sell_vol = _compute_volume(new_sell_price, cfg, state.next_entry_multiplier)
+
+        new_entry = OrderState(Side.SELL, Role.ENTRY, new_sell_price, new_sell_vol,
+                               "A", new_cycle_a)
+        orders = orders + (new_entry,)
+        actions.append(PlaceOrder(Side.SELL, Role.ENTRY, new_sell_price, new_sell_vol,
+                                  "A", new_cycle_a))
 
     completed = state.completed_cycles + (cycle_rec,)
     # Update median
@@ -696,13 +704,14 @@ def _orphan_exit(state: PairState, order: OrderState, cfg: ModelConfig,
                             consecutive_refreshes_b=0,
                             refresh_cooldown_until_b=0.0)
     else:
-        # Trade A buy exit orphaned -> place sell entry
+        # Trade A buy exit orphaned -> place sell entry (skip in long-only)
         new_cycle = state.cycle_a + 1
-        price = round(state.market_price * (1 + a_pct / 100), cfg.price_decimals)
-        vol = _compute_volume(price, cfg, state.next_entry_multiplier)
-        new_entry = OrderState(Side.SELL, Role.ENTRY, price, vol, "A", new_cycle)
-        orders = orders + (new_entry,)
-        actions.append(PlaceOrder(Side.SELL, Role.ENTRY, price, vol, "A", new_cycle))
+        if not state.long_only:
+            price = round(state.market_price * (1 + a_pct / 100), cfg.price_decimals)
+            vol = _compute_volume(price, cfg, state.next_entry_multiplier)
+            new_entry = OrderState(Side.SELL, Role.ENTRY, price, vol, "A", new_cycle)
+            orders = orders + (new_entry,)
+            actions.append(PlaceOrder(Side.SELL, Role.ENTRY, price, vol, "A", new_cycle))
         new_state = replace(state,
                             orders=orders,
                             recovery_orders=tuple(recovery),
@@ -1093,10 +1102,11 @@ def check_invariants(state: PairState, cfg: ModelConfig) -> list[str]:
     # 1. Phase matches derived phase
     #    (We derive phase, so this is always true by construction)
 
-    # 2. At most 2 active orders
-    if len(state.orders) > 2:
+    # 2. At most 2 active orders (long-only: at most 1)
+    max_orders = 1 if state.long_only else 2
+    if len(state.orders) > max_orders:
         violations.append(
-            f"INV2: {len(state.orders)} orders on book (max 2)")
+            f"INV2: {len(state.orders)} orders on book (max {max_orders})")
 
     # 3. No duplicate (side, role) combinations
     seen = set()
@@ -1122,10 +1132,21 @@ def check_invariants(state: PairState, cfg: ModelConfig) -> list[str]:
     sell_exits = [o for o in exits if o.side == Side.SELL]
 
     if phase == Phase.S0:
-        if len(buy_entries) != 1 or len(sell_entries) != 1:
-            violations.append(
-                f"INV5: S0 should have 1 buy entry + 1 sell entry, "
-                f"got {len(buy_entries)} buy + {len(sell_entries)} sell entries")
+        if state.long_only:
+            # Long-only: S0 has just 1 buy entry, no sell entry
+            if len(buy_entries) != 1:
+                violations.append(
+                    f"INV5: S0 (long-only) should have 1 buy entry, "
+                    f"got {len(buy_entries)}")
+            if sell_entries:
+                violations.append(
+                    f"INV5: S0 (long-only) should have 0 sell entries, "
+                    f"got {len(sell_entries)}")
+        else:
+            if len(buy_entries) != 1 or len(sell_entries) != 1:
+                violations.append(
+                    f"INV5: S0 should have 1 buy entry + 1 sell entry, "
+                    f"got {len(buy_entries)} buy + {len(sell_entries)} sell entries")
         if exits:
             violations.append(
                 f"INV5: S0 should have 0 exits, got {len(exits)}")
@@ -1149,6 +1170,8 @@ def check_invariants(state: PairState, cfg: ModelConfig) -> list[str]:
         if buy_exits:
             violations.append(
                 f"INV7: S1b should have 0 buy exits, got {len(buy_exits)}")
+        # Long-only: S1b has sell exit only (no sell entry companion)
+        # Normal: S1b has sell exit + sell entry (or buy entry)
 
     elif phase == Phase.S2:
         if len(buy_exits) != 1 or len(sell_exits) != 1:
@@ -1213,6 +1236,7 @@ def predict(state: PairState, cfg: ModelConfig) -> dict:
     result = {
         "phase": phase.value,
         "market_price": state.market_price,
+        "long_only": state.long_only,
         "orders": [],
         "recovery_slots": f"{len(state.recovery_orders)}/{cfg.max_recovery_slots}",
         "trend": state.detected_trend,
@@ -1470,6 +1494,7 @@ def from_state_json(path: str = "logs/state.json") -> tuple[PairState, ModelConf
         refresh_cooldown_until_b=snap.get("refresh_cooldown_until_b", 0.0),
         median_cycle_duration=median,
         next_entry_multiplier=snap.get("next_entry_multiplier", 1.0),
+        long_only=snap.get("long_only", False),
     )
 
     return state, cfg
@@ -1678,6 +1703,33 @@ def scenario_anti_chase() -> tuple[str, PairState, list[Event], ModelConfig]:
     return "Anti-Chase", state, events, cfg
 
 
+def scenario_long_only() -> tuple[str, PairState, list[Event], ModelConfig]:
+    """Long-only mode: only buy entries, sell entries skipped. Full B cycle."""
+    cfg = default_config(entry_pct=0.5, profit_pct=1.0)
+    market = 0.10
+    t = 1000000.0
+    state = make_initial_state(market, t, cfg, long_only=True)
+
+    buy_entry_price = round(market * (1 - 0.5 / 100), cfg.price_decimals)
+    buy_vol = _compute_volume(buy_entry_price, cfg)
+
+    events = []
+    # Trade B: buy entry fills -> S1b (no sell entry on book)
+    events.append(BuyFill(buy_entry_price, buy_vol))
+    events.append(TimeAdvance(t + 30))
+    # Trade B: sell exit fills -> round trip complete, back to S0 (buy entry only)
+    sell_exit_price = _exit_price(buy_entry_price, market, Side.SELL, cfg)
+    events.append(SellFill(sell_exit_price, buy_vol))
+    events.append(TimeAdvance(t + 60))
+    # Second cycle: buy entry fills again
+    new_buy_price = round(market * (1 - 0.5 / 100), cfg.price_decimals)
+    new_buy_vol = _compute_volume(new_buy_price, cfg)
+    events.append(BuyFill(new_buy_price, new_buy_vol))
+    events.append(TimeAdvance(t + 90))
+
+    return "Long Only", state, events, cfg
+
+
 def scenario_random_walk() -> tuple[str, list[str]]:
     """10K random events, check all invariants."""
     violations = explore_random(10000)
@@ -1749,6 +1801,7 @@ def main():
         scenario_s2_break_glass,
         scenario_recovery_fill,
         scenario_anti_chase,
+        scenario_long_only,
     ]
 
     for scenario_fn in scenarios:

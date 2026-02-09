@@ -518,6 +518,7 @@ saving txid to state (e.g. crash between placement and save).
 | `exit_reprice_count_b` | Times Trade B exit repriced this cycle |
 | `detected_trend` | Directional signal: "up", "down", or null |
 | `trend_detected_at` | When trend was detected |
+| `long_only` | Auto-set when sell entry fails due to no inventory (spot pairs) |
 
 ## 7. Fill Pair Cycling (The Profit Engine)
 
@@ -610,7 +611,7 @@ from which orders are on the book:
 
 | State | Open Orders | Meaning |
 |-------|-------------|---------|
-| **S0** | sell entry + buy entry | No position, both flanking market |
+| **S0** | sell entry + buy entry | No position, both flanking market (long-only: buy entry only) |
 | **S1a** | buy exit + buy entry | Trade A filled (sell entry → buy exit pending) |
 | **S1b** | sell exit + sell entry | Trade B filled (buy entry → sell exit pending) |
 | **S2** | buy exit + sell exit | Both entries filled, both exits pending |
@@ -763,7 +764,8 @@ On first startup after the refactor, `migrate_pnl_from_fills()` reconstructs
 
 1. 2 active orders + 0–N recovery orders on Kraken (N ≤ MAX_RECOVERY_SLOTS,
    §12.9). May transiently have 0-1 active during pauses, placement
-   failures, or between fill detection and replacement order placement.
+   failures, between fill detection and replacement order placement,
+   or in long-only mode (§13) where sell entries are permanently skipped.
 2. Entry fills keep the opposite-side order and add an exit
 3. Exit fills only replace the completed side's entry; the other side is never cancelled
 4. If both entries fill before either exit → S2 (both exits on book)
@@ -1399,3 +1401,300 @@ compute_total_exposure(state, current_price):
 | Recovery order fills WHILE in S2 | Book profit, free slot. Proceed with break-glass as normal |
 | Price flash-crashes through all exits | Both exits fill → normal resolution. Recovery orders also fill. Best case. |
 | `MAX_RECOVERY_SLOTS = 0` | Disables orphaning. S2 break-glass goes straight to close-at-market. |
+
+## 13. Long-Only Mode (Spot Pairs Without Inventory)
+
+When the bot adds a spot pair where it holds no base asset (e.g. WLFI/USD
+with 0 WLFI balance), sell entries fail with "Insufficient funds". Rather
+than generating repeated errors, the bot auto-detects this and switches
+to **long-only mode** — only Trade B (buy entry → sell exit) operates.
+
+### Detection
+
+```
+_place_pair_order() exception handler
+    │
+    ├── side == "sell" AND role == "entry"
+    │   AND error contains "insufficient"?
+    │     YES →
+    │       1. Set state.long_only = True
+    │       2. Log as INFO (not ERROR)
+    │       3. Do NOT increment consecutive_errors
+    │       4. Return None (order not placed)
+    │     NO →
+    │       normal error handling (log ERROR, increment errors)
+```
+
+### Behavior When `long_only = True`
+
+| Location | Effect |
+|----------|--------|
+| `build_pair_grid()` | Skip sell entry in initial pair build |
+| `_build_pair_with_position()` | Skip sell entry in position recovery |
+| `handle_pair_fill()` buy exit | Skip sell entry reopen after Trade A round trip |
+| `_place_pair_order()` | Auto-detect on first sell entry failure |
+
+### State Machine Impact
+
+In long-only mode, the pair operates as a simplified cycle:
+
+```
+S0 (buy entry only, no sell entry)
+    │
+    buy entry fills
+    │
+    ▼
+S1b (sell exit + no sell entry)
+    │
+    sell exit fills (round trip complete!)
+    │
+    ▼
+S0 (buy entry reopened, sell entry skipped)
+```
+
+Trade A (short-side) is permanently idle. Only Trade B cycles.
+S1a and S2 cannot be reached.
+
+### Invariants (Relaxed)
+
+- S0 in long-only mode: 1 buy entry (no sell entry) — **not** 2 entries
+- S1b in long-only mode: 1 sell exit (no sell entry) — **not** exit + entry
+- S1a, S2: unreachable in long-only mode
+
+### Persistence
+
+`long_only` is persisted in `state.json` and restored on startup.
+This ensures the bot doesn't retry sell entries after restart.
+
+### Dashboard
+
+- Detail view: "(LONG ONLY)" appended to state description (e.g. "Both entries open (LONG ONLY)")
+- Swarm table: "L" badge next to pair_state cell
+- Swarm status API: `long_only` field per pair
+
+## 14. Multi-Pair Swarm Architecture
+
+The bot can trade 1–50+ pairs simultaneously. Each pair gets its own
+`GridState` instance, independent state machine (§9), and persisted state.
+The swarm layer handles batch API calls, dynamic add/remove, and
+coordinated persistence.
+
+### 14.1 Main Loop (Batch Operations)
+
+Each 30-second cycle:
+
+```
+BATCH_PRICE_FETCH
+  │  get_prices(active_pairs) -- 1-2 public API calls (30 pairs/chunk)
+  │
+  ▼
+BATCH_ORDER_QUERY
+  │  query_orders_batched(all_txids) -- 1-2 private calls (50 txids/chunk)
+  │  results cached on each state._cached_order_info
+  │
+  ▼
+PER-PAIR LOOP
+  │  for each pair in _bot_states:
+  │    daily_reset → risk_check → check_fills → check_drift →
+  │    exit_lifecycle → stats → accumulation → save_state
+  │
+  ▼
+OHLC_ROUND_ROBIN
+  │  max 3 OHLC fetches per cycle via round-robin index
+  │  (_ohlc_robin_idx cycles through active pairs)
+  │
+  ▼
+PROCESS_SWARM_QUEUE
+  │  snapshot + clear global add/remove/multiplier queues
+  │  execute _add_pair() / _remove_pair() / multiplier updates
+  │
+  ▼
+SLEEP (remaining poll interval)
+```
+
+### 14.2 Dynamic Add/Remove
+
+Thread-safe queues bridge the HTTP handler thread and the main loop:
+
+```
+_swarm_pending_adds       -- list of PairConfig
+_swarm_pending_removes    -- list of pair_name strings
+_swarm_pending_multipliers -- list of (pair_name, multiplier) tuples
+```
+
+Queues are atomically snapshotted and cleared by `_process_swarm_queue()`
+at the end of each main loop cycle (CPython GIL ensures atomicity).
+
+```
+_add_pair(pair_config)
+    │
+    ├── Create GridState, register in _bot_states / config.PAIRS
+    ├── Load saved state (local file → Supabase fallback)
+    ├── Fetch initial price (batch cache → single query → remove on failure)
+    ├── Reconcile open orders on Kraken
+    ├── Build initial grid (pair mode: 2 entries)
+    └── _save_active_pairs()
+
+_remove_pair(pair_name)
+    │
+    ├── Cancel all open orders via grid_strategy.cancel_grid()
+    ├── Save final state to file + Supabase
+    ├── Remove from _bot_states / config.PAIRS / price caches
+    └── _save_active_pairs()
+```
+
+### 14.3 Active Pairs Persistence
+
+Active pair configs survive restarts via dual persistence:
+
+| Storage | Path | Format |
+|---------|------|--------|
+| Local file | `logs/active_pairs.json` | List of PairConfig dicts |
+| Supabase | `bot_state` table, key=`__swarm__` | `{active_pairs: [...]}` |
+
+- File write uses atomic temp-then-rename
+- On startup: file first, Supabase fallback, empty default `[]`
+
+### 14.4 Pair Scanner & Supabase Pairs Table
+
+`pair_scanner.py` scans all Kraken USD pairs hourly:
+
+```
+scan_all_usd_pairs()
+    │
+    ├── GET AssetPairs (1 public call)
+    ├── Filter to USD-quoted, online, non-darkpool
+    ├── GET Tickers in batches of 30 (public, ~21 calls for ~630 pairs)
+    ├── Enrich: price, volatility, spread, volume
+    ├── Cache results (TTL: 1 hour)
+    └── Persist to Supabase `pairs` table (best-effort, bulk upsert)
+```
+
+`auto_configure(PairInfo)` maps volatility to trading parameters:
+
+| Volatility | Entry % | Profit % |
+|------------|---------|----------|
+| < 3% | 0.10% | max(entry, 2×fee + 0.10) |
+| 3–8% | 0.20% | max(entry, 2×fee + 0.10) |
+| 8–15% | 0.35% | max(entry, 2×fee + 0.10) |
+| > 15% | 0.50% | max(entry, 2×fee + 0.10) |
+
+### 14.5 Swarm API Endpoints
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/api/swarm/status` | GET | Aggregate stats + per-pair summaries |
+| `/api/swarm/available` | GET | All scanner pairs with active badges |
+| `/api/swarm/add` | POST | Queue pair for addition (auto-configured) |
+| `/api/swarm/remove` | POST | Queue pair for removal (cancels orders) |
+| `/api/swarm/multiplier` | POST | Set entry size multiplier (1x–10x) |
+
+### 14.6 Rate Limit Budget (50 pairs, 30s cycle)
+
+| Operation | Calls | Type |
+|-----------|-------|------|
+| Batch Ticker | 1–2 | Public (free) |
+| Batch QueryOrders | 1–2 | Private (50 txids/chunk) |
+| OHLC round-robin | 0–3 | Public (free) |
+| AddOrder/CancelOrder | rare | Private (per event) |
+| **Total private/cycle** | **2–6** | Well within 15-counter limit |
+
+## 15. Dashboard View Routing
+
+The dashboard serves two views: **swarm view** (multi-pair overview)
+and **detail view** (single-pair deep dive). View routing depends on
+pair count and user navigation.
+
+### 15.1 Data Flow
+
+```
+                ┌──────────────────────┐
+                │   /api/stream (SSE)  │  pushes first pair only, every 3s
+                └──────────┬───────────┘
+                           │
+                           ▼
+                   ┌──────────────┐
+                   │  update(data) │  renders detail view panels
+                   └──────────────┘
+
+  ┌───────────────────────────┐     ┌──────────────────────────────┐
+  │  /api/swarm/status        │     │  /api/status?pair=<NAME>     │
+  │  (polled every 5s in      │     │  (polled every 5s when SSE   │
+  │   swarm mode)             │     │   is closed, i.e. non-first  │
+  └────────────┬──────────────┘     │   pair selected)             │
+               │                    └──────────────┬───────────────┘
+               ▼                                   ▼
+      ┌──────────────┐                    ┌──────────────┐
+      │ renderSwarm() │                    │  update(data) │
+      └──────────────┘                    └──────────────┘
+```
+
+### 15.2 View Transitions
+
+```
+initView()
+    │
+    ├── fetch /api/swarm/status
+    │     active_pairs > 1?
+    │       YES → showSwarmView()
+    │       NO  → showDetailView(first_pair)
+    │
+showSwarmView()
+    │  swarmMode = true, detailPair = null
+    │  display: swarm table + aggregate stats
+    │  refresh: pollSwarm() every 5s
+    │
+    │── click pair row → showDetailView(pair)
+    │── click "Browse Pairs" → openScanner()
+    │
+showDetailView(pair)
+    │  swarmMode = false, detailPair = pair
+    │  CLOSE SSE (SSE only streams first pair)
+    │  IMMEDIATE poll() with ?pair= param
+    │  refresh: poll() every 5s (while SSE closed)
+    │
+    │── click "Back" → showSwarmView()
+```
+
+### 15.3 SSE Limitation
+
+The `/api/stream` SSE endpoint always pushes `_first_state()` (the first
+pair added). It cannot carry a query parameter mid-stream. When the user
+navigates to a non-first pair's detail view:
+
+1. Client closes the SSE connection (`evtSource.close()`)
+2. Client polls `/api/status?pair=<NAME>` every 5s via the fallback interval
+3. On return to swarm view, SSE is not reopened (swarm uses its own polling)
+
+### 15.4 Scanner Modal
+
+The scanner modal shows all qualifying Kraken USD pairs (~600) with
+sortable column headers:
+
+| Column | Sort Key | Default Direction |
+|--------|----------|-------------------|
+| Pair | `display` | Ascending (A→Z) |
+| Price | `price` | Descending |
+| Volatility | `volatility_pct` | Descending |
+| 24h Vol | `volume_24h` | Descending |
+| Spread | `spread_pct` | Descending |
+| Fee | `fee_maker` | Descending |
+
+- Click same column → toggle asc/desc
+- Click new column → string keys default asc, numeric keys default desc
+- Active sort column highlighted with ▲/▼ arrow indicator
+- Search filter works independently of sort order
+- Scanner data cached client-side for 60s
+- Pair data persisted to Supabase `pairs` table hourly
+
+### 15.5 Supabase Persistence Summary
+
+| Table | Key | Written By | Frequency |
+|-------|-----|------------|-----------|
+| `fills` | auto-increment | `save_fill()` | Per fill event |
+| `trades` | auto-increment | `save_trade()` | Per round trip |
+| `price_history` | auto-increment | `queue_price_point()` | Every 5 min (buffered) |
+| `daily_summaries` | `(date, pair)` | `save_daily_summary()` | Daily reset |
+| `bot_state` | `pair` name | `save_state()` | After fills + every 5 min |
+| `bot_state` | `__swarm__` | `_save_active_pairs()` | On add/remove pair |
+| `pairs` | `pair` name | `save_pairs()` | Hourly (scanner refresh) |
