@@ -1308,12 +1308,12 @@ def check_fills_live(state: GridState, current_price: float = 0.0) -> list:
             return []
         state.consecutive_errors = 0  # Reset on success
 
-    # Diagnostic: log query result counts
-    if len(order_info) != len(txids):
+    # Diagnostic: only warn when txids are actually missing (not when extras come back)
+    missing = [t for t in txids if t not in order_info]
+    if missing:
         logger.warning(
-            "QueryOrders mismatch: sent %d txids, got %d back -- missing: %s",
-            len(txids), len(order_info),
-            [t for t in txids if t not in order_info],
+            "QueryOrders: sent %d txids, got %d back -- missing: %s",
+            len(txids), len(order_info), missing,
         )
 
     # Summarize statuses returned
