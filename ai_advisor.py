@@ -351,23 +351,48 @@ def _aggregate_votes(votes: list) -> dict:
     # Need strict majority (>50%)
     has_majority = winner_count > len(valid) / 2
 
+    # Majority condition (for display and fallback)
+    condition_counts = Counter(v["condition"] for v in valid)
+    final_condition = condition_counts.most_common(1)[0][0]
+    condition_winner_count = condition_counts.most_common(1)[0][1]
+
     if has_majority:
         final_action = winner_action
+        consensus_type = "majority"
         # Use reason from the first voter who picked the winner
         reason = next(
             v["reason"] for v in valid if v["action"] == final_action
         )
     else:
-        final_action = "continue"
-        # Summarize the split
-        split = ", ".join(
-            f"{count}x {act}" for act, count in action_counts.most_common()
-        )
-        reason = f"Council split ({split}) -- no majority"
-
-    # Majority condition (for display)
-    condition_counts = Counter(v["condition"] for v in valid)
-    final_condition = condition_counts.most_common(1)[0][0]
+        # No action majority -- try condition-based fallback
+        # If 2/3+ agree on the market condition, map to a safe default action
+        CONDITION_DEFAULT_ACTIONS = {
+            "trending_down": "widen_entry",
+            "trending_up": "tighten_entry",
+            "volatile": "widen_spacing",
+            "ranging": "tighten_spacing",
+            "low_volume": "continue",
+        }
+        condition_has_supermajority = condition_winner_count >= len(valid) * 2 / 3
+        if condition_has_supermajority and final_condition in CONDITION_DEFAULT_ACTIONS:
+            final_action = CONDITION_DEFAULT_ACTIONS[final_condition]
+            consensus_type = "condition_fallback"
+            split = ", ".join(
+                f"{count}x {act}" for act, count in action_counts.most_common()
+            )
+            reason = (
+                f"Council deadlock broken by condition consensus: "
+                f"{condition_winner_count}/{len(valid)} agree on '{final_condition}' "
+                f"-> {final_action} (action split: {split})"
+            )
+            logger.info(reason)
+        else:
+            final_action = "continue"
+            consensus_type = None
+            split = ", ".join(
+                f"{count}x {act}" for act, count in action_counts.most_common()
+            )
+            reason = f"Council split ({split}) -- no majority"
 
     return {
         "condition": final_condition,
@@ -377,6 +402,7 @@ def _aggregate_votes(votes: list) -> dict:
         "panel_votes": votes,
         "vote_counts": dict(action_counts),
         "consensus": has_majority,
+        "consensus_type": consensus_type,
         "panel_size": len(valid),
         "winner_count": winner_count if has_majority else 0,
     }

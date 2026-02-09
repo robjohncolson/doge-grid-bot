@@ -293,6 +293,36 @@ RECOVERY_FALLBACK_TIMEOUT_SEC: float = _env("RECOVERY_FALLBACK_TIMEOUT_SEC", 720
 S2_FALLBACK_TIMEOUT_SEC: float = _env("S2_FALLBACK_TIMEOUT_SEC", 600.0, float)
 
 # ---------------------------------------------------------------------------
+# Entry backoff after consecutive losses
+# ---------------------------------------------------------------------------
+
+# Widen entry distance after consecutive losing cycles on a trade leg.
+# Formula: effective_entry = entry_pct * min(1 + FACTOR * losses, MAX_MULTIPLIER)
+# 0 losses -> 1.0x, 1 loss -> 1.5x, 2 -> 2.0x, ... capped at MAX_MULTIPLIER.
+ENTRY_BACKOFF_ENABLED: bool = _env("ENTRY_BACKOFF_ENABLED", True, bool)
+ENTRY_BACKOFF_FACTOR: float = _env("ENTRY_BACKOFF_FACTOR", 0.5, float)
+ENTRY_BACKOFF_MAX_MULTIPLIER: float = _env("ENTRY_BACKOFF_MAX_MULTIPLIER", 5.0, float)
+
+# ---------------------------------------------------------------------------
+# Volatility-aware profit targets
+# ---------------------------------------------------------------------------
+
+# Auto-adjust profit_pct based on OHLC volatility so exit targets are reachable.
+VOLATILITY_AUTO_PROFIT: bool = _env("VOLATILITY_AUTO_PROFIT", True, bool)
+VOLATILITY_PROFIT_FACTOR: float = _env("VOLATILITY_PROFIT_FACTOR", 0.8, float)
+VOLATILITY_PROFIT_FLOOR: float = _env("VOLATILITY_PROFIT_FLOOR", 0.6, float)
+VOLATILITY_PROFIT_CEILING: float = _env("VOLATILITY_PROFIT_CEILING", 3.0, float)
+VOLATILITY_PROFIT_MIN_CHANGE: float = _env("VOLATILITY_PROFIT_MIN_CHANGE", 0.05, float)
+
+# ---------------------------------------------------------------------------
+# AI auto-execute
+# ---------------------------------------------------------------------------
+
+# Allow the AI council to auto-execute safe (conservative) actions without
+# Telegram approval.  Only widen_entry and widen_spacing auto-execute.
+AI_AUTO_EXECUTE: bool = _env("AI_AUTO_EXECUTE", True, bool)
+
+# ---------------------------------------------------------------------------
 # Multi-pair configuration
 # ---------------------------------------------------------------------------
 

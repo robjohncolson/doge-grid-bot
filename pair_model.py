@@ -59,6 +59,10 @@ class ModelConfig:
     refresh_cooldown_sec: float = 300.0
     fee_margin: float = 0.003        # 0.3% breakeven margin for repricing
     next_entry_multiplier: float = 1.0
+    # Entry backoff after consecutive losses
+    entry_backoff_enabled: bool = True
+    entry_backoff_factor: float = 0.5
+    entry_backoff_max_multiplier: float = 5.0
 
 
 def default_config(**overrides) -> ModelConfig:
@@ -175,6 +179,13 @@ class PairState:
 
     # Long-only mode (no sell entries -- spot pairs without inventory)
     long_only: bool = False
+
+    # Anti-loss-spiral: consecutive losing cycles per trade leg
+    consecutive_losses_a: int = 0
+    consecutive_losses_b: int = 0
+
+    # Volatility auto-adjust: last time profit target was adjusted
+    last_volatility_adjust: float = 0.0
 
 
 def derive_phase(state: PairState) -> Phase:
@@ -393,6 +404,18 @@ def _trend_expiry(state: PairState, cfg: ModelConfig) -> float:
     return cfg.recovery_fallback_sec
 
 
+def _backoff_entry_pct(base_pct: float, consecutive_losses: int,
+                       cfg: ModelConfig) -> float:
+    """Widen entry distance after consecutive losses. Maps to get_backoff_entry_pct()."""
+    if not cfg.entry_backoff_enabled or consecutive_losses <= 0:
+        return base_pct
+    multiplier = min(
+        1 + cfg.entry_backoff_factor * consecutive_losses,
+        cfg.entry_backoff_max_multiplier,
+    )
+    return base_pct * multiplier
+
+
 # ──────────────────────────────────────────────────────────────────────
 # 6. Fill handlers
 # ──────────────────────────────────────────────────────────────────────
@@ -531,9 +554,21 @@ def _complete_round_trip_a(state: PairState, buy_exit: OrderState,
 
     new_cycle_a = buy_exit.cycle + 1
 
+    # Backoff: track consecutive losses for Trade A
+    tid = buy_exit.trade_id
+    new_losses_a = state.consecutive_losses_a
+    new_losses_b = state.consecutive_losses_b
+    if tid == "A":
+        new_losses_a = new_losses_a + 1 if net < 0 else 0
+    elif tid == "B":
+        new_losses_b = new_losses_b + 1 if net < 0 else 0
+
     if not state.long_only:
         a_pct, _ = _entry_distances(
             replace(state, detected_trend=new_trend, trend_detected_at=new_trend_at), cfg)
+        # Apply backoff on top of asymmetry for Trade A re-entry
+        if tid == "A":
+            a_pct = _backoff_entry_pct(a_pct, new_losses_a, cfg)
         new_sell_price = round(state.market_price * (1 + a_pct / 100), cfg.price_decimals)
         new_sell_vol = _compute_volume(new_sell_price, cfg, state.next_entry_multiplier)
 
@@ -558,7 +593,9 @@ def _complete_round_trip_a(state: PairState, buy_exit: OrderState,
                         s2_entered_at=None,
                         detected_trend=new_trend,
                         trend_detected_at=new_trend_at,
-                        median_cycle_duration=new_median)
+                        median_cycle_duration=new_median,
+                        consecutive_losses_a=new_losses_a,
+                        consecutive_losses_b=new_losses_b)
     return new_state, actions
 
 
@@ -599,8 +636,20 @@ def _complete_round_trip_b(state: PairState, sell_exit: OrderState,
         orders = _remove_order(orders, buy_entry)
         actions.append(CancelOrder(buy_entry, "round-trip complete, refresh entry"))
 
+    # Backoff: track consecutive losses for Trade B
+    tid = sell_exit.trade_id
+    new_losses_a = state.consecutive_losses_a
+    new_losses_b = state.consecutive_losses_b
+    if tid == "B":
+        new_losses_b = new_losses_b + 1 if net < 0 else 0
+    elif tid == "A":
+        new_losses_a = new_losses_a + 1 if net < 0 else 0
+
     _, b_pct = _entry_distances(
         replace(state, detected_trend=new_trend, trend_detected_at=new_trend_at), cfg)
+    # Apply backoff on top of asymmetry for Trade B re-entry
+    if tid == "B":
+        b_pct = _backoff_entry_pct(b_pct, new_losses_b, cfg)
     new_buy_price = round(state.market_price * (1 - b_pct / 100), cfg.price_decimals)
     new_buy_vol = _compute_volume(new_buy_price, cfg, state.next_entry_multiplier)
     new_cycle_b = sell_exit.cycle + 1
@@ -625,7 +674,9 @@ def _complete_round_trip_b(state: PairState, sell_exit: OrderState,
                         s2_entered_at=None,
                         detected_trend=new_trend,
                         trend_detected_at=new_trend_at,
-                        median_cycle_duration=new_median)
+                        median_cycle_duration=new_median,
+                        consecutive_losses_a=new_losses_a,
+                        consecutive_losses_b=new_losses_b)
     return new_state, actions
 
 
@@ -652,6 +703,10 @@ def _orphan_exit(state: PairState, order: OrderState, cfg: ModelConfig,
     actions: list[Action] = []
     actions.append(OrphanExit(order, reason))
 
+    # Track backoff counters (may be incremented by eviction)
+    new_losses_a = state.consecutive_losses_a
+    new_losses_b = state.consecutive_losses_b
+
     # Evict oldest recovery if at capacity
     recovery = list(state.recovery_orders)
     evict_actions: list[Action] = []
@@ -661,6 +716,11 @@ def _orphan_exit(state: PairState, order: OrderState, cfg: ModelConfig,
             OrderState(evicted.side, Role.EXIT, evicted.price, evicted.volume,
                        evicted.trade_id, evicted.cycle),
             "evict oldest recovery"))
+        # Increment backoff counter for evicted trade leg
+        if evicted.trade_id == "A":
+            new_losses_a += 1
+        elif evicted.trade_id == "B":
+            new_losses_b += 1
 
     # Create recovery order
     rec = RecoveryState(
@@ -683,6 +743,9 @@ def _orphan_exit(state: PairState, order: OrderState, cfg: ModelConfig,
     # Place fresh entry
     temp_state = replace(state, detected_trend=new_trend, trend_detected_at=state.now)
     a_pct, b_pct = _entry_distances(temp_state, cfg)
+    # Apply backoff on top of asymmetry
+    a_pct = _backoff_entry_pct(a_pct, new_losses_a, cfg)
+    b_pct = _backoff_entry_pct(b_pct, new_losses_b, cfg)
 
     orders = _remove_order(state.orders, order)
 
@@ -702,7 +765,9 @@ def _orphan_exit(state: PairState, order: OrderState, cfg: ModelConfig,
                             detected_trend=new_trend,
                             trend_detected_at=state.now,
                             consecutive_refreshes_b=0,
-                            refresh_cooldown_until_b=0.0)
+                            refresh_cooldown_until_b=0.0,
+                            consecutive_losses_a=new_losses_a,
+                            consecutive_losses_b=new_losses_b)
     else:
         # Trade A buy exit orphaned -> place sell entry (skip in long-only)
         new_cycle = state.cycle_a + 1
@@ -720,7 +785,9 @@ def _orphan_exit(state: PairState, order: OrderState, cfg: ModelConfig,
                             detected_trend=new_trend,
                             trend_detected_at=state.now,
                             consecutive_refreshes_a=0,
-                            refresh_cooldown_until_a=0.0)
+                            refresh_cooldown_until_a=0.0,
+                            consecutive_losses_a=new_losses_a,
+                            consecutive_losses_b=new_losses_b)
 
     return new_state, evict_actions + actions
 
@@ -1069,12 +1136,22 @@ def transition(state: PairState, event: Event,
                 actions.append(BookProfit(rec.trade_id, rec.cycle, net, gross, fees))
                 recovery = list(state.recovery_orders)
                 recovery.pop(idx)
+                # Reset backoff counter on profitable recovery
+                new_losses_a = state.consecutive_losses_a
+                new_losses_b = state.consecutive_losses_b
+                if net >= 0:
+                    if rec.trade_id == "A":
+                        new_losses_a = 0
+                    elif rec.trade_id == "B":
+                        new_losses_b = 0
                 state = replace(state,
                                 recovery_orders=tuple(recovery),
                                 total_profit=state.total_profit + net,
                                 total_fees=state.total_fees + fees,
                                 total_round_trips=state.total_round_trips + 1,
-                                total_recovery_wins=state.total_recovery_wins + net)
+                                total_recovery_wins=state.total_recovery_wins + net,
+                                consecutive_losses_a=new_losses_a,
+                                consecutive_losses_b=new_losses_b)
 
         case RecoveryCancel(index=idx):
             if idx < len(state.recovery_orders):
@@ -1242,7 +1319,17 @@ def predict(state: PairState, cfg: ModelConfig) -> dict:
         "trend": state.detected_trend,
         "total_profit": round(state.total_profit, 4),
         "total_round_trips": state.total_round_trips,
+        "backoff_a": state.consecutive_losses_a,
+        "backoff_b": state.consecutive_losses_b,
     }
+
+    # Show effective entry distances with backoff applied
+    if state.consecutive_losses_a > 0 or state.consecutive_losses_b > 0:
+        a_pct, b_pct = _entry_distances(state, cfg)
+        eff_a = _backoff_entry_pct(a_pct, state.consecutive_losses_a, cfg)
+        eff_b = _backoff_entry_pct(b_pct, state.consecutive_losses_b, cfg)
+        result["effective_entry_a_pct"] = round(eff_a, 4)
+        result["effective_entry_b_pct"] = round(eff_b, 4)
 
     for o in state.orders:
         dist = abs(o.price - state.market_price) / state.market_price * 100
@@ -1495,6 +1582,9 @@ def from_state_json(path: str = "logs/state.json") -> tuple[PairState, ModelConf
         median_cycle_duration=median,
         next_entry_multiplier=snap.get("next_entry_multiplier", 1.0),
         long_only=snap.get("long_only", False),
+        consecutive_losses_a=snap.get("consecutive_losses_a", 0),
+        consecutive_losses_b=snap.get("consecutive_losses_b", 0),
+        last_volatility_adjust=snap.get("last_volatility_adjust", 0.0),
     )
 
     return state, cfg

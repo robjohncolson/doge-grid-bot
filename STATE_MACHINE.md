@@ -143,14 +143,25 @@ AI_COUNCIL (manual trigger only: /check or dashboard button)
   │     └── 1s pause between calls (rate limit)
   │
   ├── aggregate votes (majority >50% required)
-  │     ├── no majority ──► action = "continue" (split suppresses spam)
-  │     └── majority ──► winning action
+  │     ├── majority ──► winning action (consensus_type = "majority")
+  │     ├── no action majority, but condition has ≥2/3 ──► condition default action
+  │     │     (consensus_type = "condition_fallback", see §11 table)
+  │     └── no consensus ──► action = "continue" (consensus_type = null)
   │
   ├── action == "continue" ──► no-op
   │
-  ├── action != "continue" ──► SET_PENDING_APPROVAL
+  ├── AI_AUTO_EXECUTE enabled AND action is safe?
+  │     safe actions = {widen_entry, widen_spacing}
+  │     AND consensus_type in ("majority", "condition_fallback")
+  │     │
+  │     YES ──► EXECUTE immediately (no Telegram approval needed)
+  │             send informational Telegram message
+  │             log_approval_decision(action, "auto-executed")
+  │     │
+  │     NO  ──► SET_PENDING_APPROVAL (existing flow)
   │     │
   │     ├── user approves ──► EXECUTE_ACTION
+  │     │     ├── widen_entry ──► rebuild entries at wider distance
   │     │     ├── widen_spacing ──► rebuild grid
   │     │     ├── tighten_spacing ──► rebuild grid
   │     │     ├── pause ──► PAUSED
@@ -169,6 +180,21 @@ WEB_CONFIG_CHECK
   │
   ▼
 STATS_ENGINE (every 60s)
+  │
+  ▼
+VOLATILITY_AUTO_ADJUST (pair mode only, max once per 5 min)
+  │
+  ├── VOLATILITY_AUTO_PROFIT disabled? ──► skip
+  ├── rate limited (< 5 min since last adjust)? ──► skip
+  ├── no stats_results or no median_range_pct? ──► skip
+  │
+  ├── proposed = median_range_pct × VOLATILITY_PROFIT_FACTOR (0.8)
+  ├── clamp to [VOLATILITY_PROFIT_FLOOR, VOLATILITY_PROFIT_CEILING]
+  ├── change < VOLATILITY_PROFIT_MIN_CHANGE? ──► skip (noise filter)
+  │
+  ├── set state.profit_pct = proposed
+  ├── Telegram: "Volatility auto-adjust: profit target -> X.XX%"
+  └── save_state()
   │
   ▼
 ACCUMULATION_CHECK
@@ -519,6 +545,10 @@ saving txid to state (e.g. crash between placement and save).
 | `detected_trend` | Directional signal: "up", "down", or null |
 | `trend_detected_at` | When trend was detected |
 | `long_only` | Auto-set when sell entry fails due to no inventory (spot pairs) |
+| `consecutive_losses_a` | Entry backoff: consecutive losing cycles for Trade A (§16.1) |
+| `consecutive_losses_b` | Entry backoff: consecutive losing cycles for Trade B (§16.1) |
+| `last_volatility_adjust` | Volatility auto-adjust: timestamp of last profit target change (§16.2) |
+| `pair_profit_pct` | Per-pair profit target (may be auto-adjusted by volatility engine) |
 
 ## 7. Fill Pair Cycling (The Profit Engine)
 
@@ -579,6 +609,8 @@ When that sell fills at $0.0900:
 | MAIN_LOOP | ORPHAN_EXIT | [pair] S1a/S1b exit age > orphan threshold | move exit to recovery, place fresh entry (§12.4) |
 | MAIN_LOOP | S2_BREAK | [pair] S2 age + spread > thresholds | orphan/close worse exit, restart entry (§12.3) |
 | MAIN_LOOP | RECOVERY_FILL | [pair] recovery order fills on Kraken | book delayed round-trip profit |
+| MAIN_LOOP | VOL_ADJUST | [pair] stats engine ran + median_range changed | auto-adjust profit_pct (§16.2) |
+| MAIN_LOOP | AI_AUTO | AI safe action + consensus | auto-execute widen_entry/widen_spacing (§16.3) |
 | SHUTDOWN | EXIT | always | save, cancel orders, notify |
 
 ## 9. Pair Strategy State Machine (`STRATEGY_MODE=pair`)
@@ -603,6 +635,15 @@ fall back to entry-side convention (sell entry → A, buy entry → B).
 | `PAIR_PROFIT_PCT` (π) | 1.0% | Profit target distance from entry fill price |
 | `PAIR_REFRESH_PCT` | 1.0% | Max drift before stale entry is refreshed |
 | `volume_decimals` | 0 | Decimal places for volume rounding (DOGE=0, SOL=4) |
+| `ENTRY_BACKOFF_ENABLED` | `true` | Enable entry backoff after losses (§16.1) |
+| `ENTRY_BACKOFF_FACTOR` | `0.5` | Backoff widening per consecutive loss |
+| `ENTRY_BACKOFF_MAX_MULTIPLIER` | `5.0` | Maximum backoff multiplier cap |
+| `VOLATILITY_AUTO_PROFIT` | `true` | Auto-adjust profit target from volatility (§16.2) |
+| `VOLATILITY_PROFIT_FACTOR` | `0.8` | profit_pct = median_range × factor |
+| `VOLATILITY_PROFIT_FLOOR` | `0.6` | Minimum profit target (%) |
+| `VOLATILITY_PROFIT_CEILING` | `3.0` | Maximum profit target (%) |
+| `VOLATILITY_PROFIT_MIN_CHANGE` | `0.05` | Noise filter for profit changes |
+| `AI_AUTO_EXECUTE` | `true` | Auto-execute safe AI actions without approval (§16.3) |
 
 ### Formal States
 
@@ -956,14 +997,30 @@ Dashboard renders None as "—" (em dash).
 Three panelists vote independently. Majority (>50%) required for action.
 
 ```
-3/3 agree  →  action passes (unanimous)
-2/3 agree  →  action passes (majority)
-1/3 agree  →  "continue" (no action, suppresses spam)
-0/3 agree  →  "continue" (all error/timeout)
+3/3 agree  →  action passes (unanimous)         consensus_type = "majority"
+2/3 agree  →  action passes (majority)          consensus_type = "majority"
+1/3 agree  →  condition fallback (see below)    consensus_type = "condition_fallback" or null
+0/3 agree  →  "continue" (all error/timeout)    consensus_type = null
 ```
 
 `_aggregate_votes()` filters out error/timeout votes (`action="" or "unknown"`)
 before counting. With 2 responding and agreeing, majority passes (2 > 1.0).
+
+#### Condition-Based Deadlock Resolution
+
+When no action has majority but **condition** has ≥2/3 consensus,
+the condition maps to a safe default action:
+
+| Condition | Default Action |
+|-----------|---------------|
+| `trending_down` | `widen_entry` |
+| `trending_up` | `tighten_entry` |
+| `volatile` | `widen_spacing` |
+| `ranging` | `tighten_spacing` |
+| `low_volume` | `continue` |
+
+This prevents 3-way action deadlocks from defaulting to "continue"
+when the council agrees on the market condition.
 
 ### Timeout Skip Mechanism
 
@@ -1022,6 +1079,30 @@ panelist call
     "stop_floor": -10.0
   }
 }
+
+### Action Name Aliases
+
+The AI prompt offers `widen_profit`/`tighten_profit` but the execution
+handler uses `widen_spacing`/`tighten_spacing`. Aliases are normalized
+at the top of `_execute_approved_action()`:
+
+| AI Output | Normalized To |
+|-----------|---------------|
+| `widen_profit` | `widen_spacing` |
+| `tighten_profit` | `tighten_spacing` |
+
+### Auto-Execute Safe Actions
+
+When `AI_AUTO_EXECUTE = True` (default), conservative/protective actions
+bypass Telegram approval and execute immediately:
+
+| Safe Action | Effect | Why Safe |
+|-------------|--------|----------|
+| `widen_entry` | Widen entry distance from market | Reduces exposure |
+| `widen_spacing` | Widen profit target | Reduces trade frequency |
+
+Unsafe actions (`tighten_entry`, `tighten_spacing`, `pause`, `reset_grid`)
+always require Telegram approval.
 
 ## 12. Exit Lifecycle Management (Stale Exits, S2 Break-Glass, Recovery)
 
@@ -1698,3 +1779,155 @@ sortable column headers:
 | `bot_state` | `pair` name | `save_state()` | After fills + every 5 min |
 | `bot_state` | `__swarm__` | `_save_active_pairs()` | On add/remove pair |
 | `pairs` | `pair` name | `save_pairs()` | Hourly (scanner refresh) |
+
+## 16. Anti-Loss-Spiral System
+
+Three independent features prevent the death spiral where the bot
+repeatedly enters at the same distance after eviction losses, profit
+targets are unreachable given actual volatility, and the AI council
+deadlocks instead of acting.
+
+### 16.1 Entry Backoff After Consecutive Losses
+
+After consecutive losing cycles on a trade leg, the entry distance
+widens exponentially to reduce re-entry speed.
+
+#### Config Parameters
+
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| `ENTRY_BACKOFF_ENABLED` | `true` | Enable/disable backoff |
+| `ENTRY_BACKOFF_FACTOR` | `0.5` | Multiplier per consecutive loss |
+| `ENTRY_BACKOFF_MAX_MULTIPLIER` | `5.0` | Cap on widening multiplier |
+
+#### Formula
+
+```
+effective_entry_pct = base_entry_pct × min(1 + FACTOR × losses, MAX_MULTIPLIER)
+
+Examples (FACTOR=0.5, MAX=5.0):
+  0 losses → 1.0× (no change)
+  1 loss   → 1.5×
+  2 losses → 2.0×
+  3 losses → 2.5×
+  ...
+  8+ losses → 5.0× (capped)
+```
+
+#### Counter Lifecycle
+
+```
+LOSS COUNTER (per trade leg: consecutive_losses_a / consecutive_losses_b)
+    │
+    ├── INCREMENT on:
+    │     ├── Round trip completes with net_profit < 0 (handle_pair_fill)
+    │     └── Recovery order evicted (_cancel_oldest_recovery / _orphan_exit)
+    │
+    ├── RESET TO 0 on:
+    │     ├── Round trip completes with net_profit >= 0
+    │     └── Recovery order fills with net_profit >= 0
+    │
+    └── NOT AFFECTED by:
+          ├── Grid rebuild (build_pair_grid — intentional reset)
+          └── Entry refresh (_refresh_entry_if_stale — repositioning)
+```
+
+#### Where Backoff Is Applied
+
+```
+_orphan_exit()
+    │  a_pct, b_pct = compute_entry_distances(state)   # asymmetry
+    │  a_pct = get_backoff_entry_pct(a_pct, losses_a)  # backoff on top
+    │  b_pct = get_backoff_entry_pct(b_pct, losses_b)
+    │
+handle_pair_fill() — re-entry after round trip
+    │  entry_pct = get_backoff_entry_pct(base, losses)  # for completed leg only
+```
+
+#### Interaction with Directional Asymmetry
+
+Backoff multiplies ON TOP of asymmetry distances. Example with
+trending down + 2 consecutive B losses:
+```
+base_entry = 0.20%
+asymmetry (down): a_pct = 0.10%, b_pct = 0.30%
+backoff (2 losses on B): b_pct = 0.30% × 2.0 = 0.60%
+final: a_pct = 0.10%, b_pct = 0.60%
+```
+
+#### Manual Reset
+
+`/resetbackoff` command resets both counters to 0 immediately.
+
+#### Status Display
+
+When backoff is active, `get_status_summary()` shows:
+```
+Backoff: A=0 losses (eff 0.20%), B=3 losses (eff 0.70%)
+```
+
+### 16.2 Volatility-Aware Profit Targets
+
+Auto-adjusts `profit_pct` based on OHLC candle volatility so that
+exit targets are reachable given actual market movement.
+
+#### Config Parameters
+
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| `VOLATILITY_AUTO_PROFIT` | `true` | Enable/disable auto-adjust |
+| `VOLATILITY_PROFIT_FACTOR` | `0.8` | profit_pct = median_range × factor |
+| `VOLATILITY_PROFIT_FLOOR` | `0.6` | Never below (fees + margin) |
+| `VOLATILITY_PROFIT_CEILING` | `3.0` | Never above this |
+| `VOLATILITY_PROFIT_MIN_CHANGE` | `0.05` | Noise filter (skip tiny changes) |
+
+#### Flow
+
+```
+adjust_profit_from_volatility(state, stats_results)
+    │
+    ├── rate limited? (< 300s since last adjust) ──► skip
+    │
+    ├── read stats_results["volatility_targets"]["detail"]["median_range_pct"]
+    │
+    ├── proposed = median_range_pct × VOLATILITY_PROFIT_FACTOR
+    │
+    ├── clamp to [FLOOR, CEILING]
+    │
+    ├── |proposed - current| < MIN_CHANGE? ──► skip (noise filter)
+    │
+    ├── state.profit_pct = proposed
+    ├── state.last_volatility_adjust = now
+    │
+    └── return True (caller sends Telegram + saves state)
+```
+
+#### Scope
+
+- Only runs for `STRATEGY_MODE == "pair"` (inside per-pair stats loop)
+- Only affects FUTURE entries' exit targets (existing exits stay at
+  their original price)
+- Does NOT cancel/rebuild the grid
+- `profit_pct` is persisted as `pair_profit_pct` and restored on restart
+
+### 16.3 AI Council Auto-Execute + Deadlock Breaking
+
+See §11 for full details. Summary:
+
+- **Deadlock breaking**: When action votes deadlock 3 ways but condition
+  has ≥2/3 consensus, map condition → safe default action
+- **Auto-execute**: Safe actions (`widen_entry`, `widen_spacing`) bypass
+  Telegram approval when consensus exists (majority or condition fallback)
+- **Action aliases**: `widen_profit`→`widen_spacing`,
+  `tighten_profit`→`tighten_spacing` normalized before execution
+
+### 16.4 Feature Interaction Table
+
+| Scenario | Behavior |
+|----------|----------|
+| Backoff + Volatility adjust | Independent: backoff widens entry distance, volatility adjusts profit target |
+| Backoff + directional asymmetry | Backoff multiplies ON TOP of asymmetry (extra protection in trends) |
+| Volatility adjust + AI recommendation | AI may adjust profit_pct; volatility may override within 5 min. Data-driven wins. |
+| AI auto-execute + pending approval | Auto-execute bypasses approval flow. Existing pending approvals unaffected. |
+| Grid rebuild | Backoff does NOT apply (rebuild is intentional). Volatility adjust persists. |
+| All features disabled | Set `ENTRY_BACKOFF_ENABLED=false`, `VOLATILITY_AUTO_PROFIT=false`, `AI_AUTO_EXECUTE=false` |

@@ -299,6 +299,13 @@ class GridState:
         self.refresh_cooldown_until_a = 0.0
         self.refresh_cooldown_until_b = 0.0
 
+        # Anti-loss-spiral: consecutive losing cycles per trade leg
+        self.consecutive_losses_a = 0        # Trade A consecutive losing cycles
+        self.consecutive_losses_b = 0        # Trade B consecutive losing cycles
+
+        # Volatility auto-adjust: last time profit target was adjusted
+        self.last_volatility_adjust = 0.0
+
         # Recovery orders: stranded exits moved off the state machine
         self.recovery_orders: list = []      # List[RecoveryOrder]
         self.total_recovery_losses = 0       # Count of cancelled/expired recovery orders
@@ -500,6 +507,9 @@ def save_state(state: GridState):
         "detected_trend": state.detected_trend,
         "trend_detected_at": state.trend_detected_at,
         "long_only": state.long_only,
+        "consecutive_losses_a": state.consecutive_losses_a,
+        "consecutive_losses_b": state.consecutive_losses_b,
+        "last_volatility_adjust": state.last_volatility_adjust,
     }
     state_path = _state_file_path(state)
     tmp_path = state_path + ".tmp"
@@ -594,6 +604,16 @@ def load_state(state: GridState) -> bool:
     if state.long_only:
         logger.info("Restoring long-only mode")
 
+    # Restore backoff and volatility adjust state
+    state.consecutive_losses_a = snapshot.get("consecutive_losses_a", 0)
+    state.consecutive_losses_b = snapshot.get("consecutive_losses_b", 0)
+    state.last_volatility_adjust = snapshot.get("last_volatility_adjust", 0.0)
+    if state.consecutive_losses_a or state.consecutive_losses_b:
+        logger.info(
+            "Restoring backoff counters: A=%d, B=%d",
+            state.consecutive_losses_a, state.consecutive_losses_b,
+        )
+
     # Restore entry multiplier
     saved_mult = snapshot.get("next_entry_multiplier", 1.0)
     if saved_mult != 1.0:
@@ -608,6 +628,15 @@ def load_state(state: GridState) -> bool:
             state.entry_pct, saved_entry_pct,
         )
         state.entry_pct = saved_entry_pct
+
+    # Restore pair_profit_pct runtime override (e.g. from volatility adjust)
+    saved_profit_pct = snapshot.get("pair_profit_pct")
+    if saved_profit_pct and saved_profit_pct != state.profit_pct:
+        logger.info(
+            "Restoring profit target from state: %.2f%% -> %.2f%%",
+            state.profit_pct, saved_profit_pct,
+        )
+        state.profit_pct = saved_profit_pct
 
     saved_at = snapshot.get("saved_at", 0)
     age_min = (time.time() - saved_at) / 60 if saved_at else 0
@@ -2694,6 +2723,18 @@ def handle_pair_fill(state: GridState, filled_orders: list,
             ))
             _trim_completed_cycles(state)
 
+            # Backoff: track consecutive losses for Trade B
+            if tid == "B":
+                if net_profit < 0:
+                    state.consecutive_losses_b += 1
+                else:
+                    state.consecutive_losses_b = 0
+            elif tid == "A":
+                if net_profit < 0:
+                    state.consecutive_losses_a += 1
+                else:
+                    state.consecutive_losses_a = 0
+
             # Increment Trade B cycle, reset reprice counter
             new_cyc = cyc + 1
             if tid == "B":
@@ -2705,8 +2746,9 @@ def handle_pair_fill(state: GridState, filled_orders: list,
 
             # Round trip complete -- reopen buy entry for this side only
             _cancel_open_by_role(state, "buy", "entry")
+            b_entry = get_backoff_entry_pct(entry_pct, state.consecutive_losses_b) if tid == "B" else entry_pct
             buy_entry_price = round(
-                current_price * (1 - entry_pct / 100.0), decimals)
+                current_price * (1 - b_entry / 100.0), decimals)
             o = _place_pair_order(state, "buy", buy_entry_price, "entry",
                                   trade_id=tid, cycle=new_cyc)
             if o:
@@ -2828,6 +2870,18 @@ def handle_pair_fill(state: GridState, filled_orders: list,
             ))
             _trim_completed_cycles(state)
 
+            # Backoff: track consecutive losses for Trade A
+            if tid == "A":
+                if net_profit < 0:
+                    state.consecutive_losses_a += 1
+                else:
+                    state.consecutive_losses_a = 0
+            elif tid == "B":
+                if net_profit < 0:
+                    state.consecutive_losses_b += 1
+                else:
+                    state.consecutive_losses_b = 0
+
             # Increment Trade A cycle, reset reprice counter
             new_cyc = cyc + 1
             if tid == "A":
@@ -2842,8 +2896,9 @@ def handle_pair_fill(state: GridState, filled_orders: list,
             if state.long_only:
                 logger.info("  Skipping sell entry reopen (long-only mode)")
             else:
+                a_entry = get_backoff_entry_pct(entry_pct, state.consecutive_losses_a) if tid == "A" else entry_pct
                 sell_entry_price = round(
-                    current_price * (1 + entry_pct / 100.0), decimals)
+                    current_price * (1 + a_entry / 100.0), decimals)
                 o = _place_pair_order(state, "sell", sell_entry_price, "entry",
                                       trade_id=tid, cycle=new_cyc)
                 if o:
@@ -3098,6 +3153,22 @@ def _cancel_oldest_recovery(state: GridState, current_price: float = 0.0):
             oldest.trade_id, oldest.cycle, net,
         )
     state.total_recovery_losses += 1
+
+    # Backoff: increment consecutive loss counter for this trade leg
+    if oldest.trade_id == "A":
+        state.consecutive_losses_a += 1
+        _losses = state.consecutive_losses_a
+    else:
+        state.consecutive_losses_b += 1
+        _losses = state.consecutive_losses_b
+    if config.ENTRY_BACKOFF_ENABLED and _losses > 0:
+        base = state.entry_pct
+        widened = get_backoff_entry_pct(base, _losses)
+        logger.info(
+            "BACKOFF [%s.%d]: %d consecutive losses, entry will widen %.2f%% -> %.2f%%",
+            oldest.trade_id, oldest.cycle, _losses, base, widened,
+        )
+
     state.recovery_orders.pop(0)
 
 
@@ -3160,6 +3231,13 @@ def check_recovery_fills(state: GridState, order_info: dict) -> bool:
                 entry_time=r.entry_filled_at, exit_time=time.time(),
             ))
             _trim_completed_cycles(state)
+
+            # Backoff: reset consecutive loss counter on profitable recovery
+            if net >= 0:
+                if r.trade_id == "A":
+                    state.consecutive_losses_a = 0
+                else:
+                    state.consecutive_losses_b = 0
 
             # Log fill
             state.recent_fills.append({
@@ -3305,6 +3383,66 @@ def compute_entry_distances(state):
         return base * (2 - asym), base * asym
 
 
+def get_backoff_entry_pct(base_pct: float, consecutive_losses: int) -> float:
+    """
+    Widen entry distance after consecutive losing cycles.
+    Returns base_pct * min(1 + FACTOR * losses, MAX_MULTIPLIER) if enabled.
+    """
+    if not config.ENTRY_BACKOFF_ENABLED or consecutive_losses <= 0:
+        return base_pct
+    multiplier = min(
+        1 + config.ENTRY_BACKOFF_FACTOR * consecutive_losses,
+        config.ENTRY_BACKOFF_MAX_MULTIPLIER,
+    )
+    return base_pct * multiplier
+
+
+def adjust_profit_from_volatility(state: GridState, stats_results: dict) -> bool:
+    """
+    Auto-adjust profit_pct based on OHLC volatility so exit targets are reachable.
+    Rate limited: max once per 5 minutes.
+    Only affects FUTURE entries' exit targets (existing exits stay at their original price).
+    Returns True if profit_pct was changed.
+    """
+    if not config.VOLATILITY_AUTO_PROFIT:
+        return False
+
+    now = time.time()
+    if now - state.last_volatility_adjust < 300:
+        return False
+
+    # Extract median range from stats results
+    try:
+        vt = stats_results.get("volatility_targets", {})
+        detail = vt.get("detail", {})
+        median_range = detail.get("median_range_pct", 0)
+    except (AttributeError, TypeError):
+        return False
+
+    if not median_range or median_range <= 0:
+        return False
+
+    proposed = median_range * config.VOLATILITY_PROFIT_FACTOR
+    proposed = max(config.VOLATILITY_PROFIT_FLOOR,
+                   min(proposed, config.VOLATILITY_PROFIT_CEILING))
+
+    # Noise filter: skip if change is too small
+    if abs(proposed - state.profit_pct) < config.VOLATILITY_PROFIT_MIN_CHANGE:
+        return False
+
+    old = state.profit_pct
+    state.profit_pct = round(proposed, 4)
+    state.last_volatility_adjust = now
+
+    logger.info(
+        "VOLATILITY ADJUST [%s]: profit target %.2f%% -> %.2f%% "
+        "(median_range=%.3f%%, factor=%.1f)",
+        state.pair_display, old, state.profit_pct,
+        median_range, config.VOLATILITY_PROFIT_FACTOR,
+    )
+    return True
+
+
 def _orphan_exit(state, o, current_price, reason="timeout"):
     """
     Move an exit order to recovery and place a fresh entry.
@@ -3316,6 +3454,9 @@ def _orphan_exit(state, o, current_price, reason="timeout"):
     entry_price = o.matched_sell_price if o.side == "buy" else o.matched_buy_price
     decimals = state.price_decimals
     a_pct, b_pct = compute_entry_distances(state)
+    # Apply backoff widening on top of asymmetry
+    a_pct = get_backoff_entry_pct(a_pct, state.consecutive_losses_a)
+    b_pct = get_backoff_entry_pct(b_pct, state.consecutive_losses_b)
 
     # Enforce recovery slot cap
     if len(state.recovery_orders) >= config.MAX_RECOVERY_SLOTS:
@@ -4554,6 +4695,14 @@ def get_status_summary(state: GridState, current_price: float) -> str:
             lines.append(
                 f"Unrealized: ${upnl['total_unrealized']:.4f} "
                 f"(A: ${upnl['a_unrealized']:.4f}, B: ${upnl['b_unrealized']:.4f})"
+            )
+        # Show backoff state if any consecutive losses
+        if state.consecutive_losses_a or state.consecutive_losses_b:
+            eff_a = get_backoff_entry_pct(state.entry_pct, state.consecutive_losses_a)
+            eff_b = get_backoff_entry_pct(state.entry_pct, state.consecutive_losses_b)
+            lines.append(
+                f"Backoff: A={state.consecutive_losses_a} losses (eff {eff_a:.2f}%), "
+                f"B={state.consecutive_losses_b} losses (eff {eff_b:.2f}%)"
             )
     else:
         # Trend ratio display

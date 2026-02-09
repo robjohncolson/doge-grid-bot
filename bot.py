@@ -53,6 +53,7 @@ import grid_strategy
 import ai_advisor
 import notifier
 import dashboard
+import factory_viz
 import stats_engine
 import telegram_menu
 import supabase_store
@@ -188,6 +189,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._handle_swarm_status()
         elif path == "/api/swarm/available":
             self._handle_swarm_available()
+        elif path == "/factory":
+            self._send_html(factory_viz.FACTORY_HTML)
+        elif path == "/api/factory/status":
+            self._handle_factory_status()
+        elif path == "/api/factory/stream":
+            self._handle_factory_sse()
         elif path == "/health":
             self._handle_health()
         else:
@@ -292,6 +299,36 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         current_price = state.center_price
                     data = json.dumps(dashboard.serialize_state(state, current_price))
 
+                self.wfile.write(f"data: {data}\n\n".encode("utf-8"))
+                self.wfile.flush()
+                time.sleep(3)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            pass
+
+    def _handle_factory_status(self):
+        """GET /api/factory/status -- machine-level state for factory viz."""
+        if not _bot_states:
+            self._send_json({"error": "bot not initialized"}, 503)
+            return
+        self._send_json(factory_viz.serialize_factory_state(_bot_states, _current_prices))
+
+    def _handle_factory_sse(self):
+        """GET /api/factory/stream -- SSE stream for factory viz (3s interval)."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+        try:
+            while True:
+                if not _bot_states:
+                    data = json.dumps({"error": "bot not initialized"})
+                else:
+                    data = json.dumps(
+                        factory_viz.serialize_factory_state(_bot_states, _current_prices)
+                    )
                 self.wfile.write(f"data: {data}\n\n".encode("utf-8"))
                 self.wfile.flush()
                 time.sleep(3)
@@ -918,6 +955,10 @@ def _execute_approved_action(state: grid_strategy.GridState, action: str,
       pause           -> pause the bot
       reset_grid      -> cancel and rebuild grid at current price
     """
+    # Normalize AI prompt aliases to handler names
+    ACTION_ALIASES = {"widen_profit": "widen_spacing", "tighten_profit": "tighten_spacing"}
+    action = ACTION_ALIASES.get(action, action)
+
     if action == "widen_spacing":
         if config.STRATEGY_MODE == "pair":
             old = state.profit_pct
@@ -1069,6 +1110,8 @@ def _handle_text_commands(state: grid_strategy.GridState, current_price: float,
             _cmd_stats(state)
         elif command == "/menu":
             _cmd_menu()
+        elif command == "/resetbackoff":
+            _cmd_resetbackoff(state)
         elif command == "/help":
             _cmd_help()
         else:
@@ -1216,6 +1259,21 @@ def _cmd_stats(state: grid_strategy.GridState):
     notifier._send_message("\n".join(lines))
 
 
+def _cmd_resetbackoff(state: grid_strategy.GridState):
+    """Handle /resetbackoff -- clear consecutive loss counters."""
+    old_a = state.consecutive_losses_a
+    old_b = state.consecutive_losses_b
+    state.consecutive_losses_a = 0
+    state.consecutive_losses_b = 0
+    grid_strategy.save_state(state)
+    logger.info("Backoff counters reset via Telegram (was A=%d, B=%d)", old_a, old_b)
+    notifier._send_message(
+        f"Backoff counters reset to 0.\n"
+        f"Was: A={old_a} losses, B={old_b} losses\n"
+        f"Entry distance returns to base: {state.entry_pct:.2f}%"
+    )
+
+
 def _cmd_help():
     """Handle /help -- list available commands."""
     notifier._send_message(
@@ -1227,6 +1285,7 @@ def _cmd_help():
         "/spacing &lt;pct&gt; -- Set grid spacing % and rebuild\n"
         "/ratio -- Show/set trend ratio (asymmetric grid)\n"
         "/stats -- Statistical analysis results\n"
+        "/resetbackoff -- Clear entry backoff counters\n"
         "/help -- This message"
     )
 
@@ -2002,10 +2061,29 @@ def run():
                 ai_state.ai_recommendation = ai_advisor.format_recommendation(recommendation)
                 ai_state._last_ai_result = recommendation
 
-                msg_id = notifier.notify_ai_recommendation(recommendation, ai_price)
                 action = recommendation.get("action", "continue")
-                if action != "continue" and msg_id:
-                    _set_pending_approval(action, msg_id, recommendation)
+                consensus_type = recommendation.get("consensus_type")
+
+                # Auto-execute safe (conservative) actions without approval
+                AI_SAFE_ACTIONS = {"widen_entry", "widen_spacing"}
+                if (config.AI_AUTO_EXECUTE
+                        and action in AI_SAFE_ACTIONS
+                        and consensus_type in ("majority", "condition_fallback")):
+                    logger.info(
+                        "AI AUTO-EXECUTE: %s (consensus=%s)",
+                        action, consensus_type,
+                    )
+                    _execute_approved_action(ai_state, action, ai_price)
+                    notifier._send_message(
+                        f"AI AUTO-EXECUTE: {action}\n"
+                        f"Consensus: {consensus_type}\n"
+                        f"Reason: {recommendation.get('reason', '')}"
+                    )
+                    ai_advisor.log_approval_decision(action, "auto-executed")
+                else:
+                    msg_id = notifier.notify_ai_recommendation(recommendation, ai_price)
+                    if action != "continue" and msg_id:
+                        _set_pending_approval(action, msg_id, recommendation)
 
             # --- 4f2: Poll for approval callbacks & check expiry ---
             _check_approval_expiry()
@@ -2047,6 +2125,16 @@ def run():
                         state.stats_results = stats_engine.run_all(
                             state, cp, _ohlc_caches.get(pair_name, [])
                         )
+                        # Volatility auto-adjust profit target
+                        if config.STRATEGY_MODE == "pair":
+                            adjusted = grid_strategy.adjust_profit_from_volatility(
+                                state, state.stats_results)
+                            if adjusted:
+                                notifier._send_message(
+                                    f"[{state.pair_display}] Volatility auto-adjust: "
+                                    f"profit target -> {state.profit_pct:.2f}%"
+                                )
+                                grid_strategy.save_state(state)
                     except Exception as e:
                         logger.debug("[%s] Stats engine error: %s", pair_name, e)
 
