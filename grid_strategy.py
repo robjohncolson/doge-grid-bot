@@ -323,6 +323,17 @@ class GridState:
             return self.pair_config.stop_floor
         return config.STOP_FLOOR
 
+    @property
+    def next_entry_multiplier(self) -> float:
+        if self.pair_config:
+            return self.pair_config.next_entry_multiplier
+        return 1.0
+
+    @next_entry_multiplier.setter
+    def next_entry_multiplier(self, val):
+        if self.pair_config:
+            self.pair_config.next_entry_multiplier = val
+
 
 # ---------------------------------------------------------------------------
 # State persistence
@@ -394,6 +405,7 @@ def save_state(state: GridState):
         "grid_spacing_pct": config.GRID_SPACING_PCT,
         "pair_profit_pct": state.profit_pct,
         "pair_entry_pct": state.entry_pct,
+        "next_entry_multiplier": state.next_entry_multiplier,
     }
     state_path = _state_file_path(state)
     tmp_path = state_path + ".tmp"
@@ -465,6 +477,12 @@ def load_state(state: GridState) -> bool:
     state.last_refresh_direction_b = snapshot.get("last_refresh_direction_b", None)
     state.refresh_cooldown_until_a = snapshot.get("refresh_cooldown_until_a", 0.0)
     state.refresh_cooldown_until_b = snapshot.get("refresh_cooldown_until_b", 0.0)
+
+    # Restore entry multiplier
+    saved_mult = snapshot.get("next_entry_multiplier", 1.0)
+    if saved_mult != 1.0:
+        state.next_entry_multiplier = saved_mult
+        logger.info("Restoring entry multiplier: %.1fx", saved_mult)
 
     # Restore pair_entry_pct runtime override
     saved_entry_pct = snapshot.get("pair_entry_pct")
@@ -1125,19 +1143,25 @@ def check_fills_live(state: GridState, current_price: float = 0.0) -> list:
     if not open_orders:
         return []
 
-    # Query order status from Kraken
+    # Query order status from Kraken (or use batch-cached results)
     txids = [o.txid for o in open_orders if o.txid]
     if not txids:
         return []
 
-    try:
-        order_info = kraken_client.query_orders(txids)
-    except Exception as e:
-        logger.error("Failed to query orders: %s", e)
-        state.consecutive_errors += 1
-        return []
-
-    state.consecutive_errors = 0  # Reset on success
+    # Use batch-cached order info if available (populated by main loop)
+    cached = getattr(state, "_cached_order_info", None)
+    if cached is not None:
+        order_info = cached
+        state._cached_order_info = None  # consume cache
+        state.consecutive_errors = 0
+    else:
+        try:
+            order_info = kraken_client.query_orders(txids)
+        except Exception as e:
+            logger.error("Failed to query orders: %s", e)
+            state.consecutive_errors += 1
+            return []
+        state.consecutive_errors = 0  # Reset on success
 
     # Diagnostic: log query result counts
     if len(order_info) != len(txids):
@@ -2046,6 +2070,17 @@ def _place_pair_order(state, side, price, role, matched_buy=None,
     cycle:    int -- current cycle number for this trade.
     """
     volume = calculate_volume_for_price(price, state)
+    # Apply entry size multiplier (only for entries, exits use actual fill volume)
+    if role == "entry" and state.next_entry_multiplier > 1.0:
+        volume = volume * state.next_entry_multiplier
+        vol_dec = state.volume_decimals if state else 0
+        if vol_dec == 0:
+            volume = float(int(volume))
+        else:
+            volume = round(volume, vol_dec)
+        min_vol = state.min_volume if state and state.pair_config else ORDERMIN_DOGE
+        if volume < min_vol:
+            volume = float(min_vol)
     level = -1 if side == "buy" else +1
     order = GridOrder(level=level, side=side, price=price, volume=volume)
     order.order_role = role
@@ -2411,6 +2446,11 @@ def handle_pair_fill(state: GridState, filled_orders: list,
         if filled.side == "buy" and is_entry:
             tid = tid or "B"
             state.total_entries_filled += 1
+            # Reset entry multiplier after fill
+            if state.next_entry_multiplier > 1.0:
+                logger.info("  Entry multiplier %.1fx applied, resetting to 1x",
+                            state.next_entry_multiplier)
+                state.next_entry_multiplier = 1.0
             logger.info(
                 "PAIR [%s.%d]: Buy entry filled @ $%.6f (%.2f DOGE)",
                 tid, cyc, filled.price, filled.volume,
@@ -2535,6 +2575,11 @@ def handle_pair_fill(state: GridState, filled_orders: list,
         elif filled.side == "sell" and is_entry:
             tid = tid or "A"
             state.total_entries_filled += 1
+            # Reset entry multiplier after fill
+            if state.next_entry_multiplier > 1.0:
+                logger.info("  Entry multiplier %.1fx applied, resetting to 1x",
+                            state.next_entry_multiplier)
+                state.next_entry_multiplier = 1.0
             logger.info(
                 "PAIR [%s.%d]: Sell entry filled @ $%.6f (%.2f DOGE)",
                 tid, cyc, filled.price, filled.volume,

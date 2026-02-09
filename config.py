@@ -286,6 +286,44 @@ class PairConfig:
         self.price_decimals = price_decimals
         self.volume_decimals = volume_decimals
         self.filter_strings = filter_strings or [pair[:3].upper()]
+        self.next_entry_multiplier = 1.0  # entry size multiplier (1x = normal)
+
+    def to_dict(self) -> dict:
+        """Serialize for persistence."""
+        return {
+            "pair": self.pair,
+            "display": self.display,
+            "entry_pct": self.entry_pct,
+            "profit_pct": self.profit_pct,
+            "refresh_pct": self.refresh_pct,
+            "order_size_usd": self.order_size_usd,
+            "daily_loss_limit": self.daily_loss_limit,
+            "stop_floor": self.stop_floor,
+            "min_volume": self.min_volume,
+            "price_decimals": self.price_decimals,
+            "volume_decimals": self.volume_decimals,
+            "filter_strings": self.filter_strings,
+            "next_entry_multiplier": self.next_entry_multiplier,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "PairConfig":
+        pc = PairConfig(
+            pair=d["pair"],
+            display=d.get("display", d["pair"]),
+            entry_pct=d.get("entry_pct", PAIR_ENTRY_PCT),
+            profit_pct=d.get("profit_pct", PAIR_PROFIT_PCT),
+            refresh_pct=d.get("refresh_pct", PAIR_REFRESH_PCT),
+            order_size_usd=d.get("order_size_usd", ORDER_SIZE_USD),
+            daily_loss_limit=d.get("daily_loss_limit", DAILY_LOSS_LIMIT),
+            stop_floor=d.get("stop_floor", STOP_FLOOR),
+            min_volume=d.get("min_volume", 13),
+            price_decimals=d.get("price_decimals", 6),
+            volume_decimals=d.get("volume_decimals", 0),
+            filter_strings=d.get("filter_strings"),
+        )
+        pc.next_entry_multiplier = d.get("next_entry_multiplier", 1.0)
+        return pc
 
 
 def _build_pairs() -> dict:

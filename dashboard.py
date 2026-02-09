@@ -405,9 +405,94 @@ a{color:#58a6ff}
 .health-banner:hover{border-color:#58a6ff !important}
 .health-banner .hb-hint{font-size:10px;color:#484f58;margin-top:4px}
 .health-banner:hover .hb-hint{color:#58a6ff}
+
+/* Swarm view */
+.swarm-view{display:none}
+.swarm-header{display:flex;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap}
+.swarm-header h2{font-size:16px;color:#f0f6fc;flex:1}
+.swarm-agg{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;margin-bottom:16px}
+.swarm-agg .card .value{font-size:18px}
+.swarm-table{width:100%;border-collapse:collapse;font-size:12px}
+.swarm-table th{text-align:left;color:#8b949e;padding:6px 8px;border-bottom:1px solid #30363d;position:sticky;top:0;background:#0d1117;font-size:11px;text-transform:uppercase}
+.swarm-table td{padding:4px 8px;border-bottom:1px solid #21262d}
+.swarm-table tr:hover{background:#161b22}
+.swarm-table tr{cursor:pointer}
+.swarm-table .pnl-pos{color:#3fb950}
+.swarm-table .pnl-neg{color:#f85149}
+.swarm-table .pnl-zero{color:#8b949e}
+.swarm-table select{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:3px;padding:2px 4px;font-size:11px;font-family:inherit}
+.swarm-table .btn-remove{background:#21262d;border:1px solid #30363d;color:#f85149;border-radius:3px;padding:2px 8px;font-size:11px;cursor:pointer}
+.swarm-table .btn-remove:hover{background:#da3633;color:#fff}
+.btn-browse{background:#238636;border:1px solid #2ea043;color:#fff;border-radius:6px;padding:6px 14px;font-size:13px;cursor:pointer;font-family:inherit}
+.btn-browse:hover{background:#2ea043}
+.btn-back{background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:6px 14px;font-size:13px;cursor:pointer;font-family:inherit;margin-bottom:16px}
+.btn-back:hover{background:#30363d}
+.detail-view{display:none}
+
+/* Scanner modal */
+.scanner-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.8);z-index:2000;justify-content:center;align-items:flex-start;padding:30px 16px;overflow-y:auto}
+.scanner-overlay.active{display:flex}
+.scanner-panel{background:#0d1117;border:1px solid #30363d;border-radius:12px;max-width:900px;width:100%;max-height:85vh;display:flex;flex-direction:column}
+.scanner-head{padding:16px 20px;border-bottom:1px solid #30363d;display:flex;align-items:center;gap:12px}
+.scanner-head h3{font-size:16px;color:#f0f6fc;flex:1}
+.scanner-head input{background:#161b22;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:6px 12px;font-size:13px;font-family:inherit;width:200px}
+.scanner-head .scanner-close{background:none;border:none;color:#8b949e;font-size:24px;cursor:pointer}
+.scanner-head .scanner-close:hover{color:#f0f6fc}
+.scanner-body{overflow-y:auto;flex:1;padding:0}
+.scanner-table{width:100%;border-collapse:collapse;font-size:12px}
+.scanner-table th{text-align:left;color:#8b949e;padding:6px 10px;border-bottom:1px solid #30363d;position:sticky;top:0;background:#0d1117;font-size:11px}
+.scanner-table td{padding:5px 10px;border-bottom:1px solid #21262d}
+.scanner-table tr:hover{background:#161b22}
+.scanner-table .btn-add{background:#238636;border:1px solid #2ea043;color:#fff;border-radius:3px;padding:2px 10px;font-size:11px;cursor:pointer}
+.scanner-table .btn-add:hover{background:#2ea043}
+.scanner-table .badge-active{background:#238636;color:#fff;border-radius:3px;padding:2px 8px;font-size:10px;font-weight:700}
+.scanner-info{padding:16px 20px;color:#8b949e;font-size:12px;text-align:center}
 </style>
 </head>
 <body>
+
+<!-- Swarm View (shown when >1 pair active) -->
+<div class="swarm-view" id="swarm-view">
+  <div class="swarm-header">
+    <h2>Swarm Manager</h2>
+    <span id="swarm-badge" class="badge badge-dry">---</span>
+    <button class="btn-browse" onclick="openScanner()">Browse Pairs</button>
+    <span class="uptime" id="swarm-uptime">--</span>
+  </div>
+  <div class="swarm-agg" id="swarm-agg">
+    <div class="card"><div class="label">Active Pairs</div><div class="value" id="sw-pairs">--</div></div>
+    <div class="card"><div class="label">Today P&amp;L</div><div class="value" id="sw-today">--</div></div>
+    <div class="card"><div class="label">Total P&amp;L</div><div class="value" id="sw-total">--</div></div>
+    <div class="card"><div class="label">Trips Today</div><div class="value" id="sw-trips">--</div></div>
+    <div class="card"><div class="label">Total Trips</div><div class="value" id="sw-total-trips">--</div></div>
+  </div>
+  <div style="overflow-x:auto">
+    <table class="swarm-table">
+      <thead><tr>
+        <th>Pair</th><th>Price</th><th>State</th><th>Today</th><th>Total</th><th>Trips</th><th>Entry%</th><th>Multi</th><th></th>
+      </tr></thead>
+      <tbody id="swarm-body"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Scanner Modal -->
+<div class="scanner-overlay" id="scanner-overlay" onclick="if(event.target===this)closeScanner()">
+  <div class="scanner-panel">
+    <div class="scanner-head">
+      <h3>Available Pairs</h3>
+      <input type="text" id="scanner-search" placeholder="Search pairs..." oninput="filterScanner()">
+      <button class="scanner-close" onclick="closeScanner()">&times;</button>
+    </div>
+    <div class="scanner-body" id="scanner-body">
+      <div class="scanner-info">Loading pairs...</div>
+    </div>
+  </div>
+</div>
+
+<!-- Detail View wrapper (wraps existing single-pair dashboard) -->
+<div class="detail-view" id="detail-view">
+<button class="btn-back" id="btn-back" onclick="showSwarmView()" style="display:none">&#8592; Back to Swarm</button>
 
 <div class="header">
   <h1 id="bot-title">DOGE Grid Bot</h1>
@@ -611,6 +696,8 @@ a{color:#58a6ff}
     <div id="modal-content"></div>
   </div>
 </div>
+
+</div><!-- end detail-view -->
 
 <script>
 const API = '/api/status';
@@ -1730,7 +1817,241 @@ function startSSE() {
   };
 }
 async function poll() { try { const r = await fetch(API); if (r.ok) update(await r.json()); } catch(e) {} }
-// Initial fetch for immediate render, then start SSE
+// === Swarm View ===
+let swarmMode = false;
+let swarmData = null;
+let scannerData = null;
+let scannerCacheTime = 0;
+let detailPair = null;
+
+function isMultiPair() {
+  // Determined from swarm status or configured_pairs
+  return swarmData && swarmData.aggregate && swarmData.aggregate.active_pairs > 1;
+}
+
+function showSwarmView() {
+  swarmMode = true;
+  detailPair = null;
+  document.getElementById('swarm-view').style.display = '';
+  document.getElementById('detail-view').style.display = 'none';
+  pollSwarm();
+}
+
+function showDetailView(pair) {
+  swarmMode = false;
+  detailPair = pair;
+  document.getElementById('swarm-view').style.display = 'none';
+  document.getElementById('detail-view').style.display = '';
+  document.getElementById('btn-back').style.display = isMultiPair() ? '' : 'none';
+}
+
+function renderSwarm(data) {
+  swarmData = data;
+  const agg = data.aggregate;
+  document.getElementById('sw-pairs').textContent = agg.active_pairs;
+  const todayEl = document.getElementById('sw-today');
+  todayEl.textContent = fmtUSD(agg.today_profit);
+  todayEl.style.color = agg.today_profit >= 0 ? '#3fb950' : '#f85149';
+  const totalEl = document.getElementById('sw-total');
+  totalEl.textContent = fmtUSD(agg.total_profit);
+  totalEl.style.color = agg.total_profit >= 0 ? '#3fb950' : '#f85149';
+  document.getElementById('sw-trips').textContent = agg.trips_today;
+  document.getElementById('sw-total-trips').textContent = agg.total_trips;
+
+  const tbody = document.getElementById('swarm-body');
+  let rows = '';
+  const pairs = data.pairs || [];
+  pairs.sort(function(a,b){ return b.today_pnl - a.today_pnl; });
+  for (const p of pairs) {
+    const pnlCls = p.today_pnl > 0 ? 'pnl-pos' : (p.today_pnl < 0 ? 'pnl-neg' : 'pnl-zero');
+    const totCls = p.total_pnl > 0 ? 'pnl-pos' : (p.total_pnl < 0 ? 'pnl-neg' : 'pnl-zero');
+    const multVal = p.multiplier || 1;
+    rows += '<tr onclick="showDetailView(\'' + p.pair + '\')">';
+    rows += '<td><b>' + p.display + '</b></td>';
+    rows += '<td>$' + (p.price < 1 ? p.price.toFixed(6) : p.price.toFixed(2)) + '</td>';
+    rows += '<td>' + p.pair_state + '</td>';
+    rows += '<td class="' + pnlCls + '">' + fmtUSD(p.today_pnl) + '</td>';
+    rows += '<td class="' + totCls + '">' + fmtUSD(p.total_pnl) + '</td>';
+    rows += '<td>' + p.trips_today + '/' + p.total_trips + '</td>';
+    rows += '<td>' + fmt(p.entry_pct, 2) + '%</td>';
+    rows += '<td><select onchange="setMultiplier(\'' + p.pair + '\',this.value);event.stopPropagation()">'
+          + '<option' + (multVal===1 ? ' selected' : '') + '>1x</option>'
+          + '<option' + (multVal===2 ? ' selected' : '') + '>2x</option>'
+          + '<option' + (multVal===3 ? ' selected' : '') + '>3x</option>'
+          + '<option' + (multVal===5 ? ' selected' : '') + '>5x</option>'
+          + '</select></td>';
+    rows += '<td><button class="btn-remove" onclick="removePair(\'' + p.pair + '\');event.stopPropagation()">X</button></td>';
+    rows += '</tr>';
+  }
+  tbody.innerHTML = rows || '<tr><td colspan="9" style="text-align:center;color:#8b949e">No pairs active</td></tr>';
+}
+
+async function pollSwarm() {
+  try {
+    const r = await fetch('/api/swarm/status');
+    if (r.ok) {
+      const data = await r.json();
+      renderSwarm(data);
+    }
+  } catch(e) {}
+}
+
+async function setMultiplier(pair, val) {
+  const mult = parseInt(val);
+  try {
+    await fetch('/api/swarm/multiplier', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({pair: pair, multiplier: mult})
+    });
+  } catch(e) {}
+}
+
+async function removePair(pair) {
+  if (!confirm('Remove ' + pair + '? Open orders will be cancelled.')) return;
+  try {
+    await fetch('/api/swarm/remove', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({pair: pair})
+    });
+    setTimeout(pollSwarm, 1000);
+  } catch(e) {}
+}
+
+async function addPair(pair) {
+  try {
+    const r = await fetch('/api/swarm/add', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({pair: pair})
+    });
+    const d = await r.json();
+    if (r.ok) {
+      // Refresh scanner and swarm
+      scannerCacheTime = 0;
+      loadScanner();
+      setTimeout(pollSwarm, 2000);
+    } else {
+      alert(d.error || 'Failed to add pair');
+    }
+  } catch(e) { alert('Network error'); }
+}
+
+// === Scanner ===
+function openScanner() {
+  document.getElementById('scanner-overlay').classList.add('active');
+  loadScanner();
+}
+
+function closeScanner() {
+  document.getElementById('scanner-overlay').classList.remove('active');
+}
+
+async function loadScanner() {
+  const now = Date.now();
+  if (scannerData && (now - scannerCacheTime) < 60000) {
+    renderScanner(scannerData);
+    return;
+  }
+  document.getElementById('scanner-body').innerHTML = '<div class="scanner-info">Loading pairs from Kraken...</div>';
+  try {
+    const r = await fetch('/api/swarm/available');
+    if (r.ok) {
+      scannerData = await r.json();
+      scannerCacheTime = now;
+      renderScanner(scannerData);
+    }
+  } catch(e) {
+    document.getElementById('scanner-body').innerHTML = '<div class="scanner-info">Failed to load pairs</div>';
+  }
+}
+
+function renderScanner(data) {
+  const search = (document.getElementById('scanner-search').value || '').toUpperCase();
+  let filtered = data;
+  if (search) {
+    filtered = data.filter(function(p) {
+      return p.pair.toUpperCase().indexOf(search) >= 0
+          || p.display.toUpperCase().indexOf(search) >= 0
+          || p.base.toUpperCase().indexOf(search) >= 0;
+    });
+  }
+  let html = '<table class="scanner-table"><thead><tr>'
+    + '<th>Pair</th><th>Price</th><th>Volatility</th><th>24h Vol</th><th>Spread</th><th>Fee</th><th></th>'
+    + '</tr></thead><tbody>';
+  for (const p of filtered.slice(0, 100)) {
+    html += '<tr>';
+    html += '<td><b>' + p.display + '</b></td>';
+    html += '<td>$' + (p.price < 1 ? p.price.toFixed(6) : p.price.toFixed(2)) + '</td>';
+    html += '<td>' + p.volatility_pct.toFixed(1) + '%</td>';
+    html += '<td>$' + (p.volume_24h > 1e6 ? (p.volume_24h/1e6).toFixed(1)+'M' : Math.round(p.volume_24h).toLocaleString()) + '</td>';
+    html += '<td>' + p.spread_pct.toFixed(3) + '%</td>';
+    html += '<td>' + p.fee_maker.toFixed(2) + '%</td>';
+    if (p.active) {
+      html += '<td><span class="badge-active">Active</span></td>';
+    } else {
+      html += '<td><button class="btn-add" onclick="addPair(\'' + p.pair + '\')">Add</button></td>';
+    }
+    html += '</tr>';
+  }
+  html += '</tbody></table>';
+  if (filtered.length === 0) {
+    html = '<div class="scanner-info">No pairs match your search</div>';
+  }
+  document.getElementById('scanner-body').innerHTML = html;
+}
+
+function filterScanner() {
+  if (scannerData) renderScanner(scannerData);
+}
+
+// === View routing ===
+// On initial load, check pair count to decide view
+async function initView() {
+  try {
+    const r = await fetch('/api/swarm/status');
+    if (r.ok) {
+      const data = await r.json();
+      swarmData = data;
+      if (data.aggregate && data.aggregate.active_pairs > 1) {
+        showSwarmView();
+        renderSwarm(data);
+      } else {
+        showDetailView(null);
+      }
+    } else {
+      showDetailView(null);
+    }
+  } catch(e) {
+    showDetailView(null);
+  }
+}
+
+// Override the API url for detail view when a specific pair is selected
+const origPoll = poll;
+async function poll() {
+  if (swarmMode) {
+    pollSwarm();
+    return;
+  }
+  try {
+    let url = API;
+    if (detailPair) url = API + '?pair=' + detailPair;
+    const r = await fetch(url);
+    if (r.ok) update(await r.json());
+  } catch(e) {}
+}
+
+// Swarm auto-refresh
+setInterval(function() {
+  if (swarmMode) pollSwarm();
+}, 5000);
+
+// Initial view setup
+initView();
+
+// Initial detail fetch + SSE
 poll();
 startSSE();
 </script>

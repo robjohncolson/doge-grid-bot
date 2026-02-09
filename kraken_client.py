@@ -317,6 +317,73 @@ def get_asset_pairs(pair: str = None) -> dict:
 
 
 # ===========================================================================
+# BATCH PUBLIC API METHODS (for multi-pair swarm)
+# ===========================================================================
+
+def get_tickers(pairs: list) -> dict:
+    """
+    Fetch ticker data for multiple pairs in one call.
+    Public endpoint -- no rate limit cost.
+
+    Chunks into groups of 30 for URL length safety.
+    Returns raw {kraken_response_key: ticker_data} merged across chunks.
+    """
+    if not pairs:
+        return {}
+
+    result = {}
+    # Chunk into groups of 30
+    for i in range(0, len(pairs), 30):
+        chunk = pairs[i:i + 30]
+        pair_str = ",".join(chunk)
+        try:
+            chunk_result = _public_request(TICKER_PATH, {"pair": pair_str})
+            result.update(chunk_result)
+        except Exception as e:
+            logger.error("Batch ticker failed for chunk %d: %s", i // 30, e)
+    return result
+
+
+def get_prices(pairs: list) -> dict:
+    """
+    Get mid-prices for multiple pairs in one batch call.
+    Returns {input_pair_name: mid_price} for all pairs that returned data.
+
+    Handles Kraken's key aliasing (e.g. input "XDGUSD" -> response "XXDGZUSD")
+    by checking substring containment in both directions.
+    """
+    if not pairs:
+        return {}
+
+    raw = get_tickers(pairs)
+    if not raw:
+        return {}
+
+    # Build reverse lookup: map response keys back to input pair names
+    prices = {}
+    for input_pair in pairs:
+        inp = input_pair.upper()
+        matched = False
+        for resp_key, ticker in raw.items():
+            rk = resp_key.upper()
+            # Check substring match both directions
+            if inp in rk or rk in inp or inp == rk:
+                try:
+                    bid = float(ticker["b"][0])
+                    ask = float(ticker["a"][0])
+                    prices[input_pair] = (bid + ask) / 2.0
+                except (KeyError, IndexError, ValueError, TypeError):
+                    logger.warning("Bad ticker data for %s: %s", input_pair, ticker)
+                matched = True
+                break
+        if not matched:
+            logger.debug("No ticker match for %s in response keys: %s",
+                         input_pair, list(raw.keys()))
+
+    return prices
+
+
+# ===========================================================================
 # PRIVATE API METHODS (require auth)
 # ===========================================================================
 
@@ -450,6 +517,28 @@ def query_orders(txids: list) -> dict:
     # Kraken accepts comma-separated txids
     params = {"txid": ",".join(txids)}
     return _private_request(QUERY_ORDERS_PATH, params)
+
+
+def query_orders_batched(txids: list, batch_size: int = 50) -> dict:
+    """
+    Query order status for many txids, batching into groups of batch_size.
+    Each batch costs 1 private API call.
+    Returns merged dict of {txid: order_info}.
+    """
+    if config.DRY_RUN:
+        return {}
+    if not txids:
+        return {}
+
+    result = {}
+    for i in range(0, len(txids), batch_size):
+        chunk = txids[i:i + batch_size]
+        try:
+            chunk_result = query_orders(chunk)
+            result.update(chunk_result)
+        except Exception as e:
+            logger.error("Batch query_orders failed for chunk %d: %s", i // batch_size, e)
+    return result
 
 
 def get_trades_history(start: float = None) -> dict:

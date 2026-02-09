@@ -56,6 +56,7 @@ import dashboard
 import stats_engine
 import telegram_menu
 import supabase_store
+import pair_scanner
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -130,6 +131,15 @@ _ohlc_caches: dict = {}       # pair_name -> list
 _ohlc_last_fetches: dict = {} # pair_name -> float
 
 
+# Swarm management queues (thread-safe via CPython GIL atomic assignment)
+_swarm_pending_adds: list = []      # list of config.PairConfig
+_swarm_pending_removes: list = []   # list of pair_name strings
+_swarm_pending_multipliers: list = []  # list of (pair_name, multiplier) tuples
+
+# OHLC round-robin index for throttled fetching
+_ohlc_robin_idx = 0
+
+
 def _first_state():
     """Return the first (or only) pair's state for backward-compatible code paths."""
     if not _bot_states:
@@ -162,25 +172,39 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         """Route GET requests."""
-        if self.path == "/":
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path == "/":
             self._send_html(dashboard.DASHBOARD_HTML)
-        elif self.path == "/api/status":
+        elif path == "/api/status":
             self._handle_api_status()
-        elif self.path == "/api/stats":
+        elif path == "/api/stats":
             self._handle_api_stats()
-        elif self.path == "/api/stream":
+        elif path == "/api/stream":
             self._handle_sse()
-        elif self.path.startswith("/api/export/"):
+        elif path.startswith("/api/export/"):
             self._handle_export()
-        elif self.path == "/health":
+        elif path == "/api/swarm/status":
+            self._handle_swarm_status()
+        elif path == "/api/swarm/available":
+            self._handle_swarm_available()
+        elif path == "/health":
             self._handle_health()
         else:
             self._send_json({"error": "not found"}, 404)
 
     def do_POST(self):
         """Route POST requests."""
-        if self.path == "/api/config":
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path == "/api/config":
             self._handle_api_config()
+        elif path == "/api/swarm/add":
+            self._handle_swarm_add()
+        elif path == "/api/swarm/remove":
+            self._handle_swarm_remove()
+        elif path == "/api/swarm/multiplier":
+            self._handle_swarm_multiplier()
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -392,6 +416,154 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    # ---------------------------------------------------------------
+    # Swarm API endpoints
+    # ---------------------------------------------------------------
+
+    def _handle_swarm_status(self):
+        """GET /api/swarm/status -- aggregate stats + per-pair compact summaries."""
+        if not _bot_states:
+            self._send_json({"error": "bot not initialized"}, 503)
+            return
+
+        pairs_list = []
+        for pn, st in _bot_states.items():
+            cp = _current_prices.get(pn, 0.0)
+            open_count = sum(1 for o in st.grid_orders if o.status == "open")
+            pairs_list.append({
+                "pair": pn,
+                "display": st.pair_display,
+                "price": round(cp, 8),
+                "pair_state": st.pair_state,
+                "today_pnl": round(st.today_profit_usd, 4),
+                "total_pnl": round(st.total_profit_usd, 4),
+                "trips_today": st.round_trips_today,
+                "total_trips": st.total_round_trips,
+                "open_orders": open_count,
+                "entry_pct": st.entry_pct,
+                "profit_pct": st.profit_pct,
+                "multiplier": st.next_entry_multiplier,
+                "paused": st.is_paused,
+            })
+
+        agg = {
+            "active_pairs": len(_bot_states),
+            "today_profit": round(sum(st.today_profit_usd for st in _bot_states.values()), 4),
+            "total_profit": round(sum(st.total_profit_usd for st in _bot_states.values()), 4),
+            "trips_today": sum(st.round_trips_today for st in _bot_states.values()),
+            "total_trips": sum(st.total_round_trips for st in _bot_states.values()),
+        }
+        self._send_json({"aggregate": agg, "pairs": pairs_list})
+
+    def _handle_swarm_available(self):
+        """GET /api/swarm/available -- pair scanner results (top 200)."""
+        try:
+            ranked = pair_scanner.get_ranked_pairs(min_volume_usd=1000)
+        except Exception as e:
+            self._send_json({"error": str(e)}, 500)
+            return
+
+        active_set = set(_bot_states.keys())
+        result = []
+        for pi in ranked[:200]:
+            result.append({
+                "pair": pi.pair,
+                "altname": pi.altname,
+                "base": pi.base,
+                "display": pair_scanner.get_display_name(pi.pair, pi.altname),
+                "price": round(pi.price, 8),
+                "volatility_pct": round(pi.volatility_pct, 2),
+                "volume_24h": round(pi.volume_24h, 0),
+                "spread_pct": round(pi.spread_pct, 3),
+                "fee_maker": pi.fee_maker,
+                "ordermin": pi.ordermin,
+                "active": pi.pair in active_set,
+            })
+        self._send_json(result)
+
+    def _handle_swarm_add(self):
+        """POST /api/swarm/add -- queue a pair for addition."""
+        global _swarm_pending_adds
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length > 0 else {}
+        except (ValueError, json.JSONDecodeError):
+            self._send_json({"error": "invalid JSON"}, 400)
+            return
+
+        pair_name = body.get("pair", "")
+        if not pair_name:
+            self._send_json({"error": "missing 'pair' field"}, 400)
+            return
+
+        if pair_name in _bot_states:
+            self._send_json({"error": f"{pair_name} already active"}, 400)
+            return
+
+        # Look up pair info from scanner cache
+        all_pairs = pair_scanner.scan_all_usd_pairs()
+        info = all_pairs.get(pair_name)
+        if not info:
+            self._send_json({"error": f"unknown pair: {pair_name}"}, 404)
+            return
+
+        pc = pair_scanner.auto_configure(info)
+        _swarm_pending_adds = _swarm_pending_adds + [pc]
+        self._send_json({"ok": True, "pair": pair_name, "display": pc.display})
+
+    def _handle_swarm_remove(self):
+        """POST /api/swarm/remove -- queue a pair for removal."""
+        global _swarm_pending_removes
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length > 0 else {}
+        except (ValueError, json.JSONDecodeError):
+            self._send_json({"error": "invalid JSON"}, 400)
+            return
+
+        pair_name = body.get("pair", "")
+        if not pair_name:
+            self._send_json({"error": "missing 'pair' field"}, 400)
+            return
+
+        if pair_name not in _bot_states:
+            self._send_json({"error": f"{pair_name} not active"}, 400)
+            return
+
+        _swarm_pending_removes = _swarm_pending_removes + [pair_name]
+        self._send_json({"ok": True, "pair": pair_name})
+
+    def _handle_swarm_multiplier(self):
+        """POST /api/swarm/multiplier -- set entry size multiplier for a pair."""
+        global _swarm_pending_multipliers
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length > 0 else {}
+        except (ValueError, json.JSONDecodeError):
+            self._send_json({"error": "invalid JSON"}, 400)
+            return
+
+        pair_name = body.get("pair", "")
+        mult = body.get("multiplier", 1)
+        if not pair_name:
+            self._send_json({"error": "missing 'pair' field"}, 400)
+            return
+        try:
+            mult = float(mult)
+            if mult < 1 or mult > 10:
+                self._send_json({"error": "multiplier must be 1-10"}, 400)
+                return
+        except (ValueError, TypeError):
+            self._send_json({"error": "multiplier must be a number"}, 400)
+            return
+
+        if pair_name not in _bot_states:
+            self._send_json({"error": f"{pair_name} not active"}, 400)
+            return
+
+        _swarm_pending_multipliers = _swarm_pending_multipliers + [(pair_name, mult)]
+        self._send_json({"ok": True, "pair": pair_name, "multiplier": mult})
 
     def _handle_api_config(self):
         """POST /api/config -- validate and queue config changes."""
@@ -1178,6 +1350,166 @@ def _handle_menu_action(state: grid_strategy.GridState, current_price: float,
 
 
 # ---------------------------------------------------------------------------
+# Active pairs persistence (Step 6)
+# ---------------------------------------------------------------------------
+
+ACTIVE_PAIRS_FILE = os.path.join(config.LOG_DIR, "active_pairs.json")
+
+
+def _save_active_pairs():
+    """Save the active pair list to disk and Supabase."""
+    pairs_data = []
+    for pair_name, state in _bot_states.items():
+        if state.pair_config:
+            pairs_data.append(state.pair_config.to_dict())
+    try:
+        os.makedirs(config.LOG_DIR, exist_ok=True)
+        tmp_path = ACTIVE_PAIRS_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(pairs_data, f, indent=2)
+        if os.path.exists(ACTIVE_PAIRS_FILE):
+            os.remove(ACTIVE_PAIRS_FILE)
+        os.rename(tmp_path, ACTIVE_PAIRS_FILE)
+        logger.debug("Saved %d active pairs to %s", len(pairs_data), ACTIVE_PAIRS_FILE)
+    except Exception as e:
+        logger.error("Failed to save active pairs: %s", e)
+    # Also save to Supabase
+    supabase_store.save_state({"active_pairs": pairs_data}, pair="__swarm__")
+
+
+def _load_active_pairs() -> list:
+    """Load active pairs from file, returns list of PairConfig dicts (or empty)."""
+    if os.path.exists(ACTIVE_PAIRS_FILE):
+        try:
+            with open(ACTIVE_PAIRS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list) and data:
+                logger.info("Loaded %d active pairs from %s", len(data), ACTIVE_PAIRS_FILE)
+                return data
+        except Exception as e:
+            logger.warning("Failed to load active pairs file: %s", e)
+
+    # Try Supabase
+    sb = supabase_store.load_state(pair="__swarm__")
+    if sb and "active_pairs" in sb:
+        data = sb["active_pairs"]
+        if isinstance(data, list) and data:
+            logger.info("Loaded %d active pairs from Supabase", len(data))
+            return data
+
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Dynamic pair add/remove (Step 3d)
+# ---------------------------------------------------------------------------
+
+def _add_pair(pair_config: config.PairConfig):
+    """Add a new trading pair to the live bot."""
+    pair_name = pair_config.pair
+    if pair_name in _bot_states:
+        logger.warning("Pair %s already active, skipping add", pair_name)
+        return
+
+    state = grid_strategy.GridState(pair_config=pair_config)
+    _bot_states[pair_name] = state
+    config.PAIRS[pair_name] = pair_config
+    _current_prices.setdefault(pair_name, 0.0)
+    _ohlc_caches[pair_name] = []
+    _ohlc_last_fetches[pair_name] = 0.0
+
+    # Try to load saved state
+    local_loaded = grid_strategy.load_state(state)
+    if not local_loaded:
+        _restore_from_supabase(state)
+
+    # Fetch initial price (use batch cache if available)
+    price = _current_prices.get(pair_name, 0.0)
+    if price <= 0:
+        try:
+            price = kraken_client.get_price(pair=pair_name)
+            _current_prices[pair_name] = price
+        except Exception as e:
+            logger.error("Failed to fetch price for new pair %s: %s", pair_name, e)
+            # Remove failed pair
+            _bot_states.pop(pair_name, None)
+            config.PAIRS.pop(pair_name, None)
+            return
+
+    grid_strategy.record_price(state, price)
+
+    # Build grid
+    adopted = grid_strategy.reconcile_on_startup(state, price)
+    if adopted > 0:
+        logger.info("[%s] Reconciliation adopted %d orders", pair_name, adopted)
+    orders = grid_strategy.build_grid(state, price)
+    deduped = grid_strategy.enforce_pair_order_limit(state)
+    grid_strategy.check_daily_reset(state)
+
+    logger.info("Added pair %s (%s): %d orders @ $%.6f",
+                pair_config.display, pair_name, len(orders), price)
+    _save_active_pairs()
+
+
+def _remove_pair(pair_name: str):
+    """Remove a trading pair from the live bot."""
+    if pair_name not in _bot_states:
+        logger.warning("Pair %s not active, skipping remove", pair_name)
+        return
+
+    state = _bot_states[pair_name]
+
+    # Cancel all orders
+    cancelled = grid_strategy.cancel_grid(state)
+    logger.info("[%s] Cancelled %d orders for removal", pair_name, cancelled)
+
+    # Save final state
+    grid_strategy.save_state(state)
+
+    # Clean up
+    _bot_states.pop(pair_name, None)
+    config.PAIRS.pop(pair_name, None)
+    _current_prices.pop(pair_name, None)
+    _ohlc_caches.pop(pair_name, None)
+    _ohlc_last_fetches.pop(pair_name, None)
+
+    logger.info("Removed pair %s", pair_name)
+    _save_active_pairs()
+
+
+def _process_swarm_queue():
+    """Process pending swarm add/remove/multiplier requests (called from main loop)."""
+    global _swarm_pending_adds, _swarm_pending_removes, _swarm_pending_multipliers
+
+    # Snapshot and clear queues atomically
+    adds = _swarm_pending_adds
+    removes = _swarm_pending_removes
+    mults = _swarm_pending_multipliers
+    _swarm_pending_adds = []
+    _swarm_pending_removes = []
+    _swarm_pending_multipliers = []
+
+    for pc in adds:
+        try:
+            _add_pair(pc)
+        except Exception as e:
+            logger.error("Failed to add pair %s: %s", pc.pair, e)
+
+    for pair_name in removes:
+        try:
+            _remove_pair(pair_name)
+        except Exception as e:
+            logger.error("Failed to remove pair %s: %s", pair_name, e)
+
+    for pair_name, mult in mults:
+        state = _bot_states.get(pair_name)
+        if state:
+            old = state.next_entry_multiplier
+            state.next_entry_multiplier = mult
+            logger.info("[%s] Entry multiplier: %.1fx -> %.1fx", pair_name, old, mult)
+
+
+# ---------------------------------------------------------------------------
 # Main bot logic
 # ---------------------------------------------------------------------------
 
@@ -1255,6 +1587,15 @@ def run():
 
     _bot_start_time = time.time()
 
+    # Load active pairs from persistence (overrides PAIRS env var if found)
+    saved_pairs = _load_active_pairs()
+    if saved_pairs:
+        config.PAIRS = {}
+        for pd in saved_pairs:
+            pc = config.PairConfig.from_dict(pd)
+            config.PAIRS[pc.pair] = pc
+        logger.info("Restored %d pairs from active_pairs persistence", len(config.PAIRS))
+
     # Create one GridState per configured pair
     for pair_name, pc in config.PAIRS.items():
         state = grid_strategy.GridState(pair_config=pc)
@@ -1289,23 +1630,40 @@ def run():
     # Start health check server (Railway expects a listening port)
     health_server = start_health_server()
 
-    # --- Phase 2: Fetch initial prices per pair ---
-    for pair_name, state in _bot_states.items():
-        logger.info("[%s] Fetching current price...", state.pair_display)
-        try:
-            current_price = kraken_client.get_price(pair=pair_name)
-            bid, ask, spread = kraken_client.get_spread(pair=pair_name)
-            _current_prices[pair_name] = current_price
-            logger.info(
-                "[%s] Price: $%.6f (bid=$%.6f, ask=$%.6f, spread=%.3f%%)",
-                state.pair_display, current_price, bid, ask, spread,
-            )
-        except Exception as e:
-            logger.error("[%s] Failed to fetch initial price: %s", pair_name, e)
-            notifier.notify_error(f"Bot failed to start {state.pair_display}: cannot fetch price\n{e}")
-            return
-
-        grid_strategy.record_price(state, current_price)
+    # --- Phase 2: Fetch initial prices (batch) ---
+    all_pair_names = list(_bot_states.keys())
+    logger.info("Fetching initial prices for %d pair(s)...", len(all_pair_names))
+    try:
+        batch_prices = kraken_client.get_prices(all_pair_names)
+        for pair_name, price in batch_prices.items():
+            _current_prices[pair_name] = price
+            state = _bot_states[pair_name]
+            grid_strategy.record_price(state, price)
+            logger.info("[%s] Price: $%.6f", state.pair_display, price)
+        # Check for pairs that didn't get prices
+        missing = [pn for pn in all_pair_names if _current_prices.get(pn, 0) <= 0]
+        if missing:
+            logger.warning("No price data for %d pair(s): %s -- retrying individually",
+                           len(missing), missing[:5])
+            for pn in missing:
+                try:
+                    price = kraken_client.get_price(pair=pn)
+                    _current_prices[pn] = price
+                    grid_strategy.record_price(_bot_states[pn], price)
+                    logger.info("[%s] Price (fallback): $%.6f", _bot_states[pn].pair_display, price)
+                except Exception as e:
+                    logger.error("[%s] Failed to fetch price: %s", pn, e)
+    except Exception as e:
+        logger.error("Batch price fetch failed, falling back to individual: %s", e)
+        for pair_name, state in _bot_states.items():
+            try:
+                price = kraken_client.get_price(pair=pair_name)
+                _current_prices[pair_name] = price
+                grid_strategy.record_price(state, price)
+            except Exception as e2:
+                logger.error("[%s] Failed to fetch price: %s", pair_name, e2)
+                notifier.notify_error(f"Bot failed to start {state.pair_display}: cannot fetch price\n{e2}")
+                return
 
     # --- Phase 2b: Validation guardrails ---
     first_price = _current_prices[_first_pair_name()]
@@ -1349,32 +1707,61 @@ def run():
             should_stop_global = False
 
             # ============================================================
+            # Batch operations (before per-pair loop)
+            # ============================================================
+
+            # 4a-batch: Fetch all prices in 1-2 public API calls
+            active_pairs = list(_bot_states.keys())
+            try:
+                batch_prices = kraken_client.get_prices(active_pairs)
+                for pn, price in batch_prices.items():
+                    _current_prices[pn] = price
+                    st = _bot_states.get(pn)
+                    if st:
+                        grid_strategy.record_price(st, price)
+                        supabase_store.queue_price_point(time.time(), price, pair=pn)
+                        st.consecutive_errors = 0
+                _global_consecutive_errors = 0
+            except Exception as e:
+                _global_consecutive_errors += 1
+                logger.error("Batch price fetch failed (%d/%d): %s",
+                             _global_consecutive_errors, config.MAX_CONSECUTIVE_ERRORS, e)
+                if _global_consecutive_errors >= config.MAX_CONSECUTIVE_ERRORS:
+                    logger.critical("Too many consecutive errors -- stopping bot")
+                    notifier.notify_risk_event("error", f"Max errors reached: {e}")
+                    should_stop_global = True
+
+            # 4a-batch: Collect all open txids and batch query (1-2 private calls)
+            if not should_stop_global and not config.DRY_RUN:
+                all_txids = {}  # txid -> pair_name
+                for pn, st in _bot_states.items():
+                    for o in st.grid_orders:
+                        if o.status == "open" and o.txid:
+                            all_txids[o.txid] = pn
+                if all_txids:
+                    try:
+                        batch_order_info = kraken_client.query_orders_batched(list(all_txids.keys()))
+                        # Distribute results to per-pair caches
+                        per_pair_info = {}
+                        for txid, info in batch_order_info.items():
+                            pn = all_txids.get(txid)
+                            if pn:
+                                per_pair_info.setdefault(pn, {})[txid] = info
+                        for pn, info_dict in per_pair_info.items():
+                            _bot_states[pn]._cached_order_info = info_dict
+                    except Exception as e:
+                        logger.error("Batch order query failed: %s", e)
+
+            if should_stop_global:
+                break
+
+            # ============================================================
             # Per-pair operations
             # ============================================================
             for pair_name, state in _bot_states.items():
-
-                # --- 4a: Fetch current price ---
-                try:
-                    current_price = kraken_client.get_price(pair=pair_name)
-                    _current_prices[pair_name] = current_price
-                    grid_strategy.record_price(state, current_price)
-                    supabase_store.queue_price_point(time.time(), current_price, pair=pair_name)
-                    state.consecutive_errors = 0
-                    _global_consecutive_errors = 0
-                except Exception as e:
-                    state.consecutive_errors += 1
-                    _global_consecutive_errors += 1
-                    logger.error(
-                        "[%s] Price fetch failed (%d/%d): %s",
-                        pair_name, state.consecutive_errors,
-                        config.MAX_CONSECUTIVE_ERRORS, e,
-                    )
-                    if _global_consecutive_errors >= config.MAX_CONSECUTIVE_ERRORS:
-                        logger.critical("Too many consecutive errors across pairs -- stopping bot")
-                        notifier.notify_risk_event("error", f"Max errors reached: {e}")
-                        should_stop_global = True
-                        break
-                    continue  # Skip this pair this cycle
+                current_price = _current_prices.get(pair_name, 0.0)
+                if current_price <= 0:
+                    continue  # No price data this cycle
 
                 # --- 4b: Check daily reset ---
                 old_date = state.today_date
@@ -1608,17 +1995,29 @@ def run():
             if first_st:
                 _apply_web_config(first_st, first_price)
 
-            # --- 4f4: Run stats engine per pair (every 60s) ---
+            # --- 4f4: Run stats engine (OHLC throttled: max 3 per cycle) ---
+            ohlc_pairs = [pn for pn in _bot_states if now - _ohlc_last_fetches.get(pn, 0) >= 300]
+            ohlc_fetched = 0
+            MAX_OHLC_PER_CYCLE = 3
+            # Round-robin: start from where we left off
+            if ohlc_pairs:
+                global _ohlc_robin_idx
+                for _ in range(len(ohlc_pairs)):
+                    if ohlc_fetched >= MAX_OHLC_PER_CYCLE:
+                        break
+                    idx = _ohlc_robin_idx % len(ohlc_pairs)
+                    _ohlc_robin_idx += 1
+                    pn = ohlc_pairs[idx]
+                    try:
+                        _ohlc_caches[pn] = kraken_client.get_ohlc(pair=pn, interval=5)
+                        _ohlc_last_fetches[pn] = now
+                        ohlc_fetched += 1
+                    except Exception as e:
+                        logger.debug("[%s] OHLC fetch failed: %s", pn, e)
+
             for pair_name, state in _bot_states.items():
                 if now - state.stats_last_run >= 60:
                     state.stats_last_run = now
-                    ohlc_last = _ohlc_last_fetches.get(pair_name, 0.0)
-                    if now - ohlc_last >= 300:
-                        try:
-                            _ohlc_caches[pair_name] = kraken_client.get_ohlc(pair=pair_name, interval=5)
-                            _ohlc_last_fetches[pair_name] = now
-                        except Exception as e:
-                            logger.debug("[%s] OHLC fetch failed: %s", pair_name, e)
                     try:
                         cp = _current_prices.get(pair_name, 0.0)
                         state.stats_results = stats_engine.run_all(
@@ -1646,6 +2045,9 @@ def run():
                     cp = _current_prices.get(pair_name, 0.0)
                     logger.info(grid_strategy.get_status_summary(state, cp))
                     grid_strategy.save_state(state)
+
+            # --- 4h2: Process swarm add/remove/multiplier queue ---
+            _process_swarm_queue()
 
             # --- 4i: Sleep until next poll ---
             elapsed = time.time() - loop_start
