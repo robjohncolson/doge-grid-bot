@@ -313,6 +313,9 @@ class GridState:
         self.detected_trend = None           # "up", "down", or None
         self.trend_detected_at = None        # When trend was detected
 
+        # Long-only mode: auto-set when sell entry fails due to no inventory
+        self.long_only = False
+
     # -- Per-pair property accessors (fall back to global config) --
 
     @property
@@ -496,6 +499,7 @@ def save_state(state: GridState):
         "exit_reprice_count_b": state.exit_reprice_count_b,
         "detected_trend": state.detected_trend,
         "trend_detected_at": state.trend_detected_at,
+        "long_only": state.long_only,
     }
     state_path = _state_file_path(state)
     tmp_path = state_path + ".tmp"
@@ -584,6 +588,11 @@ def load_state(state: GridState) -> bool:
     state.exit_reprice_count_b = snapshot.get("exit_reprice_count_b", 0)
     state.detected_trend = snapshot.get("detected_trend")
     state.trend_detected_at = snapshot.get("trend_detected_at")
+
+    # Restore long-only mode
+    state.long_only = snapshot.get("long_only", False)
+    if state.long_only:
+        logger.info("Restoring long-only mode")
 
     # Restore entry multiplier
     saved_mult = snapshot.get("next_entry_multiplier", 1.0)
@@ -2047,6 +2056,9 @@ def build_pair(state: GridState, current_price: float) -> list:
         if side in adopted_sides:
             logger.debug("  Pair %s: skipped (already adopted)", side.upper())
             continue
+        if side == "sell" and state.long_only:
+            logger.info("  Pair SELL entry skipped (long-only mode)")
+            continue
 
         tid, cyc = side_identity[side]
         volume = calculate_volume_for_price(price, state)
@@ -2148,18 +2160,21 @@ def _build_pair_with_position(state: GridState, last_fill: dict,
         o.status == "open" and o.side == exit_side and o.order_role == "entry"
         for o in state.grid_orders)
     if not has_opposite_entry:
-        entry_pct = state.entry_pct
-        if exit_side == "sell":
-            entry_price = round(
-                current_price * (1 + entry_pct / 100.0), decimals)
+        if exit_side == "sell" and state.long_only:
+            logger.info("Position recovery: skipping sell entry (long-only mode)")
         else:
-            entry_price = round(
-                current_price * (1 - entry_pct / 100.0), decimals)
-        logger.info(
-            "Position recovery: placing %s entry [%s.%d] @ $%.6f",
-            exit_side.upper(), entry_tid, entry_cyc, entry_price)
-        _place_pair_order(state, exit_side, entry_price, "entry",
-                          trade_id=entry_tid, cycle=entry_cyc)
+            entry_pct = state.entry_pct
+            if exit_side == "sell":
+                entry_price = round(
+                    current_price * (1 + entry_pct / 100.0), decimals)
+            else:
+                entry_price = round(
+                    current_price * (1 - entry_pct / 100.0), decimals)
+            logger.info(
+                "Position recovery: placing %s entry [%s.%d] @ $%.6f",
+                exit_side.upper(), entry_tid, entry_cyc, entry_price)
+            _place_pair_order(state, exit_side, entry_price, "entry",
+                              trade_id=entry_tid, cycle=entry_cyc)
 
     # Set pair state based on what's on the book
     state.pair_state = _compute_pair_state(state)
@@ -2216,6 +2231,14 @@ def _place_pair_order(state, side, price, role, matched_buy=None,
         )
         return order
     except Exception as e:
+        err_msg = str(e).lower()
+        if side == "sell" and role == "entry" and "insufficient" in err_msg:
+            logger.info(
+                "Sell entry [%s.%d] failed (no inventory) -- switching to LONG ONLY: %s",
+                trade_id or "?", cycle or 0, e)
+            state.long_only = True
+            order.status = "failed"
+            return None
         logger.error("Failed to place pair %s %s [%s.%d]: %s",
                      side, role, trade_id or "?", cycle or 0, e)
         order.status = "failed"
@@ -2816,12 +2839,15 @@ def handle_pair_fill(state: GridState, filled_orders: list,
 
             # Round trip complete -- reopen sell entry for this side only
             _cancel_open_by_role(state, "sell", "entry")
-            sell_entry_price = round(
-                current_price * (1 + entry_pct / 100.0), decimals)
-            o = _place_pair_order(state, "sell", sell_entry_price, "entry",
-                                  trade_id=tid, cycle=new_cyc)
-            if o:
-                new_orders.append(o)
+            if state.long_only:
+                logger.info("  Skipping sell entry reopen (long-only mode)")
+            else:
+                sell_entry_price = round(
+                    current_price * (1 + entry_pct / 100.0), decimals)
+                o = _place_pair_order(state, "sell", sell_entry_price, "entry",
+                                      trade_id=tid, cycle=new_cyc)
+                if o:
+                    new_orders.append(o)
 
     # Recompute and log state transitions
     new_state = _compute_pair_state(state)

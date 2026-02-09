@@ -444,6 +444,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "entry_pct": st.entry_pct,
                 "profit_pct": st.profit_pct,
                 "multiplier": st.next_entry_multiplier,
+                "long_only": st.long_only,
                 "paused": st.is_paused,
             })
 

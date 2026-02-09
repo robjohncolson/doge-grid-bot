@@ -167,6 +167,7 @@ def serialize_state(state: grid_strategy.GridState, current_price: float) -> dic
         "pause_reason": state.pause_reason,
         # Pair mode state machine
         "pair_state": getattr(state, "pair_state", "S0"),
+        "long_only": getattr(state, "long_only", False),
         "cycle_a": getattr(state, "cycle_a", 1),
         "cycle_b": getattr(state, "cycle_b", 1),
         # Completed cycles (most recent 50 for dashboard)
@@ -238,7 +239,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DOGE Grid Bot</title>
+<title>Grid Bot</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0d1117;color:#c9d1d9;font-family:'Cascadia Mono','Fira Code',monospace;font-size:14px;padding:16px}
@@ -547,7 +548,7 @@ a{color:#58a6ff}
 <button class="btn-back" id="btn-back" onclick="showSwarmView()" style="display:none">&#8592; Back to Swarm</button>
 
 <div class="header">
-  <h1 id="bot-title">DOGE Grid Bot</h1>
+  <h1 id="bot-title">Grid Bot</h1>
   <span id="badge" class="badge badge-dry">---</span>
   <button class="btn-browse" onclick="openScanner()" title="Browse &amp; add trading pairs">+ Pairs</button>
   <button class="audio-btn" id="audio-btn" onclick="toggleAudio()" title="Toggle audio alerts">&#x1f507;</button>
@@ -560,7 +561,7 @@ a{color:#58a6ff}
   <div class="card"><div class="label">Today P&amp;L</div><div class="value" id="c-today">--</div><div class="sub" id="c-today-sub">--</div></div>
   <div class="card"><div class="label">Total P&amp;L</div><div class="value" id="c-total">--</div><div class="sub" id="c-total-sub">--</div></div>
   <div class="card"><div class="label">Round Trips</div><div class="value" id="c-trips">--</div><div class="sub" id="c-trips-sub">--</div></div>
-  <div class="card"><div class="label">DOGE Accumulated</div><div class="value" id="c-doge">--</div><div class="sub" id="c-doge-sub">&nbsp;</div></div>
+  <div class="card"><div class="label" id="c-doge-label">DOGE Accumulated</div><div class="value" id="c-doge">--</div><div class="sub" id="c-doge-sub">&nbsp;</div></div>
   <div class="card card-unreal" id="c-unreal-card" style="display:none"><div class="label">Unrealized P&amp;L</div><div class="value" id="c-unreal">--</div><div class="sub-a" id="c-unreal-a">&nbsp;</div><div class="sub-b" id="c-unreal-b">&nbsp;</div></div>
 </div>
 
@@ -1477,8 +1478,10 @@ function update(data) {
   const cfg = data.config;
   const isPair = cfg.strategy_mode === 'pair';
 
-  // Title + section headers
-  document.getElementById('bot-title').textContent = isPair ? 'DOGE Pair Bot' : 'DOGE Grid Bot';
+  // Title + section headers (dynamic from pair config)
+  const base = (cfg.pair_display || 'DOGE/USD').split('/')[0];
+  document.getElementById('bot-title').textContent = isPair ? base + ' Pair Bot' : base + ' Grid Bot';
+  document.title = isPair ? base + ' Pair Bot' : base + ' Grid Bot';
   document.getElementById('ladder-title').textContent = isPair ? 'Active Orders' : 'Grid Ladder';
 
   // Cards
@@ -1495,6 +1498,7 @@ function update(data) {
   document.getElementById('c-trips').textContent = pr.round_trips;
   document.getElementById('c-trips-sub').textContent = 'lifetime';
   document.getElementById('c-doge').textContent = fmt(pr.doge_accumulated, 2);
+  document.getElementById('c-doge-label').textContent = base + ' Accumulated';
 
   // Charts
   if (data.charts) {
@@ -1514,7 +1518,7 @@ function update(data) {
     psBar.style.display = 'block';
     psBar.className = 'pair-state-bar ps-' + ps;
     document.getElementById('ps-state').textContent = ps;
-    document.getElementById('ps-desc').textContent = psDesc;
+    document.getElementById('ps-desc').textContent = psDesc + (data.long_only ? ' (LONG ONLY)' : '');
 
     // Trend indicator
     const trendEl = document.getElementById('ps-trend');
@@ -2027,7 +2031,7 @@ function renderSwarm(data) {
     rows += '<tr onclick="showDetailView(\'' + p.pair + '\')">';
     rows += '<td><b>' + p.display + '</b></td>';
     rows += '<td>$' + (p.price < 1 ? p.price.toFixed(6) : p.price.toFixed(2)) + '</td>';
-    rows += '<td>' + p.pair_state + '</td>';
+    rows += '<td>' + p.pair_state + (p.long_only ? ' <span style="background:#9e6a03;color:#e3b341;font-size:10px;padding:1px 4px;border-radius:3px;font-weight:600">L</span>' : '') + '</td>';
     rows += '<td class="' + pnlCls + '">' + fmtUSD(p.today_pnl) + '</td>';
     rows += '<td class="' + totCls + '">' + fmtUSD(p.total_pnl) + '</td>';
     rows += '<td>' + p.trips_today + '/' + p.total_trips + '</td>';
