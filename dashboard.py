@@ -1832,7 +1832,7 @@ function isMultiPair() {
 function showSwarmView() {
   swarmMode = true;
   detailPair = null;
-  document.getElementById('swarm-view').style.display = '';
+  document.getElementById('swarm-view').style.display = 'block';
   document.getElementById('detail-view').style.display = 'none';
   pollSwarm();
 }
@@ -1841,8 +1841,8 @@ function showDetailView(pair) {
   swarmMode = false;
   detailPair = pair;
   document.getElementById('swarm-view').style.display = 'none';
-  document.getElementById('detail-view').style.display = '';
-  document.getElementById('btn-back').style.display = isMultiPair() ? '' : 'none';
+  document.getElementById('detail-view').style.display = 'block';
+  document.getElementById('btn-back').style.display = isMultiPair() ? 'inline-block' : 'none';
 }
 
 function renderSwarm(data) {
