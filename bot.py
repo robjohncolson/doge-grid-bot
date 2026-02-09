@@ -311,10 +311,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "volume": round(f["volume"], 2),
                 "profit": round(f.get("profit", 0), 4),
                 "fees": round(f.get("fees", 0), 4),
+                "trade_id": f.get("trade_id", ""),
+                "cycle": f.get("cycle", ""),
+                "order_role": f.get("order_role", ""),
             })
 
         if fmt == "csv":
-            self._send_csv_data(fills, ["time", "side", "price", "volume", "profit", "fees"], "fills.csv")
+            self._send_csv_data(fills, ["time", "side", "price", "volume", "profit", "fees", "trade_id", "cycle", "order_role"], "fills.csv")
         else:
             self._send_json(fills)
 
@@ -449,17 +452,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except (ValueError, TypeError):
                 errors.append("entry_pct must be a number")
 
-        # Validate interval
-        if "interval" in body:
-            try:
-                val = int(body["interval"])
-                if val < 60 or val > 86400:
-                    errors.append("interval must be between 60 and 86400")
-                else:
-                    pending["interval"] = val
-                    queued.append("interval")
-            except (ValueError, TypeError):
-                errors.append("interval must be an integer")
+        # AI check (manual trigger)
+        if "ai_check" in body:
+            pending["ai_check"] = True
+            queued.append("ai_check")
 
         if errors:
             self._send_json({"error": "; ".join(errors)}, 400)
@@ -566,12 +562,12 @@ def _apply_web_config(state: grid_strategy.GridState, current_price: float):
         if config.STRATEGY_MODE == "pair":
             old = state.profit_pct
             state.profit_pct = pending["spacing"]
-            logger.info("Web dashboard: profit target %.2f%% -> %.2f%%", old, state.profit_pct)
+            logger.info("Web dashboard: profit target %.2f%% -> %.2f%% (applies to next exit)", old, state.profit_pct)
         else:
             old = config.GRID_SPACING_PCT
             config.GRID_SPACING_PCT = pending["spacing"]
             logger.info("Web dashboard: spacing %.2f%% -> %.2f%%", old, config.GRID_SPACING_PCT)
-        needs_rebuild = True
+            needs_rebuild = True
 
     # Apply ratio
     if "ratio" in pending:
@@ -592,13 +588,15 @@ def _apply_web_config(state: grid_strategy.GridState, current_price: float):
         old = state.entry_pct
         state.entry_pct = pending["entry_pct"]
         logger.info("Web dashboard: entry distance %.2f%% -> %.2f%%", old, state.entry_pct)
-        needs_rebuild = True
+        if config.STRATEGY_MODE == "pair":
+            grid_strategy.replace_entries_at_distance(state, current_price)
+        else:
+            needs_rebuild = True
 
-    # Apply AI interval (no rebuild needed)
-    if "interval" in pending:
-        old = config.AI_ADVISOR_INTERVAL
-        config.AI_ADVISOR_INTERVAL = pending["interval"]
-        logger.info("Web dashboard: AI interval %ds -> %ds", old, config.AI_ADVISOR_INTERVAL)
+    # AI check (manual trigger, no rebuild)
+    if "ai_check" in pending:
+        state.last_ai_check = 0
+        logger.info("Web dashboard: AI check requested")
 
     # Rebuild grid if spacing or ratio changed
     if needs_rebuild:
@@ -905,25 +903,8 @@ def _handle_text_commands(state: grid_strategy.GridState, current_price: float,
 
 
 def _cmd_interval(arg: str):
-    """Handle /interval <seconds> -- change AI advisor check interval."""
-    try:
-        seconds = int(arg)
-    except (ValueError, TypeError):
-        notifier._send_message("Usage: /interval &lt;seconds&gt;\nExample: /interval 600")
-        return
-
-    if seconds < 60 or seconds > 86400:
-        notifier._send_message("Interval must be between 60 and 86400 seconds.")
-        return
-
-    config.AI_ADVISOR_INTERVAL = seconds
-    minutes = seconds / 60
-    if minutes == int(minutes):
-        label = f"{int(minutes)} min"
-    else:
-        label = f"{minutes:.1f} min"
-    notifier._send_message(f"AI interval set to {seconds}s ({label})")
-    logger.info("AI_ADVISOR_INTERVAL changed to %ds via Telegram", seconds)
+    """Handle /interval -- inform user AI is now manual-only."""
+    notifier._send_message("AI polling is now manual-only. Use /check to trigger.")
 
 
 def _cmd_check(state: grid_strategy.GridState):
@@ -1339,9 +1320,9 @@ def run():
         notifier.notify_error("Bot refused to start: validation failed (check logs)")
         return
 
-    # Notify startup (once, listing all pairs)
+    # Log startup (no Telegram notification -- reduce deploy spam)
     pair_labels = ", ".join(st.pair_display for st in _bot_states.values())
-    notifier.notify_startup(first_price, pair_display=pair_labels)
+    logger.info("Bot started: %s @ $%.6f", pair_labels, first_price)
 
     # --- Phase 2c: Startup reconciliation + build grid per pair ---
     for pair_name, state in _bot_states.items():
@@ -1353,7 +1334,6 @@ def run():
         logger.info("[%s] Building initial grid...", state.pair_display)
         orders = grid_strategy.build_grid(state, current_price)
         logger.info("[%s] Grid built: %d orders placed", state.pair_display, len(orders))
-        notifier.notify_grid_built(current_price, len(orders), pair_display=state.pair_display)
 
         grid_strategy.check_daily_reset(state)
 
@@ -1477,6 +1457,9 @@ def run():
                                 total_profit=state.today_profit_usd,
                                 trip_count=state.total_round_trips,
                                 pair_display=state.pair_display,
+                                trade_id=fill_data.get("trade_id"),
+                                cycle=fill_data.get("cycle"),
+                                entry_price=fill_data.get("entry_price"),
                             )
 
                     grid_strategy.prune_completed_orders(state)
@@ -1514,7 +1497,7 @@ def run():
             # --- 4f: Run AI advisor (hourly, using first pair's context) ---
             ai_state = _first_state()
             ai_price = _current_prices.get(_first_pair_name(), 0.0)
-            if ai_state and now - ai_state.last_ai_check >= config.AI_ADVISOR_INTERVAL:
+            if ai_state and ai_state.last_ai_check == 0:
                 ai_state.last_ai_check = now
                 ai_pair = _first_pair_name()
 

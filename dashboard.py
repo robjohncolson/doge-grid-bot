@@ -80,6 +80,9 @@ def serialize_state(state: grid_strategy.GridState, current_price: float) -> dic
             "volume": round(f["volume"], 2),
             "profit": round(f.get("profit", 0), 4),
             "fees": round(f.get("fees", 0), 4),
+            "trade_id": f.get("trade_id"),
+            "cycle": f.get("cycle"),
+            "order_role": f.get("order_role"),
         })
     recent.reverse()
 
@@ -536,7 +539,7 @@ a{color:#58a6ff}
       <tr id="p-refresh-row" style="display:none"><td>Refresh drift</td><td id="p-refresh">--</td></tr>
       <tr><td>Effective capital</td><td id="p-capital">--</td></tr>
       <tr><td>Fees (round trip)</td><td id="p-fees">--</td></tr>
-      <tr><td>AI interval</td><td id="p-ai">--</td></tr>
+      <tr><td>AI mode</td><td id="p-ai">--</td></tr>
       <tr><td>AI recommendation</td><td id="p-airec" class="ai-rec">--</td></tr>
     </table>
 
@@ -547,6 +550,11 @@ a{color:#58a6ff}
         <input type="number" id="in-spacing" step="0.1" min="0.6">
         <button onclick="applySpacing()">Apply</button>
       </div>
+      <div class="ctrl-row" id="ctrl-entry-row" style="display:none">
+        <label>Entry %</label>
+        <input type="number" id="in-entry" step="0.05" min="0.05">
+        <button onclick="applyEntry()">Apply</button>
+      </div>
       <div class="ctrl-row" id="ctrl-ratio-row">
         <label>Ratio</label>
         <input type="number" id="in-ratio" step="0.05" min="0.25" max="0.75">
@@ -554,11 +562,10 @@ a{color:#58a6ff}
         <button class="btn-auto" onclick="applyRatioAuto()">Auto</button>
       </div>
       <div class="ctrl-row">
-        <label>AI sec</label>
-        <input type="number" id="in-interval" step="60" min="60" max="86400">
-        <button onclick="applyInterval()">Apply</button>
+        <button onclick="triggerAICheck()" id="btn-ai-check">Probe AI Council</button>
       </div>
       <div id="ctrl-msg" class="ctrl-msg">&nbsp;</div>
+      <div id="ctrl-help" class="ctrl-msg" style="color:#8b949e;display:none">Entry %: replaces open entries immediately. Profit %: applies to next exit.</div>
     </div>
   </div>
 </div>
@@ -578,7 +585,7 @@ a{color:#58a6ff}
   <div class="section" style="grid-column:1/-1">
     <h2>Recent Fills (last 20)</h2>
     <div class="fills" id="fills-wrap">
-      <table><thead><tr><th>Time</th><th>Side</th><th>Price</th><th>Volume</th><th>Profit</th></tr></thead>
+      <table><thead><tr><th>Time</th><th>Leg</th><th>Price</th><th>Volume</th><th>Profit</th></tr></thead>
       <tbody id="fills-body"></tbody></table>
     </div>
   </div>
@@ -1570,20 +1577,22 @@ function update(data) {
   }
   document.getElementById('p-capital').textContent = '$' + fmt(cfg.effective_capital, 2);
   document.getElementById('p-fees').textContent = fmt(cfg.round_trip_fee_pct, 2) + '%';
-  document.getElementById('p-ai').textContent = cfg.ai_interval + 's (' + Math.round(cfg.ai_interval / 60) + ' min)';
+  document.getElementById('p-ai').textContent = 'manual (button or /check)';
   document.getElementById('p-airec').textContent = data.ai_recommendation;
 
   // Controls (pair mode adjustments)
   document.getElementById('ctrl-spacing-label').textContent = isPair ? 'Profit %' : 'Spacing %';
   document.getElementById('ctrl-ratio-row').style.display = isPair ? 'none' : '';
+  document.getElementById('ctrl-entry-row').style.display = isPair ? '' : 'none';
+  document.getElementById('ctrl-help').style.display = isPair ? '' : 'none';
 
   // Populate input placeholders
   const inS = document.getElementById('in-spacing');
   const inR = document.getElementById('in-ratio');
-  const inI = document.getElementById('in-interval');
+  const inE = document.getElementById('in-entry');
   if (!inS.value) inS.placeholder = fmt(cfg.spacing_pct, 2);
   if (!isPair && !inR.value) inR.placeholder = fmt(t.ratio, 2);
-  if (!inI.value) inI.placeholder = cfg.ai_interval;
+  if (isPair && !inE.value) inE.placeholder = fmt(cfg.pair_entry_pct, 2);
   inS.min = cfg.min_spacing;
 
   // Recent fills (last 20)
@@ -1593,8 +1602,9 @@ function update(data) {
   for (const f of fills) {
     const cls = f.side === 'buy' ? 'buy' : 'sell';
     const pcls = f.profit > 0 ? 'profit-pos' : (f.profit < 0 ? 'profit-neg' : '');
+    const leg = f.trade_id ? f.trade_id + '.' + f.cycle + ' ' + (f.order_role || '') : f.side.toUpperCase();
     frows += '<tr><td>' + fmtTime(f.time) + '</td>'
-           + '<td class="' + cls + '">' + f.side.toUpperCase() + '</td>'
+           + '<td class="' + cls + '">' + leg + '</td>'
            + '<td>$' + fmt(f.price, 6) + '</td>'
            + '<td>' + fmt(f.volume, 2) + '</td>'
            + '<td class="' + pcls + '">' + (f.profit ? fmtUSD(f.profit) : '--') + '</td></tr>';
@@ -1622,15 +1632,15 @@ async function postConfig(body) {
       showMsg('Queued: ' + (d.queued || []).join(', '), true);
       document.getElementById('in-spacing').value = '';
       document.getElementById('in-ratio').value = '';
-      document.getElementById('in-interval').value = '';
     } else { showMsg(d.error || 'Error', false); }
   } catch(e) { showMsg('Network error', false); }
 }
 
 function applySpacing() { const v = parseFloat(document.getElementById('in-spacing').value); if (isNaN(v)) return showMsg('Enter a spacing value', false); postConfig({spacing: v}); }
+function applyEntry() { const v = parseFloat(document.getElementById('in-entry').value); if (isNaN(v)) return showMsg('Enter an entry % value', false); postConfig({entry_pct: v}); document.getElementById('in-entry').value = ''; }
 function applyRatio() { const v = parseFloat(document.getElementById('in-ratio').value); if (isNaN(v)) return showMsg('Enter a ratio value', false); postConfig({ratio: v}); }
 function applyRatioAuto() { postConfig({ratio: 'auto'}); }
-function applyInterval() { const v = parseInt(document.getElementById('in-interval').value); if (isNaN(v)) return showMsg('Enter an interval value', false); postConfig({interval: v}); }
+function triggerAICheck() { postConfig({ai_check: true}); }
 
 // === Audio Alerts ===
 let audioEnabled = localStorage.getItem('audioEnabled') === 'true';

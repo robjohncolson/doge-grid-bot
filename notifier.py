@@ -277,15 +277,24 @@ def notify_shutdown(reason: str = "Manual", pair_display: str = ""):
 
 def notify_round_trip(side: str, price: float, volume: float,
                       profit: float, total_profit: float, trip_count: int,
-                      pair_display: str = "DOGE/USD"):
+                      pair_display: str = "DOGE/USD",
+                      trade_id=None, cycle=None, entry_price=None):
     """
     Notify on a completed round trip (buy->sell or sell->buy cycle).
     This is the "cha-ching" notification -- the bot made money!
     """
     emoji = "💰" if profit > 0 else "📉"
+    if trade_id and cycle is not None:
+        label = f"Trade {trade_id}.{cycle}"
+        if entry_price is not None:
+            label += f" @ ${entry_price:.4f} -> ${price:.4f}"
+        else:
+            label += f" @ ${price:.6f}"
+    else:
+        label = f"Round Trip @ ${price:.6f}"
     text = (
-        f"{emoji} <b>{_prefix()}{pair_display} Round Trip</b>\n\n"
-        f"Sell: {volume:.2f} @ ${price:.6f}\n"
+        f"{emoji} <b>{_prefix()}{pair_display} {label}</b>\n\n"
+        f"{side.upper()}: {volume:.2f} DOGE\n"
         f"Net profit: ${profit:.4f}\n"
         f"Today total: ${total_profit:.4f}\n"
         f"Trip #{trip_count}"

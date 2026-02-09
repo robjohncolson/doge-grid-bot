@@ -272,7 +272,8 @@ class PairConfig:
                  profit_pct: float, refresh_pct: float = 1.0,
                  order_size_usd: float = 3.5, daily_loss_limit: float = 3.0,
                  stop_floor: float = 100.0, min_volume: float = 13,
-                 price_decimals: int = 6, filter_strings: list = None):
+                 price_decimals: int = 6, volume_decimals: int = 0,
+                 filter_strings: list = None):
         self.pair = pair
         self.display = display
         self.entry_pct = entry_pct
@@ -283,6 +284,7 @@ class PairConfig:
         self.stop_floor = stop_floor
         self.min_volume = min_volume
         self.price_decimals = price_decimals
+        self.volume_decimals = volume_decimals
         self.filter_strings = filter_strings or [pair[:3].upper()]
 
 
@@ -308,6 +310,7 @@ def _build_pairs() -> dict:
                     stop_floor=item.get("stop_floor", STOP_FLOOR),
                     min_volume=item.get("min_volume", 13),
                     price_decimals=item.get("price_decimals", 6),
+                    volume_decimals=item.get("volume_decimals", 0),
                     filter_strings=item.get("filter_strings"),
                 )
                 pairs[pc.pair] = pc
@@ -330,6 +333,7 @@ def _build_pairs() -> dict:
             stop_floor=STOP_FLOOR,
             min_volume=13,
             price_decimals=6,
+            volume_decimals=0,
             filter_strings=["XDG", "DOGE"],
         ),
     }

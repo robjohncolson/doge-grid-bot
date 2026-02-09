@@ -78,7 +78,7 @@ _price_buffer: list = []
 _price_buffer_lock = threading.Lock()
 
 # Column support flags (older schemas may not have these)
-_pair_column_supported = False       # fills table lacks pair column; False skips doomed requests
+_pair_column_supported = None        # auto-detect on first write; None = untested
 _identity_columns_supported = None  # trade_id, cycle columns
 
 # Writer thread state

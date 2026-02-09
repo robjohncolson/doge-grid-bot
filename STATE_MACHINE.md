@@ -120,7 +120,11 @@ CHECK_DRIFT
   ├── [pair mode] stale entries refreshed via refresh_stale_entries() (anti-chase protected)
   │
   ▼ no drift
-AI_COUNCIL (if interval elapsed)
+AI_COUNCIL (manual trigger only: /check or dashboard button)
+  │
+  ├── last_ai_check == 0? (flag set by /check or web ai_check)
+  │     NO  ──► skip (AI is manual-only, no timer)
+  │     YES ──► run council, set last_ai_check = now
   │
   ├── query each panelist (Llama-70B, Llama-8B, Kimi-K2.5)
   │     └── 1s pause between calls (rate limit)
@@ -145,7 +149,10 @@ AI_COUNCIL (if interval elapsed)
   ▼
 WEB_CONFIG_CHECK
   │
-  ├── spacing/ratio changed ──► CANCEL_GRID ──► BUILD_GRID
+  ├── [grid mode] spacing/ratio changed ──► CANCEL_GRID ──► BUILD_GRID
+  ├── [pair mode] spacing (profit %) changed ──► no rebuild (applies to next exit)
+  ├── [pair mode] entry_pct changed ──► replace_entries_at_distance() (exits preserved)
+  ├── ai_check ──► set last_ai_check = 0 (triggers council next cycle)
   │
   ▼
 STATS_ENGINE (every 60s)
@@ -534,6 +541,7 @@ When that sell fills at $0.0900:
 | PAUSED | MAIN_LOOP | midnight UTC | reset counters, grid rebuilt via drift check |
 | MAIN_LOOP | DRIFT_RESET | [grid] price drift >= 5% | cancel + rebuild |
 | MAIN_LOOP | ENTRY_REFRESH | [pair] entry drifts >= PAIR_REFRESH_PCT | refresh stale entry only |
+| MAIN_LOOP | ENTRY_REPLACE | [pair] user changes entry_pct via dashboard | replace entries at new distance (exits preserved) |
 | MAIN_LOOP | RATIO_REBUILD | [grid] trend ratio shift >= 0.2 | cancel + rebuild |
 | SHUTDOWN | EXIT | always | save, cancel orders, notify |
 
@@ -558,6 +566,7 @@ fall back to entry-side convention (sell entry → A, buy entry → B).
 | `PAIR_ENTRY_PCT` (ε) | 0.2% | Distance from market for entry orders |
 | `PAIR_PROFIT_PCT` (π) | 1.0% | Profit target distance from entry fill price |
 | `PAIR_REFRESH_PCT` | 1.0% | Max drift before stale entry is refreshed |
+| `volume_decimals` | 0 | Decimal places for volume rounding (DOGE=0, SOL=4) |
 
 ### Formal States
 
@@ -724,9 +733,11 @@ On first startup after the refactor, `migrate_pnl_from_fills()` reconstructs
 3. Exit fills only replace the completed side's entry; the other side is never cancelled
 4. If both entries fill before either exit → S2 (both exits on book)
 5. Trade identity (A/B) and cycle number propagate through every order
-   placement, fill record, state save, Supabase write, AI payload, and
-   dashboard display
+   placement, fill record (`recent_fills` carry `trade_id`, `cycle`,
+   `order_role`), state save, Supabase write, AI payload, Telegram
+   notification, CSV export, and dashboard display
 6. Cycle number increments only on round-trip completion (exit fill), not on entry
+7. Exit fill records also carry `entry_price` for Telegram notification formatting
 
 ### Offline Fill Recovery
 
@@ -830,6 +841,10 @@ Used in:
 | Anti-chase | N/A | 3 consecutive same-direction → 5min cooldown |
 | Unrealized P&L | N/A | mark-to-market from open exits |
 | Statistics | stats_engine analyzers | PairStats + stats_engine |
+| AI trigger | timer (AI_ADVISOR_INTERVAL) | manual only (/check or dashboard button) |
+| Entry hot-reload | full rebuild | replace entries only (exits preserved) |
+| Profit hot-reload | full rebuild | deferred (applies to next exit placement) |
+| Notifications | startup + grid built + round trip | round trip only (with trade identity) |
 | Dashboard UI | Grid Ladder, Trend Ratio | State banner, A/B panels, Stats, AI council, Cycles |
 
 ## 10. PairStats (Pair Mode Statistical Engine)

@@ -190,8 +190,8 @@ class GridState:
         self.pause_reason = ""
         self.consecutive_errors = 0      # Consecutive API failures
 
-        # AI advisor
-        self.last_ai_check = 0.0         # Timestamp of last AI analysis
+        # AI advisor (manual-only: init to now so it doesn't auto-fire)
+        self.last_ai_check = time.time()
         self.ai_recommendation = ""      # Latest AI recommendation
         self._last_ai_result = None      # Full AI council result dict for dashboard
 
@@ -291,6 +291,12 @@ class GridState:
         if self.pair_config:
             return self.pair_config.price_decimals
         return 6
+
+    @property
+    def volume_decimals(self) -> int:
+        if self.pair_config:
+            return self.pair_config.volume_decimals
+        return 0
 
     @property
     def order_size_usd(self) -> float:
@@ -834,6 +840,11 @@ def calculate_volume_for_price(price: float, state: GridState = None) -> float:
     min_vol = state.min_volume if state and state.pair_config else ORDERMIN_DOGE
     if volume < min_vol:
         volume = float(min_vol)
+    vol_dec = state.volume_decimals if state else 0
+    if vol_dec == 0:
+        volume = float(int(volume))
+    else:
+        volume = round(volume, vol_dec)
     return volume
 
 
@@ -2150,6 +2161,9 @@ def _close_orphaned_exit(state, filled_entry):
         "volume": close_vol,
         "profit": net_profit,
         "fees": fees,
+        "trade_id": filled_entry.trade_id,
+        "cycle": filled_entry.cycle,
+        "order_role": "exit",
     })
     supabase_store.save_fill(state.recent_fills[-1], pair=state.pair_name)
 
@@ -2236,6 +2250,33 @@ def compute_unrealized_pnl(state: GridState, current_price: float) -> dict:
     }
 
 
+def replace_entries_at_distance(state: GridState, current_price: float):
+    """User-initiated entry replacement at new entry_pct. Bypasses anti-chase."""
+    entry_pct = state.entry_pct
+    decimals = state.price_decimals
+    replaced = 0
+    for o in list(state.grid_orders):
+        if o.status != "open" or o.order_role != "entry":
+            continue
+        tid, cyc = o.trade_id, o.cycle
+        if config.DRY_RUN:
+            o.status = "cancelled"
+        else:
+            ok = kraken_client.cancel_order(o.txid)
+            if not ok:
+                logger.warning("Failed to cancel entry %s for replacement", o.txid)
+                continue
+            o.status = "cancelled"
+        new_price = round(current_price * (1 - entry_pct / 100.0) if o.side == "buy"
+                          else current_price * (1 + entry_pct / 100.0), decimals)
+        _place_pair_order(state, o.side, new_price, "entry", trade_id=tid, cycle=cyc)
+        replaced += 1
+    if replaced:
+        state.center_price = current_price
+        logger.info("User entry_pct change: replaced %d entries at %.2f%% from $%.6f",
+                    replaced, entry_pct, current_price)
+
+
 MAX_COMPLETED_CYCLES = 200  # Keep most recent N completed cycles
 
 
@@ -2301,6 +2342,7 @@ def handle_pair_fill(state: GridState, filled_orders: list,
                 "time": time.time(), "side": "buy",
                 "price": filled.price, "volume": filled.volume,
                 "profit": 0, "fees": buy_fee,
+                "trade_id": tid, "cycle": cyc, "order_role": "entry",
             })
             supabase_store.save_fill(state.recent_fills[-1], pair=state.pair_name,
                                      trade_id=tid, cycle=cyc)
@@ -2367,6 +2409,8 @@ def handle_pair_fill(state: GridState, filled_orders: list,
                 "time": time.time(), "side": "sell",
                 "price": filled.price, "volume": filled.volume,
                 "profit": net_profit, "fees": fees,
+                "trade_id": tid, "cycle": cyc, "order_role": "exit",
+                "entry_price": buy_price,
             })
             supabase_store.save_fill(state.recent_fills[-1], pair=state.pair_name,
                                      trade_id=tid, cycle=cyc)
@@ -2422,6 +2466,7 @@ def handle_pair_fill(state: GridState, filled_orders: list,
                 "time": time.time(), "side": "sell",
                 "price": filled.price, "volume": filled.volume,
                 "profit": 0, "fees": sell_fee,
+                "trade_id": tid, "cycle": cyc, "order_role": "entry",
             })
             supabase_store.save_fill(state.recent_fills[-1], pair=state.pair_name,
                                      trade_id=tid, cycle=cyc)
@@ -2488,6 +2533,8 @@ def handle_pair_fill(state: GridState, filled_orders: list,
                 "time": time.time(), "side": "buy",
                 "price": filled.price, "volume": filled.volume,
                 "profit": net_profit, "fees": fees,
+                "trade_id": tid, "cycle": cyc, "order_role": "exit",
+                "entry_price": sell_price,
             })
             supabase_store.save_fill(state.recent_fills[-1], pair=state.pair_name,
                                      trade_id=tid, cycle=cyc)
@@ -3116,6 +3163,7 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                     "time": last_buy["time"], "side": "buy",
                     "price": buy_p, "volume": close_vol,
                     "profit": net_profit, "fees": fee_buy,
+                    "trade_id": "A", "cycle": state.cycle_a, "order_role": "exit",
                 })
                 supabase_store.save_fill(state.recent_fills[-1], pair=state.pair_name,
                                          trade_id="A", cycle=state.cycle_a)
@@ -3163,6 +3211,7 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                     "time": last_sell["time"], "side": "sell",
                     "price": sell_p, "volume": close_vol,
                     "profit": net_profit, "fees": fee_sell,
+                    "trade_id": "B", "cycle": state.cycle_b, "order_role": "exit",
                 })
                 supabase_store.save_fill(state.recent_fills[-1], pair=state.pair_name,
                                          trade_id="B", cycle=state.cycle_b)
@@ -3203,6 +3252,7 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                     "time": last_sell["time"], "side": "sell",
                     "price": sp, "volume": last_sell["volume"],
                     "profit": 0, "fees": sell_fee,
+                    "trade_id": "A", "cycle": state.cycle_a, "order_role": "entry",
                 })
                 supabase_store.save_fill(state.recent_fills[-1], pair=state.pair_name,
                                          trade_id="A", cycle=state.cycle_a)
@@ -3227,6 +3277,7 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                     "time": last_buy["time"], "side": "buy",
                     "price": bp, "volume": last_buy["volume"],
                     "profit": 0, "fees": buy_fee,
+                    "trade_id": "B", "cycle": state.cycle_b, "order_role": "entry",
                 })
                 supabase_store.save_fill(state.recent_fills[-1], pair=state.pair_name,
                                          trade_id="B", cycle=state.cycle_b)
@@ -3291,6 +3342,7 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                 "price": first["price"], "volume": first["volume"],
                 "profit": 0,
                 "fees": fee_buy if first["side"] == "buy" else fee_sell,
+                "trade_id": rt_tid, "cycle": rt_cyc, "order_role": "entry",
             })
             supabase_store.save_fill(state.recent_fills[-1], pair=state.pair_name,
                                      trade_id=rt_tid, cycle=rt_cyc)
@@ -3299,6 +3351,7 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                 "price": second["price"], "volume": close_vol,
                 "profit": net_profit,
                 "fees": fee_sell if second["side"] == "sell" else fee_buy,
+                "trade_id": rt_tid, "cycle": rt_cyc, "order_role": "exit",
             })
             supabase_store.save_fill(state.recent_fills[-1], pair=state.pair_name,
                                      trade_id=rt_tid, cycle=rt_cyc)
@@ -3345,13 +3398,14 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                 fee = t["price"] * t["volume"] * config.MAKER_FEE_PCT / 100.0
                 state.total_fees_usd += fee
                 state.today_fees_usd += fee
+                t_tid = "B" if t["side"] == "buy" else "A"
+                t_cyc = state.cycle_b if t_tid == "B" else state.cycle_a
                 state.recent_fills.append({
                     "time": t["time"], "side": t["side"],
                     "price": t["price"], "volume": t["volume"],
                     "profit": 0, "fees": fee,
+                    "trade_id": t_tid, "cycle": t_cyc, "order_role": "entry",
                 })
-                t_tid = "B" if t["side"] == "buy" else "A"
-                t_cyc = state.cycle_b if t_tid == "B" else state.cycle_a
                 supabase_store.save_fill(state.recent_fills[-1], pair=state.pair_name,
                                          trade_id=t_tid, cycle=t_cyc)
 
@@ -3426,6 +3480,7 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                 "time": last_buy["time"], "side": "buy",
                 "price": buy_price, "volume": last_buy["volume"],
                 "profit": 0, "fees": buy_fee,
+                "trade_id": "B", "cycle": state.cycle_b, "order_role": "entry",
             })
             supabase_store.save_fill(state.recent_fills[-1], pair=state.pair_name,
                                      trade_id="B", cycle=state.cycle_b)
@@ -3455,6 +3510,7 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                 "time": last_sell["time"], "side": "sell",
                 "price": sell_price, "volume": last_sell["volume"],
                 "profit": 0, "fees": sell_fee,
+                "trade_id": "A", "cycle": state.cycle_a, "order_role": "entry",
             })
             supabase_store.save_fill(state.recent_fills[-1], pair=state.pair_name,
                                      trade_id="A", cycle=state.cycle_a)
