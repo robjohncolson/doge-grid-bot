@@ -57,6 +57,10 @@
               │    └───────────┬───────────┘     │
               │                │                 │
               │    ┌───────────▼───────────┐     │
+              │    │  EXIT LIFECYCLE (§12) │     │  [pair mode]
+              │    └───────────┬───────────┘     │
+              │                │                 │
+              │    ┌───────────▼───────────┐     │
               │    │    AI / CALLBACKS     │     │
               │    └───────────┬───────────┘     │
               │                │                 │
@@ -120,6 +124,15 @@ CHECK_DRIFT
   ├── [pair mode] stale entries refreshed via refresh_stale_entries() (anti-chase protected)
   │
   ▼ no drift
+EXIT_LIFECYCLE (pair mode + RECOVERY_ENABLED only)
+  │
+  ├── check_recovery_fills() ──► process surprise fills / external cancellations
+  ├── check_stale_exits() ──► S1a/S1b: reprice or orphan stale exits (§12.2)
+  ├── check_s2_break_glass() ──► S2: 6-phase deadlock resolution (§12.3)
+  ├── check_recovery_timeout() ──► safety net orphaning via statistical timeout
+  │     any changes? → save_state()
+  │
+  ▼
 AI_COUNCIL (manual trigger only: /check or dashboard button)
   │
   ├── last_ai_check == 0? (flag set by /check or web ai_check)
@@ -422,6 +435,14 @@ saving txid to state (e.g. crash between placement and save).
 ┌──────────────────────┐
 │  build_pair_orders() │  places entries for uncovered sides
 └──────────────────────┘
+           │
+           ▼
+┌──────────────────────────────┐
+│  RECONCILE RECOVERY ORDERS   │  validate recovery_orders[] txids against Kraken
+│  filled → book profit        │  (§12, excluded from orphan cancellation)
+│  cancelled → book loss       │
+│  open → keep                 │
+└──────────────────────────────┘
 ```
 
 ## 6. State Persistence Flow
@@ -477,7 +498,7 @@ saving txid to state (e.g. crash between placement and save).
 | `cycle_a` | Trade A current cycle number |
 | `cycle_b` | Trade B current cycle number |
 | `completed_cycles` | List of CompletedCycle dicts (max 200) |
-| `open_orders` | Order details for identity restoration on restart |
+| `open_orders` | Order details for identity restoration on restart (includes entry_filled_at for exit age tracking) |
 | `pnl_migrated` | Flag: historical P&L reconstruction complete (prevents re-run) |
 | `consecutive_refreshes_a` | Anti-chase: same-direction refresh count for Trade A |
 | `consecutive_refreshes_b` | Anti-chase: same-direction refresh count for Trade B |
@@ -487,6 +508,16 @@ saving txid to state (e.g. crash between placement and save).
 | `refresh_cooldown_until_b` | Anti-chase: cooldown expiry timestamp for Trade B |
 | `total_entries_placed` | Lifetime entry orders placed (for fill rate) |
 | `total_entries_filled` | Lifetime entry orders filled (for fill rate) |
+| `recovery_orders` | List of orphaned exits still on Kraken book (§12) |
+| `total_recovery_losses` | Count of cancelled/evicted recovery orders |
+| `total_recovery_wins` | Net profit from surprise recovery fills |
+| `s2_entered_at` | Unix timestamp when S2 was entered (null if not in S2) |
+| `last_reprice_a` | Timestamp of last Trade A exit reprice |
+| `last_reprice_b` | Timestamp of last Trade B exit reprice |
+| `exit_reprice_count_a` | Times Trade A exit repriced this cycle |
+| `exit_reprice_count_b` | Times Trade B exit repriced this cycle |
+| `detected_trend` | Directional signal: "up", "down", or null |
+| `trend_detected_at` | When trend was detected |
 
 ## 7. Fill Pair Cycling (The Profit Engine)
 
@@ -543,6 +574,10 @@ When that sell fills at $0.0900:
 | MAIN_LOOP | ENTRY_REFRESH | [pair] entry drifts >= PAIR_REFRESH_PCT | refresh stale entry only |
 | MAIN_LOOP | ENTRY_REPLACE | [pair] user changes entry_pct via dashboard | replace entries at new distance (exits preserved) |
 | MAIN_LOOP | RATIO_REBUILD | [grid] trend ratio shift >= 0.2 | cancel + rebuild |
+| MAIN_LOOP | EXIT_REPRICE | [pair] S1a/S1b exit age > reprice threshold | reprice exit closer to market (§12.2) |
+| MAIN_LOOP | ORPHAN_EXIT | [pair] S1a/S1b exit age > orphan threshold | move exit to recovery, place fresh entry (§12.4) |
+| MAIN_LOOP | S2_BREAK | [pair] S2 age + spread > thresholds | orphan/close worse exit, restart entry (§12.3) |
+| MAIN_LOOP | RECOVERY_FILL | [pair] recovery order fills on Kraken | book delayed round-trip profit |
 | SHUTDOWN | EXIT | always | save, cancel orders, notify |
 
 ## 9. Pair Strategy State Machine (`STRATEGY_MODE=pair`)
@@ -726,9 +761,9 @@ On first startup after the refactor, `migrate_pnl_from_fills()` reconstructs
 
 ### Key Invariants
 
-1. Exactly 2 open orders under normal operation (may transiently have
-   0-1 during pauses, placement failures, or between fill detection
-   and replacement order placement)
+1. 2 active orders + 0–N recovery orders on Kraken (N ≤ MAX_RECOVERY_SLOTS,
+   §12.9). May transiently have 0-1 active during pauses, placement
+   failures, or between fill detection and replacement order placement.
 2. Entry fills keep the opposite-side order and add an exit
 3. Exit fills only replace the completed side's entry; the other side is never cancelled
 4. If both entries fill before either exit → S2 (both exits on book)
@@ -817,9 +852,10 @@ Trade A (buy exit): unrealized = (matched_sell_price - current_price) × volume
 Trade B (sell exit): unrealized = (current_price - matched_buy_price) × volume
 ```
 
-Returns `{a_unrealized, b_unrealized, total_unrealized}`.
+Returns `{a_unrealized, b_unrealized, recovery_unrealized, total_unrealized}`.
 
 Returns signed values (positive = in profit, negative = in loss).
+Recovery exposure is included in `total_unrealized` (§12.10).
 
 Used in:
 - `check_risk_limits()`: stop floor uses signed unrealized in pair mode:
@@ -845,7 +881,10 @@ Used in:
 | Entry hot-reload | full rebuild | replace entries only (exits preserved) |
 | Profit hot-reload | full rebuild | deferred (applies to next exit placement) |
 | Notifications | startup + grid built + round trip | round trip only (with trade identity) |
-| Dashboard UI | Grid Ladder, Trend Ratio | State banner, A/B panels, Stats, AI council, Cycles |
+| Exit lifecycle | N/A | Reprice → orphan → recovery (§12) |
+| Recovery orders | N/A | 0–2 lottery tickets on Kraken book |
+| Trend detection | N/A | Stalled side reveals direction (§12.5) |
+| Dashboard UI | Grid Ladder, Trend Ratio | State banner, A/B panels, Stats, AI council, Cycles, Recovery panel, Exit age badges |
 
 ## 10. PairStats (Pair Mode Statistical Engine)
 
@@ -869,6 +908,7 @@ from `CompletedCycle` records. Pure Python, zero external dependencies.
 | `profit_factor` | float | sum(wins) / abs(sum(losses)) |
 | `mean_duration_sec` | float | Average cycle duration in seconds |
 | `median_duration_sec` | float | Median cycle duration |
+| `stdev_duration_sec` | float | Sample stdev of cycle durations (§12) |
 | `max_drawdown` | float | Peak-to-trough of cumulative P&L series |
 | `current_drawdown` | float | Current distance from cumulative peak |
 | `ci_95_lower` | float | 95% CI lower bound for mean |
@@ -892,7 +932,7 @@ from `CompletedCycle` records. Pure Python, zero external dependencies.
 
 Computed stats are `None` (not 0.0) when meaningless:
 - `win_rate`, `mean_net`, `median_net` → None when n = 0
-- `stdev_net` → None when n < 2
+- `stdev_net`, `stdev_duration_sec` → None when n < 2
 - `ci_95_lower/upper` → None when n < 3
 - `profit_factor` → None when no losses
 - `fill_rate` → None when no entries placed
