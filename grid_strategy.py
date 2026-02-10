@@ -30,6 +30,7 @@ import logging
 import csv
 import os
 import json
+import threading
 from datetime import datetime, timezone
 
 import config
@@ -37,6 +38,9 @@ import kraken_client
 import supabase_store
 
 logger = logging.getLogger(__name__)
+
+# Lock serializing all recovery operations (soft_free, cancel_all)
+_recovery_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -3447,6 +3451,11 @@ def cancel_all_recovery(state: GridState, current_price: float) -> dict:
 
     Returns summary dict: {"cancelled": int, "total_loss": float, "failed": int}
     """
+    with _recovery_lock:
+        return _cancel_all_recovery_locked(state, current_price)
+
+
+def _cancel_all_recovery_locked(state: GridState, current_price: float) -> dict:
     if not state.recovery_orders:
         return {"cancelled": 0, "total_loss": 0.0, "failed": 0}
 
@@ -3515,6 +3524,12 @@ def soft_free_recovery(state: GridState, current_price: float,
 
     Returns {"replaced": int, "failed": int, "skipped": int}
     """
+    with _recovery_lock:
+        return _soft_free_recovery_locked(state, current_price, buffer_pct)
+
+
+def _soft_free_recovery_locked(state: GridState, current_price: float,
+                               buffer_pct: float = 0.2) -> dict:
     if not state.recovery_orders or current_price <= 0:
         return {"replaced": 0, "failed": 0, "skipped": 0}
 

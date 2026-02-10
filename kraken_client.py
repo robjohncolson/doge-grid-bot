@@ -21,6 +21,7 @@ import hashlib
 import base64
 import json
 import logging
+import threading
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -49,44 +50,95 @@ TRADE_BALANCE_PATH = "/0/private/TradeBalance"
 TRADES_HISTORY_PATH = "/0/private/TradesHistory"
 
 # ---------------------------------------------------------------------------
-# Rate-limit tracking
+# Rate-limit tracking (thread-safe with circuit breaker)
 # ---------------------------------------------------------------------------
 # Kraken standard tier: counter starts at 15, each call adds 1,
 # counter decays by 1 per second.  If counter hits 0, you get rate-limited.
 # We track this locally to avoid hitting the limit.
 
-_call_counter = 15      # Available calls (starts full)
-_last_decay_time = 0.0  # Last time we decayed the counter
+
+class _RateLimiter:
+    """Thread-safe rate limiter with exponential backoff circuit breaker."""
+
+    def __init__(self, max_budget: int = 15, decay_rate: float = 1.0):
+        self._lock = threading.Lock()
+        self._max_budget = max_budget
+        self._decay_rate = decay_rate
+        self._budget = float(max_budget)
+        self._last_decay = time.time()
+        self._consecutive_errors = 0
+        self._circuit_open_until = 0.0  # timestamp; 0 = closed
+
+    def _decay(self):
+        """Replenish budget based on elapsed time. Must hold _lock."""
+        now = time.time()
+        elapsed = now - self._last_decay
+        if elapsed > 0:
+            self._budget = min(self._max_budget,
+                               self._budget + elapsed * self._decay_rate)
+            self._last_decay = now
+
+    def consume(self, units: int = 1):
+        """Block until budget is available, then deduct units."""
+        while True:
+            with self._lock:
+                # Check circuit breaker
+                now = time.time()
+                if self._circuit_open_until > now:
+                    wait = self._circuit_open_until - now
+                    logger.warning("Circuit breaker open, waiting %.1fs", wait)
+                else:
+                    wait = 0.0
+
+                if wait <= 0:
+                    self._decay()
+                    if self._budget >= units:
+                        self._budget -= units
+                        return
+                    # Not enough budget -- compute wait time
+                    wait = (units - self._budget) / self._decay_rate
+                    logger.warning("Rate limit low (%.1f/%d), sleeping %.1fs",
+                                   self._budget, self._max_budget, wait)
+
+            # Sleep outside the lock so other threads aren't blocked
+            time.sleep(min(wait, 5.0))
+
+    def report_rate_error(self):
+        """Called after a Kraken rate-limit or lockout error."""
+        with self._lock:
+            self._consecutive_errors += 1
+            # Exponential backoff: 5s, 10s, 20s, 40s... capped at 60s
+            backoff = min(60.0, 5.0 * (2 ** (self._consecutive_errors - 1)))
+            self._circuit_open_until = time.time() + backoff
+            # Slash budget to prevent immediate retry storm
+            self._budget = 0.0
+            logger.warning("Rate limit error #%d, circuit open for %.0fs",
+                           self._consecutive_errors, backoff)
+
+    def report_success(self):
+        """Called after a successful API call."""
+        with self._lock:
+            self._consecutive_errors = 0
+            self._circuit_open_until = 0.0
+
+    def budget_available(self) -> float:
+        """Non-blocking check of current available budget."""
+        with self._lock:
+            self._decay()
+            return self._budget
 
 
-def _decay_counter():
-    """Replenish the rate-limit counter based on elapsed time (1/sec decay)."""
-    global _call_counter, _last_decay_time
-    now = time.time()
-    if _last_decay_time == 0:
-        _last_decay_time = now
-        return
-    elapsed = now - _last_decay_time
-    recovered = int(elapsed)  # 1 call per second
-    if recovered > 0:
-        _call_counter = min(15, _call_counter + recovered)
-        _last_decay_time = now
+_rate_limiter = _RateLimiter()
 
 
 def _consume_call():
-    """
-    Consume one rate-limit unit.  If we're out of budget, sleep until
-    we have capacity again.
-    """
-    global _call_counter
-    _decay_counter()
-    if _call_counter <= 1:
-        # We're at the limit -- wait for recovery
-        sleep_time = 2.0
-        logger.warning("Rate limit nearly exhausted, sleeping %.1fs", sleep_time)
-        time.sleep(sleep_time)
-        _decay_counter()
-    _call_counter -= 1
+    """Consume one rate-limit unit (delegates to thread-safe limiter)."""
+    _rate_limiter.consume(1)
+
+
+def budget_available() -> float:
+    """Return the current available rate-limit budget (non-blocking)."""
+    return _rate_limiter.budget_available()
 
 
 # ---------------------------------------------------------------------------
@@ -97,16 +149,18 @@ def _consume_call():
 # monotonicity even if the clock drifts.
 
 _last_nonce = 0
+_nonce_lock = threading.Lock()
 
 
 def _make_nonce() -> str:
-    """Generate a nonce that is always greater than the previous one."""
+    """Generate a nonce that is always greater than the previous one (thread-safe)."""
     global _last_nonce
-    nonce = int(time.time() * 1000)
-    if nonce <= _last_nonce:
-        nonce = _last_nonce + 1
-    _last_nonce = nonce
-    return str(nonce)
+    with _nonce_lock:
+        nonce = int(time.time() * 1000)
+        if nonce <= _last_nonce:
+            nonce = _last_nonce + 1
+        _last_nonce = nonce
+        return str(nonce)
 
 
 # ---------------------------------------------------------------------------
@@ -233,8 +287,12 @@ def _private_request(path: str, params: dict = None) -> dict:
 
     errors = resp.get("error", [])
     if errors:
+        error_str = str(errors)
+        if "EAPI:Rate limit" in error_str or "Temporary lockout" in error_str:
+            _rate_limiter.report_rate_error()
         raise Exception(f"Kraken API error: {errors}")
 
+    _rate_limiter.report_success()
     return resp.get("result", {})
 
 

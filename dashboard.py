@@ -2118,13 +2118,18 @@ async function removePair(pair) {
   } catch(e) {}
 }
 
+let _freeOrphansInProgress = false;
 async function freeOrphans(mode) {
+  if (_freeOrphansInProgress) return;
   mode = mode || 'soft';
   const count = document.getElementById('orphan-count').textContent;
   const desc = mode === 'hard'
     ? 'HARD cancel all ' + count + ' orphans? Losses booked at current market prices.'
     : 'Soft-close all ' + count + ' orphans? Exits moved to 0.2% from market — real P&L booked when they fill.';
   if (!confirm(desc)) return;
+  _freeOrphansInProgress = true;
+  const btn = event && event.target;
+  if (btn) { btn.disabled = true; btn.textContent = 'Freeing...'; }
   try {
     const r = await fetch('/api/swarm/free-orphans', {
       method: 'POST',
@@ -2143,6 +2148,10 @@ async function freeOrphans(mode) {
       alert(d.error || 'Failed to free orphans');
     }
   } catch(e) { alert('Network error'); }
+  finally {
+    _freeOrphansInProgress = false;
+    if (btn) { btn.disabled = false; btn.textContent = mode === 'hard' ? 'Hard Free' : 'Soft Free'; }
+  }
 }
 
 async function addPair(pair) {

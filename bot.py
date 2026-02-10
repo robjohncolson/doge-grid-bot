@@ -137,6 +137,10 @@ _swarm_pending_adds: list = []      # list of config.PairConfig
 _swarm_pending_removes: list = []   # list of pair_name strings
 _swarm_pending_multipliers: list = []  # list of (pair_name, multiplier) tuples
 
+# Free-orphans dedup lock -- prevents concurrent soft/hard free operations
+_free_orphans_in_progress = False
+_free_orphans_lock = threading.Lock()
+
 # OHLC round-robin index for throttled fetching
 _ohlc_robin_idx = 0
 
@@ -657,58 +661,70 @@ class DashboardHandler(BaseHTTPRequestHandler):
         Soft: replace with tight limits 0.2% from market (real fills)
         Hard: cancel outright and book theoretical loss
         """
+        global _free_orphans_in_progress
+
         if not _bot_states:
             self._send_json({"error": "bot not initialized"}, 503)
             return
 
+        with _free_orphans_lock:
+            if _free_orphans_in_progress:
+                self._send_json({"error": "already in progress"}, 429)
+                return
+            _free_orphans_in_progress = True
+
         try:
-            length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length)) if length > 0 else {}
-        except (ValueError, json.JSONDecodeError):
-            body = {}
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(length)) if length > 0 else {}
+            except (ValueError, json.JSONDecodeError):
+                body = {}
 
-        hard_mode = body.get("mode", "soft") == "hard"
-        total_ok = 0
-        total_failed = 0
-        details = []
+            hard_mode = body.get("mode", "soft") == "hard"
+            total_ok = 0
+            total_failed = 0
+            details = []
 
-        for pair_name, state in _bot_states.items():
-            if not state.recovery_orders:
-                continue
-            price = _current_prices.get(pair_name, 0.0)
+            for pair_name, state in _bot_states.items():
+                if not state.recovery_orders:
+                    continue
+                price = _current_prices.get(pair_name, 0.0)
 
-            if hard_mode:
-                result = grid_strategy.cancel_all_recovery(state, price)
-                ok = result["cancelled"]
-                fail = result["failed"]
-                loss = result["total_loss"]
-            else:
-                result = grid_strategy.soft_free_recovery(state, price)
-                ok = result["replaced"]
-                fail = result["failed"]
-                loss = 0.0  # no immediate loss; booked when fills arrive
+                if hard_mode:
+                    result = grid_strategy.cancel_all_recovery(state, price)
+                    ok = result["cancelled"]
+                    fail = result["failed"]
+                    loss = result["total_loss"]
+                else:
+                    result = grid_strategy.soft_free_recovery(state, price)
+                    ok = result["replaced"]
+                    fail = result["failed"]
+                    loss = 0.0  # no immediate loss; booked when fills arrive
 
-            grid_strategy.save_state(state)
-            total_ok += ok
-            total_failed += fail
-            if ok or fail:
-                details.append({
-                    "pair": state.pair_display,
-                    "ok": ok,
-                    "failed": fail,
-                    "loss": round(loss, 4),
-                })
+                grid_strategy.save_state(state)
+                total_ok += ok
+                total_failed += fail
+                if ok or fail:
+                    details.append({
+                        "pair": state.pair_display,
+                        "ok": ok,
+                        "failed": fail,
+                        "loss": round(loss, 4),
+                    })
 
-        mode_label = "hard" if hard_mode else "soft"
-        logger.info("FREE ORPHANS (web/%s): %d ok, %d failed",
-                     mode_label, total_ok, total_failed)
-        self._send_json({
-            "ok": True,
-            "mode": mode_label,
-            "total_ok": total_ok,
-            "total_failed": total_failed,
-            "details": details,
-        })
+            mode_label = "hard" if hard_mode else "soft"
+            logger.info("FREE ORPHANS (web/%s): %d ok, %d failed",
+                         mode_label, total_ok, total_failed)
+            self._send_json({
+                "ok": True,
+                "mode": mode_label,
+                "total_ok": total_ok,
+                "total_failed": total_failed,
+                "details": details,
+            })
+        finally:
+            with _free_orphans_lock:
+                _free_orphans_in_progress = False
 
     def _handle_api_config(self):
         """POST /api/config -- validate and queue config changes."""
@@ -1385,58 +1401,70 @@ def _cmd_resetbackoff(state: grid_strategy.GridState):
 
 def _cmd_freeorphans(arg: str = ""):
     """Handle /freeorphans -- soft-close recovery tickets (or 'hard' to cancel outright)."""
+    global _free_orphans_in_progress
+
     if not _bot_states:
         notifier._send_message("No active pairs.")
         return
 
-    hard_mode = arg.strip().lower() == "hard"
-    total_ok = 0
-    total_failed = 0
-    lines = []
+    with _free_orphans_lock:
+        if _free_orphans_in_progress:
+            notifier._send_message("Free orphans already in progress, skipping.")
+            return
+        _free_orphans_in_progress = True
 
-    for pair_name, state in _bot_states.items():
-        if not state.recovery_orders:
-            continue
-        price = _current_prices.get(pair_name, 0.0)
-        count = len(state.recovery_orders)
+    try:
+        hard_mode = arg.strip().lower() == "hard"
+        total_ok = 0
+        total_failed = 0
+        lines = []
 
-        if hard_mode:
-            result = grid_strategy.cancel_all_recovery(state, price)
-            ok = result["cancelled"]
-            fail = result["failed"]
-            detail = f"${result['total_loss']:.4f}"
-        else:
-            result = grid_strategy.soft_free_recovery(state, price)
-            ok = result["replaced"]
-            fail = result["failed"]
-            skip = result["skipped"]
-            detail = f"{skip} already tight" if skip else "tightened"
+        for pair_name, state in _bot_states.items():
+            if not state.recovery_orders:
+                continue
+            price = _current_prices.get(pair_name, 0.0)
+            count = len(state.recovery_orders)
 
-        grid_strategy.save_state(state)
-        total_ok += ok
-        total_failed += fail
-        if ok or fail:
-            lines.append(
-                f"  {state.pair_display}: {ok}/{count} {'cancelled' if hard_mode else 'replaced'}"
-                + (f", {fail} failed" if fail else "")
-                + f" ({detail})"
-            )
+            if hard_mode:
+                result = grid_strategy.cancel_all_recovery(state, price)
+                ok = result["cancelled"]
+                fail = result["failed"]
+                detail = f"${result['total_loss']:.4f}"
+            else:
+                result = grid_strategy.soft_free_recovery(state, price)
+                ok = result["replaced"]
+                fail = result["failed"]
+                skip = result["skipped"]
+                detail = f"{skip} already tight" if skip else "tightened"
 
-    if not lines:
-        notifier._send_message("No recovery tickets to free.")
-        return
+            grid_strategy.save_state(state)
+            total_ok += ok
+            total_failed += fail
+            if ok or fail:
+                lines.append(
+                    f"  {state.pair_display}: {ok}/{count} {'cancelled' if hard_mode else 'replaced'}"
+                    + (f", {fail} failed" if fail else "")
+                    + f" ({detail})"
+                )
 
-    mode_label = "Hard Free" if hard_mode else "Soft Free"
-    action_label = "cancelled" if hard_mode else "moved to 0.2% from market"
-    summary = (
-        f"<b>{mode_label} Orphans</b>\n\n"
-        + "\n".join(lines)
-        + f"\n\nTotal: {total_ok} {action_label}"
-        + (f", {total_failed} failed" if total_failed else "")
-    )
-    logger.info("FREE ORPHANS (%s): %d ok, %d failed",
-                "hard" if hard_mode else "soft", total_ok, total_failed)
-    notifier._send_message(summary)
+        if not lines:
+            notifier._send_message("No recovery tickets to free.")
+            return
+
+        mode_label = "Hard Free" if hard_mode else "Soft Free"
+        action_label = "cancelled" if hard_mode else "moved to 0.2% from market"
+        summary = (
+            f"<b>{mode_label} Orphans</b>\n\n"
+            + "\n".join(lines)
+            + f"\n\nTotal: {total_ok} {action_label}"
+            + (f", {total_failed} failed" if total_failed else "")
+        )
+        logger.info("FREE ORPHANS (%s): %d ok, %d failed",
+                    "hard" if hard_mode else "soft", total_ok, total_failed)
+        notifier._send_message(summary)
+    finally:
+        with _free_orphans_lock:
+            _free_orphans_in_progress = False
 
 
 def _cmd_help():
@@ -2070,6 +2098,7 @@ def run():
                     should_stop_global = True
 
             # 4a-batch: Collect all open txids and batch query (1-2 private calls)
+            batch_query_ok = False
             if not should_stop_global and not config.DRY_RUN:
                 all_txids = {}  # txid -> pair_name
                 for pn, st in _bot_states.items():
@@ -2081,18 +2110,26 @@ def run():
                         if r.txid:
                             all_txids[r.txid] = pn
                 if all_txids:
-                    try:
-                        batch_order_info = kraken_client.query_orders_batched(list(all_txids.keys()))
-                        # Distribute results to per-pair caches
-                        per_pair_info = {}
-                        for txid, info in batch_order_info.items():
-                            pn = all_txids.get(txid)
-                            if pn:
-                                per_pair_info.setdefault(pn, {})[txid] = info
-                        for pn, info_dict in per_pair_info.items():
-                            _bot_states[pn]._cached_order_info = info_dict
-                    except Exception as e:
-                        logger.error("Batch order query failed: %s", e)
+                    # Budget check: need ~1 call per 50 txids + 2 margin
+                    batches_needed = (len(all_txids) + 49) // 50
+                    if kraken_client.budget_available() < batches_needed + 2:
+                        logger.warning(
+                            "Skipping batch order query: budget %.1f < %d needed",
+                            kraken_client.budget_available(), batches_needed + 2)
+                    else:
+                        try:
+                            batch_order_info = kraken_client.query_orders_batched(list(all_txids.keys()))
+                            # Distribute results to per-pair caches
+                            per_pair_info = {}
+                            for txid, info in batch_order_info.items():
+                                pn = all_txids.get(txid)
+                                if pn:
+                                    per_pair_info.setdefault(pn, {})[txid] = info
+                            for pn, info_dict in per_pair_info.items():
+                                _bot_states[pn]._cached_order_info = info_dict
+                            batch_query_ok = True
+                        except Exception as e:
+                            logger.error("Batch order query failed: %s", e)
 
             if should_stop_global:
                 break
@@ -2223,12 +2260,17 @@ def run():
                 if config.STRATEGY_MODE == "pair" and config.RECOVERY_ENABLED:
                     lifecycle_changed = False
                     # Recompute pair_state from live orders (fixes stale state after restart)
-                    fresh_state = grid_strategy._compute_pair_state(state)
-                    if fresh_state != state.pair_state:
-                        logger.info("[%s] pair_state corrected: %s -> %s",
-                                    pair_name, state.pair_state, fresh_state)
-                        state.pair_state = fresh_state
-                        lifecycle_changed = True
+                    # Only correct if we got fresh order data this cycle
+                    if batch_query_ok:
+                        fresh_state = grid_strategy._compute_pair_state(state)
+                        if fresh_state != state.pair_state:
+                            logger.info("[%s] pair_state corrected: %s -> %s",
+                                        pair_name, state.pair_state, fresh_state)
+                            state.pair_state = fresh_state
+                            lifecycle_changed = True
+                    else:
+                        logger.debug("[%s] Skipping pair_state correction (stale data)",
+                                     pair_name)
                     # Exit drift check: orphan exits too far from market
                     if grid_strategy.check_exit_drift(state, current_price):
                         lifecycle_changed = True
