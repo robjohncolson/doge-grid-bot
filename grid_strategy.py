@@ -4097,11 +4097,16 @@ def _orphan_exit_lottery(state, o, current_price, reason="timeout"):
     return new_o
 
 
-def _orphan_exit(state, o, current_price, reason="timeout"):
+def _orphan_exit(state, o, current_price, reason="timeout",
+                 skip_budget_check=False):
     """
     Orphan a stranded exit order.  Dispatches to force-liquidation or
     lottery-ticket mode based on the pair's recovery_mode setting.
     Returns the new entry GridOrder on success, None on failure.
+
+    skip_budget_check: True for capital-neutral callers (exit drift,
+    S1 rebalance) where an existing exit is being recycled into a fresh
+    entry -- net exposure doesn't increase.
     """
     recovery_mode = "lottery"
     if state.pair_config:
@@ -4110,7 +4115,8 @@ def _orphan_exit(state, o, current_price, reason="timeout"):
     # Budget check for lottery mode -- lottery keeps the exit on book AND
     # places a new entry, so it INCREASES exposure.  Skip if already at limit.
     # Liquidation is exempt: it SELLS the asset, which FREES capital.
-    if recovery_mode != "liquidate":
+    # Capital-neutral callers (drift/rebalance) also skip this check.
+    if recovery_mode != "liquidate" and not skip_budget_check:
         budget = state.capital_budget_usd
         if budget > 0:
             deployed = get_capital_deployed(state, current_price)
@@ -4156,7 +4162,8 @@ def check_exit_drift(state: GridState, current_price: float) -> bool:
                 state.pair_display, o.side.upper(), tid, cyc,
                 o.price, drift_pct, current_price, max_drift,
             )
-            new_entry = _orphan_exit(state, o, current_price, reason="drift")
+            new_entry = _orphan_exit(state, o, current_price, reason="drift",
+                                       skip_budget_check=True)
             if new_entry:
                 logger.info(
                     "EXIT DRIFT [%s]: fresh %s entry [%s.%d] placed @ $%.6f",
@@ -4239,7 +4246,8 @@ def check_s1_rebalance(state: GridState, current_price: float) -> bool:
     )
 
     state.last_s1_rebalance = time.time()
-    new_entry = _orphan_exit(state, o, current_price, reason="s1_rebalance")
+    new_entry = _orphan_exit(state, o, current_price, reason="s1_rebalance",
+                             skip_budget_check=True)
     if new_entry:
         logger.info(
             "S1 REBALANCE [%s]: fresh %s entry [%s.%d] placed @ $%.6f -- "
