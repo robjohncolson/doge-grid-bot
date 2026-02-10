@@ -2265,23 +2265,73 @@ def _build_pair_with_position(state: GridState, last_fill: dict,
     return [o for o in state.grid_orders if o.status == "open"]
 
 
+def _get_asset_balance(state) -> float:
+    """Check actual Kraken balance for this pair's base asset."""
+    try:
+        balances = kraken_client.get_balance()
+        # filter_strings = [base_clean, raw_kraken_base]
+        # e.g. ["XDG", "XXDG"] for DOGE, ["LTC", "XLTC"] for LTC, ["SOL", "SOL"]
+        candidates = []
+        if state.pair_config and state.pair_config.filter_strings:
+            for fs in state.pair_config.filter_strings:
+                candidates.extend([fs, "X" + fs, "Z" + fs])
+        # Also try the pair name prefix
+        candidates.append(state.pair_name[:3])
+        for key in candidates:
+            if key in balances:
+                return float(balances[key])
+        return 0.0
+    except Exception as e:
+        logger.debug("Balance check failed for %s: %s", state.pair_display, e)
+        return 0.0
+
+
 def _attempt_seed_buy(state, sell_entry_price, volume, trade_id, cycle):
     """
     When a sell entry fails due to no inventory, market-buy enough of the
     asset to seed Trade A.  If successful, retry the sell entry as a limit
     order.  Returns the GridOrder on success, None on failure.
+
+    IMPORTANT: Checks real Kraken balance first.  Only market-buys if the
+    account truly has insufficient inventory.  This prevents duplicate seed
+    buys across restarts.
     """
     pair = state.pair_name
     display = state.pair_display
 
+    # ---- Step 1: Check actual Kraken balance ----
+    # The sell entry failed with "insufficient", but that might be because
+    # inventory is locked in existing sell orders, not because we don't own it.
+    # If we already hold enough of the asset, the issue is order collision,
+    # not missing inventory — do NOT market-buy more.
+    real_balance = _get_asset_balance(state)
+    if real_balance >= volume:
+        logger.info(
+            "SEED BUY [%s]: already hold %.4f units (need %.4f) "
+            "-- skipping market buy (inventory locked in existing orders)",
+            display, real_balance, volume)
+        # Try to place the sell entry anyway — it will fail again if
+        # inventory is truly locked, and we fall back to long-only.
+        return None
+
+    # Only seed-buy the deficit (not full volume) if we have a partial balance
+    need = volume - real_balance
+    if real_balance > 0:
+        logger.info(
+            "SEED BUY [%s]: hold %.4f, need %.4f, buying deficit %.4f",
+            display, real_balance, volume, need)
+        buy_volume = need
+    else:
+        buy_volume = volume
+
     logger.info(
         "SEED BUY [%s]: no inventory for sell entry -- market-buying %.4f units",
-        display, volume)
+        display, buy_volume)
 
-    # Capital budget check
+    # ---- Step 2: Capital budget check ----
     budget = state.capital_budget_usd
     if budget > 0:
-        order_cost = sell_entry_price * volume
+        order_cost = sell_entry_price * buy_volume
         deployed = get_capital_deployed(state, sell_entry_price)
         if deployed + order_cost > budget:
             logger.warning(
@@ -2289,17 +2339,18 @@ def _attempt_seed_buy(state, sell_entry_price, volume, trade_id, cycle):
                 display, deployed, order_cost, budget)
             return None
 
+    # ---- Step 3: Market buy ----
     try:
         seed_txid = kraken_client.place_order(
-            side="buy", volume=volume, price=sell_entry_price,
+            side="buy", volume=buy_volume, price=sell_entry_price,
             pair=pair, ordertype="market")
         logger.info(
-            "SEED BUY [%s]: market buy %.4f -> %s", display, volume, seed_txid)
+            "SEED BUY [%s]: market buy %.4f -> %s", display, buy_volume, seed_txid)
     except Exception as e:
         logger.warning("SEED BUY [%s]: market buy failed: %s", display, e)
         return None
 
-    # Seed buy succeeded -- now retry the sell entry as a limit order
+    # ---- Step 4: Place the sell entry ----
     try:
         order = GridOrder(level=+1, side="sell", price=sell_entry_price,
                           volume=volume)

@@ -1814,6 +1814,15 @@ def run():
         except Exception as e:
             logger.warning("[%s] Exit reprice failed: %s", pair_name, e)
 
+    # --- Phase 3c: Log actual Kraken balances (fidelity check) ---
+    try:
+        balances = kraken_client.get_balance()
+        # Filter to non-zero balances
+        held = {k: float(v) for k, v in balances.items() if float(v) > 0.0001}
+        logger.info("BALANCE CHECK: %s", held)
+    except Exception as e:
+        logger.warning("Balance check failed: %s", e)
+
     # --- Phase 4: Main loop ---
     _rebalance_capital_budgets()  # set per-pair budgets on startup
     logger.info("Entering main loop (poll every %ds, %d pair(s))...",
