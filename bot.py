@@ -1554,15 +1554,26 @@ def _compute_portfolio_value() -> float | None:
 # ---------------------------------------------------------------------------
 
 def _rebalance_capital_budgets():
-    """Redistribute capital evenly across active pairs."""
+    """Redistribute capital evenly across active pairs.
+
+    Budget grows with accumulated profits so compounding isn't capped
+    by the static STARTING_CAPITAL.  Each pair's net profit (trade P&L
+    minus seed costs) is added to the global pool before dividing.
+    """
     n = len(_bot_states)
     if n == 0:
         return
-    per_pair = config.STARTING_CAPITAL / n
+    total_net_profit = sum(
+        max(0, st.total_profit_usd - st.seed_cost_usd)
+        for st in _bot_states.values()
+    )
+    effective_capital = config.STARTING_CAPITAL + total_net_profit
+    per_pair = effective_capital / n
     for state in _bot_states.values():
         if state.pair_config:
             state.pair_config.capital_budget_usd = per_pair
-    logger.info("Capital rebalanced: $%.2f per pair across %d pairs", per_pair, n)
+    logger.info("Capital rebalanced: $%.2f per pair across %d pairs (effective $%.2f = $%.2f start + $%.2f profit)",
+                per_pair, n, effective_capital, config.STARTING_CAPITAL, total_net_profit)
 
 
 def _add_pair(pair_config: config.PairConfig):

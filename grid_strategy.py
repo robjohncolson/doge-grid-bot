@@ -396,9 +396,11 @@ class GridState:
     @property
     def order_size_usd(self) -> float:
         base = self.pair_config.order_size_usd if self.pair_config else config.ORDER_SIZE_USD
-        # Compound: roll profits back into trade size
-        if self.total_profit_usd > 0:
-            base += self.total_profit_usd
+        # Compound: roll NET profits (trade P&L minus seed costs) back into trade size.
+        # This ensures seed buy expenses are accounted for before compounding.
+        net_profit = self.total_profit_usd - self.seed_cost_usd
+        if net_profit > 0:
+            base += net_profit
         return base
 
     @order_size_usd.setter
@@ -997,8 +999,9 @@ def adapt_grid_params(state: GridState, current_price: float):
     min_by_volume = ORDERMIN_DOGE * current_price * 1.2
     order_size = max(min_by_volume, COSTMIN_USD)
 
-    # Effective capital = starting + accumulated profits
-    effective_capital = config.STARTING_CAPITAL + max(0, state.total_profit_usd)
+    # Effective capital = starting + net profits (trade P&L minus seed costs)
+    net_profit = state.total_profit_usd - state.seed_cost_usd
+    effective_capital = config.STARTING_CAPITAL + max(0, net_profit)
 
     # Grid levels: fit as many as capital allows
     # Worst case at max trend ratio (0.75): 75% of total are buys
@@ -1017,11 +1020,11 @@ def adapt_grid_params(state: GridState, current_price: float):
         worst_case = int(levels * 1.5) * config.ORDER_SIZE_USD
         logger.info(
             "Adaptive grid: $%.2f/order (%d DOGE), %d levels (%d total), "
-            "worst-case $%.0f of $%.0f effective capital ($%.0f start + $%.2f profit)",
+            "worst-case $%.0f of $%.0f effective capital ($%.0f start + $%.2f net profit)",
             config.ORDER_SIZE_USD,
             max(ORDERMIN_DOGE, int(config.ORDER_SIZE_USD / current_price)),
             levels, total, worst_case, effective_capital,
-            config.STARTING_CAPITAL, max(0, state.total_profit_usd),
+            config.STARTING_CAPITAL, max(0, net_profit),
         )
 
 
@@ -2396,6 +2399,16 @@ def _place_pair_order(state, side, price, role, matched_buy=None,
     cycle:    int -- current cycle number for this trade.
     """
     volume = calculate_volume_for_price(price, state)
+    # Compounding verification: log when profits affect order sizing
+    if role == "entry":
+        base_size = state.pair_config.order_size_usd if state.pair_config else config.ORDER_SIZE_USD
+        net_profit = state.total_profit_usd - state.seed_cost_usd
+        if net_profit > 0:
+            logger.info(
+                "COMPOUND [%s]: order $%.2f = $%.2f base + $%.4f net profit "
+                "(trades $%.4f - seeds $%.4f)",
+                state.pair_display, state.order_size_usd, base_size,
+                net_profit, state.total_profit_usd, state.seed_cost_usd)
     # Apply entry size multiplier (only for entries, exits use actual fill volume)
     if role == "entry" and state.next_entry_multiplier > 1.0:
         volume = volume * state.next_entry_multiplier
