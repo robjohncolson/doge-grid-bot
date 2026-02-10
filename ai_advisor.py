@@ -634,3 +634,48 @@ def format_recommendation(parsed: dict) -> str:
     lines.append(f"  Verdict: {action.upper()} ({winner_count}/{panel_size})")
 
     return "\n".join(lines)
+
+
+def analyze_trade(cycle_data: dict) -> dict:
+    """
+    Ask the first available AI panelist why a trade lost money.
+
+    Args:
+        cycle_data: Dict with trade_id, cycle, entry_side, entry_price,
+                    exit_price, volume, net_profit, fees, duration_sec.
+
+    Returns:
+        {"analysis": "...", "panelist": "..."} on success,
+        {"analysis": "No AI keys configured", "panelist": ""} on failure.
+    """
+    panel = _build_panel()
+    if not panel:
+        return {"analysis": "No AI keys configured", "panelist": ""}
+
+    prompt = (
+        f"A pair trade just closed at a loss. Analyze why and suggest what "
+        f"the bot could do differently.\n\n"
+        f"Trade: {cycle_data.get('trade_id', '?')} cycle {cycle_data.get('cycle', 0)}\n"
+        f"Side: {cycle_data.get('entry_side', '?')} entry\n"
+        f"Entry price: ${cycle_data.get('entry_price', 0):.6f}\n"
+        f"Exit price: ${cycle_data.get('exit_price', 0):.6f}\n"
+        f"Volume: {cycle_data.get('volume', 0):.2f}\n"
+        f"Net P&L: ${cycle_data.get('net_profit', 0):.4f}\n"
+        f"Fees: ${cycle_data.get('fees', 0):.4f}\n"
+        f"Duration: {cycle_data.get('duration_sec', 0):.0f}s\n\n"
+        f"Give a concise 2-3 sentence analysis of why this trade lost money "
+        f"and one actionable suggestion. Be specific about the numbers."
+    )
+
+    # Try panelists in order until one succeeds
+    for panelist in panel:
+        now = time.time()
+        skip_until = _panelist_skip_until.get(panelist["name"], 0)
+        if now < skip_until:
+            continue
+
+        response, err = _call_panelist(prompt, panelist)
+        if response:
+            return {"analysis": response.strip(), "panelist": panelist["name"]}
+
+    return {"analysis": "All AI panelists unavailable", "panelist": ""}

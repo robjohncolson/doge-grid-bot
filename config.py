@@ -114,7 +114,7 @@ CAPITAL_BUDGET_MODE: str = _env("CAPITAL_BUDGET_MODE", "off", str)
 # Base order size in USD.  Defaults to Kraken's $0.50 cost minimum so every
 # pair trades at its Kraken minimum volume.  calculate_volume_for_price()
 # floors to each pair's min_volume, so this just needs to be <= the cheapest
-# pair's minimum cost.  Compounding adds net profits on top at runtime.
+# pair's minimum cost.  Profits fund additional slots instead of compounding.
 ORDER_SIZE_USD: float = _env("ORDER_SIZE_USD", 0.50, float)
 
 # ---------------------------------------------------------------------------
@@ -374,6 +374,16 @@ SWARM_DAILY_LOSS_LIMIT: float = _env("SWARM_DAILY_LOSS_LIMIT", 10.0, float)
 SWARM_EXEMPT_PAIRS: list = _env("SWARM_EXEMPT_PAIRS", "XDGUSD", str).split(",")
 
 # ---------------------------------------------------------------------------
+# Auto-slot scaling (profits fund additional A/B slots)
+# ---------------------------------------------------------------------------
+
+# Net profit (USD) needed per additional slot.  At $5: 1 slot at $0, 2 at $5, 3 at $10.
+SLOT_PROFIT_THRESHOLD: float = _env("SLOT_PROFIT_THRESHOLD", 5.0, float)
+
+# Maximum auto-slots per base pair (including the original).
+MAX_AUTO_SLOTS: int = _env("MAX_AUTO_SLOTS", 5, int)
+
+# ---------------------------------------------------------------------------
 # Multi-pair configuration
 # ---------------------------------------------------------------------------
 
@@ -403,10 +413,10 @@ class PairConfig:
         self.price_decimals = price_decimals
         self.volume_decimals = volume_decimals
         self.filter_strings = filter_strings or [pair[:3].upper()]
-        self.next_entry_multiplier = 1.0  # entry size multiplier (1x = normal)
         self.recovery_mode = recovery_mode  # "lottery" or "liquidate"
         self.capital_budget_usd = capital_budget_usd  # 0 = unlimited (backward compat)
         self.slot_count = 1  # number of independent A/B trade slots (1 = single)
+        self.peak_slot_count = 1  # high-water mark: auto-grow but never auto-shrink
 
         # Validate critical parameters
         if self.entry_pct <= 0:
@@ -431,10 +441,10 @@ class PairConfig:
             "price_decimals": self.price_decimals,
             "volume_decimals": self.volume_decimals,
             "filter_strings": self.filter_strings,
-            "next_entry_multiplier": self.next_entry_multiplier,
             "recovery_mode": self.recovery_mode,
             "capital_budget_usd": self.capital_budget_usd,
             "slot_count": self.slot_count,
+            "peak_slot_count": self.peak_slot_count,
         }
 
     @staticmethod
@@ -496,8 +506,8 @@ class PairConfig:
                 recovery_mode=recovery_mode,
                 capital_budget_usd=capital_budget,
             )
-            pc.next_entry_multiplier = d.get("next_entry_multiplier", 1.0)
             pc.slot_count = slot_count
+            pc.peak_slot_count = max(slot_count, d.get("peak_slot_count", 1))
             return pc
         except (KeyError, TypeError, ValueError) as e:
             _logger.error("PairConfig.from_dict failed for %s: %s -- using defaults", d.get("pair", "?"), e)
@@ -586,7 +596,7 @@ def print_banner():
         f"  Strategy:        {strategy}",
         f"  Pairs:           {', '.join(pc.display for pc in PAIRS.values())}",
         f"  Capital:         ${STARTING_CAPITAL:.2f}",
-        f"  Order size:      ${ORDER_SIZE_USD:.2f} base (floors to Kraken min per pair + compounding)",
+        f"  Order size:      ${ORDER_SIZE_USD:.2f} base (floors to Kraken min per pair)",
     ]
     if STRATEGY_MODE == "pair":
         net_pair = PAIR_PROFIT_PCT - ROUND_TRIP_FEE_PCT

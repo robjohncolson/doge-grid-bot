@@ -411,13 +411,7 @@ class GridState:
 
     @property
     def order_size_usd(self) -> float:
-        base = self.pair_config.order_size_usd if self.pair_config else config.ORDER_SIZE_USD
-        # Compound: roll NET profits (trade P&L minus seed costs) back into trade size.
-        # This ensures seed buy expenses are accounted for before compounding.
-        net_profit = self.total_profit_usd - self.seed_cost_usd
-        if net_profit > 0:
-            base += net_profit
-        return base
+        return self.pair_config.order_size_usd if self.pair_config else config.ORDER_SIZE_USD
 
     @order_size_usd.setter
     def order_size_usd(self, val):
@@ -437,17 +431,6 @@ class GridState:
         if self.pair_config:
             return self.pair_config.stop_floor
         return config.STOP_FLOOR
-
-    @property
-    def next_entry_multiplier(self) -> float:
-        if self.pair_config:
-            return self.pair_config.next_entry_multiplier
-        return 1.0
-
-    @next_entry_multiplier.setter
-    def next_entry_multiplier(self, val):
-        if self.pair_config:
-            self.pair_config.next_entry_multiplier = val
 
     @property
     def capital_budget_usd(self) -> float:
@@ -601,12 +584,6 @@ def restore_state_snapshot(state: GridState, snapshot: dict, source: str = "snap
             state.consecutive_losses_a, state.consecutive_losses_b,
         )
 
-    # Restore entry multiplier
-    saved_mult = snapshot.get("next_entry_multiplier", 1.0)
-    if saved_mult != 1.0:
-        state.next_entry_multiplier = saved_mult
-        logger.info("Restoring entry multiplier: %.1fx", saved_mult)
-
     # Restore pair_entry_pct runtime override
     saved_entry_pct = snapshot.get("pair_entry_pct")
     if saved_entry_pct and saved_entry_pct != state.entry_pct:
@@ -700,7 +677,6 @@ def save_state(state: GridState):
         "grid_spacing_pct": config.GRID_SPACING_PCT,
         "pair_profit_pct": state.profit_pct,
         "pair_entry_pct": state.entry_pct,
-        "next_entry_multiplier": state.next_entry_multiplier,
         "recovery_orders": [r.to_dict() for r in state.recovery_orders],
         "total_recovery_losses": state.total_recovery_losses,
         "total_recovery_wins": state.total_recovery_wins,
@@ -2468,27 +2444,6 @@ def _place_pair_order(state, side, price, role, matched_buy=None,
     cycle:    int -- current cycle number for this trade.
     """
     volume = calculate_volume_for_price(price, state)
-    # Compounding verification: log when profits affect order sizing
-    if role == "entry":
-        base_size = state.pair_config.order_size_usd if state.pair_config else config.ORDER_SIZE_USD
-        net_profit = state.total_profit_usd - state.seed_cost_usd
-        if net_profit > 0:
-            logger.info(
-                "COMPOUND [%s]: order $%.2f = $%.2f base + $%.4f net profit "
-                "(trades $%.4f - seeds $%.4f)",
-                state.pair_display, state.order_size_usd, base_size,
-                net_profit, state.total_profit_usd, state.seed_cost_usd)
-    # Apply entry size multiplier (only for entries, exits use actual fill volume)
-    if role == "entry" and state.next_entry_multiplier > 1.0:
-        volume = volume * state.next_entry_multiplier
-        vol_dec = state.volume_decimals if state else 0
-        if vol_dec == 0:
-            volume = float(int(volume))
-        else:
-            volume = round(volume, vol_dec)
-        min_vol = state.min_volume if state and state.pair_config else ORDERMIN_DOGE
-        if volume < min_vol:
-            volume = float(min_vol)
     level = -1 if side == "buy" else +1
     order = GridOrder(level=level, side=side, price=price, volume=volume)
     order.order_role = role
@@ -2696,6 +2651,8 @@ def _pair_exit_price(entry_fill: float, current_price: float,
     The min/max ensures the exit is never placed inside the current spread.
     """
     profit_pct = state.profit_pct / 100.0
+    fee_floor = (config.ROUND_TRIP_FEE_PCT + 0.20) / 100.0
+    profit_pct = max(profit_pct, fee_floor)
     entry_pct = state.entry_pct / 100.0
     decimals = state.price_decimals
 
@@ -2960,11 +2917,6 @@ def handle_pair_fill(state: GridState, filled_orders: list,
         if filled.side == "buy" and is_entry:
             tid = tid or "B"
             state.total_entries_filled += 1
-            # Reset entry multiplier after fill
-            if state.next_entry_multiplier > 1.0:
-                logger.info("  Entry multiplier %.1fx applied, resetting to 1x",
-                            state.next_entry_multiplier)
-                state.next_entry_multiplier = 1.0
             logger.info(
                 "PAIR [%s.%d]: Buy entry filled @ $%.6f (%.2f %s)",
                 tid, cyc, filled.price, filled.volume, state.base_display,
@@ -3108,11 +3060,6 @@ def handle_pair_fill(state: GridState, filled_orders: list,
         elif filled.side == "sell" and is_entry:
             tid = tid or "A"
             state.total_entries_filled += 1
-            # Reset entry multiplier after fill
-            if state.next_entry_multiplier > 1.0:
-                logger.info("  Entry multiplier %.1fx applied, resetting to 1x",
-                            state.next_entry_multiplier)
-                state.next_entry_multiplier = 1.0
             logger.info(
                 "PAIR [%s.%d]: Sell entry filled @ $%.6f (%.2f %s)",
                 tid, cyc, filled.price, filled.volume, state.base_display,

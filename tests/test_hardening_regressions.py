@@ -76,7 +76,6 @@ class HardeningRegressionTests(unittest.TestCase):
             "pair_state": "S1b",
             "cycle_a": 5,
             "cycle_b": 6,
-            "next_entry_multiplier": 2.0,
             "pair_entry_pct": 0.55,
             "pair_profit_pct": 1.75,
             "consecutive_losses_a": 3,
@@ -106,7 +105,6 @@ class HardeningRegressionTests(unittest.TestCase):
         self.assertEqual(state.cycle_b, 6)
         self.assertEqual(state.entry_pct, 0.55)
         self.assertEqual(state.profit_pct, 1.75)
-        self.assertEqual(state.next_entry_multiplier, 2.0)
         self.assertEqual(state.consecutive_losses_a, 3)
         self.assertEqual(state.consecutive_losses_b, 1)
         self.assertEqual(len(state.recovery_orders), 1)

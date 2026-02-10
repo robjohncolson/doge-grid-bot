@@ -228,6 +228,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._handle_swarm_multiplier()
         elif path == "/api/swarm/free-orphans":
             self._handle_swarm_free_orphans()
+        elif path == "/api/ai/analyze-trade":
+            self._handle_ai_analyze_trade()
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -523,7 +525,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "paused": any_paused,
                 "seed_cost": round(agg_seed, 4),
                 "recovery_count": agg_recovery,
-                "capital_budget": round(primary_st.pair_config.capital_budget_usd, 2) if primary_st.pair_config else 0.0,
+                "net_profit": round(agg_total_pnl - agg_seed, 4),
+                "peak_slot_count": primary_st.pair_config.peak_slot_count if primary_st.pair_config else 1,
             })
 
         _compute_portfolio_value()  # refresh cached balances for per-pair asset values
@@ -541,6 +544,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "bot_net_pnl": bot_net_pnl,
             "total_seed_cost": round(total_seed, 4),
             "total_recovery": sum(len(st.recovery_orders) for st in _bot_states.values()),
+            "slot_profit_threshold": config.SLOT_PROFIT_THRESHOLD,
         }
 
         # Add per-pair asset balance value (reuse cached balances)
@@ -750,6 +754,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
         finally:
             with _free_orphans_lock:
                 _free_orphans_in_progress = False
+
+    def _handle_ai_analyze_trade(self):
+        """POST /api/ai/analyze-trade -- AI analysis of a losing trade."""
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length > 0 else {}
+        except (ValueError, json.JSONDecodeError):
+            self._send_json({"error": "invalid JSON"}, 400)
+            return
+
+        result = ai_advisor.analyze_trade(body)
+        self._send_json(result)
 
     def _handle_api_config(self):
         """POST /api/config -- validate and queue config changes."""
@@ -1782,30 +1798,8 @@ def _compute_portfolio_value() -> float | None:
 # ---------------------------------------------------------------------------
 
 def _rebalance_capital_budgets():
-    """Redistribute capital evenly across all active slots.
-
-    Budget grows with accumulated profits so compounding isn't capped
-    by the static STARTING_CAPITAL.  Each slot (including multi-slot pairs)
-    counts as an individual capital consumer since each has its own orders.
-
-    Gated by CAPITAL_BUDGET_MODE: only runs when mode is "auto".
-    """
-    if config.CAPITAL_BUDGET_MODE != "auto":
-        return
-    n = len(_bot_states)  # Total slots (including XDGUSD#1, etc.)
-    if n == 0:
-        return
-    total_net_profit = sum(
-        max(0, st.total_profit_usd - st.seed_cost_usd)
-        for st in _bot_states.values()
-    )
-    effective_capital = config.STARTING_CAPITAL + total_net_profit
-    per_slot = effective_capital / n
-    for state in _bot_states.values():
-        if state.pair_config:
-            state.pair_config.capital_budget_usd = per_slot
-    logger.info("Capital rebalanced: $%.2f per slot across %d slots (effective $%.2f = $%.2f start + $%.2f profit)",
-                per_slot, n, effective_capital, config.STARTING_CAPITAL, total_net_profit)
+    """No-op.  Capital budgets are fully off; minimum order sizes are the safety net."""
+    return
 
 
 def _capture_rollover_summary(current_utc_date: str, last_daily_summary_date: str):
@@ -2053,10 +2047,12 @@ def _process_swarm_queue():
             if target_slots == current_count:
                 continue
 
-            # Update PairConfig slot_count
+            # Update PairConfig slot_count + peak high-water mark
             primary_st = _bot_states.get(base_pair)
             if primary_st and primary_st.pair_config:
                 primary_st.pair_config.slot_count = target_slots
+                if target_slots > primary_st.pair_config.peak_slot_count:
+                    primary_st.pair_config.peak_slot_count = target_slots
 
             if target_slots > current_count:
                 # Scale up: add new slots
@@ -2108,6 +2104,52 @@ def _process_swarm_queue():
             _save_active_pairs()
         except Exception as e:
             logger.error("Failed to adjust slots for %s: %s", base_pair, e)
+
+
+def _auto_slot_check():
+    """Scale slots up based on accumulated net profit per base pair.
+
+    target = min(1 + floor(net_profit / threshold), MAX_AUTO_SLOTS)
+    Never shrinks below peak_slot_count (high-water mark).
+    """
+    threshold = config.SLOT_PROFIT_THRESHOLD
+    if threshold <= 0:
+        return
+
+    # Group by base pair
+    grouped = {}
+    for pn, st in _bot_states.items():
+        bp = _base_pair(pn)
+        grouped.setdefault(bp, []).append((pn, st))
+
+    for bp, slot_list in grouped.items():
+        primary_st = _bot_states.get(bp)
+        if not primary_st or not primary_st.pair_config:
+            continue
+
+        # Aggregate net profit across all slots of this pair
+        net_profit = sum(st.total_profit_usd - st.seed_cost_usd
+                         for _, st in slot_list)
+
+        target = min(1 + int(net_profit / threshold),
+                     config.MAX_AUTO_SLOTS)
+        target = max(target, 1)
+
+        # Never shrink below peak
+        peak = primary_st.pair_config.peak_slot_count
+        target = max(target, peak)
+
+        current_count = len(slot_list)
+        if target <= current_count:
+            continue
+
+        # Update peak high-water mark
+        primary_st.pair_config.peak_slot_count = target
+
+        # Scale up via the multiplier queue (reuses existing logic)
+        _swarm_pending_multipliers.put((bp, target))
+        logger.info("[%s] Auto-slot: net $%.2f -> %d slots (was %d, peak %d)",
+                    bp, net_profit, target, current_count, peak)
 
 
 # ---------------------------------------------------------------------------
@@ -2804,6 +2846,9 @@ def run():
 
             # --- 4h2: Process swarm add/remove/multiplier queue ---
             _process_swarm_queue()
+
+            # --- 4h3: Auto-slot scaling (profits fund additional slots) ---
+            _auto_slot_check()
 
             # --- 4i: Sleep until next poll ---
             elapsed = time.time() - loop_start

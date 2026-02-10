@@ -340,6 +340,12 @@ a{color:#58a6ff}
 .pair-state-bar.ps-S2{border-color:#da3633} .pair-state-bar.ps-S2 .ps-state{color:#f85149}
 .ps-trend{font-size:12px;margin-top:4px;font-weight:600}
 .ps-s2-timer{font-size:11px;color:#8b949e;margin-top:4px}
+.slot-btn{background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:3px;padding:1px 8px;font-size:14px;cursor:pointer;font-weight:700}
+.slot-btn:hover{background:#30363d}
+.btn-analyze{background:none;border:1px solid #30363d;color:#8b949e;border-radius:3px;padding:0 5px;font-size:11px;cursor:pointer;margin-left:4px}
+.btn-analyze:hover{color:#58a6ff;border-color:#58a6ff}
+.btn-analyze:disabled{opacity:0.4;cursor:wait}
+.ai-analysis-row td{padding:8px 12px !important;color:#c9d1d9;font-size:12px;background:#161b22;border-left:3px solid #58a6ff}
 .exit-age-badge{display:inline-block;font-size:10px;padding:1px 6px;border-radius:3px;margin-left:6px;font-weight:600}
 .exit-age-badge.ok{background:#238636;color:#3fb950}
 .exit-age-badge.warn{background:#9e6a03;color:#e3b341}
@@ -495,7 +501,6 @@ a{color:#58a6ff}
 .swarm-table .pnl-pos{color:#3fb950}
 .swarm-table .pnl-neg{color:#f85149}
 .swarm-table .pnl-zero{color:#8b949e}
-.swarm-table select{background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:3px;padding:2px 4px;font-size:11px;font-family:inherit}
 .swarm-table .btn-remove{background:#21262d;border:1px solid #30363d;color:#f85149;border-radius:3px;padding:2px 8px;font-size:11px;cursor:pointer}
 .swarm-table .btn-remove:hover{background:#da3633;color:#fff}
 .btn-browse{background:#238636;border:1px solid #2ea043;color:#fff;border-radius:6px;padding:6px 14px;font-size:13px;cursor:pointer;font-family:inherit}
@@ -552,7 +557,7 @@ a{color:#58a6ff}
   <div style="overflow-x:auto">
     <table class="swarm-table">
       <thead><tr>
-        <th>Pair</th><th>Price</th><th>State</th><th>Today</th><th>Total</th><th>Value</th><th>Trips</th><th>Entry%</th><th>Budget</th><th>Multi</th><th></th>
+        <th>Pair</th><th>Price</th><th>State</th><th>Today</th><th>Total</th><th>Value</th><th>Trips</th><th>Entry%</th><th>Slots</th><th></th>
       </tr></thead>
       <tbody id="swarm-body"></tbody>
     </table>
@@ -602,6 +607,13 @@ a{color:#58a6ff}
   <div class="ps-desc" id="ps-desc">Both entries open</div>
   <div class="ps-trend" id="ps-trend" style="display:none"></div>
   <div class="ps-s2-timer" id="ps-s2-timer" style="display:none"></div>
+  <div class="ps-slots" id="ps-slots" style="margin-top:6px">
+    <span style="font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:1px">Slots</span>
+    <button class="slot-btn" onclick="adjustSlots(-1)">&minus;</button>
+    <span id="ps-slot-count" style="font-size:14px;font-weight:700;margin:0 4px">1</span>
+    <button class="slot-btn" onclick="adjustSlots(+1)">+</button>
+    <span id="ps-slot-info" style="font-size:11px;color:#8b949e;margin-left:8px"></span>
+  </div>
 </div>
 
 <!-- Recovery Orders Panel (pair mode, conditional) -->
@@ -1583,6 +1595,27 @@ function update(data) {
       s2Timer.style.display = 'none';
     }
 
+    // Slot controls (populated from swarm data)
+    const slotEl = document.getElementById('ps-slots');
+    if (detailPair && swarmData) {
+      const pInfo = (swarmData.pairs || []).find(function(x){ return x.pair === detailPair; });
+      if (pInfo) {
+        const sc = pInfo.slot_count || pInfo.multiplier || 1;
+        document.getElementById('ps-slot-count').textContent = sc;
+        const np = pInfo.net_profit || 0;
+        const thresh = swarmData.aggregate.slot_profit_threshold || 5;
+        const nextAt = (sc) * thresh;
+        const toGo = Math.max(0, nextAt - np);
+        document.getElementById('ps-slot-info').textContent =
+          sc < 5 ? 'Next at $' + fmt(nextAt, 2) + ' ($' + fmt(toGo, 2) + ' to go)' : 'Max slots';
+        slotEl.style.display = '';
+      } else {
+        slotEl.style.display = 'none';
+      }
+    } else {
+      slotEl.style.display = 'none';
+    }
+
     // Trade A/B panels
     ppDiv.style.display = 'grid';
     const cycles = data.completed_cycles || [];
@@ -1800,7 +1833,9 @@ function update(data) {
              + '<td>$' + fmt(c.exit_price, 6) + '</td>'
              + '<td>' + fmt(c.volume, 2) + '</td>'
              + '<td>' + dur + '</td>'
-             + '<td class="' + pcls + '">' + fmtUSD(c.net_profit) + '</td></tr>';
+             + '<td class="' + pcls + '">' + fmtUSD(c.net_profit)
+             + (c.net_profit < 0 ? ' <button class="btn-analyze" onclick="analyzeTrade(this,' + JSON.stringify(JSON.stringify(c)) + ')" title="AI analysis">?</button>' : '')
+             + '</td></tr>';
     }
     cb.innerHTML = crows || '<tr><td colspan="8" style="text-align:center;color:#8b949e">No completed cycles yet</td></tr>';
   } else {
@@ -1863,7 +1898,13 @@ function update(data) {
   }
 
   // Params
-  document.getElementById('p-size').textContent = '$' + fmt(cfg.order_size, 2);
+  // Order size with slot + profit context
+  {
+    const pInfo = swarmData && detailPair ? (swarmData.pairs || []).find(function(x){ return x.pair === detailPair; }) : null;
+    const sc = pInfo ? (pInfo.slot_count || 1) : 1;
+    const np = pInfo ? (pInfo.net_profit || 0) : 0;
+    document.getElementById('p-size').textContent = '$' + fmt(cfg.order_size, 2) + ' base \u00d7 ' + sc + ' slot' + (sc > 1 ? 's' : '') + ' | Profit: ' + fmtUSD(np);
+  }
   document.getElementById('p-levels-row').style.display = isPair ? 'none' : '';
   if (!isPair) {
     document.getElementById('p-levels').textContent = cfg.grid_levels + ' per side (' + (cfg.grid_levels * 2) + ' total)';
@@ -2110,17 +2151,11 @@ function renderSwarm(data) {
     rows += '<td>' + (p.asset_value != null ? '$' + p.asset_value.toFixed(2) : '--') + '</td>';
     rows += '<td>' + p.trips_today + '/' + p.total_trips + '</td>';
     rows += '<td>' + fmt(p.entry_pct, 2) + '%</td>';
-    rows += '<td>' + (p.capital_budget > 0 ? '$' + fmt(p.capital_budget, 2) : '<span style="color:#8b949e">unlim</span>') + '</td>';
-    rows += '<td><select onclick="event.stopPropagation()" onchange="setMultiplier(\'' + p.pair + '\',this.value);event.stopPropagation()">'
-          + '<option value="1"' + (slotCount===1 ? ' selected' : '') + '>1x</option>'
-          + '<option value="2"' + (slotCount===2 ? ' selected' : '') + '>2x</option>'
-          + '<option value="3"' + (slotCount===3 ? ' selected' : '') + '>3x</option>'
-          + '<option value="5"' + (slotCount===5 ? ' selected' : '') + '>5x</option>'
-          + '</select></td>';
+    rows += '<td>' + slotCount + '</td>';
     rows += '<td><button class="btn-remove" onclick="removePair(\'' + p.pair + '\');event.stopPropagation()">X</button></td>';
     rows += '</tr>';
   }
-  tbody.innerHTML = rows || '<tr><td colspan="11" style="text-align:center;color:#8b949e">No pairs active</td></tr>';
+  tbody.innerHTML = rows || '<tr><td colspan="10" style="text-align:center;color:#8b949e">No pairs active</td></tr>';
 
   // Show/hide Free Orphans button based on total recovery count
   const orphanBtn = document.getElementById('btn-free-orphans');
@@ -2145,14 +2180,50 @@ async function pollSwarm() {
   } catch(e) {}
 }
 
-async function setMultiplier(pair, val) {
-  const mult = parseInt(val);
+async function analyzeTrade(btn, cycleJson) {
+  btn.disabled = true;
+  btn.textContent = '...';
+  try {
+    const c = JSON.parse(cycleJson);
+    const dur = (c.entry_time && c.exit_time) ? (c.exit_time - c.entry_time) : 0;
+    const r = await fetch('/api/ai/analyze-trade', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        trade_id: c.trade_id, cycle: c.cycle, entry_side: c.entry_side,
+        entry_price: c.entry_price, exit_price: c.exit_price,
+        volume: c.volume, net_profit: c.net_profit, fees: c.fees,
+        duration_sec: dur
+      })
+    });
+    const data = await r.json();
+    const row = btn.closest('tr');
+    const aRow = document.createElement('tr');
+    aRow.className = 'ai-analysis-row';
+    const panelist = data.panelist ? ' <span style="color:#8b949e">(' + data.panelist + ')</span>' : '';
+    aRow.innerHTML = '<td colspan="8">' + (data.analysis || 'No analysis available') + panelist + '</td>';
+    row.after(aRow);
+    btn.textContent = '\u2713';
+  } catch(e) {
+    btn.textContent = '!';
+    btn.disabled = false;
+  }
+}
+
+async function adjustSlots(delta) {
+  if (!detailPair) return;
+  const pInfo = swarmData && (swarmData.pairs || []).find(function(x){ return x.pair === detailPair; });
+  const current = pInfo ? (pInfo.slot_count || pInfo.multiplier || 1) : 1;
+  const target = Math.min(5, Math.max(1, current + delta));
+  if (target === current) return;
   try {
     await fetch('/api/swarm/multiplier', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({pair: pair, multiplier: mult})
+      body: JSON.stringify({pair: detailPair, multiplier: target})
     });
+    document.getElementById('ps-slot-count').textContent = target;
+    await pollSwarm();
   } catch(e) {}
 }
 
@@ -2375,6 +2446,8 @@ async function poll() {
     const r = await fetch(url);
     if (r.ok) update(await r.json());
   } catch(e) {}
+  // Keep swarm data fresh for slot controls / params
+  if (detailPair) pollSwarm();
 }
 
 // Auto-refresh: swarm view via pollSwarm, detail view via poll (when SSE is closed)
