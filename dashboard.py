@@ -2086,7 +2086,13 @@ async function removePair(pair) {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({pair: pair})
     });
-    setTimeout(pollSwarm, 1000);
+    setTimeout(async function() {
+      await pollSwarm();
+      if (swarmData && swarmData.aggregate && swarmData.aggregate.active_pairs <= 1) {
+        const pairs = swarmData.pairs || [];
+        if (pairs.length === 1) showDetailView(pairs[0].pair);
+      }
+    }, 1000);
   } catch(e) {}
 }
 
@@ -2099,10 +2105,16 @@ async function addPair(pair) {
     });
     const d = await r.json();
     if (r.ok) {
-      // Refresh scanner and swarm
+      // Refresh scanner and swarm, auto-switch to swarm view
       scannerCacheTime = 0;
       loadScanner();
-      setTimeout(pollSwarm, 2000);
+      setTimeout(async function() {
+        await pollSwarm();
+        if (swarmData && swarmData.aggregate && swarmData.aggregate.active_pairs > 1) {
+          closeScanner();
+          showSwarmView();
+        }
+      }, 2000);
     } else {
       alert(d.error || 'Failed to add pair');
     }
