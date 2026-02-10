@@ -2197,6 +2197,14 @@ def run():
         config.PAIRS = {}
         for pd in saved_pairs:
             pc = config.PairConfig.from_dict(pd)
+            # Persisted snapshots may carry old per-pair sizing from prior
+            # deployments; force runtime sizing back to the global base.
+            if abs(pc.order_size_usd - config.ORDER_SIZE_USD) >= 1e-9:
+                logger.info(
+                    "Pair %s: resetting saved order_size_usd $%.2f -> base $%.2f",
+                    pc.display, pc.order_size_usd, config.ORDER_SIZE_USD,
+                )
+                pc.order_size_usd = config.ORDER_SIZE_USD
             config.PAIRS[pc.pair] = pc
         logger.info("Restored %d pairs from active_pairs persistence", len(config.PAIRS))
 

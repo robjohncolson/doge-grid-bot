@@ -178,6 +178,56 @@ class HardeningRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(summary["total_profit"], 10.0, places=8)
         self.assertEqual(summary["total_trips"], 38)
 
+    def test_place_pair_order_respects_volume_override(self):
+        st = grid_strategy.GridState(
+            pair_config=config.PairConfig(
+                "XDGUSD", "DOGE/USD", 0.2, 1.0, min_volume=13, volume_decimals=0
+            )
+        )
+        with mock.patch.object(grid_strategy.kraken_client, "place_order", return_value="TX123") as place_order:
+            o = grid_strategy._place_pair_order(
+                st, "sell", 0.10, "exit", trade_id="B", cycle=7, volume_override=53
+            )
+        self.assertIsNotNone(o)
+        self.assertEqual(o.volume, 53.0)
+        place_order.assert_called_once_with(
+            side="sell", volume=53.0, price=0.10, pair="XDGUSD"
+        )
+
+    def test_handle_pair_fill_uses_filled_volume_for_exit(self):
+        st = grid_strategy.GridState(
+            pair_config=config.PairConfig(
+                "XDGUSD", "DOGE/USD", 0.2, 1.0, min_volume=13, volume_decimals=0
+            )
+        )
+        filled = grid_strategy.GridOrder(level=-1, side="buy", price=0.10, volume=53.0)
+        filled.order_role = "entry"
+        filled.trade_id = "B"
+        filled.cycle = 4
+
+        with mock.patch.object(grid_strategy, "_place_pair_order", return_value=mock.Mock()) as place_mock:
+            with mock.patch.object(grid_strategy.supabase_store, "save_fill"):
+                grid_strategy.handle_pair_fill(st, [filled], current_price=0.10)
+
+        self.assertEqual(place_mock.call_count, 1)
+        self.assertEqual(place_mock.call_args.kwargs.get("volume_override"), 53.0)
+
+    def test_build_pair_with_position_uses_fill_volume_for_exit(self):
+        st = grid_strategy.GridState(
+            pair_config=config.PairConfig(
+                "XDGUSD", "DOGE/USD", 0.2, 1.0, min_volume=13, volume_decimals=0
+            )
+        )
+        last_fill = {"side": "buy", "price": 0.10, "volume": 53.0, "profit": 0}
+        with mock.patch.object(grid_strategy, "_place_pair_order", return_value=mock.Mock()) as place_mock:
+            grid_strategy._build_pair_with_position(st, last_fill, current_price=0.10)
+
+        self.assertGreaterEqual(place_mock.call_count, 1)
+        first_call = place_mock.call_args_list[0]
+        first_kwargs = first_call.kwargs
+        self.assertEqual(first_kwargs.get("volume_override"), 53.0)
+        self.assertEqual(first_call.args[3], "exit")
+
 
 if __name__ == "__main__":
     unittest.main()

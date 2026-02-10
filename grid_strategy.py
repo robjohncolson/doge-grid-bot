@@ -2277,7 +2277,8 @@ def _build_pair_with_position(state: GridState, last_fill: dict,
             state, exit_side, exit_price, "exit",
             matched_buy=fill_price if fill_side == "buy" else None,
             matched_sell=fill_price if fill_side == "sell" else None,
-            trade_id=exit_tid, cycle=exit_cyc)
+            trade_id=exit_tid, cycle=exit_cyc,
+            volume_override=last_fill.get("volume"))
     else:
         logger.info(
             "Position recovery: %s entry $%.6f -- %s exit [%s.%d] @ $%.6f on book",
@@ -2429,15 +2430,38 @@ def _attempt_seed_buy(state, sell_entry_price, volume, trade_id, cycle):
 
 def _place_pair_order(state, side, price, role, matched_buy=None,
                       matched_sell=None, trade_id=None, cycle=None,
-                      skip_budget_check=False):
+                      skip_budget_check=False, volume_override=None):
     """
     Place a single pair order and add it to state.grid_orders.
     Returns the GridOrder on success, None on failure.
 
     trade_id: "A" or "B" -- inherited from caller context.
     cycle:    int -- current cycle number for this trade.
+    volume_override: optional explicit volume (used to preserve position size
+        when placing/replacing exits for already-filled entries).
     """
-    volume = calculate_volume_for_price(price, state)
+    if volume_override is None:
+        volume = calculate_volume_for_price(price, state)
+    else:
+        try:
+            volume = float(volume_override)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid volume_override=%r for %s %s on %s -- using calculated size",
+                volume_override, side, role, state.pair_display,
+            )
+            volume = calculate_volume_for_price(price, state)
+        else:
+            min_vol = state.min_volume if state and state.pair_config else ORDERMIN_DOGE
+            if volume < min_vol:
+                volume = float(min_vol)
+            vol_dec = state.volume_decimals if state else 0
+            if vol_dec == 0:
+                volume = float(int(volume))
+            else:
+                volume = round(volume, vol_dec)
+            if volume <= 0:
+                volume = calculate_volume_for_price(price, state)
     level = -1 if side == "buy" else +1
     order = GridOrder(level=level, side=side, price=price, volume=volume)
     order.order_role = role
@@ -2720,7 +2744,8 @@ def reprice_thin_exits(state: GridState, current_price: float) -> int:
             state, o.side, new_price, "exit",
             matched_buy=o.matched_buy_price if o.side == "sell" else None,
             matched_sell=getattr(o, "matched_sell_price", None) if o.side == "buy" else None,
-            trade_id=tid, cycle=cyc)
+            trade_id=tid, cycle=cyc,
+            volume_override=o.volume)
         if new_o:
             new_o.entry_filled_at = getattr(o, "entry_filled_at", 0.0)
             repriced += 1
@@ -2935,7 +2960,8 @@ def handle_pair_fill(state: GridState, filled_orders: list,
             o = _place_pair_order(
                 state, "sell", exit_price, "exit",
                 matched_buy=filled.price,
-                trade_id=tid, cycle=cyc)
+                trade_id=tid, cycle=cyc,
+                volume_override=filled.volume)
             if o:
                 o.entry_filled_at = time.time()
                 new_orders.append(o)
@@ -3078,7 +3104,8 @@ def handle_pair_fill(state: GridState, filled_orders: list,
             o = _place_pair_order(
                 state, "buy", exit_price, "exit",
                 matched_sell=filled.price,
-                trade_id=tid, cycle=cyc)
+                trade_id=tid, cycle=cyc,
+                volume_override=filled.volume)
             if o:
                 o.entry_filled_at = time.time()
                 new_orders.append(o)
@@ -4351,7 +4378,8 @@ def check_stale_exits(state: GridState, current_price: float) -> bool:
             state, o.side, new_price, "exit",
             matched_buy=o.matched_buy_price,
             matched_sell=o.matched_sell_price,
-            trade_id=tid, cycle=cyc)
+            trade_id=tid, cycle=cyc,
+            volume_override=o.volume)
         if new_o:
             new_o.entry_filled_at = o.entry_filled_at  # Preserve original time
 
@@ -4513,7 +4541,8 @@ def check_s2_break_glass(state: GridState, current_price: float) -> bool:
                             matched_buy=worse.matched_buy_price,
                             matched_sell=worse.matched_sell_price,
                             trade_id=worse_tid,
-                            cycle=getattr(worse, "cycle", 0))
+                            cycle=getattr(worse, "cycle", 0),
+                            volume_override=worse.volume)
                         if new_o:
                             new_o.entry_filled_at = worse.entry_filled_at
 
@@ -5115,7 +5144,8 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                 if not has_buy_exit:
                     o = _place_pair_order(
                         state, "buy", exit_price, "exit", matched_sell=sp,
-                        trade_id="A", cycle=state.cycle_a)
+                        trade_id="A", cycle=state.cycle_a,
+                        volume_override=last_sell["volume"])
                     if o:
                         placed += 1
                 sell_fee = sp * last_sell["volume"] * config.MAKER_FEE_PCT / 100.0
@@ -5140,7 +5170,8 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                 if not has_sell_exit:
                     o = _place_pair_order(
                         state, "sell", exit_price, "exit", matched_buy=bp,
-                        trade_id="B", cycle=state.cycle_b)
+                        trade_id="B", cycle=state.cycle_b,
+                        volume_override=last_buy["volume"])
                     if o:
                         placed += 1
                 buy_fee = bp * last_buy["volume"] * config.MAKER_FEE_PCT / 100.0
@@ -5298,14 +5329,16 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                 exit_price = _pair_exit_price(first["price"], current_price, "sell", state)
                 o = _place_pair_order(
                     state, "sell", exit_price, "exit", matched_buy=first["price"],
-                    trade_id="B", cycle=state.cycle_b)
+                    trade_id="B", cycle=state.cycle_b,
+                    volume_override=first["volume"])
                 if o:
                     placed += 1
             if first["side"] == "sell" and not has_buy_exit:
                 exit_price = _pair_exit_price(first["price"], current_price, "buy", state)
                 o = _place_pair_order(
                     state, "buy", exit_price, "exit", matched_sell=first["price"],
-                    trade_id="A", cycle=state.cycle_a)
+                    trade_id="A", cycle=state.cycle_a,
+                    volume_override=first["volume"])
                 if o:
                     placed += 1
 
@@ -5313,14 +5346,16 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                 exit_price = _pair_exit_price(second["price"], current_price, "sell", state)
                 o = _place_pair_order(
                     state, "sell", exit_price, "exit", matched_buy=second["price"],
-                    trade_id="B", cycle=state.cycle_b)
+                    trade_id="B", cycle=state.cycle_b,
+                    volume_override=second["volume"])
                 if o:
                     placed += 1
             if second["side"] == "sell" and not has_buy_exit:
                 exit_price = _pair_exit_price(second["price"], current_price, "buy", state)
                 o = _place_pair_order(
                     state, "buy", exit_price, "exit", matched_sell=second["price"],
-                    trade_id="A", cycle=state.cycle_a)
+                    trade_id="A", cycle=state.cycle_a,
+                    volume_override=second["volume"])
                 if o:
                     placed += 1
 
@@ -5343,7 +5378,8 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
         _cancel_open_by_role(state, "sell", "entry")
         o = _place_pair_order(
             state, "sell", exit_price, "exit", matched_buy=buy_price,
-            trade_id="B", cycle=state.cycle_b)
+            trade_id="B", cycle=state.cycle_b,
+            volume_override=last_buy["volume"])
         if o:
             placed += 1
             buy_fee = buy_price * last_buy["volume"] * config.MAKER_FEE_PCT / 100.0
@@ -5373,7 +5409,8 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
         _cancel_open_by_role(state, "buy", "entry")
         o = _place_pair_order(
             state, "buy", exit_price, "exit", matched_sell=sell_price,
-            trade_id="A", cycle=state.cycle_a)
+            trade_id="A", cycle=state.cycle_a,
+            volume_override=last_sell["volume"])
         if o:
             placed += 1
             sell_fee = sell_price * last_sell["volume"] * config.MAKER_FEE_PCT / 100.0
