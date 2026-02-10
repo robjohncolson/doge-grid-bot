@@ -2211,6 +2211,57 @@ def _build_pair_with_position(state: GridState, last_fill: dict,
     return [o for o in state.grid_orders if o.status == "open"]
 
 
+def _attempt_seed_buy(state, sell_entry_price, volume, trade_id, cycle):
+    """
+    When a sell entry fails due to no inventory, market-buy enough of the
+    asset to seed Trade A.  If successful, retry the sell entry as a limit
+    order.  Returns the GridOrder on success, None on failure.
+    """
+    pair = state.pair_name
+    display = state.pair_display
+
+    logger.info(
+        "SEED BUY [%s]: no inventory for sell entry -- market-buying %.4f units",
+        display, volume)
+
+    try:
+        seed_txid = kraken_client.place_order(
+            side="buy", volume=volume, price=sell_entry_price,
+            pair=pair, ordertype="market")
+        logger.info(
+            "SEED BUY [%s]: market buy %.4f -> %s", display, volume, seed_txid)
+    except Exception as e:
+        logger.warning("SEED BUY [%s]: market buy failed: %s", display, e)
+        return None
+
+    # Seed buy succeeded -- now retry the sell entry as a limit order
+    try:
+        order = GridOrder(level=+1, side="sell", price=sell_entry_price,
+                          volume=volume)
+        order.order_role = "entry"
+        if trade_id is not None:
+            order.trade_id = trade_id
+        if cycle is not None:
+            order.cycle = cycle
+
+        txid = kraken_client.place_order(
+            side="sell", volume=volume, price=sell_entry_price, pair=pair)
+        order.txid = txid
+        order.status = "open"
+        order.placed_at = time.time()
+        state.grid_orders.append(order)
+        state.total_entries_placed += 1
+        logger.info(
+            "SEED BUY [%s]: sell entry [%s.%d] placed @ $%.6f -> %s",
+            display, trade_id or "?", cycle or 0, sell_entry_price, txid)
+        return order
+    except Exception as e:
+        logger.warning(
+            "SEED BUY [%s]: sell entry retry failed: %s -- will use long-only",
+            display, e)
+        return None
+
+
 def _place_pair_order(state, side, price, role, matched_buy=None,
                       matched_sell=None, trade_id=None, cycle=None):
     """
@@ -2262,6 +2313,11 @@ def _place_pair_order(state, side, price, role, matched_buy=None,
     except Exception as e:
         err_msg = str(e).lower()
         if side == "sell" and role == "entry" and "insufficient" in err_msg:
+            # Attempt seed buy: market-buy enough inventory, then retry
+            seed_result = _attempt_seed_buy(state, price, volume, trade_id, cycle)
+            if seed_result is not None:
+                return seed_result
+            # Seed buy failed or unavailable -- fall back to long-only
             logger.info(
                 "Sell entry [%s.%d] failed (no inventory) -- switching to LONG ONLY: %s",
                 trade_id or "?", cycle or 0, e)
