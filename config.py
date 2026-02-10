@@ -434,7 +434,11 @@ class PairConfig:
         try:
             entry_pct = d.get("entry_pct", PAIR_ENTRY_PCT)
             profit_pct = d.get("profit_pct", PAIR_PROFIT_PCT)
-            order_size = ORDER_SIZE_USD
+            order_size = d.get("order_size_usd", ORDER_SIZE_USD)
+            refresh_pct = d.get("refresh_pct", PAIR_REFRESH_PCT)
+            recovery_mode = d.get("recovery_mode", "lottery")
+            capital_budget = d.get("capital_budget_usd", 0.0)
+            slot_count = d.get("slot_count", 1)
             # Clamp bad persisted values
             if entry_pct <= 0:
                 _logger.warning("Clamping bad entry_pct=%.4f to 0.01 for %s", entry_pct, d.get("pair"))
@@ -445,12 +449,34 @@ class PairConfig:
             if order_size <= 0:
                 _logger.warning("Clamping bad order_size_usd=%.4f to 0.50 for %s", order_size, d.get("pair"))
                 order_size = max(0.50, order_size)
+            if refresh_pct <= 0:
+                _logger.warning("Clamping bad refresh_pct=%.4f to 0.10 for %s", refresh_pct, d.get("pair"))
+                refresh_pct = max(0.10, refresh_pct)
+            if recovery_mode not in ("lottery", "liquidate"):
+                _logger.warning("Unknown recovery_mode=%r for %s; defaulting to lottery", recovery_mode, d.get("pair"))
+                recovery_mode = "lottery"
+            try:
+                capital_budget = float(capital_budget)
+            except (ValueError, TypeError):
+                _logger.warning("Invalid capital_budget_usd=%r for %s; defaulting to 0", capital_budget, d.get("pair"))
+                capital_budget = 0.0
+            if capital_budget < 0:
+                _logger.warning("Clamping negative capital_budget_usd=%.4f to 0 for %s", capital_budget, d.get("pair"))
+                capital_budget = 0.0
+            try:
+                slot_count = int(slot_count)
+            except (ValueError, TypeError):
+                _logger.warning("Invalid slot_count=%r for %s; defaulting to 1", slot_count, d.get("pair"))
+                slot_count = 1
+            if slot_count < 1:
+                _logger.warning("Clamping slot_count=%d to 1 for %s", slot_count, d.get("pair"))
+                slot_count = 1
             pc = PairConfig(
                 pair=d["pair"],
                 display=d.get("display", d["pair"]),
                 entry_pct=entry_pct,
                 profit_pct=profit_pct,
-                refresh_pct=d.get("refresh_pct", PAIR_REFRESH_PCT),
+                refresh_pct=refresh_pct,
                 order_size_usd=order_size,
                 daily_loss_limit=d.get("daily_loss_limit", DAILY_LOSS_LIMIT),
                 stop_floor=d.get("stop_floor", STOP_FLOOR),
@@ -458,11 +484,11 @@ class PairConfig:
                 price_decimals=d.get("price_decimals", 6),
                 volume_decimals=d.get("volume_decimals", 0),
                 filter_strings=d.get("filter_strings"),
+                recovery_mode=recovery_mode,
+                capital_budget_usd=capital_budget,
             )
             pc.next_entry_multiplier = d.get("next_entry_multiplier", 1.0)
-            pc.recovery_mode = d.get("recovery_mode", "lottery")
-            pc.capital_budget_usd = d.get("capital_budget_usd", 0.0)
-            pc.slot_count = d.get("slot_count", 1)
+            pc.slot_count = slot_count
             return pc
         except (KeyError, TypeError, ValueError) as e:
             _logger.error("PairConfig.from_dict failed for %s: %s -- using defaults", d.get("pair", "?"), e)
@@ -498,7 +524,13 @@ def _build_pairs() -> dict:
                     price_decimals=item.get("price_decimals", 6),
                     volume_decimals=item.get("volume_decimals", 0),
                     filter_strings=item.get("filter_strings"),
+                    recovery_mode=item.get("recovery_mode", "lottery"),
+                    capital_budget_usd=item.get("capital_budget_usd", 0.0),
                 )
+                try:
+                    pc.slot_count = max(1, int(item.get("slot_count", 1)))
+                except (ValueError, TypeError):
+                    pc.slot_count = 1
                 pairs[pc.pair] = pc
             if pairs:
                 return pairs

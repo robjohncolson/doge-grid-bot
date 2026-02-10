@@ -500,6 +500,142 @@ def _state_file_path(state: GridState) -> str:
     return config.STATE_FILE
 
 
+def state_store_key(state: GridState) -> str:
+    """Return the Supabase bot_state key for this slot-aware state."""
+    if state.slot_id > 0:
+        return f"{state.pair_name}#{state.slot_id}"
+    return state.pair_name
+
+
+def restore_state_snapshot(state: GridState, snapshot: dict, source: str = "snapshot") -> bool:
+    """
+    Apply a persisted snapshot dict onto `state`.
+
+    This is shared by local-file restore and Supabase restore so both paths
+    keep parity as new persisted fields are added.
+    """
+    if not isinstance(snapshot, dict) or not snapshot:
+        return False
+
+    state.center_price = snapshot.get("center_price", 0.0)
+    state.total_profit_usd = snapshot.get("total_profit_usd", 0.0)
+    state.today_profit_usd = snapshot.get("today_profit_usd", 0.0)
+    state.today_loss_usd = snapshot.get("today_loss_usd", 0.0)
+    state.today_fees_usd = snapshot.get("today_fees_usd", 0.0)
+    state.today_date = snapshot.get("today_date", "")
+    state.round_trips_today = snapshot.get("round_trips_today", 0)
+    state.total_round_trips = snapshot.get("total_round_trips", 0)
+    state.total_fees_usd = snapshot.get("total_fees_usd", 0.0)
+    state.doge_accumulated = snapshot.get("doge_accumulated", 0.0)
+    state.last_accumulation = snapshot.get("last_accumulation", 0.0)
+    if config.STRATEGY_MODE != "pair":
+        state.trend_ratio = snapshot.get("trend_ratio", 0.5)
+        state.trend_ratio_override = snapshot.get("trend_ratio_override", None)
+        saved_spacing = snapshot.get("grid_spacing_pct")
+        if saved_spacing and saved_spacing != config.GRID_SPACING_PCT:
+            logger.info(
+                "Restoring spacing from state: %.2f%% -> %.2f%%",
+                config.GRID_SPACING_PCT, saved_spacing,
+            )
+            config.GRID_SPACING_PCT = saved_spacing
+
+    # Restore pair mode identity fields
+    state.pair_state = snapshot.get("pair_state", "S0")
+    state.cycle_a = snapshot.get("cycle_a", 1)
+    state.cycle_b = snapshot.get("cycle_b", 1)
+    # Store open_orders detail for reconciliation to restore identity
+    state._saved_open_orders = snapshot.get("open_orders", [])
+
+    # Restore completed cycles history
+    saved_cycles = snapshot.get("completed_cycles", [])
+    state.completed_cycles = [CompletedCycle.from_dict(c) for c in saved_cycles]
+    state._pnl_migrated = snapshot.get("pnl_migrated", False)
+    state.total_entries_placed = snapshot.get("total_entries_placed", 0)
+    state.total_entries_filled = snapshot.get("total_entries_filled", 0)
+
+    # Restore anti-chase state
+    state.consecutive_refreshes_a = snapshot.get("consecutive_refreshes_a", 0)
+    state.consecutive_refreshes_b = snapshot.get("consecutive_refreshes_b", 0)
+    state.last_refresh_direction_a = snapshot.get("last_refresh_direction_a", None)
+    state.last_refresh_direction_b = snapshot.get("last_refresh_direction_b", None)
+    state.refresh_cooldown_until_a = snapshot.get("refresh_cooldown_until_a", 0.0)
+    state.refresh_cooldown_until_b = snapshot.get("refresh_cooldown_until_b", 0.0)
+
+    # Restore recovery orders
+    saved_recovery = snapshot.get("recovery_orders", [])
+    state.recovery_orders = [RecoveryOrder.from_dict(r) for r in saved_recovery]
+    state.total_recovery_losses = snapshot.get("total_recovery_losses", 0)
+    state.total_recovery_wins = snapshot.get("total_recovery_wins", 0.0)
+    if state.recovery_orders:
+        logger.info("Restored %d recovery orders", len(state.recovery_orders))
+
+    # Restore exit lifecycle state
+    state.s2_entered_at = snapshot.get("s2_entered_at")
+    state.last_reprice_a = snapshot.get("last_reprice_a", 0.0)
+    state.last_reprice_b = snapshot.get("last_reprice_b", 0.0)
+    state.exit_reprice_count_a = snapshot.get("exit_reprice_count_a", 0)
+    state.exit_reprice_count_b = snapshot.get("exit_reprice_count_b", 0)
+    state.detected_trend = snapshot.get("detected_trend")
+    state.trend_detected_at = snapshot.get("trend_detected_at")
+
+    # Restore long-only mode
+    state.long_only = snapshot.get("long_only", False)
+    if state.long_only:
+        logger.info("Restoring long-only mode")
+
+    # Restore backoff and volatility adjust state
+    state.consecutive_losses_a = snapshot.get("consecutive_losses_a", 0)
+    state.consecutive_losses_b = snapshot.get("consecutive_losses_b", 0)
+    state.last_volatility_adjust = snapshot.get("last_volatility_adjust", 0.0)
+    state.last_s1_rebalance = snapshot.get("last_s1_rebalance", 0.0)
+    state.seed_cost_usd = snapshot.get("seed_cost_usd", 0.0)
+    state.slot_id = snapshot.get("slot_id", state.slot_id)
+    state.winding_down = snapshot.get("winding_down", False)
+    if state.consecutive_losses_a or state.consecutive_losses_b:
+        logger.info(
+            "Restoring backoff counters: A=%d, B=%d",
+            state.consecutive_losses_a, state.consecutive_losses_b,
+        )
+
+    # Restore entry multiplier
+    saved_mult = snapshot.get("next_entry_multiplier", 1.0)
+    if saved_mult != 1.0:
+        state.next_entry_multiplier = saved_mult
+        logger.info("Restoring entry multiplier: %.1fx", saved_mult)
+
+    # Restore pair_entry_pct runtime override
+    saved_entry_pct = snapshot.get("pair_entry_pct")
+    if saved_entry_pct and saved_entry_pct != state.entry_pct:
+        logger.info(
+            "Restoring entry distance from state: %.2f%% -> %.2f%%",
+            state.entry_pct, saved_entry_pct,
+        )
+        state.entry_pct = saved_entry_pct
+
+    # Restore pair_profit_pct runtime override (e.g. from volatility adjust)
+    saved_profit_pct = snapshot.get("pair_profit_pct")
+    if saved_profit_pct and saved_profit_pct != state.profit_pct:
+        logger.info(
+            "Restoring profit target from state: %.2f%% -> %.2f%%",
+            state.profit_pct, saved_profit_pct,
+        )
+        state.profit_pct = saved_profit_pct
+
+    saved_at = snapshot.get("saved_at", 0)
+    age_min = (time.time() - saved_at) / 60 if saved_at else 0
+    txid_count = len(snapshot.get("open_txids", []))
+
+    logger.info(
+        "State restored from %s (%.0f min old): "
+        "$%.4f profit, %d round trips, %d open txids, "
+        "pair_state=%s cycle_a=%d cycle_b=%d",
+        source, age_min,
+        state.total_profit_usd, state.total_round_trips, txid_count,
+        state.pair_state, state.cycle_a, state.cycle_b,
+    )
+    return True
+
+
 def save_state(state: GridState):
     """
     Save a minimal state snapshot to disk for crash recovery.
@@ -590,7 +726,7 @@ def save_state(state: GridState):
     except Exception as e:
         logger.error("Failed to save state: %s", e)
 
-    supabase_store.save_state(snapshot, pair=state.pair_name)
+    supabase_store.save_state(snapshot, pair=state_store_key(state))
 
 
 def load_state(state: GridState) -> bool:
@@ -611,116 +747,7 @@ def load_state(state: GridState) -> bool:
         logger.warning("Failed to read state file: %s -- starting fresh", e)
         return False
 
-    state.center_price = snapshot.get("center_price", 0.0)
-    state.total_profit_usd = snapshot.get("total_profit_usd", 0.0)
-    state.today_profit_usd = snapshot.get("today_profit_usd", 0.0)
-    state.today_loss_usd = snapshot.get("today_loss_usd", 0.0)
-    state.today_fees_usd = snapshot.get("today_fees_usd", 0.0)
-    state.today_date = snapshot.get("today_date", "")
-    state.round_trips_today = snapshot.get("round_trips_today", 0)
-    state.total_round_trips = snapshot.get("total_round_trips", 0)
-    state.total_fees_usd = snapshot.get("total_fees_usd", 0.0)
-    state.doge_accumulated = snapshot.get("doge_accumulated", 0.0)
-    state.last_accumulation = snapshot.get("last_accumulation", 0.0)
-    if config.STRATEGY_MODE != "pair":
-        state.trend_ratio = snapshot.get("trend_ratio", 0.5)
-        state.trend_ratio_override = snapshot.get("trend_ratio_override", None)
-
-    # Restore pair mode identity fields
-    state.pair_state = snapshot.get("pair_state", "S0")
-    state.cycle_a = snapshot.get("cycle_a", 1)
-    state.cycle_b = snapshot.get("cycle_b", 1)
-    # Store open_orders detail for reconciliation to restore identity
-    state._saved_open_orders = snapshot.get("open_orders", [])
-
-    # Restore completed cycles history
-    saved_cycles = snapshot.get("completed_cycles", [])
-    state.completed_cycles = [CompletedCycle.from_dict(c) for c in saved_cycles]
-    state._pnl_migrated = snapshot.get("pnl_migrated", False)
-    state.total_entries_placed = snapshot.get("total_entries_placed", 0)
-    state.total_entries_filled = snapshot.get("total_entries_filled", 0)
-
-    # Restore anti-chase state
-    state.consecutive_refreshes_a = snapshot.get("consecutive_refreshes_a", 0)
-    state.consecutive_refreshes_b = snapshot.get("consecutive_refreshes_b", 0)
-    state.last_refresh_direction_a = snapshot.get("last_refresh_direction_a", None)
-    state.last_refresh_direction_b = snapshot.get("last_refresh_direction_b", None)
-    state.refresh_cooldown_until_a = snapshot.get("refresh_cooldown_until_a", 0.0)
-    state.refresh_cooldown_until_b = snapshot.get("refresh_cooldown_until_b", 0.0)
-
-    # Restore recovery orders
-    saved_recovery = snapshot.get("recovery_orders", [])
-    state.recovery_orders = [RecoveryOrder.from_dict(r) for r in saved_recovery]
-    state.total_recovery_losses = snapshot.get("total_recovery_losses", 0)
-    state.total_recovery_wins = snapshot.get("total_recovery_wins", 0.0)
-    if state.recovery_orders:
-        logger.info("Restored %d recovery orders", len(state.recovery_orders))
-
-    # Restore exit lifecycle state
-    state.s2_entered_at = snapshot.get("s2_entered_at")
-    state.last_reprice_a = snapshot.get("last_reprice_a", 0.0)
-    state.last_reprice_b = snapshot.get("last_reprice_b", 0.0)
-    state.exit_reprice_count_a = snapshot.get("exit_reprice_count_a", 0)
-    state.exit_reprice_count_b = snapshot.get("exit_reprice_count_b", 0)
-    state.detected_trend = snapshot.get("detected_trend")
-    state.trend_detected_at = snapshot.get("trend_detected_at")
-
-    # Restore long-only mode
-    state.long_only = snapshot.get("long_only", False)
-    if state.long_only:
-        logger.info("Restoring long-only mode")
-
-    # Restore backoff and volatility adjust state
-    state.consecutive_losses_a = snapshot.get("consecutive_losses_a", 0)
-    state.consecutive_losses_b = snapshot.get("consecutive_losses_b", 0)
-    state.last_volatility_adjust = snapshot.get("last_volatility_adjust", 0.0)
-    state.last_s1_rebalance = snapshot.get("last_s1_rebalance", 0.0)
-    state.seed_cost_usd = snapshot.get("seed_cost_usd", 0.0)
-    state.slot_id = snapshot.get("slot_id", 0)
-    state.winding_down = snapshot.get("winding_down", False)
-    if state.consecutive_losses_a or state.consecutive_losses_b:
-        logger.info(
-            "Restoring backoff counters: A=%d, B=%d",
-            state.consecutive_losses_a, state.consecutive_losses_b,
-        )
-
-    # Restore entry multiplier
-    saved_mult = snapshot.get("next_entry_multiplier", 1.0)
-    if saved_mult != 1.0:
-        state.next_entry_multiplier = saved_mult
-        logger.info("Restoring entry multiplier: %.1fx", saved_mult)
-
-    # Restore pair_entry_pct runtime override
-    saved_entry_pct = snapshot.get("pair_entry_pct")
-    if saved_entry_pct and saved_entry_pct != state.entry_pct:
-        logger.info(
-            "Restoring entry distance from state: %.2f%% -> %.2f%%",
-            state.entry_pct, saved_entry_pct,
-        )
-        state.entry_pct = saved_entry_pct
-
-    # Restore pair_profit_pct runtime override (e.g. from volatility adjust)
-    saved_profit_pct = snapshot.get("pair_profit_pct")
-    if saved_profit_pct and saved_profit_pct != state.profit_pct:
-        logger.info(
-            "Restoring profit target from state: %.2f%% -> %.2f%%",
-            state.profit_pct, saved_profit_pct,
-        )
-        state.profit_pct = saved_profit_pct
-
-    saved_at = snapshot.get("saved_at", 0)
-    age_min = (time.time() - saved_at) / 60 if saved_at else 0
-    txid_count = len(snapshot.get("open_txids", []))
-
-    logger.info(
-        "State restored from %s (%.0f min old): "
-        "$%.4f profit, %d round trips, %d open txids, "
-        "pair_state=%s cycle_a=%d cycle_b=%d",
-        state_path, age_min,
-        state.total_profit_usd, state.total_round_trips, txid_count,
-        state.pair_state, state.cycle_a, state.cycle_b,
-    )
-    return True
+    return restore_state_snapshot(state, snapshot, source=state_path)
 
 
 def migrate_pnl_from_fills(state: GridState):

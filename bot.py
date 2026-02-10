@@ -818,6 +818,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
         queued = []
         pending = {}
 
+        # Optional target pair (for multi-pair detail controls)
+        if "pair" in body:
+            raw_pair = body.get("pair")
+            if not isinstance(raw_pair, str) or not raw_pair.strip():
+                errors.append("pair must be a non-empty string")
+            else:
+                target_pair = _base_pair(raw_pair.strip())
+                if target_pair not in _bot_states:
+                    errors.append(f"pair not active: {target_pair}")
+                else:
+                    pending["pair"] = target_pair
+
         # Validate spacing
         if "spacing" in body:
             val = body["spacing"]
@@ -951,7 +963,7 @@ def setup_signal_handlers():
 # Web config integration
 # ---------------------------------------------------------------------------
 
-def _apply_web_config(state: grid_strategy.GridState, current_price: float):
+def _apply_web_config():
     """
     Check for pending web config changes and apply them.
     Called from the main loop each iteration (main thread only).
@@ -964,6 +976,24 @@ def _apply_web_config(state: grid_strategy.GridState, current_price: float):
     # Copy + clear (atomic read in CPython)
     pending = _web_config_pending
     _web_config_pending = {}
+    target_pair = _base_pair(pending.get("pair", "")) if pending.get("pair") else ""
+    if target_pair:
+        state = _bot_states.get(target_pair)
+        if not state:
+            logger.warning("Web dashboard: target pair %s is not active; skipping update", target_pair)
+            return
+    else:
+        state = _first_state()
+        if not state:
+            return
+        target_pair = state.pair_name
+
+    current_price = _get_price(target_pair)
+    if current_price <= 0:
+        if state.price_history:
+            current_price = state.price_history[-1][1]
+        else:
+            current_price = state.center_price
 
     needs_rebuild = False
 
@@ -972,11 +1002,17 @@ def _apply_web_config(state: grid_strategy.GridState, current_price: float):
         if config.STRATEGY_MODE == "pair":
             old = state.profit_pct
             state.profit_pct = pending["spacing"]
-            logger.info("Web dashboard: profit target %.2f%% -> %.2f%% (applies to next exit)", old, state.profit_pct)
+            logger.info(
+                "[%s] Web dashboard: profit target %.2f%% -> %.2f%% (applies to next exit)",
+                target_pair, old, state.profit_pct,
+            )
         else:
             old = config.GRID_SPACING_PCT
             config.GRID_SPACING_PCT = pending["spacing"]
-            logger.info("Web dashboard: spacing %.2f%% -> %.2f%%", old, config.GRID_SPACING_PCT)
+            logger.info(
+                "[%s] Web dashboard: spacing %.2f%% -> %.2f%%",
+                target_pair, old, config.GRID_SPACING_PCT,
+            )
             needs_rebuild = True
 
     # Apply ratio
@@ -985,19 +1021,22 @@ def _apply_web_config(state: grid_strategy.GridState, current_price: float):
         if val == "auto":
             state.trend_ratio_override = None
             grid_strategy.update_trend_ratio(state)
-            logger.info("Web dashboard: ratio set to auto (%.2f)", state.trend_ratio)
+            logger.info("[%s] Web dashboard: ratio set to auto (%.2f)", target_pair, state.trend_ratio)
             needs_rebuild = True
         else:
             state.trend_ratio = val
             state.trend_ratio_override = val
-            logger.info("Web dashboard: ratio manually set to %.2f", val)
+            logger.info("[%s] Web dashboard: ratio manually set to %.2f", target_pair, val)
             needs_rebuild = True
 
     # Apply entry_pct (pair mode)
     if "entry_pct" in pending:
         old = state.entry_pct
         state.entry_pct = pending["entry_pct"]
-        logger.info("Web dashboard: entry distance %.2f%% -> %.2f%%", old, state.entry_pct)
+        logger.info(
+            "[%s] Web dashboard: entry distance %.2f%% -> %.2f%%",
+            target_pair, old, state.entry_pct,
+        )
         if config.STRATEGY_MODE == "pair":
             grid_strategy.replace_entries_at_distance(state, current_price)
         else:
@@ -1006,13 +1045,16 @@ def _apply_web_config(state: grid_strategy.GridState, current_price: float):
     # AI check (manual trigger, no rebuild)
     if "ai_check" in pending:
         state.last_ai_check = 0
-        logger.info("Web dashboard: AI check requested")
+        logger.info("[%s] Web dashboard: AI check requested", target_pair)
 
     # Rebuild grid if spacing or ratio changed
     if needs_rebuild:
         grid_strategy.cancel_grid(state)
         orders = grid_strategy.build_grid(state, current_price)
-        logger.info("Web dashboard: grid rebuilt -- %d orders around $%.6f", len(orders), current_price)
+        logger.info(
+            "[%s] Web dashboard: grid rebuilt -- %d orders around $%.6f",
+            target_pair, len(orders), current_price,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1814,6 +1856,36 @@ def _rebalance_capital_budgets():
                 per_slot, n, effective_capital, config.STARTING_CAPITAL, total_net_profit)
 
 
+def _capture_rollover_summary(current_utc_date: str, last_daily_summary_date: str):
+    """Build a pre-reset daily summary snapshot if any pair is rolling over."""
+    rollover_dates = sorted({
+        st.today_date for st in _bot_states.values()
+        if st.today_date and st.today_date != current_utc_date
+    })
+    if not rollover_dates:
+        return None
+
+    rollover_date = rollover_dates[-1]
+    if len(rollover_dates) > 1:
+        logger.warning("Mixed rollover dates detected across pairs: %s", rollover_dates)
+    if rollover_date == last_daily_summary_date:
+        return None
+
+    rollover_states = [
+        st for st in _bot_states.values()
+        if st.today_date == rollover_date
+    ]
+    return {
+        "date": rollover_date,
+        "trades": sum(st.round_trips_today for st in rollover_states),
+        "profit": sum(st.today_profit_usd for st in rollover_states),
+        "fees": sum(st.today_fees_usd for st in rollover_states),
+        "doge_accumulated": sum(st.doge_accumulated for st in _bot_states.values()),
+        "total_profit": sum(st.total_profit_usd for st in _bot_states.values()),
+        "total_trips": sum(st.total_round_trips for st in _bot_states.values()),
+    }
+
+
 def _add_pair(pair_config: config.PairConfig):
     """Add a new trading pair to the live bot."""
     pair_name = pair_config.pair
@@ -2093,57 +2165,18 @@ def _process_swarm_queue():
 def _restore_from_supabase(state: grid_strategy.GridState):
     """Restore a single pair's state from Supabase cloud."""
     pair_name = state.pair_name
-    sb_state = supabase_store.load_state(pair=pair_name)
+    state_key = grid_strategy.state_store_key(state)
+    sb_state = supabase_store.load_state(pair=state_key)
+    # Backward compatibility: pre-slot snapshots were keyed by base pair only.
+    if not sb_state and state.slot_id > 0:
+        sb_state = supabase_store.load_state(pair=pair_name)
+        if sb_state:
+            logger.info("[%s] Loaded legacy slot state from key=%s", state_key, pair_name)
     if not sb_state:
         return False
-
-    state.center_price = sb_state.get("center_price", 0.0)
-    state.total_profit_usd = sb_state.get("total_profit_usd", 0.0)
-    state.today_profit_usd = sb_state.get("today_profit_usd", 0.0)
-    state.today_loss_usd = sb_state.get("today_loss_usd", 0.0)
-    state.today_fees_usd = sb_state.get("today_fees_usd", 0.0)
-    state.today_date = sb_state.get("today_date", "")
-    state.round_trips_today = sb_state.get("round_trips_today", 0)
-    state.total_round_trips = sb_state.get("total_round_trips", 0)
-    state.total_fees_usd = sb_state.get("total_fees_usd", 0.0)
-    state.doge_accumulated = sb_state.get("doge_accumulated", 0.0)
-    state.last_accumulation = sb_state.get("last_accumulation", 0.0)
-    if config.STRATEGY_MODE != "pair":
-        state.trend_ratio = sb_state.get("trend_ratio", 0.5)
-        state.trend_ratio_override = sb_state.get("trend_ratio_override", None)
-    # Restore pair mode identity fields
-    state.pair_state = sb_state.get("pair_state", "S0")
-    state.cycle_a = sb_state.get("cycle_a", 1)
-    state.cycle_b = sb_state.get("cycle_b", 1)
-    state._saved_open_orders = sb_state.get("open_orders", [])
-    # Restore completed cycles
-    saved_cycles = sb_state.get("completed_cycles", [])
-    state.completed_cycles = [
-        grid_strategy.CompletedCycle.from_dict(c) for c in saved_cycles
-    ]
-    state._pnl_migrated = sb_state.get("pnl_migrated", False)
-    # Restore runtime config overrides
-    if config.STRATEGY_MODE != "pair":
-        saved_spacing = sb_state.get("grid_spacing_pct")
-        if saved_spacing and saved_spacing != config.GRID_SPACING_PCT:
-            logger.info(
-                "[%s] Restoring spacing from Supabase: %.2f%% -> %.2f%%",
-                pair_name, config.GRID_SPACING_PCT, saved_spacing,
-            )
-            config.GRID_SPACING_PCT = saved_spacing
-    saved_entry_pct = sb_state.get("pair_entry_pct")
-    if saved_entry_pct and saved_entry_pct != state.entry_pct:
-        logger.info(
-            "[%s] Restoring entry distance from Supabase: %.2f%% -> %.2f%%",
-            pair_name, state.entry_pct, saved_entry_pct,
-        )
-        state.entry_pct = saved_entry_pct
-    # AI interval no longer restored (AI is manual-only now)
-    logger.info(
-        "[%s] State restored from Supabase: $%.4f profit, %d round trips",
-        pair_name, state.total_profit_usd, state.total_round_trips,
+    return grid_strategy.restore_state_snapshot(
+        state, sb_state, source=f"Supabase:{state_key}"
     )
-    return True
 
 
 def run():
@@ -2417,6 +2450,13 @@ def run():
                         f"Exempt: {config.SWARM_EXEMPT_PAIRS}")
                     swarm_limit_notified = True
 
+            # Capture a pre-reset snapshot so daily summary reflects
+            # yesterday's actual counters, not zeroed post-reset values.
+            utc_today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            rollover_summary = _capture_rollover_summary(
+                utc_today, last_daily_summary_date
+            )
+
             # ============================================================
             # Per-pair operations (iterate snapshot -- dict may change from wind-down)
             # ============================================================
@@ -2436,31 +2476,7 @@ def run():
                         continue  # Skip trading for this slot
 
                 # --- 4b: Check daily reset ---
-                old_date = state.today_date
-                old_profit = state.today_profit_usd
-                old_trips = state.round_trips_today
-                old_fees = state.today_fees_usd
                 grid_strategy.check_daily_reset(state)
-
-                if old_date and old_date != state.today_date and old_date != last_daily_summary_date:
-                    last_daily_summary_date = old_date
-                    swarm_limit_notified = False  # reset for new day
-                    # Aggregate daily summary across all pairs
-                    total_day_profit = sum(st.today_profit_usd for st in _bot_states.values())
-                    total_day_trips = sum(st.round_trips_today for st in _bot_states.values())
-                    total_day_fees = sum(st.today_fees_usd for st in _bot_states.values())
-                    total_doge = sum(st.doge_accumulated for st in _bot_states.values())
-                    total_profit = sum(st.total_profit_usd for st in _bot_states.values())
-                    total_trips = sum(st.total_round_trips for st in _bot_states.values())
-                    notifier.notify_daily_summary(
-                        date=old_date,
-                        trades=total_day_trips,
-                        profit=total_day_profit,
-                        fees=total_day_fees,
-                        doge_accumulated=total_doge,
-                        total_profit=total_profit,
-                        total_trips=total_trips,
-                    )
 
                 # --- 4c: Check risk limits (per-pair) ---
                 should_stop, should_pause, reason = grid_strategy.check_risk_limits(
@@ -2591,6 +2607,19 @@ def run():
                                    pair_name, state.consecutive_errors)
 
             # End per-pair loop
+
+            if rollover_summary:
+                last_daily_summary_date = rollover_summary["date"]
+                swarm_limit_notified = False  # reset for new day
+                notifier.notify_daily_summary(
+                    date=rollover_summary["date"],
+                    trades=rollover_summary["trades"],
+                    profit=rollover_summary["profit"],
+                    fees=rollover_summary["fees"],
+                    doge_accumulated=rollover_summary["doge_accumulated"],
+                    total_profit=rollover_summary["total_profit"],
+                    total_trips=rollover_summary["total_trips"],
+                )
 
             # Remove completed wind-down slots
             for sk in _slots_to_remove:
@@ -2752,8 +2781,7 @@ def run():
                 _poll_and_handle_callbacks(first_st, first_price)
 
             # --- 4f3: Apply web dashboard config changes ---
-            if first_st:
-                _apply_web_config(first_st, first_price)
+            _apply_web_config()
 
             # --- 4f4: Run stats engine (OHLC throttled: max 3 per cycle) ---
             # Deduplicate OHLC by base pair (slots share candles)

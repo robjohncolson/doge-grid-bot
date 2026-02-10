@@ -1883,7 +1883,9 @@ function showMsg(text, ok) {
 
 async function postConfig(body) {
   try {
-    const r = await fetch(CONFIG, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
+    const payload = {...body};
+    if (detailPair) payload.pair = detailPair;
+    const r = await fetch(CONFIG, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
     const d = await r.json();
     if (r.ok) {
       showMsg('Queued: ' + (d.queued || []).join(', '), true);
