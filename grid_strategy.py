@@ -3442,6 +3442,67 @@ def _cancel_oldest_recovery(state: GridState, current_price: float = 0.0):
     state.recovery_orders.pop(0)
 
 
+def cancel_all_recovery(state: GridState, current_price: float) -> dict:
+    """Cancel ALL recovery orders for a pair, book losses, clear the list.
+
+    Returns summary dict: {"cancelled": int, "total_loss": float, "failed": int}
+    """
+    if not state.recovery_orders:
+        return {"cancelled": 0, "total_loss": 0.0, "failed": 0}
+
+    cancelled = 0
+    failed = 0
+    total_loss = 0.0
+    remaining = []
+
+    for r in state.recovery_orders:
+        # Cancel on Kraken
+        if not config.DRY_RUN:
+            try:
+                kraken_client.cancel_order(r.txid)
+            except Exception as e:
+                logger.warning("Free orphan: failed to cancel %s [%s.%d]: %s",
+                               r.txid, r.trade_id, r.cycle, e)
+                failed += 1
+                remaining.append(r)
+                continue
+
+        # Book the loss at current market price
+        net = 0.0
+        if current_price > 0 and r.entry_price > 0:
+            if r.side == "sell":
+                loss = (r.entry_price - current_price) * r.volume
+            else:
+                loss = (current_price - r.entry_price) * r.volume
+            fees = current_price * r.volume * config.MAKER_FEE_PCT / 100.0 * 2
+            net = -abs(loss) - fees
+            state.total_profit_usd += net
+            state.today_profit_usd += net
+            state.today_loss_usd += abs(net)
+            state.total_fees_usd += fees
+            state.today_fees_usd += fees
+            total_loss += net
+            state.completed_cycles.append(CompletedCycle(
+                trade_id=r.trade_id, cycle=r.cycle,
+                entry_side="buy" if r.side == "sell" else "sell",
+                entry_price=r.entry_price, exit_price=current_price,
+                volume=r.volume, gross_profit=-abs(loss),
+                fees=fees, net_profit=net,
+                entry_time=r.entry_filled_at, exit_time=time.time(),
+            ))
+
+        state.total_recovery_losses += 1
+        cancelled += 1
+        logger.info(
+            "FREED ORPHAN [%s.%d]: %s @ $%.6f (entry $%.6f) -> booked $%.4f",
+            r.trade_id, r.cycle, r.side, r.price, r.entry_price, net,
+        )
+
+    state.recovery_orders = remaining
+    _trim_completed_cycles(state)
+    return {"cancelled": cancelled, "total_loss": total_loss, "failed": failed}
+
+
 def check_recovery_fills(state: GridState, order_info: dict) -> bool:
     """
     Check recovery orders against batch order query results.

@@ -1155,6 +1155,8 @@ def _handle_text_commands(state: grid_strategy.GridState, current_price: float,
             _cmd_menu()
         elif command == "/resetbackoff":
             _cmd_resetbackoff(state)
+        elif command == "/freeorphans":
+            _cmd_freeorphans()
         elif command == "/help":
             _cmd_help()
         else:
@@ -1317,6 +1319,48 @@ def _cmd_resetbackoff(state: grid_strategy.GridState):
     )
 
 
+def _cmd_freeorphans():
+    """Handle /freeorphans -- cancel all recovery tickets across all pairs."""
+    if not _bot_states:
+        notifier._send_message("No active pairs.")
+        return
+
+    total_cancelled = 0
+    total_failed = 0
+    grand_loss = 0.0
+    lines = []
+
+    for pair_name, state in _bot_states.items():
+        if not state.recovery_orders:
+            continue
+        price = _current_prices.get(pair_name, 0.0)
+        result = grid_strategy.cancel_all_recovery(state, price)
+        grid_strategy.save_state(state)
+        total_cancelled += result["cancelled"]
+        total_failed += result["failed"]
+        grand_loss += result["total_loss"]
+        lines.append(
+            f"  {state.pair_display}: {result['cancelled']} freed"
+            + (f", {result['failed']} failed" if result["failed"] else "")
+            + f" (${result['total_loss']:.4f})"
+        )
+
+    if not lines:
+        notifier._send_message("No recovery tickets to free.")
+        return
+
+    summary = (
+        f"<b>Orphans Freed</b>\n\n"
+        + "\n".join(lines)
+        + f"\n\nTotal: {total_cancelled} cancelled"
+        + (f", {total_failed} failed" if total_failed else "")
+        + f"\nBooked loss: ${grand_loss:.4f}"
+    )
+    logger.info("FREE ORPHANS: %d cancelled, %d failed, $%.4f booked",
+                total_cancelled, total_failed, grand_loss)
+    notifier._send_message(summary)
+
+
 def _cmd_help():
     """Handle /help -- list available commands."""
     notifier._send_message(
@@ -1329,6 +1373,7 @@ def _cmd_help():
         "/ratio -- Show/set trend ratio (asymmetric grid)\n"
         "/stats -- Statistical analysis results\n"
         "/resetbackoff -- Clear entry backoff counters\n"
+        "/freeorphans -- Cancel all recovery tickets, book losses\n"
         "/help -- This message"
     )
 
