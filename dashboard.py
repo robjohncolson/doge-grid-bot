@@ -512,9 +512,7 @@ a{color:#58a6ff}
 <div class="swarm-view" id="swarm-view">
   <div class="swarm-header">
     <h2>Swarm Manager</h2>
-    <span id="swarm-badge" class="badge badge-dry">---</span>
     <button class="btn-browse" onclick="openScanner()">Browse Pairs</button>
-    <span class="uptime" id="swarm-uptime">--</span>
   </div>
   <div class="swarm-agg" id="swarm-agg">
     <div class="card"><div class="label">Active Pairs</div><div class="value" id="sw-pairs">--</div></div>

@@ -389,9 +389,11 @@ class GridState:
 
     @property
     def order_size_usd(self) -> float:
-        if self.pair_config:
-            return self.pair_config.order_size_usd
-        return config.ORDER_SIZE_USD
+        base = self.pair_config.order_size_usd if self.pair_config else config.ORDER_SIZE_USD
+        # Compound: roll profits back into trade size
+        if self.total_profit_usd > 0:
+            base += self.total_profit_usd
+        return base
 
     @order_size_usd.setter
     def order_size_usd(self, val):
@@ -2019,7 +2021,11 @@ def build_pair(state: GridState, current_price: float) -> list:
     # Use state property (per-pair) instead of mutating global config.
     min_vol = state.min_volume if state.pair_config else ORDERMIN_DOGE
     min_by_volume = min_vol * current_price * 1.2
-    state.order_size_usd = max(state.order_size_usd, min_by_volume, COSTMIN_USD)
+    # Floor the *base* order size at Kraken minimums (don't write compounded value back)
+    base_size = state.pair_config.order_size_usd if state.pair_config else config.ORDER_SIZE_USD
+    floored = max(base_size, min_by_volume, COSTMIN_USD)
+    if floored > base_size:
+        state.order_size_usd = floored
 
     state.center_price = current_price
 
