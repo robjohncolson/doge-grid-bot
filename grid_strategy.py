@@ -4815,6 +4815,18 @@ def get_status_summary(state: GridState, current_price: float) -> str:
                 f"Unrealized: ${upnl['total_unrealized']:.4f} "
                 f"(A: ${upnl['a_unrealized']:.4f}, B: ${upnl['b_unrealized']:.4f})"
             )
+        # Show recovery (lottery ticket) orders
+        if state.recovery_orders:
+            rec_lines = []
+            for r in state.recovery_orders:
+                age_min = int((time.time() - r.orphaned_at) / 60) if r.orphaned_at else 0
+                upnl_r = r.unrealized_pnl(current_price)
+                rec_lines.append(
+                    f"  [{r.trade_id}.{r.cycle}] {r.side.upper()} @ ${r.price:.6f} "
+                    f"(${upnl_r:+.4f}, {age_min}m ago)"
+                )
+            lines.append(f"Recovery tickets: {len(state.recovery_orders)}")
+            lines.extend(rec_lines)
         # Show backoff state if any consecutive losses
         if state.consecutive_losses_a or state.consecutive_losses_b:
             eff_a = get_backoff_entry_pct(state.entry_pct, state.consecutive_losses_a)
