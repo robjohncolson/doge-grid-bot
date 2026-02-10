@@ -1683,7 +1683,13 @@ def run():
         logger.info("Restored %d pairs from active_pairs persistence", len(config.PAIRS))
 
     # Create one GridState per configured pair
+    min_profit = round(2 * config.MAKER_FEE_PCT + 0.10, 2)
     for pair_name, pc in config.PAIRS.items():
+        # Floor profit_pct so it always covers actual round-trip fees
+        if pc.profit_pct < min_profit:
+            logger.info("Pair %s: profit_pct %.2f%% < fee floor %.2f%%, correcting",
+                         pc.display, pc.profit_pct, min_profit)
+            pc.profit_pct = min_profit
         state = grid_strategy.GridState(pair_config=pc)
         _bot_states[pair_name] = state
         _current_prices[pair_name] = 0.0
