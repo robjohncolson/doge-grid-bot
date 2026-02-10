@@ -1072,8 +1072,8 @@ def calculate_volume_for_price(price: float, state: GridState = None) -> float:
         price: Limit price in USD.
         state: Optional GridState; if set, uses per-pair order_size_usd and min_volume.
 
-    Example: at $0.09/DOGE with order_size_usd=$5:
-      volume = $5 / $0.09 = 55.56 DOGE
+    Example: at $0.09/DOGE with order_size_usd=$0.50:
+      volume = $0.50 / $0.09 = 5.6 DOGE -> floored to min_volume (13)
     """
     if price <= 0:
         return 0.0
@@ -2104,16 +2104,10 @@ def build_pair(state: GridState, current_price: float) -> list:
 
     Returns the list of open GridOrder objects.
     """
-    # Pair mode: keep user's order_size_usd but floor at Kraken minimums.
-    # No grid-level capital budgeting (only 2 orders, not 40).
-    # Use state property (per-pair) instead of mutating global config.
-    min_vol = state.min_volume if state.pair_config else ORDERMIN_DOGE
-    min_by_volume = min_vol * current_price * 1.2
-    # Floor the *base* order size at Kraken minimums (don't write compounded value back)
-    base_size = state.pair_config.order_size_usd if state.pair_config else config.ORDER_SIZE_USD
-    floored = max(base_size, min_by_volume, COSTMIN_USD)
-    if floored > base_size:
-        state.order_size_usd = floored
+    # Pair mode: always reset to global base so calculate_volume_for_price()
+    # naturally floors each order to the pair's Kraken minimum volume.
+    # Previously saved order_size_usd values may be inflated from old configs.
+    state.order_size_usd = config.ORDER_SIZE_USD
 
     state.center_price = current_price
 
