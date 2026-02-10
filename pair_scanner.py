@@ -335,9 +335,9 @@ def auto_configure(info: PairInfo) -> "config.PairConfig":
     entry_pct = max(info.spread_pct / 2 + 0.05, entry_floor)
     entry_pct = round(entry_pct, 2)
 
-    # Profit must clear round-trip fees with real margin (not razor-thin)
+    # Profit must clear round-trip fees with DOGE-like margin
     actual_fee = max(info.fee_maker, config.MAKER_FEE_PCT)
-    profit_pct = max(entry_pct, 2 * actual_fee + 0.20)
+    profit_pct = max(entry_pct, 2 * actual_fee + 0.50)
     profit_pct = round(profit_pct, 2)
 
     refresh_pct = round(entry_pct * 2, 2)
