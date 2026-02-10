@@ -3565,8 +3565,11 @@ def adjust_profit_from_volatility(state: GridState, stats_results: dict) -> bool
     dir_factor = 1.0 - directionality * squeeze  # 1.0 at range, (1-squeeze) at max trend
 
     proposed = vol_target * dir_factor
-    proposed = max(config.VOLATILITY_PROFIT_FLOOR,
-                   min(proposed, config.VOLATILITY_PROFIT_CEILING))
+    # Hard floor: never go below round-trip fees + safety buffer.
+    # This prevents the razor-thin margin that causes guaranteed losses.
+    fee_floor = config.ROUND_TRIP_FEE_PCT + 0.20
+    floor = max(config.VOLATILITY_PROFIT_FLOOR, fee_floor)
+    proposed = max(floor, min(proposed, config.VOLATILITY_PROFIT_CEILING))
 
     # Noise filter: skip if change is too small
     if abs(proposed - state.profit_pct) < config.VOLATILITY_PROFIT_MIN_CHANGE:

@@ -322,7 +322,8 @@ ENTRY_BACKOFF_MAX_MULTIPLIER: float = _env("ENTRY_BACKOFF_MAX_MULTIPLIER", 5.0, 
 # Auto-adjust profit_pct based on OHLC volatility so exit targets are reachable.
 VOLATILITY_AUTO_PROFIT: bool = _env("VOLATILITY_AUTO_PROFIT", True, bool)
 VOLATILITY_PROFIT_FACTOR: float = _env("VOLATILITY_PROFIT_FACTOR", 0.8, float)
-VOLATILITY_PROFIT_FLOOR: float = _env("VOLATILITY_PROFIT_FLOOR", 0.6, float)
+VOLATILITY_PROFIT_FLOOR: float = _env("VOLATILITY_PROFIT_FLOOR",
+                                      ROUND_TRIP_FEE_PCT + 0.20, float)  # must clear fees + 0.20% buffer
 VOLATILITY_PROFIT_CEILING: float = _env("VOLATILITY_PROFIT_CEILING", 3.0, float)
 VOLATILITY_PROFIT_MIN_CHANGE: float = _env("VOLATILITY_PROFIT_MIN_CHANGE", 0.05, float)
 
