@@ -212,6 +212,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._handle_swarm_remove()
         elif path == "/api/swarm/multiplier":
             self._handle_swarm_multiplier()
+        elif path == "/api/swarm/free-orphans":
+            self._handle_swarm_free_orphans()
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -500,6 +502,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "long_only": st.long_only,
                 "paused": st.is_paused,
                 "seed_cost": round(st.seed_cost_usd, 4),
+                "recovery_count": len(st.recovery_orders),
             })
 
         _compute_portfolio_value()  # refresh cached balances for per-pair asset values
@@ -514,6 +517,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "total_trips": sum(st.total_round_trips for st in _bot_states.values()),
             "bot_net_pnl": bot_net_pnl,
             "total_seed_cost": round(total_seed, 4),
+            "total_recovery": sum(len(st.recovery_orders) for st in _bot_states.values()),
         }
 
         # Add per-pair asset balance value (reuse cached balances)
@@ -645,6 +649,43 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         _swarm_pending_multipliers = _swarm_pending_multipliers + [(pair_name, mult)]
         self._send_json({"ok": True, "pair": pair_name, "multiplier": mult})
+
+    def _handle_swarm_free_orphans(self):
+        """POST /api/swarm/free-orphans -- cancel all recovery tickets."""
+        if not _bot_states:
+            self._send_json({"error": "bot not initialized"}, 503)
+            return
+
+        total_cancelled = 0
+        total_failed = 0
+        grand_loss = 0.0
+        details = []
+
+        for pair_name, state in _bot_states.items():
+            if not state.recovery_orders:
+                continue
+            price = _current_prices.get(pair_name, 0.0)
+            result = grid_strategy.cancel_all_recovery(state, price)
+            grid_strategy.save_state(state)
+            total_cancelled += result["cancelled"]
+            total_failed += result["failed"]
+            grand_loss += result["total_loss"]
+            details.append({
+                "pair": state.pair_display,
+                "cancelled": result["cancelled"],
+                "failed": result["failed"],
+                "loss": round(result["total_loss"], 4),
+            })
+
+        logger.info("FREE ORPHANS (web): %d cancelled, %d failed, $%.4f booked",
+                     total_cancelled, total_failed, grand_loss)
+        self._send_json({
+            "ok": True,
+            "total_cancelled": total_cancelled,
+            "total_failed": total_failed,
+            "total_loss": round(grand_loss, 4),
+            "details": details,
+        })
 
     def _handle_api_config(self):
         """POST /api/config -- validate and queue config changes."""

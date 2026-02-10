@@ -478,6 +478,8 @@ a{color:#58a6ff}
 .swarm-table .btn-remove:hover{background:#da3633;color:#fff}
 .btn-browse{background:#238636;border:1px solid #2ea043;color:#fff;border-radius:6px;padding:6px 14px;font-size:13px;cursor:pointer;font-family:inherit}
 .btn-browse:hover{background:#2ea043}
+.btn-free-orphans{background:#21262d;border:1px solid #9e6a03;color:#e3b341;border-radius:6px;padding:6px 14px;font-size:13px;cursor:pointer;font-family:inherit}
+.btn-free-orphans:hover{background:#9e6a03;color:#fff}
 .btn-back{background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;padding:6px 14px;font-size:13px;cursor:pointer;font-family:inherit;margin-bottom:16px}
 .btn-back:hover{background:#30363d}
 .detail-view{display:none}
@@ -512,7 +514,10 @@ a{color:#58a6ff}
 <div class="swarm-view" id="swarm-view">
   <div class="swarm-header">
     <h2>Swarm Manager</h2>
-    <button class="btn-browse" onclick="openScanner()">Browse Pairs</button>
+    <div style="display:flex;gap:8px;align-items:center">
+      <button class="btn-free-orphans" id="btn-free-orphans" onclick="freeOrphans()" style="display:none">Free Orphans (<span id="orphan-count">0</span>)</button>
+      <button class="btn-browse" onclick="openScanner()">Browse Pairs</button>
+    </div>
   </div>
   <div class="swarm-agg" id="swarm-agg">
     <div class="card"><div class="label">Active Pairs</div><div class="value" id="sw-pairs">--</div></div>
@@ -2060,6 +2065,18 @@ function renderSwarm(data) {
     rows += '</tr>';
   }
   tbody.innerHTML = rows || '<tr><td colspan="10" style="text-align:center;color:#8b949e">No pairs active</td></tr>';
+
+  // Show/hide Free Orphans button based on total recovery count
+  const orphanBtn = document.getElementById('btn-free-orphans');
+  const orphanCount = agg.total_recovery || 0;
+  if (orphanBtn) {
+    if (orphanCount > 0) {
+      orphanBtn.style.display = 'inline-block';
+      document.getElementById('orphan-count').textContent = orphanCount;
+    } else {
+      orphanBtn.style.display = 'none';
+    }
+  }
 }
 
 async function pollSwarm() {
@@ -2099,6 +2116,28 @@ async function removePair(pair) {
       }
     }, 1000);
   } catch(e) {}
+}
+
+async function freeOrphans() {
+  const count = document.getElementById('orphan-count').textContent;
+  if (!confirm('Free all ' + count + ' orphan recovery tickets? Losses will be booked at current market prices.')) return;
+  try {
+    const r = await fetch('/api/swarm/free-orphans', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: '{}'
+    });
+    const d = await r.json();
+    if (r.ok) {
+      let msg = 'Freed ' + d.total_cancelled + ' orphans';
+      if (d.total_failed > 0) msg += ' (' + d.total_failed + ' failed)';
+      msg += '\nBooked loss: ' + fmtUSD(d.total_loss);
+      alert(msg);
+      await pollSwarm();
+    } else {
+      alert(d.error || 'Failed to free orphans');
+    }
+  } catch(e) { alert('Network error'); }
 }
 
 async function addPair(pair) {
