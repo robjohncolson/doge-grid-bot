@@ -79,29 +79,39 @@ class _RateLimiter:
             self._last_decay = now
 
     def consume(self, units: int = 1):
-        """Block until budget is available, then deduct units."""
-        while True:
-            with self._lock:
-                # Check circuit breaker
-                now = time.time()
-                if self._circuit_open_until > now:
-                    wait = self._circuit_open_until - now
-                    logger.warning("Circuit breaker open, waiting %.1fs", wait)
-                else:
-                    wait = 0.0
+        """Consume rate-limit units. Allows overdraft down to -2 (like the
+        old code) so startup bursts aren't blocked for minutes.  Only truly
+        blocks when the circuit breaker is open or budget is deeply negative."""
+        with self._lock:
+            # Circuit breaker: hard block until it clears
+            now = time.time()
+            if self._circuit_open_until > now:
+                wait = self._circuit_open_until - now
+                logger.warning("Circuit breaker open, waiting %.1fs", wait)
+                # Release lock while sleeping
+                self._lock.release()
+                try:
+                    time.sleep(wait)
+                finally:
+                    self._lock.acquire()
+                self._decay()
 
-                if wait <= 0:
-                    self._decay()
-                    if self._budget >= units:
-                        self._budget -= units
-                        return
-                    # Not enough budget -- compute wait time
-                    wait = (units - self._budget) / self._decay_rate
-                    logger.warning("Rate limit low (%.1f/%d), sleeping %.1fs",
-                                   self._budget, self._max_budget, wait)
+            self._decay()
 
-            # Sleep outside the lock so other threads aren't blocked
-            time.sleep(min(wait, 5.0))
+            # Soft throttle: if budget is very low, sleep briefly (like old 2s pause)
+            if self._budget <= 1:
+                sleep_time = 2.0
+                logger.warning("Rate limit nearly exhausted (%.1f/%d), sleeping %.1fs",
+                               self._budget, self._max_budget, sleep_time)
+                self._lock.release()
+                try:
+                    time.sleep(sleep_time)
+                finally:
+                    self._lock.acquire()
+                self._decay()
+
+            # Always deduct (can go negative -- matches old behavior)
+            self._budget -= units
 
     def report_rate_error(self):
         """Called after a Kraken rate-limit or lockout error."""
