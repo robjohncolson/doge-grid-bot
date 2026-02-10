@@ -3427,20 +3427,8 @@ def _cancel_oldest_recovery(state: GridState, current_price: float = 0.0):
         )
     state.total_recovery_losses += 1
 
-    # Backoff: increment consecutive loss counter for this trade leg
-    if oldest.trade_id == "A":
-        state.consecutive_losses_a += 1
-        _losses = state.consecutive_losses_a
-    else:
-        state.consecutive_losses_b += 1
-        _losses = state.consecutive_losses_b
-    if config.ENTRY_BACKOFF_ENABLED and _losses > 0:
-        base = state.entry_pct
-        widened = get_backoff_entry_pct(base, _losses)
-        logger.info(
-            "BACKOFF [%s.%d]: %d consecutive losses, entry will widen %.2f%% -> %.2f%%",
-            oldest.trade_id, oldest.cycle, _losses, base, widened,
-        )
+    # Note: consecutive loss counter was already incremented when exit was
+    # orphaned (in _orphan_exit_lottery), so no additional increment here.
 
     state.recovery_orders.pop(0)
 
@@ -3782,7 +3770,22 @@ def _force_liquidate_exit(state, o, current_price, reason="timeout"):
     # Detect directional trend
     _detect_trend(state, o.side)
 
-    # Place fresh entry (same logic as lottery mode)
+    # Increment consecutive loss counter -- liquidation is a definitive loss.
+    if tid == "A":
+        state.consecutive_losses_a += 1
+        _losses = state.consecutive_losses_a
+    else:
+        state.consecutive_losses_b += 1
+        _losses = state.consecutive_losses_b
+    if config.ENTRY_BACKOFF_ENABLED and _losses > 0:
+        base = state.entry_pct
+        widened = get_backoff_entry_pct(base, _losses)
+        logger.info(
+            "BACKOFF [%s.%d]: liquidation counts as loss #%d, entry widens %.2f%% -> %.2f%%",
+            tid, cyc, _losses, base, widened,
+        )
+
+    # Place fresh entry (uses updated backoff from above)
     a_pct, b_pct = compute_entry_distances(state)
     a_pct = get_backoff_entry_pct(a_pct, state.consecutive_losses_a)
     b_pct = get_backoff_entry_pct(b_pct, state.consecutive_losses_b)
@@ -3831,9 +3834,6 @@ def _orphan_exit_lottery(state, o, current_price, reason="timeout"):
     cyc = getattr(o, "cycle", 0)
     entry_price = o.matched_sell_price if o.side == "buy" else o.matched_buy_price
     decimals = state.price_decimals
-    a_pct, b_pct = compute_entry_distances(state)
-    a_pct = get_backoff_entry_pct(a_pct, state.consecutive_losses_a)
-    b_pct = get_backoff_entry_pct(b_pct, state.consecutive_losses_b)
 
     # Enforce recovery slot cap
     if len(state.recovery_orders) >= config.MAX_RECOVERY_SLOTS:
@@ -3855,7 +3855,27 @@ def _orphan_exit_lottery(state, o, current_price, reason="timeout"):
     # Detect directional trend
     _detect_trend(state, o.side)
 
-    # Place fresh entry on that side
+    # Increment consecutive loss counter -- orphaning means the exit failed
+    # to fill, which is effectively a losing cycle.  If the lottery ticket
+    # later fills, check_recovery_fills() resets the counter to 0.
+    if tid == "A":
+        state.consecutive_losses_a += 1
+        _losses = state.consecutive_losses_a
+    else:
+        state.consecutive_losses_b += 1
+        _losses = state.consecutive_losses_b
+    if config.ENTRY_BACKOFF_ENABLED and _losses > 0:
+        base = state.entry_pct
+        widened = get_backoff_entry_pct(base, _losses)
+        logger.info(
+            "BACKOFF [%s.%d]: orphan counts as loss #%d, entry widens %.2f%% -> %.2f%%",
+            tid, cyc, _losses, base, widened,
+        )
+
+    # Place fresh entry on that side (uses updated backoff from above)
+    a_pct, b_pct = compute_entry_distances(state)
+    a_pct = get_backoff_entry_pct(a_pct, state.consecutive_losses_a)
+    b_pct = get_backoff_entry_pct(b_pct, state.consecutive_losses_b)
     if o.side == "sell":
         new_entry_price = round(
             current_price * (1 - b_pct / 100.0), decimals)
@@ -5196,6 +5216,8 @@ def get_status_summary(state: GridState, current_price: float) -> str:
 
     prefix = "[DRY RUN] " if config.DRY_RUN else ""
 
+    tag = f"[{state.pair_display}] "
+
     if config.STRATEGY_MODE == "pair":
         # Show roles and trade identity for pair mode
         entry_orders = [o for o in open_orders if o.order_role == "entry"]
@@ -5212,22 +5234,22 @@ def get_status_summary(state: GridState, current_price: float) -> str:
 
         lines = [
             f"{prefix}{state.pair_display} Pair Bot Status",
-            f"Price: ${current_price:.6f}",
-            f"State: {state.pair_state} | A.cycle={state.cycle_a} B.cycle={state.cycle_b}",
-            f"Open: {order_details or 'none'}",
-            f"Entry dist: {state.entry_pct:.2f}% | Profit tgt: {state.profit_pct:.2f}%",
-            f"Today: {state.round_trips_today} round trips, ${state.today_profit_usd:.4f} profit",
-            f"Lifetime: {state.total_round_trips} round trips, ${state.total_profit_usd:.4f} profit",
-            f"  Trade A: {len(a_cycles)} cycles, ${a_net:.4f} net",
-            f"  Trade B: {len(b_cycles)} cycles, ${b_net:.4f} net",
-            f"Fees paid: ${state.total_fees_usd:.4f}",
-            f"DOGE accumulated: {state.doge_accumulated:.2f}",
+            f"{tag}Price: ${current_price:.6f}",
+            f"{tag}State: {state.pair_state} | A.cycle={state.cycle_a} B.cycle={state.cycle_b}",
+            f"{tag}Open: {order_details or 'none'}",
+            f"{tag}Entry dist: {state.entry_pct:.2f}% | Profit tgt: {state.profit_pct:.2f}%",
+            f"{tag}Today: {state.round_trips_today} round trips, ${state.today_profit_usd:.4f} profit",
+            f"{tag}Lifetime: {state.total_round_trips} round trips, ${state.total_profit_usd:.4f} profit",
+            f"{tag}  Trade A: {len(a_cycles)} cycles, ${a_net:.4f} net",
+            f"{tag}  Trade B: {len(b_cycles)} cycles, ${b_net:.4f} net",
+            f"{tag}Fees paid: ${state.total_fees_usd:.4f}",
+            f"{tag}DOGE accumulated: {state.doge_accumulated:.2f}",
         ]
         # Add unrealized P&L
         upnl = compute_unrealized_pnl(state, current_price)
         if upnl["total_unrealized"] != 0:
             lines.append(
-                f"Unrealized: ${upnl['total_unrealized']:.4f} "
+                f"{tag}Unrealized: ${upnl['total_unrealized']:.4f} "
                 f"(A: ${upnl['a_unrealized']:.4f}, B: ${upnl['b_unrealized']:.4f})"
             )
         # Show recovery (lottery ticket) orders
@@ -5237,17 +5259,17 @@ def get_status_summary(state: GridState, current_price: float) -> str:
                 age_min = int((time.time() - r.orphaned_at) / 60) if r.orphaned_at else 0
                 upnl_r = r.unrealized_pnl(current_price)
                 rec_lines.append(
-                    f"  [{r.trade_id}.{r.cycle}] {r.side.upper()} @ ${r.price:.6f} "
+                    f"{tag}  [{r.trade_id}.{r.cycle}] {r.side.upper()} @ ${r.price:.6f} "
                     f"(${upnl_r:+.4f}, {age_min}m ago)"
                 )
-            lines.append(f"Recovery tickets: {len(state.recovery_orders)}")
+            lines.append(f"{tag}Recovery tickets: {len(state.recovery_orders)}")
             lines.extend(rec_lines)
         # Show backoff state if any consecutive losses
         if state.consecutive_losses_a or state.consecutive_losses_b:
             eff_a = get_backoff_entry_pct(state.entry_pct, state.consecutive_losses_a)
             eff_b = get_backoff_entry_pct(state.entry_pct, state.consecutive_losses_b)
             lines.append(
-                f"Backoff: A={state.consecutive_losses_a} losses (eff {eff_a:.2f}%), "
+                f"{tag}Backoff: A={state.consecutive_losses_a} losses (eff {eff_a:.2f}%), "
                 f"B={state.consecutive_losses_b} losses (eff {eff_b:.2f}%)"
             )
     else:
@@ -5260,19 +5282,19 @@ def get_status_summary(state: GridState, current_price: float) -> str:
 
         lines = [
             f"{prefix}{state.pair_display} Grid Bot Status",
-            f"Price: ${current_price:.6f}",
-            f"Grid center: ${state.center_price:.6f}",
-            f"Open orders: {open_buys} buys + {open_sells} sells = {len(open_orders)}",
-            f"Trend ratio: {ratio:.0%} buy / {1-ratio:.0%} sell (grid: {n_buys}B+{n_sells}S) [{ratio_src}]",
-            f"Today: {state.round_trips_today} round trips, ${state.today_profit_usd:.4f} profit",
-            f"Lifetime: {state.total_round_trips} round trips, ${state.total_profit_usd:.4f} profit",
-            f"Fees paid: ${state.total_fees_usd:.4f}",
-            f"DOGE accumulated: {state.doge_accumulated:.2f}",
+            f"{tag}Price: ${current_price:.6f}",
+            f"{tag}Grid center: ${state.center_price:.6f}",
+            f"{tag}Open orders: {open_buys} buys + {open_sells} sells = {len(open_orders)}",
+            f"{tag}Trend ratio: {ratio:.0%} buy / {1-ratio:.0%} sell (grid: {n_buys}B+{n_sells}S) [{ratio_src}]",
+            f"{tag}Today: {state.round_trips_today} round trips, ${state.today_profit_usd:.4f} profit",
+            f"{tag}Lifetime: {state.total_round_trips} round trips, ${state.total_profit_usd:.4f} profit",
+            f"{tag}Fees paid: ${state.total_fees_usd:.4f}",
+            f"{tag}DOGE accumulated: {state.doge_accumulated:.2f}",
         ]
 
     if state.is_paused:
-        lines.append(f"PAUSED: {state.pause_reason}")
+        lines.append(f"{tag}PAUSED: {state.pause_reason}")
     if state.ai_recommendation:
-        lines.append(f"AI says: {state.ai_recommendation}")
+        lines.append(f"{tag}AI says: {state.ai_recommendation}")
 
     return "\n".join(lines)
