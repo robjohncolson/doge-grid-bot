@@ -371,5 +371,5 @@ def auto_configure(info: PairInfo) -> "config.PairConfig":
         volume_decimals=info.lot_decimals,
         filter_strings=[base_clean, info.base],
         recovery_mode=recovery_mode,
-        capital_budget_usd=10.0,  # conservative default, overridden by _add_pair()
+        capital_budget_usd=0.0,  # 0 = unlimited; user sets per-pair via PAIRS JSON in manual mode
     )

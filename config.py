@@ -104,6 +104,12 @@ PAIR_DISPLAY: str = "DOGE/USD"
 # Lowering it: fewer orders, less profit, less risk.
 STARTING_CAPITAL: float = _env("STARTING_CAPITAL", 120.0, float)
 
+# Capital budget mode: controls how per-pair budgets are managed.
+# "off"    = no per-pair budgets (default -- small order sizes are the safety net)
+# "auto"   = auto-rebalance across slots (legacy behavior)
+# "manual" = per-pair budgets from PAIRS JSON only, no auto-rebalance
+CAPITAL_BUDGET_MODE: str = _env("CAPITAL_BUDGET_MODE", "off", str)
+
 # Dollar value of each individual grid order (initial value).
 # Base order size in USD.  Defaults to Kraken's $0.50 cost minimum so every
 # pair trades at its Kraken minimum volume.  calculate_volume_for_price()
@@ -291,6 +297,9 @@ RECOVERY_FALLBACK_TIMEOUT_SEC: float = _env("RECOVERY_FALLBACK_TIMEOUT_SEC", 720
 
 # S2 fallback timeout (seconds) when no PairStats yet.
 S2_FALLBACK_TIMEOUT_SEC: float = _env("S2_FALLBACK_TIMEOUT_SEC", 600.0, float)
+
+# Cooldown (seconds) after S2 break-glass fires before it can re-trigger.
+S2_COOLDOWN_SEC: float = _env("S2_COOLDOWN_SEC", 300.0, float)
 
 # Max distance (%) an exit can drift from market price before being orphaned.
 # If an exit is farther than this from current price, cancel it and re-enter.

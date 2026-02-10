@@ -203,6 +203,7 @@ def serialize_state(state: grid_strategy.GridState, current_price: float) -> dic
                 "age_minutes": round((time.time() - r.orphaned_at) / 60, 1)
                     if r.orphaned_at > 0 else 0,
                 "unrealized_pnl": round(r.unrealized_pnl(current_price), 4),
+                "reason": getattr(r, "reason", "timeout"),
             }
             for r in getattr(state, "recovery_orders", [])
         ] if is_pair_mode else [],
@@ -217,6 +218,11 @@ def serialize_state(state: grid_strategy.GridState, current_price: float) -> dic
         "s2_entered_at": getattr(state, "s2_entered_at", None),
         "s2_age_minutes": round((time.time() - state.s2_entered_at) / 60, 1)
             if is_pair_mode and getattr(state, "s2_entered_at", None) else None,
+        "exit_reprice_count_a": getattr(state, "exit_reprice_count_a", 0),
+        "exit_reprice_count_b": getattr(state, "exit_reprice_count_b", 0),
+        "s2_cooldown_remaining": max(0, round(
+            config.S2_COOLDOWN_SEC - (now - state.s2_last_action_at)))
+            if is_pair_mode and getattr(state, "s2_last_action_at", None) else 0,
         "exit_thresholds": None,
     }
     # Compute exit thresholds for dashboard display
@@ -227,6 +233,22 @@ def serialize_state(state: grid_strategy.GridState, current_price: float) -> dic
                 "reprice_min": round(th["reprice_after"] / 60, 1),
                 "orphan_min": round(th["orphan_after"] / 60, 1),
             }
+    # S2 diagnostics: spread and worse side
+    if is_pair_mode and getattr(state, "pair_state", "") == "S2" and current_price > 0:
+        buy_exit = sell_exit = None
+        for o in state.grid_orders:
+            if o.status != "open" or getattr(o, "order_role", "") != "exit":
+                continue
+            if o.side == "buy":
+                buy_exit = o
+            elif o.side == "sell":
+                sell_exit = o
+        if buy_exit and sell_exit:
+            spread = (sell_exit.price - buy_exit.price) / current_price * 100
+            a_dist = abs(buy_exit.price - current_price) / current_price
+            b_dist = abs(sell_exit.price - current_price) / current_price
+            result["s2_spread_pct"] = round(spread, 2)
+            result["s2_worse_side"] = "A" if a_dist > b_dist else "B"
     return result
 
 
@@ -530,7 +552,7 @@ a{color:#58a6ff}
   <div style="overflow-x:auto">
     <table class="swarm-table">
       <thead><tr>
-        <th>Pair</th><th>Price</th><th>State</th><th>Today</th><th>Total</th><th>Value</th><th>Trips</th><th>Entry%</th><th>Multi</th><th></th>
+        <th>Pair</th><th>Price</th><th>State</th><th>Today</th><th>Total</th><th>Value</th><th>Trips</th><th>Entry%</th><th>Budget</th><th>Multi</th><th></th>
       </tr></thead>
       <tbody id="swarm-body"></tbody>
     </table>
@@ -589,7 +611,7 @@ a{color:#58a6ff}
     <span class="recovery-stats" id="recovery-stats"></span>
   </div>
   <table class="recovery-table">
-    <thead><tr><th>Trade</th><th>Side</th><th>Exit Price</th><th>Entry Price</th><th>Age</th><th>Unrealized P&amp;L</th></tr></thead>
+    <thead><tr><th>Trade</th><th>Side</th><th>Exit Price</th><th>Entry Price</th><th>Age</th><th>Reason</th><th>Unrealized P&amp;L</th></tr></thead>
     <tbody id="recovery-body"></tbody>
   </table>
 </div>
@@ -1540,7 +1562,7 @@ function update(data) {
       trendEl.style.display = 'none';
     }
 
-    // S2 timer
+    // S2 timer with diagnostics
     const s2Timer = document.getElementById('ps-s2-timer');
     if (ps === 'S2' && data.s2_age_minutes != null) {
       s2Timer.style.display = '';
@@ -1548,11 +1570,14 @@ function update(data) {
       const th = data.exit_thresholds;
       const ageTxt = ageM < 60 ? fmt(ageM, 0) + 'm' : fmt(ageM / 60, 1) + 'h';
       let timerTxt = 'S2 for ' + ageTxt;
+      if (data.s2_spread_pct != null) timerTxt += ' \u2014 spread ' + fmt(data.s2_spread_pct, 1) + '%';
+      if (data.s2_worse_side) timerTxt += ' \u2014 worse: ' + data.s2_worse_side;
       if (th && th.orphan_min) {
         const remain = th.orphan_min - ageM;
         if (remain > 0) timerTxt += ' \u2014 break-glass in ' + fmt(remain, 0) + 'm';
         else timerTxt += ' \u2014 break-glass active';
       }
+      if (data.s2_cooldown_remaining > 0) timerTxt += ' \u2014 cooldown ' + fmt(data.s2_cooldown_remaining / 60, 1) + 'm';
       s2Timer.textContent = timerTxt;
     } else {
       s2Timer.style.display = 'none';
@@ -1587,6 +1612,15 @@ function update(data) {
     const oldBadgeA = aLegEl.parentElement.querySelector('.exit-age-badge');
     if (oldBadgeA) oldBadgeA.remove();
     if (aExitAge) aLegEl.parentElement.appendChild(aExitAge);
+    const oldRpA = aLegEl.parentElement.querySelector('.reprice-badge');
+    if (oldRpA) oldRpA.remove();
+    if (data.exit_reprice_count_a > 0) {
+      const rpA = document.createElement('span');
+      rpA.className = 'reprice-badge';
+      rpA.style.cssText = 'background:#9e6a03;color:#e3b341;font-size:10px;padding:1px 4px;border-radius:3px;margin-left:6px';
+      rpA.textContent = 'repriced ' + data.exit_reprice_count_a + 'x';
+      aLegEl.parentElement.appendChild(rpA);
+    }
     document.getElementById('pp-a-entry').textContent = aEntry ? '$' + fmt(aEntry, 6) : '--';
     document.getElementById('pp-a-target').textContent = aTarget ? '$' + fmt(aTarget, 6) : '--';
     document.getElementById('pp-a-dist').textContent = aDist != null ? fmt(aDist, 2) + '%' : '--';
@@ -1612,6 +1646,15 @@ function update(data) {
     const oldBadgeB = bLegEl.parentElement.querySelector('.exit-age-badge');
     if (oldBadgeB) oldBadgeB.remove();
     if (bExitAge) bLegEl.parentElement.appendChild(bExitAge);
+    const oldRpB = bLegEl.parentElement.querySelector('.reprice-badge');
+    if (oldRpB) oldRpB.remove();
+    if (data.exit_reprice_count_b > 0) {
+      const rpB = document.createElement('span');
+      rpB.className = 'reprice-badge';
+      rpB.style.cssText = 'background:#9e6a03;color:#e3b341;font-size:10px;padding:1px 4px;border-radius:3px;margin-left:6px';
+      rpB.textContent = 'repriced ' + data.exit_reprice_count_b + 'x';
+      bLegEl.parentElement.appendChild(rpB);
+    }
     document.getElementById('pp-b-entry').textContent = bEntry ? '$' + fmt(bEntry, 6) : '--';
     document.getElementById('pp-b-target').textContent = bTarget ? '$' + fmt(bTarget, 6) : '--';
     document.getElementById('pp-b-dist').textContent = bDist != null ? fmt(bDist, 2) + '%' : '--';
@@ -1642,6 +1685,7 @@ function update(data) {
         rrows += '<td>$' + fmt(r.price, 6) + '</td>';
         rrows += '<td>$' + fmt(r.entry_price, 6) + '</td>';
         rrows += '<td>' + ageTxt + '</td>';
+        rrows += '<td style="color:#8b949e;font-size:10px">' + (r.reason || 'timeout') + '</td>';
         rrows += '<td style="color:' + pnlColor + '">' + fmtUSD(r.unrealized_pnl) + '</td>';
         rrows += '</tr>';
       }
@@ -2066,6 +2110,7 @@ function renderSwarm(data) {
     rows += '<td>' + (p.asset_value != null ? '$' + p.asset_value.toFixed(2) : '--') + '</td>';
     rows += '<td>' + p.trips_today + '/' + p.total_trips + '</td>';
     rows += '<td>' + fmt(p.entry_pct, 2) + '%</td>';
+    rows += '<td>' + (p.capital_budget > 0 ? '$' + fmt(p.capital_budget, 2) : '<span style="color:#8b949e">unlim</span>') + '</td>';
     rows += '<td><select onclick="event.stopPropagation()" onchange="setMultiplier(\'' + p.pair + '\',this.value);event.stopPropagation()">'
           + '<option value="1"' + (slotCount===1 ? ' selected' : '') + '>1x</option>'
           + '<option value="2"' + (slotCount===2 ? ' selected' : '') + '>2x</option>'
@@ -2075,7 +2120,7 @@ function renderSwarm(data) {
     rows += '<td><button class="btn-remove" onclick="removePair(\'' + p.pair + '\');event.stopPropagation()">X</button></td>';
     rows += '</tr>';
   }
-  tbody.innerHTML = rows || '<tr><td colspan="10" style="text-align:center;color:#8b949e">No pairs active</td></tr>';
+  tbody.innerHTML = rows || '<tr><td colspan="11" style="text-align:center;color:#8b949e">No pairs active</td></tr>';
 
   // Show/hide Free Orphans button based on total recovery count
   const orphanBtn = document.getElementById('btn-free-orphans');

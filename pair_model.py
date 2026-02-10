@@ -63,6 +63,9 @@ class ModelConfig:
     entry_backoff_enabled: bool = True
     entry_backoff_factor: float = 0.5
     entry_backoff_max_multiplier: float = 5.0
+    # S2 break-glass hardening
+    s2_cooldown_sec: float = 300.0    # Cooldown after break-glass fires
+    price_staleness_limit: float = 90.0  # Max seconds before price considered stale
 
 
 def default_config(**overrides) -> ModelConfig:
@@ -152,10 +155,12 @@ class PairState:
 
     # Exit lifecycle
     s2_entered_at: float | None = None
+    s2_last_action_at: float | None = None  # Cooldown anchor after break-glass
     last_reprice_a: float = 0.0
     last_reprice_b: float = 0.0
     exit_reprice_count_a: int = 0
     exit_reprice_count_b: int = 0
+    last_price_update_at: float | None = None  # When price was last fetched
 
     # Directional signal
     detected_trend: str | None = None  # "up", "down", or None
@@ -897,6 +902,16 @@ def _check_s2_break_glass(state: PairState,
             state = replace(state, s2_entered_at=None)
         return state, actions
 
+    # Stale price guard
+    if (state.last_price_update_at is not None
+            and (state.now - state.last_price_update_at) > cfg.price_staleness_limit):
+        return state, actions
+
+    # Cooldown after last break-glass action
+    if (state.s2_last_action_at is not None
+            and (state.now - state.s2_last_action_at) < cfg.s2_cooldown_sec):
+        return state, actions
+
     # Phase 1: Record entry time
     if state.s2_entered_at is None:
         return replace(state, s2_entered_at=state.now), actions
@@ -930,9 +945,11 @@ def _check_s2_break_glass(state: PairState,
     b_dist = abs(sell_exit.price - state.market_price) / state.market_price
     worse = buy_exit if a_dist > b_dist else sell_exit
 
-    # Phase 4: Opportunity cost check
+    # Phase 4: Opportunity cost check (with entry price guard)
     do_close = False
-    if (state.mean_net_profit is not None and state.mean_duration_sec
+    if not worse.matched_entry_price or worse.matched_entry_price <= 0:
+        pass  # Skip opp cost — no entry price, fall through to reprice
+    elif (state.mean_net_profit is not None and state.mean_duration_sec
             and state.mean_duration_sec > 0):
         profit_per_sec = state.mean_net_profit / state.mean_duration_sec
         foregone = profit_per_sec * s2_age
@@ -981,6 +998,7 @@ def _check_s2_break_glass(state: PairState,
                                     exit_reprice_count_b=reprice_count + 1)
 
                 if new_spread < cfg.s2_max_spread_pct:
+                    state = replace(state, s2_last_action_at=state.now)
                     return state, actions
                 do_close = True
             else:
@@ -990,7 +1008,7 @@ def _check_s2_break_glass(state: PairState,
     if do_close:
         state, orphan_actions = _orphan_exit(state, worse, cfg, "s2_break")
         actions.extend(orphan_actions)
-        state = replace(state, s2_entered_at=None)
+        state = replace(state, s2_entered_at=None, s2_last_action_at=state.now)
 
     return state, actions
 
@@ -1113,7 +1131,7 @@ def transition(state: PairState, event: Event,
             state, actions = _handle_sell_fill(state, event, cfg)
 
         case PriceTick(price=price):
-            state = replace(state, market_price=price)
+            state = replace(state, market_price=price, last_price_update_at=state.now)
             state, refresh_actions = _check_entry_refresh(state, cfg)
             actions.extend(refresh_actions)
 
@@ -1569,8 +1587,10 @@ def from_state_json(path: str = "logs/state.json") -> tuple[PairState, ModelConf
         total_recovery_wins=snap.get("total_recovery_wins", 0.0),
         total_recovery_losses=snap.get("total_recovery_losses", 0),
         s2_entered_at=snap.get("s2_entered_at"),
+        s2_last_action_at=snap.get("s2_last_action_at"),
         last_reprice_a=snap.get("last_reprice_a", 0.0),
         last_reprice_b=snap.get("last_reprice_b", 0.0),
+        last_price_update_at=snap.get("last_price_update_at"),
         exit_reprice_count_a=snap.get("exit_reprice_count_a", 0),
         exit_reprice_count_b=snap.get("exit_reprice_count_b", 0),
         detected_trend=snap.get("detected_trend"),

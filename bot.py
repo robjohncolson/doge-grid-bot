@@ -54,7 +54,6 @@ import grid_strategy
 import ai_advisor
 import notifier
 import dashboard
-import factory_viz
 import stats_engine
 import telegram_menu
 import supabase_store
@@ -210,12 +209,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._handle_swarm_status()
         elif path == "/api/swarm/available":
             self._handle_swarm_available()
-        elif path == "/factory":
-            self._send_html(factory_viz.FACTORY_HTML)
-        elif path == "/api/factory/status":
-            self._handle_factory_status()
-        elif path == "/api/factory/stream":
-            self._handle_factory_sse()
         elif path == "/health":
             self._handle_health()
         else:
@@ -329,52 +322,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.wfile.write(f"data: {data}\n\n".encode("utf-8"))
                 self.wfile.flush()
                 time.sleep(3)
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
-            pass
-
-    def _handle_factory_status(self):
-        """GET /api/factory/status -- machine-level state for factory viz."""
-        if not _bot_states:
-            self._send_json({"error": "bot not initialized"}, 503)
-            return
-        self._send_json(factory_viz.serialize_factory_state(_bot_states, _current_prices))
-
-    def _handle_factory_sse(self):
-        """GET /api/factory/stream -- SSE with diffs (5s interval)."""
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-
-        prev_snapshot = None
-        try:
-            while True:
-                if not _bot_states:
-                    data = json.dumps({"error": "bot not initialized"})
-                    self.wfile.write(f"data: {data}\n\n".encode("utf-8"))
-                else:
-                    snapshot = factory_viz.serialize_factory_state(
-                        _bot_states, _current_prices
-                    )
-                    if prev_snapshot is None:
-                        # First tick: send full state
-                        self.wfile.write(
-                            f"event: full\ndata: {json.dumps(snapshot)}\n\n"
-                            .encode("utf-8")
-                        )
-                    else:
-                        # Subsequent ticks: send only changed machine states
-                        diff = factory_viz.compute_diff(prev_snapshot, snapshot)
-                        if diff:
-                            self.wfile.write(
-                                f"event: diff\ndata: {json.dumps(diff)}\n\n"
-                                .encode("utf-8")
-                            )
-                    prev_snapshot = snapshot
-                self.wfile.flush()
-                time.sleep(5)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
             pass
 
@@ -576,6 +523,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "paused": any_paused,
                 "seed_cost": round(agg_seed, 4),
                 "recovery_count": agg_recovery,
+                "capital_budget": round(primary_st.pair_config.capital_budget_usd, 2) if primary_st.pair_config else 0.0,
             })
 
         _compute_portfolio_value()  # refresh cached balances for per-pair asset values
@@ -1839,7 +1787,11 @@ def _rebalance_capital_budgets():
     Budget grows with accumulated profits so compounding isn't capped
     by the static STARTING_CAPITAL.  Each slot (including multi-slot pairs)
     counts as an individual capital consumer since each has its own orders.
+
+    Gated by CAPITAL_BUDGET_MODE: only runs when mode is "auto".
     """
+    if config.CAPITAL_BUDGET_MODE != "auto":
+        return
     n = len(_bot_states)  # Total slots (including XDGUSD#1, etc.)
     if n == 0:
         return
@@ -2371,11 +2323,13 @@ def run():
             base_pairs = list({_base_pair(k): k for k in _bot_states}.keys())
             try:
                 batch_prices = kraken_client.get_prices(base_pairs)
+                price_now = time.time()
                 for bp, price in batch_prices.items():
                     _current_prices[bp] = price
                     # Fan out to all slots of this base pair
                     for sk, st in _get_slots_for_pair(bp):
                         grid_strategy.record_price(st, price)
+                        st.last_price_update_at = price_now
                         st.consecutive_errors = 0
                     supabase_store.queue_price_point(time.time(), price, pair=bp)
                 _global_consecutive_errors = 0

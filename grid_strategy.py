@@ -317,12 +317,14 @@ class GridState:
 
         # Exit lifecycle: repricing + S2 break-glass + directional signal
         self.s2_entered_at = None            # Unix timestamp when S2 was entered
+        self.s2_last_action_at = None        # Last time break-glass fired (cooldown anchor)
         self.last_reprice_a = 0.0            # Timestamp of last Trade A exit reprice
         self.last_reprice_b = 0.0            # Timestamp of last Trade B exit reprice
         self.exit_reprice_count_a = 0        # Times Trade A exit repriced this cycle
         self.exit_reprice_count_b = 0        # Times Trade B exit repriced this cycle
         self.detected_trend = None           # "up", "down", or None
         self.trend_detected_at = None        # When trend was detected
+        self.last_price_update_at = None     # When price was last fetched from API
 
         # Long-only mode: auto-set when sell entry fails due to no inventory
         self.long_only = False
@@ -571,12 +573,14 @@ def restore_state_snapshot(state: GridState, snapshot: dict, source: str = "snap
 
     # Restore exit lifecycle state
     state.s2_entered_at = snapshot.get("s2_entered_at")
+    state.s2_last_action_at = snapshot.get("s2_last_action_at")
     state.last_reprice_a = snapshot.get("last_reprice_a", 0.0)
     state.last_reprice_b = snapshot.get("last_reprice_b", 0.0)
     state.exit_reprice_count_a = snapshot.get("exit_reprice_count_a", 0)
     state.exit_reprice_count_b = snapshot.get("exit_reprice_count_b", 0)
     state.detected_trend = snapshot.get("detected_trend")
     state.trend_detected_at = snapshot.get("trend_detected_at")
+    state.last_price_update_at = snapshot.get("last_price_update_at")
 
     # Restore long-only mode
     state.long_only = snapshot.get("long_only", False)
@@ -701,12 +705,14 @@ def save_state(state: GridState):
         "total_recovery_losses": state.total_recovery_losses,
         "total_recovery_wins": state.total_recovery_wins,
         "s2_entered_at": state.s2_entered_at,
+        "s2_last_action_at": state.s2_last_action_at,
         "last_reprice_a": state.last_reprice_a,
         "last_reprice_b": state.last_reprice_b,
         "exit_reprice_count_a": state.exit_reprice_count_a,
         "exit_reprice_count_b": state.exit_reprice_count_b,
         "detected_trend": state.detected_trend,
         "trend_detected_at": state.trend_detected_at,
+        "last_price_update_at": state.last_price_update_at,
         "long_only": state.long_only,
         "consecutive_losses_a": state.consecutive_losses_a,
         "consecutive_losses_b": state.consecutive_losses_b,
@@ -4439,6 +4445,16 @@ def check_s2_break_glass(state: GridState, current_price: float) -> bool:
 
     now = time.time()
 
+    # Stale price guard: skip decisions when price data is old
+    if state.last_price_update_at and (now - state.last_price_update_at) > config.POLL_INTERVAL_SECONDS * 3:
+        logger.debug("S2: skipping break-glass -- price stale (%.0fs old)",
+                      now - state.last_price_update_at)
+        return False
+
+    # Cooldown after last break-glass action
+    if state.s2_last_action_at and (now - state.s2_last_action_at) < config.S2_COOLDOWN_SEC:
+        return False
+
     # Record S2 entry time
     if state.s2_entered_at is None:
         state.s2_entered_at = now
@@ -4491,9 +4507,14 @@ def check_s2_break_glass(state: GridState, current_price: float) -> bool:
         worse_tid = getattr(worse, "trade_id", "A")
 
     # Phase 4: Opportunity cost check
+    # Guard: need a valid entry price to compute loss
+    entry_price = getattr(worse, "matched_buy_price", 0) or getattr(worse, "matched_sell_price", 0)
     ps = state.pair_stats
     do_close = False
-    if (ps and ps.mean_net and ps.mean_duration_sec
+    if not entry_price or entry_price <= 0:
+        logger.warning("S2 BREAK-GLASS: skipping opp cost -- no entry price for %s exit", worse.side)
+        # Fall through to Phase 5 (reprice) instead of making a bad decision
+    elif (ps and ps.mean_net and ps.mean_duration_sec
             and ps.mean_duration_sec > 0):
         profit_per_sec = ps.mean_net / ps.mean_duration_sec
         foregone = profit_per_sec * s2_age
@@ -4569,6 +4590,7 @@ def check_s2_break_glass(state: GridState, current_price: float) -> bool:
                         elif worse.side == "buy" and new_o:
                             new_spread = (sell_exit.price - new_price) / current_price * 100
                         if new_spread < config.S2_MAX_SPREAD_PCT:
+                            state.s2_last_action_at = now
                             return True  # Spread resolved via reprice
                         # Spread still too wide -- fall through to close
                         do_close = True
@@ -4587,6 +4609,7 @@ def check_s2_break_glass(state: GridState, current_price: float) -> bool:
         _orphan_exit(state, worse, current_price, reason="s2_break")
     state.pair_state = _compute_pair_state(state)
     state.s2_entered_at = None  # No longer in S2
+    state.s2_last_action_at = now
     return True
 
 
