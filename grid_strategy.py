@@ -2108,8 +2108,20 @@ def build_pair(state: GridState, current_price: float) -> list:
                 side.upper(), tid, cyc, volume, price, volume * price, txid,
             )
         except Exception as e:
-            logger.error("Failed to place pair %s entry [%s.%d]: %s",
-                         side, tid, cyc, e)
+            err_msg = str(e).lower()
+            if side == "sell" and "insufficient" in err_msg:
+                # Attempt seed buy before falling back to long-only
+                seed = _attempt_seed_buy(state, price, volume, tid, cyc)
+                if seed is not None:
+                    placed.append(seed)
+                    continue
+                logger.info(
+                    "Sell entry [%s.%d] failed (no inventory) -- long-only: %s",
+                    tid, cyc, e)
+                state.long_only = True
+            else:
+                logger.error("Failed to place pair %s entry [%s.%d]: %s",
+                             side, tid, cyc, e)
             order.status = "failed"
 
         if not config.DRY_RUN:
