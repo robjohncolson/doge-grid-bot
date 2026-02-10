@@ -502,16 +502,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "seed_cost": round(st.seed_cost_usd, 4),
             })
 
-        portfolio = _compute_portfolio_value()
+        _compute_portfolio_value()  # refresh cached balances for per-pair asset values
+        total_seed = sum(st.seed_cost_usd for st in _bot_states.values())
+        total_trade_pnl = sum(st.total_profit_usd for st in _bot_states.values())
+        bot_net_pnl = round(total_trade_pnl - total_seed, 4)
         agg = {
             "active_pairs": len(_bot_states),
             "today_profit": round(sum(st.today_profit_usd for st in _bot_states.values()), 4),
-            "total_profit": round(sum(st.total_profit_usd for st in _bot_states.values()), 4),
+            "total_profit": round(total_trade_pnl, 4),
             "trips_today": sum(st.round_trips_today for st in _bot_states.values()),
             "total_trips": sum(st.total_round_trips for st in _bot_states.values()),
-            "portfolio_value": portfolio,
-            "account_pnl": round(portfolio - config.STARTING_CAPITAL, 2) if portfolio else None,
-            "starting_capital": config.STARTING_CAPITAL,
+            "bot_net_pnl": bot_net_pnl,
+            "total_seed_cost": round(total_seed, 4),
         }
 
         # Add per-pair asset balance value (reuse cached balances)

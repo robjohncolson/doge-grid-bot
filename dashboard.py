@@ -520,8 +520,7 @@ a{color:#58a6ff}
     <div class="card"><div class="label">Total P&amp;L</div><div class="value" id="sw-total">--</div></div>
     <div class="card"><div class="label">Trips Today</div><div class="value" id="sw-trips">--</div></div>
     <div class="card"><div class="label">Total Trips</div><div class="value" id="sw-total-trips">--</div></div>
-    <div class="card"><div class="label">Account P&amp;L</div><div class="value" id="sw-account-pnl">--</div></div>
-    <div class="card"><div class="label">Portfolio</div><div class="value" id="sw-portfolio">--</div></div>
+    <div class="card"><div class="label">Bot P&amp;L</div><div class="value" id="sw-bot-pnl">--</div></div>
   </div>
   <div style="overflow-x:auto">
     <table class="swarm-table">
@@ -2028,14 +2027,10 @@ function renderSwarm(data) {
   totalEl.style.color = agg.total_profit >= 0 ? '#3fb950' : '#f85149';
   document.getElementById('sw-trips').textContent = agg.trips_today;
   document.getElementById('sw-total-trips').textContent = agg.total_trips;
-  const acctEl = document.getElementById('sw-account-pnl');
-  if (agg.account_pnl != null) {
-    acctEl.textContent = fmtUSD(agg.account_pnl);
-    acctEl.style.color = agg.account_pnl >= 0 ? '#3fb950' : '#f85149';
-  }
-  const portEl = document.getElementById('sw-portfolio');
-  if (agg.portfolio_value != null) {
-    portEl.textContent = '$' + agg.portfolio_value.toFixed(2);
+  const botPnlEl = document.getElementById('sw-bot-pnl');
+  if (agg.bot_net_pnl != null) {
+    botPnlEl.textContent = fmtUSD(agg.bot_net_pnl);
+    botPnlEl.style.color = agg.bot_net_pnl >= 0 ? '#3fb950' : '#f85149';
   }
 
   const tbody = document.getElementById('swarm-body');
