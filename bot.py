@@ -1809,7 +1809,7 @@ def run():
                 n = grid_strategy.reprice_thin_exits(state, cp)
                 if n:
                     logger.info("[%s] Repriced %d thin exits to %.2f%% floor",
-                                pair_name, n, state.profit_pct)
+                                pair_name, n, config.VOLATILITY_PROFIT_FLOOR)
                     grid_strategy.save_state(state)
         except Exception as e:
             logger.warning("[%s] Exit reprice failed: %s", pair_name, e)

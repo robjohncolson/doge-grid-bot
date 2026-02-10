@@ -2664,8 +2664,12 @@ def reprice_thin_exits(state: GridState, current_price: float) -> int:
                 continue
             o.status = "cancelled"
 
-        # Place new exit at the correct (wider) price
+        # Place new exit at the correct (wider) price.
+        # Temporarily set profit_pct to the floor so _pair_exit_price uses it.
+        saved_profit_pct = state.profit_pct
+        state.profit_pct = floor_pct
         new_price = _pair_exit_price(entry_price, current_price, o.side, state)
+        state.profit_pct = saved_profit_pct
 
         new_o = _place_pair_order(
             state, o.side, new_price, "exit",
