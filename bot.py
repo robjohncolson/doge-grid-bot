@@ -1801,6 +1801,7 @@ def run():
         grid_strategy.check_daily_reset(state)
 
     # --- Phase 4: Main loop ---
+    _rebalance_capital_budgets()  # set per-pair budgets on startup
     logger.info("Entering main loop (poll every %ds, %d pair(s))...",
                 config.POLL_INTERVAL_SECONDS, len(_bot_states))
     last_daily_summary_date = ""
