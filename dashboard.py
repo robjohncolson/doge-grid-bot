@@ -520,11 +520,13 @@ a{color:#58a6ff}
     <div class="card"><div class="label">Total P&amp;L</div><div class="value" id="sw-total">--</div></div>
     <div class="card"><div class="label">Trips Today</div><div class="value" id="sw-trips">--</div></div>
     <div class="card"><div class="label">Total Trips</div><div class="value" id="sw-total-trips">--</div></div>
+    <div class="card"><div class="label">Account P&amp;L</div><div class="value" id="sw-account-pnl">--</div></div>
+    <div class="card"><div class="label">Portfolio</div><div class="value" id="sw-portfolio">--</div></div>
   </div>
   <div style="overflow-x:auto">
     <table class="swarm-table">
       <thead><tr>
-        <th>Pair</th><th>Price</th><th>State</th><th>Today</th><th>Total</th><th>Trips</th><th>Entry%</th><th>Multi</th><th></th>
+        <th>Pair</th><th>Price</th><th>State</th><th>Today</th><th>Total</th><th>Value</th><th>Trips</th><th>Entry%</th><th>Multi</th><th></th>
       </tr></thead>
       <tbody id="swarm-body"></tbody>
     </table>
@@ -2026,6 +2028,15 @@ function renderSwarm(data) {
   totalEl.style.color = agg.total_profit >= 0 ? '#3fb950' : '#f85149';
   document.getElementById('sw-trips').textContent = agg.trips_today;
   document.getElementById('sw-total-trips').textContent = agg.total_trips;
+  const acctEl = document.getElementById('sw-account-pnl');
+  if (agg.account_pnl != null) {
+    acctEl.textContent = fmtUSD(agg.account_pnl);
+    acctEl.style.color = agg.account_pnl >= 0 ? '#3fb950' : '#f85149';
+  }
+  const portEl = document.getElementById('sw-portfolio');
+  if (agg.portfolio_value != null) {
+    portEl.textContent = '$' + agg.portfolio_value.toFixed(2);
+  }
 
   const tbody = document.getElementById('swarm-body');
   let rows = '';
@@ -2041,6 +2052,7 @@ function renderSwarm(data) {
     rows += '<td>' + p.pair_state + (p.long_only ? ' <span style="background:#9e6a03;color:#e3b341;font-size:10px;padding:1px 4px;border-radius:3px;font-weight:600">L</span>' : '') + '</td>';
     rows += '<td class="' + pnlCls + '">' + fmtUSD(p.today_pnl) + '</td>';
     rows += '<td class="' + totCls + '">' + fmtUSD(p.total_pnl) + '</td>';
+    rows += '<td>' + (p.asset_value != null ? '$' + p.asset_value.toFixed(2) : '--') + '</td>';
     rows += '<td>' + p.trips_today + '/' + p.total_trips + '</td>';
     rows += '<td>' + fmt(p.entry_pct, 2) + '%</td>';
     rows += '<td><select onclick="event.stopPropagation()" onchange="setMultiplier(\'' + p.pair + '\',this.value);event.stopPropagation()">'
@@ -2052,7 +2064,7 @@ function renderSwarm(data) {
     rows += '<td><button class="btn-remove" onclick="removePair(\'' + p.pair + '\');event.stopPropagation()">X</button></td>';
     rows += '</tr>';
   }
-  tbody.innerHTML = rows || '<tr><td colspan="9" style="text-align:center;color:#8b949e">No pairs active</td></tr>';
+  tbody.innerHTML = rows || '<tr><td colspan="10" style="text-align:center;color:#8b949e">No pairs active</td></tr>';
 }
 
 async function pollSwarm() {

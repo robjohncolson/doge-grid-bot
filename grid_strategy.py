@@ -326,6 +326,9 @@ class GridState:
         # Rebalance cooldown: prevent rapid S1 rebalances
         self.last_s1_rebalance = 0.0
 
+        # Seed buy cost tracking: total USD spent on market-buy seed purchases
+        self.seed_cost_usd = 0.0
+
     # -- Per-pair property accessors (fall back to global config) --
 
     @property
@@ -547,6 +550,7 @@ def save_state(state: GridState):
         "consecutive_losses_b": state.consecutive_losses_b,
         "last_volatility_adjust": state.last_volatility_adjust,
         "last_s1_rebalance": state.last_s1_rebalance,
+        "seed_cost_usd": state.seed_cost_usd,
     }
     state_path = _state_file_path(state)
     tmp_path = state_path + ".tmp"
@@ -646,6 +650,7 @@ def load_state(state: GridState) -> bool:
     state.consecutive_losses_b = snapshot.get("consecutive_losses_b", 0)
     state.last_volatility_adjust = snapshot.get("last_volatility_adjust", 0.0)
     state.last_s1_rebalance = snapshot.get("last_s1_rebalance", 0.0)
+    state.seed_cost_usd = snapshot.get("seed_cost_usd", 0.0)
     if state.consecutive_losses_a or state.consecutive_losses_b:
         logger.info(
             "Restoring backoff counters: A=%d, B=%d",
@@ -2344,8 +2349,11 @@ def _attempt_seed_buy(state, sell_entry_price, volume, trade_id, cycle):
         seed_txid = kraken_client.place_order(
             side="buy", volume=buy_volume, price=sell_entry_price,
             pair=pair, ordertype="market")
+        seed_cost = sell_entry_price * buy_volume
+        state.seed_cost_usd += seed_cost
         logger.info(
-            "SEED BUY [%s]: market buy %.4f -> %s", display, buy_volume, seed_txid)
+            "SEED BUY [%s]: market buy %.4f -> %s (cost $%.4f, total seed costs: $%.4f)",
+            display, buy_volume, seed_txid, seed_cost, state.seed_cost_usd)
     except Exception as e:
         logger.warning("SEED BUY [%s]: market buy failed: %s", display, e)
         return None

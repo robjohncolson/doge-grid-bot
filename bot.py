@@ -499,15 +499,37 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "multiplier": st.next_entry_multiplier,
                 "long_only": st.long_only,
                 "paused": st.is_paused,
+                "seed_cost": round(st.seed_cost_usd, 4),
             })
 
+        portfolio = _compute_portfolio_value()
         agg = {
             "active_pairs": len(_bot_states),
             "today_profit": round(sum(st.today_profit_usd for st in _bot_states.values()), 4),
             "total_profit": round(sum(st.total_profit_usd for st in _bot_states.values()), 4),
             "trips_today": sum(st.round_trips_today for st in _bot_states.values()),
             "total_trips": sum(st.total_round_trips for st in _bot_states.values()),
+            "portfolio_value": portfolio,
+            "account_pnl": round(portfolio - config.STARTING_CAPITAL, 2) if portfolio else None,
+            "starting_capital": config.STARTING_CAPITAL,
         }
+
+        # Add per-pair asset balance value (reuse cached balances)
+        balances = _portfolio_balances
+        if balances:
+            for item in pairs_list:
+                st = _bot_states.get(item["pair"])
+                if st and st.pair_config and st.pair_config.filter_strings:
+                    asset_val = 0.0
+                    for fs in st.pair_config.filter_strings:
+                        for key in [fs, "X" + fs]:
+                            if key in balances:
+                                asset_val = float(balances[key]) * item["price"]
+                                break
+                        if asset_val > 0:
+                            break
+                    item["asset_value"] = round(asset_val, 4)
+
         self._send_json({"aggregate": agg, "pairs": pairs_list})
 
     def _handle_swarm_available(self):
@@ -1477,6 +1499,54 @@ def _load_active_pairs() -> list:
             return data
 
     return []
+
+
+# ---------------------------------------------------------------------------
+# Portfolio value (balance-based P&L)
+# ---------------------------------------------------------------------------
+
+_portfolio_cache: tuple = (0.0, None)   # (timestamp, value)
+_portfolio_balances: dict | None = None  # raw balances from last fetch
+
+def _compute_portfolio_value() -> float | None:
+    """Compute total portfolio value from actual Kraken balances + current prices.
+
+    Caches the result for 30 seconds to avoid hammering the private API.
+    Also stores raw balances in _portfolio_balances for per-pair asset lookups.
+    """
+    global _portfolio_cache, _portfolio_balances
+    now = time.time()
+    if _portfolio_cache[1] is not None and now - _portfolio_cache[0] < 30:
+        return _portfolio_cache[1]
+
+    try:
+        balances = kraken_client.get_balance()
+    except Exception:
+        return _portfolio_cache[1]  # return stale value on error
+
+    _portfolio_balances = balances
+    total = 0.0
+    for asset, amount_str in balances.items():
+        amount = float(amount_str)
+        if amount < 0.0001:
+            continue
+        if asset in ("ZUSD", "USD"):
+            total += amount
+            continue
+        # Match asset to an active trading pair to get its price
+        for pn, st in _bot_states.items():
+            if not st.pair_config:
+                continue
+            fs = st.pair_config.filter_strings or []
+            if asset in fs or any(asset == "X" + f or asset == f.lstrip("X") for f in fs):
+                price = _current_prices.get(pn, 0)
+                if price > 0:
+                    total += amount * price
+                break
+
+    total = round(total, 2)
+    _portfolio_cache = (now, total)
+    return total
 
 
 # ---------------------------------------------------------------------------
