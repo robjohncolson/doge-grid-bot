@@ -585,10 +585,7 @@ def save_state(state: GridState):
     try:
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(snapshot, f, indent=2)
-        # Atomic rename (works on Windows if dest doesn't exist, so remove first)
-        if os.path.exists(state_path):
-            os.remove(state_path)
-        os.rename(tmp_path, state_path)
+        os.replace(tmp_path, state_path)  # Atomic on both Windows and POSIX
         logger.debug("State saved to %s", state_path)
     except Exception as e:
         logger.error("Failed to save state: %s", e)
@@ -1424,28 +1421,32 @@ def check_fills_live(state: GridState, current_price: float = 0.0) -> list:
                 order.volume = vol_exec
             order.status = "filled"
             filled.append(order)
+            vd = max(state.volume_decimals, 2)
             logger.info(
-                "FILLED: %s %.2f DOGE @ $%.6f (L%+d) [vol_exec=%.2f]",
-                order.side.upper(), order.volume, order.price,
-                order.level, vol_exec,
+                "FILLED: %s %.*f %s @ $%.6f (L%+d) [vol_exec=%.*f]",
+                order.side.upper(), vd, order.volume, state.base_display,
+                order.price, order.level, vd, vol_exec,
             )
 
         elif status in ("canceled", "expired"):
             # Kraken canceled or expired this order -- mark it so we can replace
             order.status = "cancelled"
             logger.warning(
-                "ORDER %s: %s L%+d %.2f DOGE @ $%.6f -- will replace",
+                "ORDER %s: %s L%+d %.*f %s @ $%.6f -- will replace",
                 status.upper(), order.side.upper(), order.level,
-                order.volume, order.price,
+                max(state.volume_decimals, 2), order.volume,
+                state.base_display, order.price,
             )
 
         elif status == "open":
             # Check for partial fill (still open but some volume executed)
             vol_exec = float(info.get("vol_exec", 0))
             if vol_exec > 0 and not getattr(order, '_partial_warned', False):
+                vd = max(state.volume_decimals, 2)
                 logger.warning(
-                    "PARTIAL FILL: %s L%+d %.2f/%.2f DOGE @ $%.6f -- waiting for full fill",
-                    order.side.upper(), order.level, vol_exec, order.volume, order.price,
+                    "PARTIAL FILL: %s L%+d %.*f/%.*f %s @ $%.6f -- waiting for full fill",
+                    order.side.upper(), order.level, vd, vol_exec,
+                    vd, order.volume, state.base_display, order.price,
                 )
                 order._partial_warned = True
 
@@ -1534,17 +1535,21 @@ def check_fills_dry_run(state: GridState, current_price: float) -> list:
         if order.side == "buy" and current_price <= order.price:
             order.status = "filled"
             filled.append(order)
+            vd = max(state.volume_decimals, 2)
             logger.info(
-                "[DRY RUN] FILLED: BUY %.2f DOGE @ $%.6f (L%+d) -- price=$%.6f",
-                order.volume, order.price, order.level, current_price,
+                "[DRY RUN] FILLED: BUY %.*f %s @ $%.6f (L%+d) -- price=$%.6f",
+                vd, order.volume, state.base_display,
+                order.price, order.level, current_price,
             )
 
         elif order.side == "sell" and current_price >= order.price:
             order.status = "filled"
             filled.append(order)
+            vd = max(state.volume_decimals, 2)
             logger.info(
-                "[DRY RUN] FILLED: SELL %.2f DOGE @ $%.6f (L%+d) -- price=$%.6f",
-                order.volume, order.price, order.level, current_price,
+                "[DRY RUN] FILLED: SELL %.*f %s @ $%.6f (L%+d) -- price=$%.6f",
+                vd, order.volume, state.base_display,
+                order.price, order.level, current_price,
             )
 
     return filled
@@ -2420,7 +2425,8 @@ def _attempt_seed_buy(state, sell_entry_price, volume, trade_id, cycle):
 
 
 def _place_pair_order(state, side, price, role, matched_buy=None,
-                      matched_sell=None, trade_id=None, cycle=None):
+                      matched_sell=None, trade_id=None, cycle=None,
+                      skip_budget_check=False):
     """
     Place a single pair order and add it to state.grid_orders.
     Returns the GridOrder on success, None on failure.
@@ -2464,8 +2470,9 @@ def _place_pair_order(state, side, price, role, matched_buy=None,
         order.cycle = cycle
 
     # Capital budget check (entries only -- exits MUST be placed to close exposure)
+    # skip_budget_check: True for capital-neutral replacement entries after exit fills
     budget = state.capital_budget_usd
-    if budget > 0 and role == "entry":
+    if budget > 0 and role == "entry" and not skip_budget_check:
         order_cost = price * volume
         deployed = get_capital_deployed(state, price)
         if deployed + order_cost > budget:
@@ -3056,7 +3063,8 @@ def handle_pair_fill(state: GridState, filled_orders: list,
             buy_entry_price = round(
                 current_price * (1 - b_entry / 100.0), decimals)
             o = _place_pair_order(state, "buy", buy_entry_price, "entry",
-                                  trade_id=tid, cycle=new_cyc)
+                                  trade_id=tid, cycle=new_cyc,
+                                  skip_budget_check=True)
             if o:
                 new_orders.append(o)
 
@@ -3206,7 +3214,8 @@ def handle_pair_fill(state: GridState, filled_orders: list,
                 sell_entry_price = round(
                     current_price * (1 + a_entry / 100.0), decimals)
                 o = _place_pair_order(state, "sell", sell_entry_price, "entry",
-                                      trade_id=tid, cycle=new_cyc)
+                                      trade_id=tid, cycle=new_cyc,
+                                      skip_budget_check=True)
                 if o:
                     new_orders.append(o)
 
@@ -4275,7 +4284,11 @@ def check_stale_exits(state: GridState, current_price: float) -> bool:
 
     thresholds = compute_exit_thresholds(state.pair_stats)
     if thresholds is None:
-        return False
+        # Fallback for new pairs without enough cycle history
+        thresholds = {
+            "reprice_after": config.RECOVERY_FALLBACK_TIMEOUT_SEC,
+            "orphan_after": config.RECOVERY_FALLBACK_TIMEOUT_SEC * 2,
+        }
 
     now = time.time()
     changed = False
@@ -4435,7 +4448,9 @@ def check_s2_break_glass(state: GridState, current_price: float) -> bool:
     # Phase 2: Evaluate spread
     spread_pct = (sell_exit.price - buy_exit.price) / current_price * 100
     if spread_pct < config.S2_MAX_SPREAD_PCT:
-        return False  # Spread tolerable
+        # Spread tolerable -- reset timer so it measures continuous bad-spread duration
+        state.s2_entered_at = now
+        return False
 
     # Phase 3: Identify worse trade (further from market)
     a_dist = abs(buy_exit.price - current_price) / current_price

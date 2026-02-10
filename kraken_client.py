@@ -62,6 +62,7 @@ class _RateLimiter:
 
     def __init__(self, max_budget: int = 15, decay_rate: float = 1.0):
         self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
         self._max_budget = max_budget
         self._decay_rate = decay_rate
         self._budget = float(max_budget)
@@ -82,36 +83,26 @@ class _RateLimiter:
         """Consume rate-limit units. Allows overdraft down to -2 (like the
         old code) so startup bursts aren't blocked for minutes.  Only truly
         blocks when the circuit breaker is open or budget is deeply negative."""
-        with self._lock:
+        with self._cond:
             # Circuit breaker: hard block until it clears
             now = time.time()
             if self._circuit_open_until > now:
                 wait = self._circuit_open_until - now
                 logger.warning("Circuit breaker open, waiting %.1fs", wait)
-                # Release lock while sleeping
-                self._lock.release()
-                try:
-                    time.sleep(wait)
-                finally:
-                    self._lock.acquire()
+                self._cond.wait(timeout=wait)
                 self._decay()
 
             self._decay()
 
-            # Soft throttle: if budget is very low, sleep briefly (like old 2s pause)
+            # Soft throttle: if budget is very low, wait briefly (like old 2s pause)
             if self._budget <= 1:
-                sleep_time = 2.0
-                logger.warning("Rate limit nearly exhausted (%.1f/%d), sleeping %.1fs",
-                               self._budget, self._max_budget, sleep_time)
-                self._lock.release()
-                try:
-                    time.sleep(sleep_time)
-                finally:
-                    self._lock.acquire()
+                logger.warning("Rate limit nearly exhausted (%.1f/%d), waiting 2s",
+                               self._budget, self._max_budget)
+                self._cond.wait(timeout=2.0)
                 self._decay()
 
-            # Always deduct (can go negative -- matches old behavior)
-            self._budget -= units
+            # Always deduct (can go negative -- floor at -2 to bound overdraft)
+            self._budget = max(-2.0, self._budget - units)
 
     def report_rate_error(self):
         """Called after a Kraken rate-limit or lockout error."""
@@ -400,6 +391,7 @@ def get_tickers(pairs: list) -> dict:
         return {}
 
     result = {}
+    failed_pairs = []
     # Chunk into groups of 30
     for i in range(0, len(pairs), 30):
         chunk = pairs[i:i + 30]
@@ -409,7 +401,34 @@ def get_tickers(pairs: list) -> dict:
             result.update(chunk_result)
         except Exception as e:
             logger.error("Batch ticker failed for chunk %d: %s", i // 30, e)
+            failed_pairs.extend(chunk)
+    if failed_pairs:
+        logger.warning("get_tickers: %d/%d pairs failed: %s",
+                       len(failed_pairs), len(pairs), failed_pairs[:10])
     return result
+
+
+def _normalize_pair(pair: str) -> str:
+    """Strip Kraken's X/Z prefixes for normalized comparison.
+
+    Kraken prepends X to crypto and Z to fiat in some response keys:
+    e.g. XXDGZUSD for XDG/USD, XETHZUSD for ETH/USD.
+    We strip a leading X from the base and leading Z from the quote
+    to get a canonical form for matching.
+    """
+    p = pair.upper()
+    # Known fiat suffixes (Kraken prepends Z)
+    for fiat in ("ZUSD", "ZEUR", "ZGBP", "ZJPY", "ZCAD", "ZAUD"):
+        if p.endswith(fiat):
+            base = p[:-len(fiat)]
+            quote = fiat[1:]  # strip Z
+            if base.startswith("X") and len(base) > 1:
+                base = base[1:]  # strip X prefix from crypto
+            return base + quote
+    # No known fiat suffix -- just strip leading X if present
+    if p.startswith("X") and len(p) > 3:
+        p = p[1:]
+    return p
 
 
 def get_prices(pairs: list) -> dict:
@@ -418,7 +437,7 @@ def get_prices(pairs: list) -> dict:
     Returns {input_pair_name: mid_price} for all pairs that returned data.
 
     Handles Kraken's key aliasing (e.g. input "XDGUSD" -> response "XXDGZUSD")
-    by checking substring containment in both directions.
+    by normalizing both sides and doing exact match on the normalized form.
     """
     if not pairs:
         return {}
@@ -427,26 +446,27 @@ def get_prices(pairs: list) -> dict:
     if not raw:
         return {}
 
-    # Build reverse lookup: map response keys back to input pair names
+    # Build normalized lookup: norm_key -> (resp_key, ticker)
+    norm_to_resp = {}
+    for resp_key, ticker in raw.items():
+        nk = _normalize_pair(resp_key)
+        norm_to_resp[nk] = (resp_key, ticker)
+
     prices = {}
     for input_pair in pairs:
-        inp = input_pair.upper()
-        matched = False
-        for resp_key, ticker in raw.items():
-            rk = resp_key.upper()
-            # Check substring match both directions
-            if inp in rk or rk in inp or inp == rk:
-                try:
-                    bid = float(ticker["b"][0])
-                    ask = float(ticker["a"][0])
-                    prices[input_pair] = (bid + ask) / 2.0
-                except (KeyError, IndexError, ValueError, TypeError):
-                    logger.warning("Bad ticker data for %s: %s", input_pair, ticker)
-                matched = True
-                break
-        if not matched:
-            logger.debug("No ticker match for %s in response keys: %s",
-                         input_pair, list(raw.keys()))
+        ni = _normalize_pair(input_pair)
+        entry = norm_to_resp.get(ni)
+        if entry:
+            resp_key, ticker = entry
+            try:
+                bid = float(ticker["b"][0])
+                ask = float(ticker["a"][0])
+                prices[input_pair] = (bid + ask) / 2.0
+            except (KeyError, IndexError, ValueError, TypeError):
+                logger.warning("Bad ticker data for %s: %s", input_pair, ticker)
+        else:
+            logger.debug("No ticker match for %s (normalized: %s) in response keys: %s",
+                         input_pair, ni, list(raw.keys()))
 
     return prices
 
@@ -603,6 +623,7 @@ def query_orders_batched(txids: list, batch_size: int = 50) -> dict:
         return {}
 
     result = {}
+    failed_txids = []
     for i in range(0, len(txids), batch_size):
         chunk = txids[i:i + batch_size]
         try:
@@ -610,6 +631,10 @@ def query_orders_batched(txids: list, batch_size: int = 50) -> dict:
             result.update(chunk_result)
         except Exception as e:
             logger.error("Batch query_orders failed for chunk %d: %s", i // batch_size, e)
+            failed_txids.extend(chunk)
+    if failed_txids:
+        logger.warning("query_orders_batched: %d/%d txids failed: %s",
+                       len(failed_txids), len(txids), failed_txids[:10])
     return result
 
 

@@ -40,6 +40,7 @@ import logging
 import threading
 import json
 import os
+import queue
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
@@ -132,10 +133,10 @@ _ohlc_caches: dict = {}       # pair_name -> list
 _ohlc_last_fetches: dict = {} # pair_name -> float
 
 
-# Swarm management queues (thread-safe via CPython GIL atomic assignment)
-_swarm_pending_adds: list = []      # list of config.PairConfig
-_swarm_pending_removes: list = []   # list of pair_name strings
-_swarm_pending_multipliers: list = []  # list of (pair_name, multiplier) tuples
+# Swarm management queues (thread-safe via queue.Queue)
+_swarm_pending_adds: queue.Queue = queue.Queue()
+_swarm_pending_removes: queue.Queue = queue.Queue()
+_swarm_pending_multipliers: queue.Queue = queue.Queue()
 
 # Free-orphans dedup lock -- prevents concurrent soft/hard free operations
 _free_orphans_in_progress = False
@@ -645,7 +646,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _handle_swarm_add(self):
         """POST /api/swarm/add -- queue a pair for addition."""
-        global _swarm_pending_adds
         try:
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length > 0 else {}
@@ -670,12 +670,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
 
         pc = pair_scanner.auto_configure(info)
-        _swarm_pending_adds = _swarm_pending_adds + [pc]
+        _swarm_pending_adds.put(pc)
         self._send_json({"ok": True, "pair": pair_name, "display": pc.display})
 
     def _handle_swarm_remove(self):
         """POST /api/swarm/remove -- queue a pair for removal."""
-        global _swarm_pending_removes
         try:
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length > 0 else {}
@@ -693,7 +692,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json({"error": f"{bp} not active"}, 400)
             return
 
-        _swarm_pending_removes = _swarm_pending_removes + [bp]
+        _swarm_pending_removes.put(bp)
         self._send_json({"ok": True, "pair": bp})
 
     def _handle_swarm_multiplier(self):
@@ -702,7 +701,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
         The multiplier value (1-5) now means the number of independent
         A/B trade slots to run concurrently on this pair.
         """
-        global _swarm_pending_multipliers
         try:
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length > 0 else {}
@@ -730,7 +728,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json({"error": f"{bp} not active"}, 400)
             return
 
-        _swarm_pending_multipliers = _swarm_pending_multipliers + [(bp, mult)]
+        _swarm_pending_multipliers.put((bp, mult))
         self._send_json({"ok": True, "pair": bp, "slot_count": mult})
 
     def _handle_swarm_free_orphans(self):
@@ -1710,9 +1708,7 @@ def _save_active_pairs():
         tmp_path = ACTIVE_PAIRS_FILE + ".tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(pairs_data, f, indent=2)
-        if os.path.exists(ACTIVE_PAIRS_FILE):
-            os.remove(ACTIVE_PAIRS_FILE)
-        os.rename(tmp_path, ACTIVE_PAIRS_FILE)
+        os.replace(tmp_path, ACTIVE_PAIRS_FILE)  # Atomic on both Windows and POSIX
         logger.debug("Saved %d active pairs to %s", len(pairs_data), ACTIVE_PAIRS_FILE)
     except Exception as e:
         logger.error("Failed to save active pairs: %s", e)
@@ -1991,15 +1987,25 @@ def _get_claimed_txids(base_pair: str) -> set:
 
 def _process_swarm_queue():
     """Process pending swarm add/remove/multiplier requests (called from main loop)."""
-    global _swarm_pending_adds, _swarm_pending_removes, _swarm_pending_multipliers
-
-    # Snapshot and clear queues atomically
-    adds = _swarm_pending_adds
-    removes = _swarm_pending_removes
-    mults = _swarm_pending_multipliers
-    _swarm_pending_adds = []
-    _swarm_pending_removes = []
-    _swarm_pending_multipliers = []
+    # Drain queues (thread-safe)
+    adds = []
+    while not _swarm_pending_adds.empty():
+        try:
+            adds.append(_swarm_pending_adds.get_nowait())
+        except queue.Empty:
+            break
+    removes = []
+    while not _swarm_pending_removes.empty():
+        try:
+            removes.append(_swarm_pending_removes.get_nowait())
+        except queue.Empty:
+            break
+    mults = []
+    while not _swarm_pending_multipliers.empty():
+        try:
+            mults.append(_swarm_pending_multipliers.get_nowait())
+        except queue.Empty:
+            break
 
     for pc in adds:
         try:
@@ -2416,6 +2422,7 @@ def run():
             # ============================================================
             _slots_to_remove = []  # Collect completed wind-downs for post-loop removal
             for pair_name, state in list(_bot_states.items()):
+              try:
                 current_price = _get_price(pair_name)
                 if current_price <= 0:
                     continue  # No price data this cycle
@@ -2538,19 +2545,24 @@ def run():
                     # S1 rebalance: orphan stranded exit to restore S0 balance
                     if grid_strategy.check_s1_rebalance(state, current_price):
                         lifecycle_changed = True
-                    # Check for surprise fills on recovery orders
-                    cached_info = getattr(state, "_cached_order_info", None) or {}
-                    if grid_strategy.check_recovery_fills(state, cached_info):
-                        lifecycle_changed = True
-                    # S1a/S1b: reprice stale exits (Section 12.2)
-                    if grid_strategy.check_stale_exits(state, current_price):
-                        lifecycle_changed = True
-                    # S2: break-glass protocol (Section 12.3)
-                    if grid_strategy.check_s2_break_glass(state, current_price):
-                        lifecycle_changed = True
-                    # Fallback: orphan exits past orphan threshold
-                    if grid_strategy.check_recovery_timeout(state, current_price):
-                        lifecycle_changed = True
+                    # Order-status-dependent checks: skip when batch query failed (stale data)
+                    if batch_query_ok:
+                        # Check for surprise fills on recovery orders
+                        cached_info = getattr(state, "_cached_order_info", None) or {}
+                        if grid_strategy.check_recovery_fills(state, cached_info):
+                            lifecycle_changed = True
+                        # S1a/S1b: reprice stale exits (Section 12.2)
+                        if grid_strategy.check_stale_exits(state, current_price):
+                            lifecycle_changed = True
+                        # S2: break-glass protocol (Section 12.3)
+                        if grid_strategy.check_s2_break_glass(state, current_price):
+                            lifecycle_changed = True
+                        # Fallback: orphan exits past orphan threshold
+                        if grid_strategy.check_recovery_timeout(state, current_price):
+                            lifecycle_changed = True
+                    else:
+                        logger.debug("[%s] Skipping order-dependent lifecycle checks (stale data)",
+                                     pair_name)
                     if lifecycle_changed:
                         grid_strategy.save_state(state)
 
@@ -2567,6 +2579,16 @@ def run():
 
                     notifier.notify_grid_reset(old_center, current_price, drift_pct, pair_display=state.pair_display)
                     notifier.notify_grid_built(current_price, len(orders), pair_display=state.pair_display)
+
+              except Exception as pair_err:
+                state.consecutive_errors += 1
+                logger.error("[%s] Per-pair error (%d consecutive): %s",
+                             pair_name, state.consecutive_errors, pair_err, exc_info=True)
+                if state.consecutive_errors >= config.MAX_CONSECUTIVE_ERRORS:
+                    state.is_paused = True
+                    state.pause_reason = f"Too many errors: {pair_err}"
+                    logger.warning("[%s] Auto-paused after %d consecutive errors",
+                                   pair_name, state.consecutive_errors)
 
             # End per-pair loop
 
@@ -2803,6 +2825,9 @@ def run():
 
             # --- 4i: Sleep until next poll ---
             elapsed = time.time() - loop_start
+            if elapsed > config.POLL_INTERVAL_SECONDS:
+                logger.warning("Cycle overrun: %.1fs elapsed (target %ds)",
+                               elapsed, config.POLL_INTERVAL_SECONDS)
             sleep_time = max(0, config.POLL_INTERVAL_SECONDS - elapsed)
             if sleep_time > 0:
                 time.sleep(sleep_time)

@@ -99,6 +99,8 @@ def compute_score(pi: "PairInfo") -> float:
         Spread (30%):  how much room between spread and min profit target
         Range  (40%):  volatility sweet spot 0.5%-3.0%
     """
+    if math.isnan(pi.volume_24h) or math.isnan(pi.spread_pct) or math.isnan(pi.volatility_pct):
+        return 0.0
     # Volume score: log-scaled, 0-100
     vol_score = min(100, math.log10(max(pi.volume_24h, 1)) / 7 * 100)
 

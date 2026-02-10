@@ -399,6 +399,14 @@ class PairConfig:
         self.capital_budget_usd = capital_budget_usd  # 0 = unlimited (backward compat)
         self.slot_count = 1  # number of independent A/B trade slots (1 = single)
 
+        # Validate critical parameters
+        if self.entry_pct <= 0:
+            raise ValueError(f"entry_pct must be positive, got {self.entry_pct}")
+        if self.profit_pct <= 0:
+            raise ValueError(f"profit_pct must be positive, got {self.profit_pct}")
+        if self.order_size_usd <= 0:
+            raise ValueError(f"order_size_usd must be positive, got {self.order_size_usd}")
+
     def to_dict(self) -> dict:
         """Serialize for persistence."""
         return {
@@ -422,25 +430,48 @@ class PairConfig:
 
     @staticmethod
     def from_dict(d: dict) -> "PairConfig":
-        pc = PairConfig(
-            pair=d["pair"],
-            display=d.get("display", d["pair"]),
-            entry_pct=d.get("entry_pct", PAIR_ENTRY_PCT),
-            profit_pct=d.get("profit_pct", PAIR_PROFIT_PCT),
-            refresh_pct=d.get("refresh_pct", PAIR_REFRESH_PCT),
-            order_size_usd=ORDER_SIZE_USD,  # always use current config (not stale saved value)
-            daily_loss_limit=d.get("daily_loss_limit", DAILY_LOSS_LIMIT),
-            stop_floor=d.get("stop_floor", STOP_FLOOR),
-            min_volume=d.get("min_volume", 13),
-            price_decimals=d.get("price_decimals", 6),
-            volume_decimals=d.get("volume_decimals", 0),
-            filter_strings=d.get("filter_strings"),
-        )
-        pc.next_entry_multiplier = d.get("next_entry_multiplier", 1.0)
-        pc.recovery_mode = d.get("recovery_mode", "lottery")
-        pc.capital_budget_usd = d.get("capital_budget_usd", 0.0)
-        pc.slot_count = d.get("slot_count", 1)
-        return pc
+        _logger = logging.getLogger("config")
+        try:
+            entry_pct = d.get("entry_pct", PAIR_ENTRY_PCT)
+            profit_pct = d.get("profit_pct", PAIR_PROFIT_PCT)
+            order_size = ORDER_SIZE_USD
+            # Clamp bad persisted values
+            if entry_pct <= 0:
+                _logger.warning("Clamping bad entry_pct=%.4f to 0.01 for %s", entry_pct, d.get("pair"))
+                entry_pct = max(0.01, entry_pct)
+            if profit_pct <= 0:
+                _logger.warning("Clamping bad profit_pct=%.4f to 0.01 for %s", profit_pct, d.get("pair"))
+                profit_pct = max(0.01, profit_pct)
+            if order_size <= 0:
+                _logger.warning("Clamping bad order_size_usd=%.4f to 0.50 for %s", order_size, d.get("pair"))
+                order_size = max(0.50, order_size)
+            pc = PairConfig(
+                pair=d["pair"],
+                display=d.get("display", d["pair"]),
+                entry_pct=entry_pct,
+                profit_pct=profit_pct,
+                refresh_pct=d.get("refresh_pct", PAIR_REFRESH_PCT),
+                order_size_usd=order_size,
+                daily_loss_limit=d.get("daily_loss_limit", DAILY_LOSS_LIMIT),
+                stop_floor=d.get("stop_floor", STOP_FLOOR),
+                min_volume=d.get("min_volume", 13),
+                price_decimals=d.get("price_decimals", 6),
+                volume_decimals=d.get("volume_decimals", 0),
+                filter_strings=d.get("filter_strings"),
+            )
+            pc.next_entry_multiplier = d.get("next_entry_multiplier", 1.0)
+            pc.recovery_mode = d.get("recovery_mode", "lottery")
+            pc.capital_budget_usd = d.get("capital_budget_usd", 0.0)
+            pc.slot_count = d.get("slot_count", 1)
+            return pc
+        except (KeyError, TypeError, ValueError) as e:
+            _logger.error("PairConfig.from_dict failed for %s: %s -- using defaults", d.get("pair", "?"), e)
+            return PairConfig(
+                pair=d.get("pair", "UNKNOWN"),
+                display=d.get("display", d.get("pair", "UNKNOWN")),
+                entry_pct=PAIR_ENTRY_PCT,
+                profit_pct=PAIR_PROFIT_PCT,
+            )
 
 
 def _build_pairs() -> dict:
