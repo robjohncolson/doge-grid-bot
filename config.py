@@ -397,6 +397,7 @@ class PairConfig:
         self.next_entry_multiplier = 1.0  # entry size multiplier (1x = normal)
         self.recovery_mode = recovery_mode  # "lottery" or "liquidate"
         self.capital_budget_usd = capital_budget_usd  # 0 = unlimited (backward compat)
+        self.slot_count = 1  # number of independent A/B trade slots (1 = single)
 
     def to_dict(self) -> dict:
         """Serialize for persistence."""
@@ -416,6 +417,7 @@ class PairConfig:
             "next_entry_multiplier": self.next_entry_multiplier,
             "recovery_mode": self.recovery_mode,
             "capital_budget_usd": self.capital_budget_usd,
+            "slot_count": self.slot_count,
         }
 
     @staticmethod
@@ -437,6 +439,7 @@ class PairConfig:
         pc.next_entry_multiplier = d.get("next_entry_multiplier", 1.0)
         pc.recovery_mode = d.get("recovery_mode", "lottery")
         pc.capital_budget_usd = d.get("capital_budget_usd", 0.0)
+        pc.slot_count = d.get("slot_count", 1)
         return pc
 
 

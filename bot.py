@@ -160,8 +160,24 @@ def _first_pair_name():
 
 
 def _get_price(pair_name: str) -> float:
-    """Get latest known price for a pair."""
-    return _current_prices.get(pair_name, 0.0)
+    """Get latest known price for a pair (resolves slot keys to base pair)."""
+    return _current_prices.get(_base_pair(pair_name), 0.0)
+
+
+def _base_pair(key: str) -> str:
+    """Strip slot suffix: 'XDGUSD#2' -> 'XDGUSD', 'XDGUSD' -> 'XDGUSD'."""
+    return key.split("#")[0] if "#" in key else key
+
+
+def _slot_key(pair_name: str, slot_id: int) -> str:
+    """Build slot key: slot 0 = 'XDGUSD', slot N = 'XDGUSD#N'."""
+    return f"{pair_name}#{slot_id}" if slot_id > 0 else pair_name
+
+
+def _get_slots_for_pair(pair_name: str) -> list:
+    """Return all (key, state) tuples for slots of a base pair."""
+    base = _base_pair(pair_name)
+    return [(k, st) for k, st in _bot_states.items() if _base_pair(k) == base]
 
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
@@ -239,11 +255,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
             current_price = state.center_price
 
         data = dashboard.serialize_state(state, current_price)
-        # Add list of configured pairs for dashboard pair selector
-        data["configured_pairs"] = [
-            {"pair": pn, "display": st.pair_display}
-            for pn, st in _bot_states.items()
-        ]
+        # Add list of configured pairs for dashboard pair selector (base pairs only)
+        seen = set()
+        configured = []
+        for pn, st in _bot_states.items():
+            bp = _base_pair(pn)
+            if bp not in seen:
+                seen.add(bp)
+                configured.append({"pair": bp, "display": st.pair_display})
+        data["configured_pairs"] = configured
         self._send_json(data)
 
     def _handle_api_stats(self):
@@ -260,7 +280,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "status": "healthy" if _bot_healthy else "unhealthy",
             "mode": "dry_run" if config.DRY_RUN else "live",
             "uptime_seconds": int(time.time() - _bot_start_time) if _bot_start_time else 0,
-            "pairs": [st.pair_display for st in _bot_states.values()] if _bot_states else [config.PAIR_DISPLAY],
+            "pairs": list({st.pair_display for st in _bot_states.values()}) if _bot_states else [config.PAIR_DISPLAY],
         }
         if _bot_states:
             # Aggregate across all pairs
@@ -481,40 +501,90 @@ class DashboardHandler(BaseHTTPRequestHandler):
     # ---------------------------------------------------------------
 
     def _handle_swarm_status(self):
-        """GET /api/swarm/status -- aggregate stats + per-pair compact summaries."""
+        """GET /api/swarm/status -- aggregate stats + per-pair compact summaries.
+
+        Slots are grouped by base pair. Each base pair shows aggregated P&L
+        and a slots array with per-slot detail.
+        """
         if not _bot_states:
             self._send_json({"error": "bot not initialized"}, 503)
             return
 
-        pairs_list = []
+        # Group slots by base pair
+        grouped = {}  # base_pair -> list of (key, state)
         for pn, st in _bot_states.items():
-            cp = _current_prices.get(pn, 0.0)
-            open_count = sum(1 for o in st.grid_orders if o.status == "open")
+            bp = _base_pair(pn)
+            grouped.setdefault(bp, []).append((pn, st))
+
+        pairs_list = []
+        for bp, slot_list in grouped.items():
+            # Use slot 0 for display/config values
+            primary_st = slot_list[0][1]
+            cp = _get_price(bp)
+            slot_count = len(slot_list)
+
+            # Per-slot details
+            slots_detail = []
+            agg_today_pnl = 0.0
+            agg_total_pnl = 0.0
+            agg_trips_today = 0
+            agg_total_trips = 0
+            agg_open = 0
+            agg_seed = 0.0
+            agg_recovery = 0
+            any_long_only = False
+            any_paused = False
+
+            for sk, st in slot_list:
+                open_count = sum(1 for o in st.grid_orders if o.status == "open")
+                agg_today_pnl += st.today_profit_usd
+                agg_total_pnl += st.total_profit_usd
+                agg_trips_today += st.round_trips_today
+                agg_total_trips += st.total_round_trips
+                agg_open += open_count
+                agg_seed += st.seed_cost_usd
+                agg_recovery += len(st.recovery_orders)
+                if st.long_only:
+                    any_long_only = True
+                if st.is_paused:
+                    any_paused = True
+                slots_detail.append({
+                    "slot_id": st.slot_id,
+                    "pair_state": st.pair_state,
+                    "today_pnl": round(st.today_profit_usd, 4),
+                    "total_pnl": round(st.total_profit_usd, 4),
+                    "winding_down": st.winding_down,
+                })
+
             pairs_list.append({
-                "pair": pn,
-                "display": st.pair_display,
+                "pair": bp,
+                "display": primary_st.pair_display,
                 "price": round(cp, 8),
-                "pair_state": st.pair_state,
-                "today_pnl": round(st.today_profit_usd, 4),
-                "total_pnl": round(st.total_profit_usd, 4),
-                "trips_today": st.round_trips_today,
-                "total_trips": st.total_round_trips,
-                "open_orders": open_count,
-                "entry_pct": st.entry_pct,
-                "profit_pct": st.profit_pct,
-                "multiplier": st.next_entry_multiplier,
-                "long_only": st.long_only,
-                "paused": st.is_paused,
-                "seed_cost": round(st.seed_cost_usd, 4),
-                "recovery_count": len(st.recovery_orders),
+                "pair_state": " ".join(s["pair_state"] for s in slots_detail),
+                "today_pnl": round(agg_today_pnl, 4),
+                "total_pnl": round(agg_total_pnl, 4),
+                "trips_today": agg_trips_today,
+                "total_trips": agg_total_trips,
+                "open_orders": agg_open,
+                "entry_pct": primary_st.entry_pct,
+                "profit_pct": primary_st.profit_pct,
+                "multiplier": slot_count,
+                "slot_count": slot_count,
+                "slots": slots_detail,
+                "long_only": any_long_only,
+                "paused": any_paused,
+                "seed_cost": round(agg_seed, 4),
+                "recovery_count": agg_recovery,
             })
 
         _compute_portfolio_value()  # refresh cached balances for per-pair asset values
         total_seed = sum(st.seed_cost_usd for st in _bot_states.values())
         total_trade_pnl = sum(st.total_profit_usd for st in _bot_states.values())
         bot_net_pnl = round(total_trade_pnl - total_seed, 4)
+        # Count unique base pairs for the active_pairs display
+        unique_bases = len(grouped)
         agg = {
-            "active_pairs": len(_bot_states),
+            "active_pairs": unique_bases,
             "today_profit": round(sum(st.today_profit_usd for st in _bot_states.values()), 4),
             "total_profit": round(total_trade_pnl, 4),
             "trips_today": sum(st.round_trips_today for st in _bot_states.values()),
@@ -528,7 +598,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         balances = _portfolio_balances
         if balances:
             for item in pairs_list:
-                st = _bot_states.get(item["pair"])
+                bp = item["pair"]
+                # Use primary slot (slot 0) for filter_strings lookup
+                st = _bot_states.get(bp) or (grouped.get(bp, [(None, None)])[0][1])
                 if st and st.pair_config and st.pair_config.filter_strings:
                     asset_val = 0.0
                     for fs in st.pair_config.filter_strings:
@@ -550,7 +622,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json({"error": str(e)}, 500)
             return
 
-        active_set = set(_bot_states.keys())
+        active_set = {_base_pair(k) for k in _bot_states}
         result = []
         for pi in ranked:
             result.append({
@@ -616,15 +688,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "missing 'pair' field"}, 400)
             return
 
-        if pair_name not in _bot_states:
-            self._send_json({"error": f"{pair_name} not active"}, 400)
+        bp = _base_pair(pair_name)
+        if bp not in _bot_states:
+            self._send_json({"error": f"{bp} not active"}, 400)
             return
 
-        _swarm_pending_removes = _swarm_pending_removes + [pair_name]
-        self._send_json({"ok": True, "pair": pair_name})
+        _swarm_pending_removes = _swarm_pending_removes + [bp]
+        self._send_json({"ok": True, "pair": bp})
 
     def _handle_swarm_multiplier(self):
-        """POST /api/swarm/multiplier -- set entry size multiplier for a pair."""
+        """POST /api/swarm/multiplier -- set target slot count for a pair.
+
+        The multiplier value (1-5) now means the number of independent
+        A/B trade slots to run concurrently on this pair.
+        """
         global _swarm_pending_multipliers
         try:
             length = int(self.headers.get("Content-Length", 0))
@@ -639,20 +716,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "missing 'pair' field"}, 400)
             return
         try:
-            mult = float(mult)
-            if mult < 1 or mult > 10:
-                self._send_json({"error": "multiplier must be 1-10"}, 400)
+            mult = int(mult)
+            if mult < 1 or mult > 5:
+                self._send_json({"error": "slot count must be 1-5"}, 400)
                 return
         except (ValueError, TypeError):
             self._send_json({"error": "multiplier must be a number"}, 400)
             return
 
-        if pair_name not in _bot_states:
-            self._send_json({"error": f"{pair_name} not active"}, 400)
+        # Resolve base pair (dashboard always sends base pair name)
+        bp = _base_pair(pair_name)
+        if bp not in _bot_states:
+            self._send_json({"error": f"{bp} not active"}, 400)
             return
 
-        _swarm_pending_multipliers = _swarm_pending_multipliers + [(pair_name, mult)]
-        self._send_json({"ok": True, "pair": pair_name, "multiplier": mult})
+        _swarm_pending_multipliers = _swarm_pending_multipliers + [(bp, mult)]
+        self._send_json({"ok": True, "pair": bp, "slot_count": mult})
 
     def _handle_swarm_free_orphans(self):
         """POST /api/swarm/free-orphans -- soft or hard free recovery tickets.
@@ -688,7 +767,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             for pair_name, state in _bot_states.items():
                 if not state.recovery_orders:
                     continue
-                price = _current_prices.get(pair_name, 0.0)
+                price = _get_price(pair_name)
 
                 if hard_mode:
                     result = grid_strategy.cancel_all_recovery(state, price)
@@ -1422,7 +1501,7 @@ def _cmd_freeorphans(arg: str = ""):
         for pair_name, state in _bot_states.items():
             if not state.recovery_orders:
                 continue
-            price = _current_prices.get(pair_name, 0.0)
+            price = _get_price(pair_name)
             count = len(state.recovery_orders)
 
             if hard_mode:
@@ -1612,9 +1691,18 @@ ACTIVE_PAIRS_FILE = os.path.join(config.LOG_DIR, "active_pairs.json")
 
 
 def _save_active_pairs():
-    """Save the active pair list to disk and Supabase."""
+    """Save the active pair list to disk and Supabase.
+
+    Only saves one PairConfig per base pair (with slot_count),
+    skipping slot entries (XDGUSD#1, etc.).
+    """
     pairs_data = []
+    seen_bases = set()
     for pair_name, state in _bot_states.items():
+        bp = _base_pair(pair_name)
+        if bp in seen_bases:
+            continue
+        seen_bases.add(bp)
         if state.pair_config:
             pairs_data.append(state.pair_config.to_dict())
     try:
@@ -1693,7 +1781,7 @@ def _compute_portfolio_value() -> float | None:
                 continue
             fs = st.pair_config.filter_strings or []
             if asset in fs or any(asset == "X" + f or asset == f.lstrip("X") for f in fs):
-                price = _current_prices.get(pn, 0)
+                price = _current_prices.get(_base_pair(pn), 0)
                 if price > 0:
                     total += amount * price
                 break
@@ -1708,13 +1796,13 @@ def _compute_portfolio_value() -> float | None:
 # ---------------------------------------------------------------------------
 
 def _rebalance_capital_budgets():
-    """Redistribute capital evenly across active pairs.
+    """Redistribute capital evenly across all active slots.
 
     Budget grows with accumulated profits so compounding isn't capped
-    by the static STARTING_CAPITAL.  Each pair's net profit (trade P&L
-    minus seed costs) is added to the global pool before dividing.
+    by the static STARTING_CAPITAL.  Each slot (including multi-slot pairs)
+    counts as an individual capital consumer since each has its own orders.
     """
-    n = len(_bot_states)
+    n = len(_bot_states)  # Total slots (including XDGUSD#1, etc.)
     if n == 0:
         return
     total_net_profit = sum(
@@ -1722,12 +1810,12 @@ def _rebalance_capital_budgets():
         for st in _bot_states.values()
     )
     effective_capital = config.STARTING_CAPITAL + total_net_profit
-    per_pair = effective_capital / n
+    per_slot = effective_capital / n
     for state in _bot_states.values():
         if state.pair_config:
-            state.pair_config.capital_budget_usd = per_pair
-    logger.info("Capital rebalanced: $%.2f per pair across %d pairs (effective $%.2f = $%.2f start + $%.2f profit)",
-                per_pair, n, effective_capital, config.STARTING_CAPITAL, total_net_profit)
+            state.pair_config.capital_budget_usd = per_slot
+    logger.info("Capital rebalanced: $%.2f per slot across %d slots (effective $%.2f = $%.2f start + $%.2f profit)",
+                per_slot, n, effective_capital, config.STARTING_CAPITAL, total_net_profit)
 
 
 def _add_pair(pair_config: config.PairConfig):
@@ -1786,30 +1874,119 @@ def _add_pair(pair_config: config.PairConfig):
 
 
 def _remove_pair(pair_name: str):
-    """Remove a trading pair from the live bot."""
-    if pair_name not in _bot_states:
-        logger.warning("Pair %s not active, skipping remove", pair_name)
+    """Remove a trading pair and all its slots from the live bot."""
+    bp = _base_pair(pair_name)
+
+    # Remove all non-primary slots first
+    for sk, st in list(_get_slots_for_pair(bp)):
+        if sk != bp:
+            _remove_slot(sk)
+
+    if bp not in _bot_states:
+        logger.warning("Pair %s not active, skipping remove", bp)
         return
 
-    state = _bot_states[pair_name]
+    state = _bot_states[bp]
 
     # Cancel all orders
     cancelled = grid_strategy.cancel_grid(state)
-    logger.info("[%s] Cancelled %d orders for removal", pair_name, cancelled)
+    logger.info("[%s] Cancelled %d orders for removal", bp, cancelled)
 
     # Save final state
     grid_strategy.save_state(state)
 
     # Clean up
-    _bot_states.pop(pair_name, None)
-    config.PAIRS.pop(pair_name, None)
-    _current_prices.pop(pair_name, None)
-    _ohlc_caches.pop(pair_name, None)
-    _ohlc_last_fetches.pop(pair_name, None)
+    _bot_states.pop(bp, None)
+    config.PAIRS.pop(bp, None)
+    _current_prices.pop(bp, None)
+    _ohlc_caches.pop(bp, None)
+    _ohlc_last_fetches.pop(bp, None)
 
-    logger.info("Removed pair %s", pair_name)
+    logger.info("Removed pair %s", bp)
     _rebalance_capital_budgets()
     _save_active_pairs()
+
+
+def _add_slot(pair_config: config.PairConfig, slot_id: int,
+              price: float, claimed_txids: set = None):
+    """Add one additional trade slot for a pair.
+
+    Creates a new GridState with its own independent A/B state machine.
+    The slot shares the same PairConfig (copy) and price feed as slot 0.
+    """
+    import copy
+    base_pair = pair_config.pair
+    sk = _slot_key(base_pair, slot_id)
+    if sk in _bot_states:
+        logger.warning("Slot %s already exists, skipping", sk)
+        return
+
+    # Each slot gets its own PairConfig copy (independent profit tracking)
+    slot_pc = copy.copy(pair_config)
+    state = grid_strategy.GridState(pair_config=slot_pc)
+    state.slot_id = slot_id
+
+    _bot_states[sk] = state
+
+    # Try to load saved state (from prior run)
+    local_loaded = grid_strategy.load_state(state)
+    if not local_loaded:
+        _restore_from_supabase(state)
+
+    grid_strategy.record_price(state, price)
+
+    # Reconcile, excluding txids already claimed by other slots
+    adopted = grid_strategy.reconcile_on_startup(state, price,
+                                                  claimed_txids=claimed_txids)
+    if adopted > 0:
+        logger.info("[%s] Slot reconciliation adopted %d orders", sk, adopted)
+
+    # Build grid for this slot
+    orders = grid_strategy.build_grid(state, price)
+    grid_strategy.enforce_pair_order_limit(state)
+    grid_strategy.check_daily_reset(state)
+
+    logger.info("Added slot %s: %d orders @ $%.6f", sk, len(orders), price)
+
+
+def _remove_slot(slot_key: str):
+    """Remove a slot: cancel remaining orders, save state, clean up."""
+    state = _bot_states.get(slot_key)
+    if not state:
+        return
+
+    # Cancel all remaining orders for this slot
+    cancelled = grid_strategy.cancel_grid(state)
+    logger.info("[%s] Cancelled %d orders for slot removal", slot_key, cancelled)
+
+    # Save final state
+    grid_strategy.save_state(state)
+
+    # Delete state file
+    state_path = grid_strategy._state_file_path(state)
+    try:
+        if os.path.exists(state_path):
+            os.remove(state_path)
+            logger.info("Deleted state file: %s", state_path)
+    except Exception as e:
+        logger.warning("Failed to delete slot state file %s: %s", state_path, e)
+
+    # Remove from _bot_states
+    _bot_states.pop(slot_key, None)
+    logger.info("Removed slot %s", slot_key)
+
+
+def _get_claimed_txids(base_pair: str) -> set:
+    """Collect all txids already adopted by existing slots of a base pair."""
+    claimed = set()
+    for sk, st in _get_slots_for_pair(base_pair):
+        for o in st.grid_orders:
+            if o.status == "open" and o.txid:
+                claimed.add(o.txid)
+        for r in st.recovery_orders:
+            if r.txid:
+                claimed.add(r.txid)
+    return claimed
 
 
 def _process_swarm_queue():
@@ -1836,12 +2013,71 @@ def _process_swarm_queue():
         except Exception as e:
             logger.error("Failed to remove pair %s: %s", pair_name, e)
 
-    for pair_name, mult in mults:
-        state = _bot_states.get(pair_name)
-        if state:
-            old = state.next_entry_multiplier
-            state.next_entry_multiplier = mult
-            logger.info("[%s] Entry multiplier: %.1fx -> %.1fx", pair_name, old, mult)
+    # Process slot count changes (multiplier = target slot count)
+    for base_pair, target_slots in mults:
+        try:
+            target_slots = int(target_slots)
+            current_slots = _get_slots_for_pair(base_pair)
+            current_count = len(current_slots)
+
+            if target_slots == current_count:
+                continue
+
+            # Update PairConfig slot_count
+            primary_st = _bot_states.get(base_pair)
+            if primary_st and primary_st.pair_config:
+                primary_st.pair_config.slot_count = target_slots
+
+            if target_slots > current_count:
+                # Scale up: add new slots
+                price = _get_price(base_pair)
+                if price <= 0:
+                    logger.error("[%s] Cannot add slots: no price data", base_pair)
+                    continue
+                claimed = _get_claimed_txids(base_pair)
+                for sid in range(current_count, target_slots):
+                    _add_slot(primary_st.pair_config, sid, price, claimed)
+                    # Update claimed txids with newly adopted orders
+                    new_sk = _slot_key(base_pair, sid)
+                    new_st = _bot_states.get(new_sk)
+                    if new_st:
+                        for o in new_st.grid_orders:
+                            if o.status == "open" and o.txid:
+                                claimed.add(o.txid)
+                logger.info("[%s] Scaled up: %d -> %d slots",
+                            base_pair, current_count, target_slots)
+
+            else:
+                # Scale down: wind down excess slots (highest IDs first)
+                # Never wind down slot 0
+                slot_states = sorted(current_slots, key=lambda x: -x[1].slot_id)
+                to_remove = current_count - target_slots
+                removed = 0
+                for sk, st in slot_states:
+                    if removed >= to_remove:
+                        break
+                    if st.slot_id == 0:
+                        continue  # Never wind down slot 0
+                    # Mark as winding down: cancel entries, keep exits
+                    st.winding_down = True
+                    for o in st.grid_orders:
+                        if o.status == "open" and o.order_role == "entry" and o.txid:
+                            try:
+                                kraken_client.cancel_order(o.txid)
+                                o.status = "cancelled"
+                                logger.info("[%s] Wind-down: cancelled entry %s",
+                                            sk, o.txid)
+                            except Exception as e:
+                                logger.warning("[%s] Failed to cancel entry: %s", sk, e)
+                    grid_strategy.save_state(st)
+                    removed += 1
+                logger.info("[%s] Winding down %d slots (%d -> %d target)",
+                            base_pair, removed, current_count, target_slots)
+
+            _rebalance_capital_budgets()
+            _save_active_pairs()
+        except Exception as e:
+            logger.error("Failed to adjust slots for %s: %s", base_pair, e)
 
 
 # ---------------------------------------------------------------------------
@@ -2018,8 +2254,8 @@ def run():
     logger.info("Bot started: %s @ $%.6f", pair_labels, first_price)
 
     # --- Phase 2c: Startup reconciliation + build grid per pair ---
-    for pair_name, state in _bot_states.items():
-        current_price = _current_prices[pair_name]
+    for pair_name, state in list(_bot_states.items()):
+        current_price = _current_prices.get(_base_pair(pair_name), 0.0)
         adopted = grid_strategy.reconcile_on_startup(state, current_price)
         if adopted > 0:
             logger.info("[%s] Reconciliation adopted %d orders", pair_name, adopted)
@@ -2034,6 +2270,21 @@ def run():
             logger.info("[%s] Pair dedup: cancelled %d duplicate orders", pair_name, deduped)
 
         grid_strategy.check_daily_reset(state)
+
+        # Create additional slots if slot_count > 1
+        if state.pair_config and state.pair_config.slot_count > 1:
+            claimed = _get_claimed_txids(pair_name)
+            for sid in range(1, state.pair_config.slot_count):
+                _add_slot(state.pair_config, sid, current_price, claimed)
+                # Update claimed txids with newly adopted orders
+                new_sk = _slot_key(pair_name, sid)
+                new_st = _bot_states.get(new_sk)
+                if new_st:
+                    for o in new_st.grid_orders:
+                        if o.status == "open" and o.txid:
+                            claimed.add(o.txid)
+            logger.info("[%s] Created %d total slots",
+                        pair_name, state.pair_config.slot_count)
 
     # --- Phase 3b: One-time reprice thin exits to new profit floor ---
     for pair_name, state in _bot_states.items():
@@ -2077,16 +2328,17 @@ def run():
             # ============================================================
 
             # 4a-batch: Fetch all prices in 1-2 public API calls
-            active_pairs = list(_bot_states.keys())
+            # Deduplicate by base pair (slots share the same price)
+            base_pairs = list({_base_pair(k): k for k in _bot_states}.keys())
             try:
-                batch_prices = kraken_client.get_prices(active_pairs)
-                for pn, price in batch_prices.items():
-                    _current_prices[pn] = price
-                    st = _bot_states.get(pn)
-                    if st:
+                batch_prices = kraken_client.get_prices(base_pairs)
+                for bp, price in batch_prices.items():
+                    _current_prices[bp] = price
+                    # Fan out to all slots of this base pair
+                    for sk, st in _get_slots_for_pair(bp):
                         grid_strategy.record_price(st, price)
-                        supabase_store.queue_price_point(time.time(), price, pair=pn)
                         st.consecutive_errors = 0
+                    supabase_store.queue_price_point(time.time(), price, pair=bp)
                 _global_consecutive_errors = 0
             except Exception as e:
                 _global_consecutive_errors += 1
@@ -2139,8 +2391,8 @@ def run():
                 st.today_loss_usd for st in _bot_states.values())
             if total_today_loss >= config.SWARM_DAILY_LOSS_LIMIT:
                 for pname, st in list(_bot_states.items()):
-                    if pname in config.SWARM_EXEMPT_PAIRS:
-                        continue  # DOGE keeps running
+                    if _base_pair(pname) in config.SWARM_EXEMPT_PAIRS:
+                        continue  # DOGE keeps running (including slots)
                     if not st.is_paused:
                         st.is_paused = True
                         st.pause_reason = (
@@ -2160,12 +2412,21 @@ def run():
                     swarm_limit_notified = True
 
             # ============================================================
-            # Per-pair operations
+            # Per-pair operations (iterate snapshot -- dict may change from wind-down)
             # ============================================================
-            for pair_name, state in _bot_states.items():
-                current_price = _current_prices.get(pair_name, 0.0)
+            _slots_to_remove = []  # Collect completed wind-downs for post-loop removal
+            for pair_name, state in list(_bot_states.items()):
+                current_price = _get_price(pair_name)
                 if current_price <= 0:
                     continue  # No price data this cycle
+
+                # Wind-down check: if slot is winding down and has no open orders
+                # and no recovery orders, mark for removal after loop
+                if state.winding_down:
+                    open_orders = [o for o in state.grid_orders if o.status == "open"]
+                    if not open_orders and not state.recovery_orders:
+                        _slots_to_remove.append(pair_name)
+                        continue  # Skip trading for this slot
 
                 # --- 4b: Check daily reset ---
                 old_date = state.today_date
@@ -2308,6 +2569,22 @@ def run():
                     notifier.notify_grid_built(current_price, len(orders), pair_display=state.pair_display)
 
             # End per-pair loop
+
+            # Remove completed wind-down slots
+            for sk in _slots_to_remove:
+                try:
+                    _remove_slot(sk)
+                    logger.info("Slot %s wind-down complete, removed", sk)
+                    # Update primary pair's slot_count
+                    bp = _base_pair(sk)
+                    primary = _bot_states.get(bp)
+                    if primary and primary.pair_config:
+                        actual = len(_get_slots_for_pair(bp))
+                        primary.pair_config.slot_count = actual
+                    _rebalance_capital_budgets()
+                    _save_active_pairs()
+                except Exception as e:
+                    logger.error("Failed to remove wound-down slot %s: %s", sk, e)
 
             if should_stop_global:
                 break
@@ -2457,32 +2734,36 @@ def run():
                 _apply_web_config(first_st, first_price)
 
             # --- 4f4: Run stats engine (OHLC throttled: max 3 per cycle) ---
-            ohlc_pairs = [pn for pn in _bot_states if now - _ohlc_last_fetches.get(pn, 0) >= 300]
+            # Deduplicate OHLC by base pair (slots share candles)
+            ohlc_base_pairs = list({_base_pair(k) for k in _bot_states
+                                    if now - _ohlc_last_fetches.get(_base_pair(k), 0) >= 300})
             ohlc_fetched = 0
             MAX_OHLC_PER_CYCLE = 3
             # Round-robin: start from where we left off
-            if ohlc_pairs:
+            if ohlc_base_pairs:
                 global _ohlc_robin_idx
-                for _ in range(len(ohlc_pairs)):
+                for _ in range(len(ohlc_base_pairs)):
                     if ohlc_fetched >= MAX_OHLC_PER_CYCLE:
                         break
-                    idx = _ohlc_robin_idx % len(ohlc_pairs)
+                    idx = _ohlc_robin_idx % len(ohlc_base_pairs)
                     _ohlc_robin_idx += 1
-                    pn = ohlc_pairs[idx]
+                    bp = ohlc_base_pairs[idx]
                     try:
-                        _ohlc_caches[pn] = kraken_client.get_ohlc(pair=pn, interval=5)
-                        _ohlc_last_fetches[pn] = now
+                        candles = kraken_client.get_ohlc(pair=bp, interval=5)
+                        _ohlc_caches[bp] = candles
+                        _ohlc_last_fetches[bp] = now
                         ohlc_fetched += 1
                     except Exception as e:
-                        logger.debug("[%s] OHLC fetch failed: %s", pn, e)
+                        logger.debug("[%s] OHLC fetch failed: %s", bp, e)
 
             for pair_name, state in _bot_states.items():
                 if now - state.stats_last_run >= 60:
                     state.stats_last_run = now
                     try:
-                        cp = _current_prices.get(pair_name, 0.0)
+                        bp = _base_pair(pair_name)
+                        cp = _get_price(pair_name)
                         state.stats_results = stats_engine.run_all(
-                            state, cp, _ohlc_caches.get(pair_name, [])
+                            state, cp, _ohlc_caches.get(bp, [])
                         )
                         # Volatility auto-adjust profit target
                         if config.STRATEGY_MODE == "pair":
@@ -2513,7 +2794,7 @@ def run():
             # --- 4h: Periodic status log + state save ---
             if int(now) % 300 < config.POLL_INTERVAL_SECONDS:
                 for pair_name, state in _bot_states.items():
-                    cp = _current_prices.get(pair_name, 0.0)
+                    cp = _get_price(pair_name)
                     logger.info(grid_strategy.get_status_summary(state, cp))
                     grid_strategy.save_state(state)
 

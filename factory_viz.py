@@ -37,7 +37,9 @@ def serialize_factory_state(bot_states: dict, current_prices: dict) -> dict:
     pairs = []
 
     for pair_name, state in bot_states.items():
-        price = current_prices.get(pair_name, 0.0)
+        # Use base pair for price lookup (slots share prices with primary)
+        base = pair_name.split("#")[0] if "#" in pair_name else pair_name
+        price = current_prices.get(base, 0.0)
         if not price and state.price_history:
             price = state.price_history[-1][1]
         if not price:

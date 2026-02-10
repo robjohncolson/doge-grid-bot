@@ -333,6 +333,10 @@ class GridState:
         # Seed buy cost tracking: total USD spent on market-buy seed purchases
         self.seed_cost_usd = 0.0
 
+        # Multi-slot fields (for N independent A/B state machines per pair)
+        self.slot_id = 0              # 0 = primary, 1+ = additional slots
+        self.winding_down = False     # True when slot is being removed (entries cancelled, exits kept)
+
     # -- Per-pair property accessors (fall back to global config) --
 
     @property
@@ -480,9 +484,19 @@ def get_capital_deployed(state: GridState, current_price: float) -> float:
 # ---------------------------------------------------------------------------
 
 def _state_file_path(state: GridState) -> str:
-    """Return the state file path for this pair (or the global default)."""
+    """Return the state file path for this pair (or the global default).
+
+    Slot routing: slot 0 keeps the original filename for backward compat.
+    Slot N (N>0) uses state_XDGUSD_N.json.
+    """
     if state.pair_config and len(config.PAIRS) > 1:
-        return os.path.join(config.LOG_DIR, f"state_{state.pair_name}.json")
+        base = os.path.join(config.LOG_DIR, f"state_{state.pair_name}")
+        if state.slot_id > 0:
+            return f"{base}_{state.slot_id}.json"
+        return f"{base}.json"
+    # Single-pair mode: slot 0 uses global STATE_FILE
+    if state.slot_id > 0:
+        return os.path.join(config.LOG_DIR, f"state_{state.pair_name}_{state.slot_id}.json")
     return config.STATE_FILE
 
 
@@ -563,6 +577,8 @@ def save_state(state: GridState):
         "last_volatility_adjust": state.last_volatility_adjust,
         "last_s1_rebalance": state.last_s1_rebalance,
         "seed_cost_usd": state.seed_cost_usd,
+        "slot_id": state.slot_id,
+        "winding_down": state.winding_down,
     }
     state_path = _state_file_path(state)
     tmp_path = state_path + ".tmp"
@@ -663,6 +679,8 @@ def load_state(state: GridState) -> bool:
     state.last_volatility_adjust = snapshot.get("last_volatility_adjust", 0.0)
     state.last_s1_rebalance = snapshot.get("last_s1_rebalance", 0.0)
     state.seed_cost_usd = snapshot.get("seed_cost_usd", 0.0)
+    state.slot_id = snapshot.get("slot_id", 0)
+    state.winding_down = snapshot.get("winding_down", False)
     if state.consecutive_losses_a or state.consecutive_losses_b:
         logger.info(
             "Restoring backoff counters: A=%d, B=%d",
@@ -1070,7 +1088,8 @@ def calculate_volume_for_price(price: float, state: GridState = None) -> float:
 # Startup reconciliation
 # ---------------------------------------------------------------------------
 
-def reconcile_on_startup(state: GridState, current_price: float) -> int:
+def reconcile_on_startup(state: GridState, current_price: float,
+                         claimed_txids: set = None) -> int:
     """
     Adopt open orders on Kraken that belong to this bot, cancel orphans.
 
@@ -1083,7 +1102,8 @@ def reconcile_on_startup(state: GridState, current_price: float) -> int:
     Returns the number of adopted orders.
     """
     if config.STRATEGY_MODE == "pair":
-        return reconcile_pair_on_startup(state, current_price)
+        return reconcile_pair_on_startup(state, current_price,
+                                         claimed_txids=claimed_txids)
 
     if config.DRY_RUN:
         logger.info("[DRY RUN] Skipping startup reconciliation")
@@ -4674,11 +4694,15 @@ def _identify_order_3tier(order_info: dict, state: GridState,
         }
 
 
-def reconcile_pair_on_startup(state: GridState, current_price: float) -> int:
+def reconcile_pair_on_startup(state: GridState, current_price: float,
+                              claimed_txids: set = None) -> int:
     """
     Simplified reconciliation for pair mode.
     Adopt up to 2 open orders (exit-first, then entry). Cancel extras.
     Uses 3-tier identity resolution (saved_txid > price_match > side_convention).
+
+    claimed_txids: set of txids already adopted by other slots of the same pair.
+        These are skipped to prevent two slots from adopting the same order.
     """
     if config.DRY_RUN:
         logger.info("[DRY RUN] Skipping pair reconciliation")
@@ -4708,8 +4732,12 @@ def reconcile_pair_on_startup(state: GridState, current_price: float) -> int:
 
     # Collect orders (without pre-assigning role)
     our_orders = []
+    if claimed_txids is None:
+        claimed_txids = set()
 
     for txid, info in open_orders.items():
+        if txid in claimed_txids:
+            continue  # Already adopted by another slot of this pair
         descr = info.get("descr", {})
         pair = descr.get("pair", "")
         if not any(s in pair.upper() for s in filter_strings):

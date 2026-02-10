@@ -2045,21 +2045,30 @@ function renderSwarm(data) {
   for (const p of pairs) {
     const pnlCls = p.today_pnl > 0 ? 'pnl-pos' : (p.today_pnl < 0 ? 'pnl-neg' : 'pnl-zero');
     const totCls = p.total_pnl > 0 ? 'pnl-pos' : (p.total_pnl < 0 ? 'pnl-neg' : 'pnl-zero');
-    const multVal = p.multiplier || 1;
+    const slotCount = p.slot_count || p.multiplier || 1;
+    // Build state display: show per-slot states when multi-slot
+    let stateDisplay = p.pair_state;
+    if (p.slots && p.slots.length > 1) {
+      stateDisplay = p.slots.map(function(s) {
+        let st = s.pair_state;
+        if (s.winding_down) st = '<span style="opacity:0.4">' + st + '</span>';
+        return st;
+      }).join(' ');
+    }
     rows += '<tr onclick="showDetailView(\'' + p.pair + '\')">';
     rows += '<td><b>' + p.display + '</b></td>';
     rows += '<td>$' + (p.price < 1 ? p.price.toFixed(6) : p.price.toFixed(2)) + '</td>';
-    rows += '<td>' + p.pair_state + (p.long_only ? ' <span style="background:#9e6a03;color:#e3b341;font-size:10px;padding:1px 4px;border-radius:3px;font-weight:600">L</span>' : '') + '</td>';
+    rows += '<td>' + stateDisplay + (p.long_only ? ' <span style="background:#9e6a03;color:#e3b341;font-size:10px;padding:1px 4px;border-radius:3px;font-weight:600">L</span>' : '') + '</td>';
     rows += '<td class="' + pnlCls + '">' + fmtUSD(p.today_pnl) + '</td>';
     rows += '<td class="' + totCls + '">' + fmtUSD(p.total_pnl) + '</td>';
     rows += '<td>' + (p.asset_value != null ? '$' + p.asset_value.toFixed(2) : '--') + '</td>';
     rows += '<td>' + p.trips_today + '/' + p.total_trips + '</td>';
     rows += '<td>' + fmt(p.entry_pct, 2) + '%</td>';
     rows += '<td><select onclick="event.stopPropagation()" onchange="setMultiplier(\'' + p.pair + '\',this.value);event.stopPropagation()">'
-          + '<option' + (multVal===1 ? ' selected' : '') + '>1x</option>'
-          + '<option' + (multVal===2 ? ' selected' : '') + '>2x</option>'
-          + '<option' + (multVal===3 ? ' selected' : '') + '>3x</option>'
-          + '<option' + (multVal===5 ? ' selected' : '') + '>5x</option>'
+          + '<option value="1"' + (slotCount===1 ? ' selected' : '') + '>1x</option>'
+          + '<option value="2"' + (slotCount===2 ? ' selected' : '') + '>2x</option>'
+          + '<option value="3"' + (slotCount===3 ? ' selected' : '') + '>3x</option>'
+          + '<option value="5"' + (slotCount===5 ? ' selected' : '') + '>5x</option>'
           + '</select></td>';
     rows += '<td><button class="btn-remove" onclick="removePair(\'' + p.pair + '\');event.stopPropagation()">X</button></td>';
     rows += '</tr>';
