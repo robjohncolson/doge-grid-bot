@@ -335,8 +335,9 @@ def auto_configure(info: PairInfo) -> "config.PairConfig":
     entry_pct = max(info.spread_pct / 2 + 0.05, entry_floor)
     entry_pct = round(entry_pct, 2)
 
-    # Profit must exceed round-trip fees
-    profit_pct = max(entry_pct, 2 * info.fee_maker + 0.10)
+    # Profit must exceed round-trip fees (use actual fee, not Kraken's schedule)
+    actual_fee = max(info.fee_maker, config.MAKER_FEE_PCT)
+    profit_pct = max(entry_pct, 2 * actual_fee + 0.10)
     profit_pct = round(profit_pct, 2)
 
     refresh_pct = round(entry_pct * 2, 2)

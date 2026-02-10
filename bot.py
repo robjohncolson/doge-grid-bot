@@ -1490,6 +1490,13 @@ def _add_pair(pair_config: config.PairConfig):
         logger.warning("Pair %s already active, skipping add", pair_name)
         return
 
+    # Floor profit_pct so it always covers actual round-trip fees
+    min_profit = round(2 * config.MAKER_FEE_PCT + 0.10, 2)
+    if pair_config.profit_pct < min_profit:
+        logger.info("Pair %s: profit_pct %.2f%% < fee floor %.2f%%, correcting",
+                     pair_config.display, pair_config.profit_pct, min_profit)
+        pair_config.profit_pct = min_profit
+
     state = grid_strategy.GridState(pair_config=pair_config)
     _bot_states[pair_name] = state
     config.PAIRS[pair_name] = pair_config
