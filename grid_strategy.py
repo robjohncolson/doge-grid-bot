@@ -323,6 +323,9 @@ class GridState:
         # Long-only mode: auto-set when sell entry fails due to no inventory
         self.long_only = False
 
+        # Rebalance cooldown: prevent rapid S1 rebalances
+        self.last_s1_rebalance = 0.0
+
     # -- Per-pair property accessors (fall back to global config) --
 
     @property
@@ -425,6 +428,23 @@ class GridState:
         if self.pair_config:
             self.pair_config.next_entry_multiplier = val
 
+    @property
+    def capital_budget_usd(self) -> float:
+        if self.pair_config and self.pair_config.capital_budget_usd > 0:
+            return self.pair_config.capital_budget_usd
+        return 0.0  # 0 = unlimited (backward compat)
+
+
+def get_capital_deployed(state: GridState, current_price: float) -> float:
+    """Total capital tied up in open orders + recovery exposure for this pair."""
+    total = 0.0
+    for o in state.grid_orders:
+        if o.status == "open":
+            total += o.price * o.volume
+    for r in state.recovery_orders:
+        total += r.price * r.volume
+    return total
+
 
 # ---------------------------------------------------------------------------
 # State persistence
@@ -512,6 +532,7 @@ def save_state(state: GridState):
         "consecutive_losses_a": state.consecutive_losses_a,
         "consecutive_losses_b": state.consecutive_losses_b,
         "last_volatility_adjust": state.last_volatility_adjust,
+        "last_s1_rebalance": state.last_s1_rebalance,
     }
     state_path = _state_file_path(state)
     tmp_path = state_path + ".tmp"
@@ -610,6 +631,7 @@ def load_state(state: GridState) -> bool:
     state.consecutive_losses_a = snapshot.get("consecutive_losses_a", 0)
     state.consecutive_losses_b = snapshot.get("consecutive_losses_b", 0)
     state.last_volatility_adjust = snapshot.get("last_volatility_adjust", 0.0)
+    state.last_s1_rebalance = snapshot.get("last_s1_rebalance", 0.0)
     if state.consecutive_losses_a or state.consecutive_losses_b:
         logger.info(
             "Restoring backoff counters: A=%d, B=%d",
@@ -2242,6 +2264,17 @@ def _attempt_seed_buy(state, sell_entry_price, volume, trade_id, cycle):
         "SEED BUY [%s]: no inventory for sell entry -- market-buying %.4f units",
         display, volume)
 
+    # Capital budget check
+    budget = state.capital_budget_usd
+    if budget > 0:
+        order_cost = sell_entry_price * volume
+        deployed = get_capital_deployed(state, sell_entry_price)
+        if deployed + order_cost > budget:
+            logger.warning(
+                "SEED BUY [%s]: capital limit ($%.2f + $%.2f > $%.2f) -- skipping",
+                display, deployed, order_cost, budget)
+            return None
+
     try:
         seed_txid = kraken_client.place_order(
             side="buy", volume=volume, price=sell_entry_price,
@@ -2313,6 +2346,19 @@ def _place_pair_order(state, side, price, role, matched_buy=None,
         order.trade_id = trade_id
     if cycle is not None:
         order.cycle = cycle
+
+    # Capital budget check (entries only -- exits MUST be placed to close exposure)
+    budget = state.capital_budget_usd
+    if budget > 0 and role == "entry":
+        order_cost = price * volume
+        deployed = get_capital_deployed(state, price)
+        if deployed + order_cost > budget:
+            logger.warning(
+                "CAPITAL LIMIT [%s]: $%.2f deployed + $%.2f new > $%.2f budget -- skipping",
+                state.pair_display, deployed, order_cost, budget)
+            order.status = "failed"
+            return None
+
     try:
         txid = kraken_client.place_order(
             side=side, volume=volume, price=price, pair=state.pair_name)
@@ -3773,6 +3819,11 @@ def check_s1_rebalance(state: GridState, current_price: float) -> bool:
     if state.pair_state not in ("S1a", "S1b"):
         return False
 
+    # Cooldown: max one rebalance per 5 minutes
+    now = time.time()
+    if now - state.last_s1_rebalance < 300:
+        return False
+
     # Find the stranded exit
     # S1a: A has exit (buy), B has entry (buy) -> orphan A's exit
     # S1b: B has exit (sell), A has entry (sell) -> orphan B's exit
@@ -3787,9 +3838,19 @@ def check_s1_rebalance(state: GridState, current_price: float) -> bool:
     cyc = getattr(o, "cycle", 0)
     drift_pct = abs(o.price - current_price) / current_price * 100.0
 
-    # Only rebalance if exit is beyond profit target from market.
-    # Below that threshold, S1 is expected and the exit will fill naturally.
-    threshold = state.profit_pct
+    # Use the exit's ACTUAL placement distance as baseline threshold.
+    # If exit was placed at 1.0% from entry, don't rebalance just because
+    # volatility-adjust lowered state.profit_pct to 0.6%.
+    if o.side == "sell" and o.matched_buy_price:
+        original_spread = abs(o.price - o.matched_buy_price) / o.matched_buy_price * 100.0
+    elif o.side == "buy" and getattr(o, "matched_sell_price", None):
+        original_spread = abs(o.matched_sell_price - o.price) / o.matched_sell_price * 100.0
+    else:
+        original_spread = state.profit_pct
+
+    # Rebalance only when exit drifts MORE than 2x its original spread from market.
+    # This means market has moved significantly beyond where the exit can fill.
+    threshold = max(original_spread * 2.0, state.profit_pct)
     if drift_pct <= threshold:
         return False
 
@@ -3800,6 +3861,7 @@ def check_s1_rebalance(state: GridState, current_price: float) -> bool:
         tid, cyc, o.price, drift_pct, threshold,
     )
 
+    state.last_s1_rebalance = time.time()
     new_entry = _orphan_exit(state, o, current_price, reason="s1_rebalance")
     if new_entry:
         logger.info(

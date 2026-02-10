@@ -1483,6 +1483,18 @@ def _load_active_pairs() -> list:
 # Dynamic pair add/remove (Step 3d)
 # ---------------------------------------------------------------------------
 
+def _rebalance_capital_budgets():
+    """Redistribute capital evenly across active pairs."""
+    n = len(_bot_states)
+    if n == 0:
+        return
+    per_pair = config.STARTING_CAPITAL / n
+    for state in _bot_states.values():
+        if state.pair_config:
+            state.pair_config.capital_budget_usd = per_pair
+    logger.info("Capital rebalanced: $%.2f per pair across %d pairs", per_pair, n)
+
+
 def _add_pair(pair_config: config.PairConfig):
     """Add a new trading pair to the live bot."""
     pair_name = pair_config.pair
@@ -1534,6 +1546,7 @@ def _add_pair(pair_config: config.PairConfig):
 
     logger.info("Added pair %s (%s): %d orders @ $%.6f",
                 pair_config.display, pair_name, len(orders), price)
+    _rebalance_capital_budgets()
     _save_active_pairs()
 
 
@@ -1560,6 +1573,7 @@ def _remove_pair(pair_name: str):
     _ohlc_last_fetches.pop(pair_name, None)
 
     logger.info("Removed pair %s", pair_name)
+    _rebalance_capital_budgets()
     _save_active_pairs()
 
 
@@ -1791,6 +1805,7 @@ def run():
                 config.POLL_INTERVAL_SECONDS, len(_bot_states))
     last_daily_summary_date = ""
     _global_consecutive_errors = 0
+    swarm_limit_notified = False
 
     while not _shutdown_requested:
         try:
@@ -1851,6 +1866,31 @@ def run():
             if should_stop_global:
                 break
 
+            # Global swarm daily loss check
+            total_today_loss = sum(
+                st.today_loss_usd for st in _bot_states.values())
+            if total_today_loss >= config.SWARM_DAILY_LOSS_LIMIT:
+                for pname, st in list(_bot_states.items()):
+                    if pname in config.SWARM_EXEMPT_PAIRS:
+                        continue  # DOGE keeps running
+                    if not st.is_paused:
+                        st.is_paused = True
+                        st.pause_reason = (
+                            f"Swarm daily loss limit: "
+                            f"${total_today_loss:.2f} >= "
+                            f"${config.SWARM_DAILY_LOSS_LIMIT:.2f}")
+                        grid_strategy.cancel_grid(st)
+                        grid_strategy.save_state(st)
+                        logger.warning(
+                            "[%s] SWARM PAUSED: %s", pname, st.pause_reason)
+                if not swarm_limit_notified:
+                    notifier.notify_risk_event(
+                        "swarm_daily_limit",
+                        f"Swarm daily loss ${total_today_loss:.2f} hit limit "
+                        f"${config.SWARM_DAILY_LOSS_LIMIT:.2f}. "
+                        f"Exempt: {config.SWARM_EXEMPT_PAIRS}")
+                    swarm_limit_notified = True
+
             # ============================================================
             # Per-pair operations
             # ============================================================
@@ -1868,6 +1908,7 @@ def run():
 
                 if old_date and old_date != state.today_date and old_date != last_daily_summary_date:
                     last_daily_summary_date = old_date
+                    swarm_limit_notified = False  # reset for new day
                     # Aggregate daily summary across all pairs
                     total_day_profit = sum(st.today_profit_usd for st in _bot_states.values())
                     total_day_trips = sum(st.round_trips_today for st in _bot_states.values())

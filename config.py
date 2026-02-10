@@ -357,6 +357,13 @@ SWARM_MAX_SPREAD_PCT: float = _env("SWARM_MAX_SPREAD_PCT", 0.30, float)
 # Diversity cap: max pairs sharing the same base asset in top-N selection.
 SWARM_MAX_PER_BASE: int = _env("SWARM_MAX_PER_BASE", 2, int)
 
+# Global daily loss limit across all swarm pairs (USD).
+# If aggregate daily losses exceed this, non-exempt pairs are paused.
+SWARM_DAILY_LOSS_LIMIT: float = _env("SWARM_DAILY_LOSS_LIMIT", 10.0, float)
+
+# Pairs exempt from swarm-level pausing (comma-separated Kraken pair names).
+SWARM_EXEMPT_PAIRS: list = _env("SWARM_EXEMPT_PAIRS", "XDGUSD", str).split(",")
+
 # ---------------------------------------------------------------------------
 # Multi-pair configuration
 # ---------------------------------------------------------------------------
@@ -373,7 +380,8 @@ class PairConfig:
                  order_size_usd: float = 3.5, daily_loss_limit: float = 3.0,
                  stop_floor: float = 100.0, min_volume: float = 13,
                  price_decimals: int = 6, volume_decimals: int = 0,
-                 filter_strings: list = None, recovery_mode: str = "lottery"):
+                 filter_strings: list = None, recovery_mode: str = "lottery",
+                 capital_budget_usd: float = 0.0):
         self.pair = pair
         self.display = display
         self.entry_pct = entry_pct
@@ -388,6 +396,7 @@ class PairConfig:
         self.filter_strings = filter_strings or [pair[:3].upper()]
         self.next_entry_multiplier = 1.0  # entry size multiplier (1x = normal)
         self.recovery_mode = recovery_mode  # "lottery" or "liquidate"
+        self.capital_budget_usd = capital_budget_usd  # 0 = unlimited (backward compat)
 
     def to_dict(self) -> dict:
         """Serialize for persistence."""
@@ -406,6 +415,7 @@ class PairConfig:
             "filter_strings": self.filter_strings,
             "next_entry_multiplier": self.next_entry_multiplier,
             "recovery_mode": self.recovery_mode,
+            "capital_budget_usd": self.capital_budget_usd,
         }
 
     @staticmethod
@@ -426,6 +436,7 @@ class PairConfig:
         )
         pc.next_entry_multiplier = d.get("next_entry_multiplier", 1.0)
         pc.recovery_mode = d.get("recovery_mode", "lottery")
+        pc.capital_budget_usd = d.get("capital_budget_usd", 0.0)
         return pc
 
 
