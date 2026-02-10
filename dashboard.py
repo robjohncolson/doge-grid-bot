@@ -2043,7 +2043,7 @@ function renderSwarm(data) {
     rows += '<td class="' + totCls + '">' + fmtUSD(p.total_pnl) + '</td>';
     rows += '<td>' + p.trips_today + '/' + p.total_trips + '</td>';
     rows += '<td>' + fmt(p.entry_pct, 2) + '%</td>';
-    rows += '<td><select onchange="setMultiplier(\'' + p.pair + '\',this.value);event.stopPropagation()">'
+    rows += '<td><select onclick="event.stopPropagation()" onchange="setMultiplier(\'' + p.pair + '\',this.value);event.stopPropagation()">'
           + '<option' + (multVal===1 ? ' selected' : '') + '>1x</option>'
           + '<option' + (multVal===2 ? ' selected' : '') + '>2x</option>'
           + '<option' + (multVal===3 ? ' selected' : '') + '>3x</option>'
