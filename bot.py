@@ -651,39 +651,62 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._send_json({"ok": True, "pair": pair_name, "multiplier": mult})
 
     def _handle_swarm_free_orphans(self):
-        """POST /api/swarm/free-orphans -- cancel all recovery tickets."""
+        """POST /api/swarm/free-orphans -- soft or hard free recovery tickets.
+
+        Body: {"mode": "soft"} (default) or {"mode": "hard"}
+        Soft: replace with tight limits 0.2% from market (real fills)
+        Hard: cancel outright and book theoretical loss
+        """
         if not _bot_states:
             self._send_json({"error": "bot not initialized"}, 503)
             return
 
-        total_cancelled = 0
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length)) if length > 0 else {}
+        except (ValueError, json.JSONDecodeError):
+            body = {}
+
+        hard_mode = body.get("mode", "soft") == "hard"
+        total_ok = 0
         total_failed = 0
-        grand_loss = 0.0
         details = []
 
         for pair_name, state in _bot_states.items():
             if not state.recovery_orders:
                 continue
             price = _current_prices.get(pair_name, 0.0)
-            result = grid_strategy.cancel_all_recovery(state, price)
-            grid_strategy.save_state(state)
-            total_cancelled += result["cancelled"]
-            total_failed += result["failed"]
-            grand_loss += result["total_loss"]
-            details.append({
-                "pair": state.pair_display,
-                "cancelled": result["cancelled"],
-                "failed": result["failed"],
-                "loss": round(result["total_loss"], 4),
-            })
 
-        logger.info("FREE ORPHANS (web): %d cancelled, %d failed, $%.4f booked",
-                     total_cancelled, total_failed, grand_loss)
+            if hard_mode:
+                result = grid_strategy.cancel_all_recovery(state, price)
+                ok = result["cancelled"]
+                fail = result["failed"]
+                loss = result["total_loss"]
+            else:
+                result = grid_strategy.soft_free_recovery(state, price)
+                ok = result["replaced"]
+                fail = result["failed"]
+                loss = 0.0  # no immediate loss; booked when fills arrive
+
+            grid_strategy.save_state(state)
+            total_ok += ok
+            total_failed += fail
+            if ok or fail:
+                details.append({
+                    "pair": state.pair_display,
+                    "ok": ok,
+                    "failed": fail,
+                    "loss": round(loss, 4),
+                })
+
+        mode_label = "hard" if hard_mode else "soft"
+        logger.info("FREE ORPHANS (web/%s): %d ok, %d failed",
+                     mode_label, total_ok, total_failed)
         self._send_json({
             "ok": True,
-            "total_cancelled": total_cancelled,
+            "mode": mode_label,
+            "total_ok": total_ok,
             "total_failed": total_failed,
-            "total_loss": round(grand_loss, 4),
             "details": details,
         })
 
@@ -1197,7 +1220,7 @@ def _handle_text_commands(state: grid_strategy.GridState, current_price: float,
         elif command == "/resetbackoff":
             _cmd_resetbackoff(state)
         elif command == "/freeorphans":
-            _cmd_freeorphans()
+            _cmd_freeorphans(arg)
         elif command == "/help":
             _cmd_help()
         else:
@@ -1360,45 +1383,59 @@ def _cmd_resetbackoff(state: grid_strategy.GridState):
     )
 
 
-def _cmd_freeorphans():
-    """Handle /freeorphans -- cancel all recovery tickets across all pairs."""
+def _cmd_freeorphans(arg: str = ""):
+    """Handle /freeorphans -- soft-close recovery tickets (or 'hard' to cancel outright)."""
     if not _bot_states:
         notifier._send_message("No active pairs.")
         return
 
-    total_cancelled = 0
+    hard_mode = arg.strip().lower() == "hard"
+    total_ok = 0
     total_failed = 0
-    grand_loss = 0.0
     lines = []
 
     for pair_name, state in _bot_states.items():
         if not state.recovery_orders:
             continue
         price = _current_prices.get(pair_name, 0.0)
-        result = grid_strategy.cancel_all_recovery(state, price)
+        count = len(state.recovery_orders)
+
+        if hard_mode:
+            result = grid_strategy.cancel_all_recovery(state, price)
+            ok = result["cancelled"]
+            fail = result["failed"]
+            detail = f"${result['total_loss']:.4f}"
+        else:
+            result = grid_strategy.soft_free_recovery(state, price)
+            ok = result["replaced"]
+            fail = result["failed"]
+            skip = result["skipped"]
+            detail = f"{skip} already tight" if skip else "tightened"
+
         grid_strategy.save_state(state)
-        total_cancelled += result["cancelled"]
-        total_failed += result["failed"]
-        grand_loss += result["total_loss"]
-        lines.append(
-            f"  {state.pair_display}: {result['cancelled']} freed"
-            + (f", {result['failed']} failed" if result["failed"] else "")
-            + f" (${result['total_loss']:.4f})"
-        )
+        total_ok += ok
+        total_failed += fail
+        if ok or fail:
+            lines.append(
+                f"  {state.pair_display}: {ok}/{count} {'cancelled' if hard_mode else 'replaced'}"
+                + (f", {fail} failed" if fail else "")
+                + f" ({detail})"
+            )
 
     if not lines:
         notifier._send_message("No recovery tickets to free.")
         return
 
+    mode_label = "Hard Free" if hard_mode else "Soft Free"
+    action_label = "cancelled" if hard_mode else "moved to 0.2% from market"
     summary = (
-        f"<b>Orphans Freed</b>\n\n"
+        f"<b>{mode_label} Orphans</b>\n\n"
         + "\n".join(lines)
-        + f"\n\nTotal: {total_cancelled} cancelled"
+        + f"\n\nTotal: {total_ok} {action_label}"
         + (f", {total_failed} failed" if total_failed else "")
-        + f"\nBooked loss: ${grand_loss:.4f}"
     )
-    logger.info("FREE ORPHANS: %d cancelled, %d failed, $%.4f booked",
-                total_cancelled, total_failed, grand_loss)
+    logger.info("FREE ORPHANS (%s): %d ok, %d failed",
+                "hard" if hard_mode else "soft", total_ok, total_failed)
     notifier._send_message(summary)
 
 
@@ -1414,7 +1451,8 @@ def _cmd_help():
         "/ratio -- Show/set trend ratio (asymmetric grid)\n"
         "/stats -- Statistical analysis results\n"
         "/resetbackoff -- Clear entry backoff counters\n"
-        "/freeorphans -- Cancel all recovery tickets, book losses\n"
+        "/freeorphans -- Soft-close orphans (tight limits near market)\n"
+        "/freeorphans hard -- Hard cancel orphans (book theoretical loss)\n"
         "/help -- This message"
     )
 

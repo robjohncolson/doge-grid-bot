@@ -515,7 +515,7 @@ a{color:#58a6ff}
   <div class="swarm-header">
     <h2>Swarm Manager</h2>
     <div style="display:flex;gap:8px;align-items:center">
-      <button class="btn-free-orphans" id="btn-free-orphans" onclick="freeOrphans()" style="display:none">Free Orphans (<span id="orphan-count">0</span>)</button>
+      <button class="btn-free-orphans" id="btn-free-orphans" onclick="freeOrphans('soft')" style="display:none" title="Replace far exits with tight limits 0.2% from market">Soft Free (<span id="orphan-count">0</span>)</button>
       <button class="btn-browse" onclick="openScanner()">Browse Pairs</button>
     </div>
   </div>
@@ -2118,20 +2118,25 @@ async function removePair(pair) {
   } catch(e) {}
 }
 
-async function freeOrphans() {
+async function freeOrphans(mode) {
+  mode = mode || 'soft';
   const count = document.getElementById('orphan-count').textContent;
-  if (!confirm('Free all ' + count + ' orphan recovery tickets? Losses will be booked at current market prices.')) return;
+  const desc = mode === 'hard'
+    ? 'HARD cancel all ' + count + ' orphans? Losses booked at current market prices.'
+    : 'Soft-close all ' + count + ' orphans? Exits moved to 0.2% from market — real P&L booked when they fill.';
+  if (!confirm(desc)) return;
   try {
     const r = await fetch('/api/swarm/free-orphans', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: '{}'
+      body: JSON.stringify({mode: mode})
     });
     const d = await r.json();
     if (r.ok) {
-      let msg = 'Freed ' + d.total_cancelled + ' orphans';
+      const action = mode === 'hard' ? 'cancelled' : 'moved near market';
+      let msg = d.total_ok + ' orphans ' + action;
       if (d.total_failed > 0) msg += ' (' + d.total_failed + ' failed)';
-      msg += '\nBooked loss: ' + fmtUSD(d.total_loss);
+      if (mode === 'soft') msg += '\nP&L will be booked as fills arrive.';
       alert(msg);
       await pollSwarm();
     } else {

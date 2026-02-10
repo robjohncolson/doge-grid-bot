@@ -3503,6 +3503,88 @@ def cancel_all_recovery(state: GridState, current_price: float) -> dict:
     return {"cancelled": cancelled, "total_loss": total_loss, "failed": failed}
 
 
+def soft_free_recovery(state: GridState, current_price: float,
+                       buffer_pct: float = 0.2) -> dict:
+    """Replace far-away recovery exits with tight limits near market price.
+
+    For sell exits: new price = current_price * (1 + buffer_pct/100)
+    For buy exits:  new price = current_price * (1 - buffer_pct/100)
+
+    Orders stay in recovery_orders for check_recovery_fills() to detect
+    the fill and book real P&L from the actual execution price.
+
+    Returns {"replaced": int, "failed": int, "skipped": int}
+    """
+    if not state.recovery_orders or current_price <= 0:
+        return {"replaced": 0, "failed": 0, "skipped": 0}
+
+    replaced = 0
+    failed = 0
+    skipped = 0
+    decimals = state.price_decimals
+
+    for r in state.recovery_orders:
+        # Compute tight exit price
+        if r.side == "sell":
+            new_price = round(current_price * (1 + buffer_pct / 100.0), decimals)
+        else:
+            new_price = round(current_price * (1 - buffer_pct / 100.0), decimals)
+
+        # Skip if recovery order is already at or tighter than the new price
+        if r.side == "sell" and r.price <= new_price:
+            skipped += 1
+            continue
+        if r.side == "buy" and r.price >= new_price:
+            skipped += 1
+            continue
+
+        old_price = r.price
+        old_txid = r.txid
+
+        # Cancel old order
+        if not config.DRY_RUN:
+            try:
+                kraken_client.cancel_order(r.txid)
+            except Exception as e:
+                logger.warning("Soft free: cancel failed %s [%s.%d]: %s",
+                               r.txid, r.trade_id, r.cycle, e)
+                failed += 1
+                continue
+
+        # Place new tight limit
+        if not config.DRY_RUN:
+            try:
+                new_txid = kraken_client.place_order(
+                    side=r.side, volume=r.volume, price=new_price,
+                    pair=state.pair_name)
+            except Exception as e:
+                logger.warning(
+                    "Soft free: place failed %s [%s.%d] @ $%.6f: %s -- "
+                    "old order already cancelled, will be picked up as external cancel",
+                    r.side, r.trade_id, r.cycle, new_price, e)
+                failed += 1
+                continue
+        else:
+            new_txid = f"DRY-SOFT-{r.trade_id}.{r.cycle}"
+
+        # Update recovery order in-place (keeps it in the list for fill detection)
+        r.txid = new_txid
+        r.price = new_price
+        r.reason = "soft_free"
+        replaced += 1
+
+        logger.info(
+            "SOFT FREE [%s.%d]: %s $%.6f -> $%.6f (%.1f%% from $%.6f) -> %s",
+            r.trade_id, r.cycle, r.side.upper(),
+            old_price, new_price, buffer_pct, current_price, new_txid,
+        )
+
+        if not config.DRY_RUN:
+            time.sleep(0.5)  # rate limit courtesy
+
+    return {"replaced": replaced, "failed": failed, "skipped": skipped}
+
+
 def check_recovery_fills(state: GridState, order_info: dict) -> bool:
     """
     Check recovery orders against batch order query results.
