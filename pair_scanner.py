@@ -361,7 +361,7 @@ def auto_configure(info: PairInfo) -> "config.PairConfig":
         entry_pct=entry_pct,
         profit_pct=profit_pct,
         refresh_pct=refresh_pct,
-        order_size_usd=5.0,
+        order_size_usd=config.ORDER_SIZE_USD,
         daily_loss_limit=1.0,
         stop_floor=0.0,  # per-pair stop floor disabled for swarm
         min_volume=min_volume,

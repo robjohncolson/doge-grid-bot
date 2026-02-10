@@ -105,11 +105,11 @@ PAIR_DISPLAY: str = "DOGE/USD"
 STARTING_CAPITAL: float = _env("STARTING_CAPITAL", 120.0, float)
 
 # Dollar value of each individual grid order (initial value).
-# Overridden at each grid build by adapt_grid_params() which sizes orders
-# near Kraken's 13 DOGE minimum for maximum resolution.
-# Set via env var to force a fixed size (adapt will still run but this
-# becomes the starting point before first build).
-ORDER_SIZE_USD: float = _env("ORDER_SIZE_USD", 3.5, float)
+# Base order size in USD.  Defaults to Kraken's $0.50 cost minimum so every
+# pair trades at its Kraken minimum volume.  calculate_volume_for_price()
+# floors to each pair's min_volume, so this just needs to be <= the cheapest
+# pair's minimum cost.  Compounding adds net profits on top at runtime.
+ORDER_SIZE_USD: float = _env("ORDER_SIZE_USD", 0.50, float)
 
 # ---------------------------------------------------------------------------
 # Grid geometry
@@ -377,7 +377,7 @@ class PairConfig:
     """
     def __init__(self, pair: str, display: str, entry_pct: float,
                  profit_pct: float, refresh_pct: float = 1.0,
-                 order_size_usd: float = 3.5, daily_loss_limit: float = 3.0,
+                 order_size_usd: float = 0.50, daily_loss_limit: float = 3.0,
                  stop_floor: float = 100.0, min_volume: float = 13,
                  price_decimals: int = 6, volume_decimals: int = 0,
                  filter_strings: list = None, recovery_mode: str = "lottery",
@@ -426,7 +426,7 @@ class PairConfig:
             entry_pct=d.get("entry_pct", PAIR_ENTRY_PCT),
             profit_pct=d.get("profit_pct", PAIR_PROFIT_PCT),
             refresh_pct=d.get("refresh_pct", PAIR_REFRESH_PCT),
-            order_size_usd=d.get("order_size_usd", ORDER_SIZE_USD),
+            order_size_usd=ORDER_SIZE_USD,  # always use current config (not stale saved value)
             daily_loss_limit=d.get("daily_loss_limit", DAILY_LOSS_LIMIT),
             stop_floor=d.get("stop_floor", STOP_FLOOR),
             min_volume=d.get("min_volume", 13),
@@ -511,7 +511,7 @@ def print_banner():
         f"  Strategy:        {strategy}",
         f"  Pairs:           {', '.join(pc.display for pc in PAIRS.values())}",
         f"  Capital:         ${STARTING_CAPITAL:.2f}",
-        f"  Order size:      ${ORDER_SIZE_USD:.2f} (adaptive, min 13 DOGE)",
+        f"  Order size:      ${ORDER_SIZE_USD:.2f} base (floors to Kraken min per pair + compounding)",
     ]
     if STRATEGY_MODE == "pair":
         net_pair = PAIR_PROFIT_PCT - ROUND_TRIP_FEE_PCT
