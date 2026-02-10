@@ -344,6 +344,12 @@ class GridState:
         return config.PAIR_DISPLAY
 
     @property
+    def base_display(self) -> str:
+        """Base asset name for log messages (e.g. 'DOGE', 'ETH', 'LTC')."""
+        d = self.pair_display
+        return d.split("/")[0] if "/" in d else "DOGE"
+
+    @property
     def entry_pct(self) -> float:
         if self.pair_config:
             return self.pair_config.entry_pct
@@ -2154,8 +2160,8 @@ def build_pair(state: GridState, current_price: float) -> list:
             order.placed_at = time.time()
             placed.append(order)
             logger.info(
-                "  Pair %s entry [%s.%d]: %.2f DOGE @ $%.6f ($%.2f) -> %s",
-                side.upper(), tid, cyc, volume, price, volume * price, txid,
+                "  Pair %s entry [%s.%d]: %.2f %s @ $%.6f ($%.2f) -> %s",
+                side.upper(), tid, cyc, volume, state.base_display, price, volume * price, txid,
             )
         except Exception as e:
             err_msg = str(e).lower()
@@ -2455,9 +2461,9 @@ def _place_pair_order(state, side, price, role, matched_buy=None,
         if role == "entry":
             state.total_entries_placed += 1
         logger.info(
-            "  Pair %s %s [%s.%d]: %.2f DOGE @ $%.6f -> %s",
+            "  Pair %s %s [%s.%d]: %.2f %s @ $%.6f -> %s",
             side.upper(), role, trade_id or "?", cycle or 0,
-            volume, price, txid,
+            volume, state.base_display, price, txid,
         )
         return order
     except Exception as e:
@@ -2568,11 +2574,11 @@ def _close_orphaned_exit(state, filled_entry):
 
     logger.warning(
         "RACE CLOSE: %s entry $%.6f implicitly closed %s "
-        "(cost $%.6f, %.2f DOGE) -> net $%.4f "
+        "(cost $%.6f, %.2f %s) -> net $%.4f "
         "(intended exit $%.6f cancelled)",
         filled_entry.side.upper(), filled_entry.price,
         "long" if filled_entry.side == "sell" else "short",
-        cost_basis, close_vol, net_profit, orphan.price,
+        cost_basis, close_vol, state.base_display, net_profit, orphan.price,
     )
 
     # Log trade and fill record for the implicit close
@@ -2670,11 +2676,21 @@ def reprice_thin_exits(state: GridState, current_price: float) -> int:
         if margin >= floor_pct:
             continue  # already wide enough
 
-        # Cancel the thin exit
         entry_price = o.matched_buy_price if o.side == "sell" else o.matched_sell_price
         tid = getattr(o, "trade_id", None)
         cyc = getattr(o, "cycle", 0)
 
+        # Compute new price BEFORE cancelling to avoid no-op reprices
+        saved_profit_pct = state.profit_pct
+        state.profit_pct = floor_pct
+        new_price = _pair_exit_price(entry_price, current_price, o.side, state)
+        state.profit_pct = saved_profit_pct
+
+        # Skip if price wouldn't actually change (avoids wasting rate limit)
+        if new_price == o.price:
+            continue
+
+        # Cancel the thin exit
         if config.DRY_RUN:
             o.status = "cancelled"
         else:
@@ -2684,13 +2700,6 @@ def reprice_thin_exits(state: GridState, current_price: float) -> int:
                                state.pair_display, o.side, o.txid)
                 continue
             o.status = "cancelled"
-
-        # Place new exit at the correct (wider) price.
-        # Temporarily set profit_pct to the floor so _pair_exit_price uses it.
-        saved_profit_pct = state.profit_pct
-        state.profit_pct = floor_pct
-        new_price = _pair_exit_price(entry_price, current_price, o.side, state)
-        state.profit_pct = saved_profit_pct
 
         new_o = _place_pair_order(
             state, o.side, new_price, "exit",
@@ -2893,8 +2902,8 @@ def handle_pair_fill(state: GridState, filled_orders: list,
                             state.next_entry_multiplier)
                 state.next_entry_multiplier = 1.0
             logger.info(
-                "PAIR [%s.%d]: Buy entry filled @ $%.6f (%.2f DOGE)",
-                tid, cyc, filled.price, filled.volume,
+                "PAIR [%s.%d]: Buy entry filled @ $%.6f (%.2f %s)",
+                tid, cyc, filled.price, filled.volume, state.base_display,
             )
 
             # Track buy fill fee
@@ -3040,8 +3049,8 @@ def handle_pair_fill(state: GridState, filled_orders: list,
                             state.next_entry_multiplier)
                 state.next_entry_multiplier = 1.0
             logger.info(
-                "PAIR [%s.%d]: Sell entry filled @ $%.6f (%.2f DOGE)",
-                tid, cyc, filled.price, filled.volume,
+                "PAIR [%s.%d]: Sell entry filled @ $%.6f (%.2f %s)",
+                tid, cyc, filled.price, filled.volume, state.base_display,
             )
 
             # Track sell fill fee
@@ -4632,9 +4641,9 @@ def reconcile_pair_on_startup(state: GridState, current_price: float) -> int:
         state.grid_orders.append(order)
         adopted += 1
         logger.info(
-            "Pair reconcile: adopted %s %s [%s.%d] %.2f DOGE @ $%.6f -> %s (id: %s)",
+            "Pair reconcile: adopted %s %s [%s.%d] %.2f %s @ $%.6f -> %s (id: %s)",
             o["side"].upper(), order.order_role, order.trade_id, order.cycle,
-            o["volume"], o["price"], o["txid"], identity["method"],
+            o["volume"], state.base_display, o["price"], o["txid"], identity["method"],
         )
 
     # Build set of recovery txids to protect from orphan cancellation
@@ -4820,8 +4829,8 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                     state.today_loss_usd += abs(net_profit)
                 logger.warning(
                     "OFFLINE EXIT: Buy $%.6f closes short "
-                    "(sell entry $%.6f, %.2f DOGE) -> net $%.4f",
-                    buy_p, sell_p, close_vol, net_profit,
+                    "(sell entry $%.6f, %.2f %s) -> net $%.4f",
+                    buy_p, sell_p, close_vol, state.base_display, net_profit,
                 )
                 state.recent_fills.append({
                     "time": last_buy["time"], "side": "buy",
@@ -4868,8 +4877,8 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
                     state.today_loss_usd += abs(net_profit)
                 logger.warning(
                     "OFFLINE EXIT: Sell $%.6f closes long "
-                    "(buy entry $%.6f, %.2f DOGE) -> net $%.4f",
-                    sell_p, buy_p, close_vol, net_profit,
+                    "(buy entry $%.6f, %.2f %s) -> net $%.4f",
+                    sell_p, buy_p, close_vol, state.base_display, net_profit,
                 )
                 state.recent_fills.append({
                     "time": last_sell["time"], "side": "sell",
@@ -5033,10 +5042,10 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
 
             logger.warning(
                 "OFFLINE ROUND TRIP: %s entry $%.6f -> %s exit $%.6f "
-                "(%.2f DOGE) -> net $%.4f",
+                "(%.2f %s) -> net $%.4f",
                 first["side"].upper(), first["price"],
                 second["side"].upper(), second["price"],
-                close_vol, net_profit,
+                close_vol, state.base_display, net_profit,
             )
 
             # Reopen entry for the completed side only
@@ -5079,10 +5088,10 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
 
             logger.warning(
                 "OFFLINE DUAL ENTRY: %s entry $%.6f + %s entry $%.6f "
-                "(%.2f DOGE) -- placing exits (no implicit close)",
+                "(%.2f %s) -- placing exits (no implicit close)",
                 first["side"].upper(), first["price"],
                 second["side"].upper(), second["price"],
-                first["volume"],
+                first["volume"], state.base_display,
             )
 
             if first["side"] == "buy" and not has_sell_exit:
@@ -5124,9 +5133,9 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
         buy_price = last_buy["price"]
         exit_price = _pair_exit_price(buy_price, current_price, "sell", state)
         logger.warning(
-            "OFFLINE FILL RECOVERY: Buy filled @ $%.6f (%.2f DOGE) at %s "
+            "OFFLINE FILL RECOVERY: Buy filled @ $%.6f (%.2f %s) at %s "
             "-- placing sell exit @ $%.6f",
-            buy_price, last_buy["volume"],
+            buy_price, last_buy["volume"], state.base_display,
             datetime.fromtimestamp(last_buy["time"], timezone.utc)
                 .strftime("%Y-%m-%d %H:%M UTC"),
             exit_price,
@@ -5154,9 +5163,9 @@ def _reconcile_offline_fills(state: GridState, current_price: float):
         sell_price = last_sell["price"]
         exit_price = _pair_exit_price(sell_price, current_price, "buy", state)
         logger.warning(
-            "OFFLINE FILL RECOVERY: Sell filled @ $%.6f (%.2f DOGE) at %s "
+            "OFFLINE FILL RECOVERY: Sell filled @ $%.6f (%.2f %s) at %s "
             "-- placing buy exit @ $%.6f",
-            sell_price, last_sell["volume"],
+            sell_price, last_sell["volume"], state.base_display,
             datetime.fromtimestamp(last_sell["time"], timezone.utc)
                 .strftime("%Y-%m-%d %H:%M UTC"),
             exit_price,
@@ -5243,7 +5252,7 @@ def get_status_summary(state: GridState, current_price: float) -> str:
             f"{tag}  Trade A: {len(a_cycles)} cycles, ${a_net:.4f} net",
             f"{tag}  Trade B: {len(b_cycles)} cycles, ${b_net:.4f} net",
             f"{tag}Fees paid: ${state.total_fees_usd:.4f}",
-            f"{tag}DOGE accumulated: {state.doge_accumulated:.2f}",
+            f"{tag}{state.base_display} accumulated: {state.doge_accumulated:.2f}",
         ]
         # Add unrealized P&L
         upnl = compute_unrealized_pnl(state, current_price)
@@ -5289,7 +5298,7 @@ def get_status_summary(state: GridState, current_price: float) -> str:
             f"{tag}Today: {state.round_trips_today} round trips, ${state.today_profit_usd:.4f} profit",
             f"{tag}Lifetime: {state.total_round_trips} round trips, ${state.total_profit_usd:.4f} profit",
             f"{tag}Fees paid: ${state.total_fees_usd:.4f}",
-            f"{tag}DOGE accumulated: {state.doge_accumulated:.2f}",
+            f"{tag}{state.base_display} accumulated: {state.doge_accumulated:.2f}",
         ]
 
     if state.is_paused:
