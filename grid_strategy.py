@@ -436,11 +436,25 @@ class GridState:
 
 
 def get_capital_deployed(state: GridState, current_price: float) -> float:
-    """Total capital tied up in open orders + recovery exposure for this pair."""
+    """Total USD-equivalent exposure for this pair.
+
+    Counts three things:
+      1. Open buy orders  -- USD committed on book
+      2. Inventory         -- filled buys not yet closed out, valued at market
+         (open sell exits are NOT added; they represent the same asset)
+      3. Recovery orders   -- lottery tickets / stranded exposure
+    """
     total = 0.0
     for o in state.grid_orders:
-        if o.status == "open":
+        if o.status == "open" and o.side == "buy":
+            # USD sitting on the order book
             total += o.price * o.volume
+        elif (o.side == "buy" and o.status == "filled"
+              and not o.closed_out):
+            # Inventory held -- value at current market price.
+            # This creates the rubber-band: if price drops, value drops,
+            # freeing budget room; if price rises, value rises, tightening it.
+            total += current_price * o.volume
     for r in state.recovery_orders:
         total += r.price * r.volume
     return total
@@ -3743,6 +3757,20 @@ def _orphan_exit(state, o, current_price, reason="timeout"):
     recovery_mode = "lottery"
     if state.pair_config:
         recovery_mode = getattr(state.pair_config, "recovery_mode", "lottery")
+
+    # Budget check for lottery mode -- lottery keeps the exit on book AND
+    # places a new entry, so it INCREASES exposure.  Skip if already at limit.
+    # Liquidation is exempt: it SELLS the asset, which FREES capital.
+    if recovery_mode != "liquidate":
+        budget = state.capital_budget_usd
+        if budget > 0:
+            deployed = get_capital_deployed(state, current_price)
+            if deployed >= budget:
+                logger.info(
+                    "ORPHAN [%s]: skipped (%s) -- at capital limit "
+                    "($%.2f >= $%.2f budget)",
+                    state.pair_display, reason, deployed, budget)
+                return None
 
     if recovery_mode == "liquidate":
         return _force_liquidate_exit(state, o, current_price, reason)
