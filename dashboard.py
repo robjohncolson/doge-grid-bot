@@ -1988,7 +1988,7 @@ let swarmMode = false;
 let swarmData = null;
 let scannerData = null;
 let scannerCacheTime = 0;
-let scannerSortKey = 'volatility_pct';
+let scannerSortKey = 'score';
 let scannerSortAsc = false;
 let detailPair = null;
 
@@ -2160,7 +2160,8 @@ function renderScanner(data) {
     return scannerSortAsc ? cmp : -cmp;
   });
   const cols = [
-    {key:'display',label:'Pair'}, {key:'price',label:'Price'},
+    {key:'display',label:'Pair'}, {key:'score',label:'Score'},
+    {key:'price',label:'Price'},
     {key:'volatility_pct',label:'Volatility'}, {key:'volume_24h',label:'24h Vol'},
     {key:'spread_pct',label:'Spread'}, {key:'fee_maker',label:'Fee'}
   ];
@@ -2173,8 +2174,12 @@ function renderScanner(data) {
   hdr += '<th></th>';
   let html = '<table class="scanner-table"><thead><tr>' + hdr + '</tr></thead><tbody>';
   for (const p of filtered) {
+    const rmBadge = p.recovery_mode === 'liquidate'
+      ? ' <span style="background:#9e6a03;color:#e3b341;font-size:9px;padding:1px 4px;border-radius:3px;font-weight:600" title="Force liquidate on orphan">F</span>'
+      : '';
     html += '<tr>';
-    html += '<td><b>' + p.display + '</b></td>';
+    html += '<td><b>' + p.display + '</b>' + rmBadge + '</td>';
+    html += '<td>' + (p.score || 0).toFixed(1) + '</td>';
     html += '<td>$' + (p.price < 1 ? p.price.toFixed(6) : p.price.toFixed(2)) + '</td>';
     html += '<td>' + p.volatility_pct.toFixed(1) + '%</td>';
     html += '<td>$' + (p.volume_24h > 1e6 ? (p.volume_24h/1e6).toFixed(1)+'M' : Math.round(p.volume_24h).toLocaleString()) + '</td>';

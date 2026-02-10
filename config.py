@@ -339,6 +339,25 @@ DIRECTIONAL_SQUEEZE: float = _env("DIRECTIONAL_SQUEEZE", 0.5, float)
 AI_AUTO_EXECUTE: bool = _env("AI_AUTO_EXECUTE", True, bool)
 
 # ---------------------------------------------------------------------------
+# Swarm scanner settings
+# ---------------------------------------------------------------------------
+
+# Quote currencies considered safe (lottery recovery on orphan exit).
+SWARM_SAFE_QUOTES: str = _env("SWARM_SAFE_QUOTES", "USD,JPY", str)
+
+# Quote currencies acceptable but riskier (force-liquidate on orphan exit).
+SWARM_ACCEPTABLE_QUOTES: str = _env("SWARM_ACCEPTABLE_QUOTES", "EUR,GBP,USDT,USDC,DOGE", str)
+
+# Minimum 24h USD volume for a pair to appear in scanner results.
+SWARM_MIN_VOLUME_USD: float = _env("SWARM_MIN_VOLUME_USD", 100000, float)
+
+# Maximum spread (%) for a pair to be eligible.
+SWARM_MAX_SPREAD_PCT: float = _env("SWARM_MAX_SPREAD_PCT", 0.30, float)
+
+# Diversity cap: max pairs sharing the same base asset in top-N selection.
+SWARM_MAX_PER_BASE: int = _env("SWARM_MAX_PER_BASE", 2, int)
+
+# ---------------------------------------------------------------------------
 # Multi-pair configuration
 # ---------------------------------------------------------------------------
 
@@ -354,7 +373,7 @@ class PairConfig:
                  order_size_usd: float = 3.5, daily_loss_limit: float = 3.0,
                  stop_floor: float = 100.0, min_volume: float = 13,
                  price_decimals: int = 6, volume_decimals: int = 0,
-                 filter_strings: list = None):
+                 filter_strings: list = None, recovery_mode: str = "lottery"):
         self.pair = pair
         self.display = display
         self.entry_pct = entry_pct
@@ -368,6 +387,7 @@ class PairConfig:
         self.volume_decimals = volume_decimals
         self.filter_strings = filter_strings or [pair[:3].upper()]
         self.next_entry_multiplier = 1.0  # entry size multiplier (1x = normal)
+        self.recovery_mode = recovery_mode  # "lottery" or "liquidate"
 
     def to_dict(self) -> dict:
         """Serialize for persistence."""
@@ -385,6 +405,7 @@ class PairConfig:
             "volume_decimals": self.volume_decimals,
             "filter_strings": self.filter_strings,
             "next_entry_multiplier": self.next_entry_multiplier,
+            "recovery_mode": self.recovery_mode,
         }
 
     @staticmethod
@@ -404,6 +425,7 @@ class PairConfig:
             filter_strings=d.get("filter_strings"),
         )
         pc.next_entry_multiplier = d.get("next_entry_multiplier", 1.0)
+        pc.recovery_mode = d.get("recovery_mode", "lottery")
         return pc
 
 

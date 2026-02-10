@@ -3451,9 +3451,103 @@ def adjust_profit_from_volatility(state: GridState, stats_results: dict) -> bool
     return True
 
 
-def _orphan_exit(state, o, current_price, reason="timeout"):
+def _force_liquidate_exit(state, o, current_price, reason="timeout"):
     """
-    Move an exit order to recovery and place a fresh entry.
+    Force-close a stranded exit: cancel limit order, market-sell the asset.
+    Books the realized loss.  No recovery order created.
+    Returns the new entry GridOrder on success, None on failure.
+    """
+    tid = getattr(o, "trade_id", None) or ("A" if o.side == "buy" else "B")
+    cyc = getattr(o, "cycle", 0)
+    entry_price = o.matched_sell_price if o.side == "buy" else o.matched_buy_price
+    decimals = state.price_decimals
+
+    # Cancel the stranded limit exit on Kraken
+    try:
+        kraken_client.cancel_order(o.txid)
+    except Exception as e:
+        logger.warning("Force liquidate: cancel failed for %s: %s", o.txid, e)
+
+    # Market-close the position to get back to quote currency
+    # sell exit stranded → we hold asset, market sell it
+    # buy exit stranded → we hold quote, market buy to close
+    close_side = o.side  # same side as the stranded exit
+    try:
+        kraken_client.place_order(
+            side=close_side, volume=o.volume, price=current_price,
+            pair=state.pair_name, ordertype="market")
+    except Exception as e:
+        logger.error("Force liquidate: market order failed: %s -- "
+                     "falling back to lottery mode", e)
+        # Fall back to normal lottery-style orphan
+        return _orphan_exit_lottery(state, o, current_price, reason)
+
+    # Book the realized loss (approximate -- actual fill may differ slightly)
+    fill_price = current_price
+    if o.side == "sell":
+        gross = (fill_price - (entry_price or current_price)) * o.volume
+    else:
+        gross = ((entry_price or current_price) - fill_price) * o.volume
+    fees = fill_price * o.volume * config.MAKER_FEE_PCT / 100.0 * 2
+    net = gross - fees
+    state.total_profit_usd += net
+    state.today_profit_usd += net
+    state.total_fees_usd += fees
+
+    logger.info(
+        "FORCE LIQUIDATE [%s.%d]: market %s %.8f @ ~$%.6f "
+        "(entry $%.6f) -> net $%.4f | reason=%s",
+        tid, cyc, close_side.upper(), o.volume,
+        fill_price, entry_price or 0, net, reason)
+
+    # Remove from grid_orders
+    state.grid_orders.remove(o)
+
+    # Detect directional trend
+    _detect_trend(state, o.side)
+
+    # Place fresh entry (same logic as lottery mode)
+    a_pct, b_pct = compute_entry_distances(state)
+    a_pct = get_backoff_entry_pct(a_pct, state.consecutive_losses_a)
+    b_pct = get_backoff_entry_pct(b_pct, state.consecutive_losses_b)
+
+    if o.side == "sell":
+        new_entry_price = round(
+            current_price * (1 - b_pct / 100.0), decimals)
+        new_cyc = cyc + 1
+        if tid == "B":
+            state.cycle_b = new_cyc
+        new_o = _place_pair_order(
+            state, "buy", new_entry_price, "entry",
+            trade_id=tid, cycle=new_cyc)
+    else:
+        new_entry_price = round(
+            current_price * (1 + a_pct / 100.0), decimals)
+        new_cyc = cyc + 1
+        if tid == "A":
+            state.cycle_a = new_cyc
+        new_o = _place_pair_order(
+            state, "sell", new_entry_price, "entry",
+            trade_id=tid, cycle=new_cyc)
+
+    # Reset anti-chase and reprice counters for this side
+    if tid == "A":
+        state.consecutive_refreshes_a = 0
+        state.last_refresh_direction_a = None
+        state.refresh_cooldown_until_a = 0.0
+        state.exit_reprice_count_a = 0
+    else:
+        state.consecutive_refreshes_b = 0
+        state.last_refresh_direction_b = None
+        state.refresh_cooldown_until_b = 0.0
+        state.exit_reprice_count_b = 0
+
+    return new_o
+
+
+def _orphan_exit_lottery(state, o, current_price, reason="timeout"):
+    """
+    Move an exit order to recovery (lottery ticket) and place a fresh entry.
     Returns the new entry GridOrder on success, None on failure.
     """
     now = time.time()
@@ -3462,7 +3556,6 @@ def _orphan_exit(state, o, current_price, reason="timeout"):
     entry_price = o.matched_sell_price if o.side == "buy" else o.matched_buy_price
     decimals = state.price_decimals
     a_pct, b_pct = compute_entry_distances(state)
-    # Apply backoff widening on top of asymmetry
     a_pct = get_backoff_entry_pct(a_pct, state.consecutive_losses_a)
     b_pct = get_backoff_entry_pct(b_pct, state.consecutive_losses_b)
 
@@ -3519,6 +3612,22 @@ def _orphan_exit(state, o, current_price, reason="timeout"):
         state.exit_reprice_count_b = 0
 
     return new_o
+
+
+def _orphan_exit(state, o, current_price, reason="timeout"):
+    """
+    Orphan a stranded exit order.  Dispatches to force-liquidation or
+    lottery-ticket mode based on the pair's recovery_mode setting.
+    Returns the new entry GridOrder on success, None on failure.
+    """
+    recovery_mode = "lottery"
+    if state.pair_config:
+        recovery_mode = getattr(state.pair_config, "recovery_mode", "lottery")
+
+    if recovery_mode == "liquidate":
+        return _force_liquidate_exit(state, o, current_price, reason)
+
+    return _orphan_exit_lottery(state, o, current_price, reason)
 
 
 def check_exit_drift(state: GridState, current_price: float) -> bool:

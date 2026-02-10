@@ -525,13 +525,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "pair": pi.pair,
                 "altname": pi.altname,
                 "base": pi.base,
-                "display": pair_scanner.get_display_name(pi.pair, pi.altname),
+                "display": pair_scanner.get_display_name(pi.pair, pi.altname,
+                                                         pi.quote),
                 "price": round(pi.price, 8),
                 "volatility_pct": round(pi.volatility_pct, 2),
                 "volume_24h": round(pi.volume_24h, 0),
                 "spread_pct": round(pi.spread_pct, 3),
                 "fee_maker": pi.fee_maker,
                 "ordermin": pi.ordermin,
+                "score": getattr(pi, "score", 0),
+                "recovery_mode": getattr(pi, "recovery_mode", "lottery"),
                 "active": pi.pair in active_set,
             })
         self._send_json(result)
@@ -556,7 +559,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
 
         # Look up pair info from scanner cache
-        all_pairs = pair_scanner.scan_all_usd_pairs()
+        all_pairs = pair_scanner.scan_all_pairs()
         info = all_pairs.get(pair_name)
         if not info:
             self._send_json({"error": f"unknown pair: {pair_name}"}, 404)

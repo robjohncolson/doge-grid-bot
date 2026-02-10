@@ -1,16 +1,19 @@
 """
-pair_scanner.py -- Scans Kraken for all USD-quoted pairs, ranks by volatility,
+pair_scanner.py -- Scans Kraken for tradeable pairs, ranks by composite score,
 and auto-configures trading parameters.
 
 Used by the swarm dashboard to browse/add pairs.
 All API calls are public (no rate limit cost).
 
 Public API:
-    scan_all_usd_pairs()       -> dict of pair_name -> PairInfo
-    get_ranked_pairs(min_vol)  -> sorted list of PairInfo
+    scan_all_pairs()           -> dict of pair_name -> PairInfo
+    scan_all_usd_pairs()       -> alias for scan_all_pairs() (backward compat)
+    get_ranked_pairs(min_vol)  -> sorted list of PairInfo (by composite score)
     auto_configure(info)       -> config.PairConfig
+    select_top_pairs(scored)   -> diversity-capped top-N list
 """
 
+import math
 import time
 import logging
 
@@ -29,6 +32,7 @@ class PairInfo:
         "pair", "altname", "base", "quote", "price",
         "pair_decimals", "lot_decimals", "ordermin", "costmin",
         "fee_maker", "volatility_pct", "spread_pct", "volume_24h", "status",
+        "score", "recovery_mode",
     )
 
     def __init__(self, **kwargs):
@@ -49,15 +53,107 @@ CACHE_TTL = 3600             # re-scan hourly
 
 
 # ---------------------------------------------------------------------------
+# Quote currency classification
+# ---------------------------------------------------------------------------
+
+def _build_quote_sets():
+    """Parse SWARM_SAFE_QUOTES / SWARM_ACCEPTABLE_QUOTES into Kraken-style sets.
+
+    Kraken prefixes some currencies with Z (ZUSD, ZJPY, ZEUR, ZGBP).
+    We expand each user-facing symbol to include the Z-prefixed variant.
+    """
+    safe = set()
+    for q in config.SWARM_SAFE_QUOTES.split(","):
+        q = q.strip().upper()
+        if q:
+            safe.add(q)
+            safe.add("Z" + q)
+    acceptable = set()
+    for q in config.SWARM_ACCEPTABLE_QUOTES.split(","):
+        q = q.strip().upper()
+        if q:
+            acceptable.add(q)
+            acceptable.add("Z" + q)
+    return safe, acceptable
+
+SAFE_QUOTES, ACCEPTABLE_QUOTES = _build_quote_sets()
+ALL_QUOTES = SAFE_QUOTES | ACCEPTABLE_QUOTES
+
+
+def _recovery_mode_for_quote(quote: str) -> str:
+    """Return 'lottery' for safe quotes, 'liquidate' for acceptable quotes."""
+    if quote in SAFE_QUOTES:
+        return "lottery"
+    return "liquidate"
+
+
+# ---------------------------------------------------------------------------
+# Composite scoring
+# ---------------------------------------------------------------------------
+
+def compute_score(pi: "PairInfo") -> float:
+    """Composite grid-bot-friendliness score (0-100).
+
+    Components:
+        Volume (30%):  log-scaled 24h USD volume
+        Spread (30%):  how much room between spread and min profit target
+        Range  (40%):  volatility sweet spot 0.5%-3.0%
+    """
+    # Volume score: log-scaled, 0-100
+    vol_score = min(100, math.log10(max(pi.volume_24h, 1)) / 7 * 100)
+
+    # Spread efficiency: profit_target / spread.  Higher = better.
+    min_profit = 2 * pi.fee_maker + 0.10
+    if pi.spread_pct < min_profit:
+        spread_eff = min(100, (min_profit / max(pi.spread_pct, 0.01)) * 25)
+    else:
+        spread_eff = 0
+
+    # Volatility fit: sweet spot 0.5%-3.0%.  Penalize outside range.
+    v = pi.volatility_pct
+    if 0.5 <= v <= 3.0:
+        range_score = 100
+    elif v < 0.5:
+        range_score = max(0, v / 0.5 * 100)
+    else:
+        range_score = max(0, 100 - (v - 3.0) * 10)
+
+    return round(vol_score * 0.30 + spread_eff * 0.30 + range_score * 0.40, 1)
+
+
+# ---------------------------------------------------------------------------
+# Diversity cap
+# ---------------------------------------------------------------------------
+
+def select_top_pairs(scored: list, n: int = 50,
+                     max_per_base: int = None) -> list:
+    """Apply diversity cap and return top N pairs by score."""
+    if max_per_base is None:
+        max_per_base = config.SWARM_MAX_PER_BASE
+    scored.sort(key=lambda p: p.score, reverse=True)
+    base_counts = {}
+    result = []
+    for pi in scored:
+        base = pi.base
+        if base_counts.get(base, 0) >= max_per_base:
+            continue
+        base_counts[base] = base_counts.get(base, 0) + 1
+        result.append(pi)
+        if len(result) >= n:
+            break
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Scanner
 # ---------------------------------------------------------------------------
 
-def scan_all_usd_pairs() -> dict:
+def scan_all_pairs() -> dict:
     """
-    Fetch all USD-quoted online pairs from Kraken, enrich with ticker data.
+    Fetch all eligible pairs from Kraken, enrich with ticker data.
 
-    1 private call for AssetPairs (public, no rate limit)
-    ~21 public calls for tickers (30 pairs per call, ~632 USD pairs)
+    Scans USD, JPY, EUR, GBP, USDT, USDC, DOGE (configurable via env vars).
+    Each pair is tagged with a composite score and recovery_mode.
 
     Results cached for 1 hour.
     Returns dict of pair_name -> PairInfo.
@@ -67,7 +163,7 @@ def scan_all_usd_pairs() -> dict:
     if _pair_cache and (time.time() - _cache_time) < CACHE_TTL:
         return _pair_cache
 
-    logger.info("Scanning all USD pairs from Kraken...")
+    logger.info("Scanning all eligible pairs from Kraken...")
 
     # Step 1: Get all asset pair info
     try:
@@ -76,13 +172,12 @@ def scan_all_usd_pairs() -> dict:
         logger.error("Failed to fetch asset pairs: %s", e)
         return _pair_cache  # return stale cache if available
 
-    # Step 2: Filter to USD-quoted, online pairs
-    usd_pairs = {}
+    # Step 2: Filter to eligible quote currencies, online pairs
+    eligible = {}
     for pair_name, info in all_pairs.items():
         quote = info.get("quote", "")
         status = info.get("status", "online")
-        # USD quote assets: "ZUSD", "USD"
-        if quote not in ("ZUSD", "USD"):
+        if quote not in ALL_QUOTES:
             continue
         if status != "online":
             continue
@@ -99,7 +194,6 @@ def scan_all_usd_pairs() -> dict:
         # Build base display name
         base = info.get("base", "")
         altname = info.get("altname", pair_name)
-        wsname = info.get("wsname", "")
 
         pi = PairInfo(
             pair=pair_name,
@@ -116,13 +210,15 @@ def scan_all_usd_pairs() -> dict:
             spread_pct=0.0,
             volume_24h=0.0,
             status=status,
+            score=0.0,
+            recovery_mode=_recovery_mode_for_quote(quote),
         )
-        usd_pairs[pair_name] = pi
+        eligible[pair_name] = pi
 
-    logger.info("Found %d USD-quoted online pairs", len(usd_pairs))
+    logger.info("Found %d eligible online pairs", len(eligible))
 
     # Step 3: Get ticker data in batches of 30
-    pair_names = list(usd_pairs.keys())
+    pair_names = list(eligible.keys())
     for i in range(0, len(pair_names), 30):
         chunk = pair_names[i:i + 30]
         try:
@@ -136,7 +232,7 @@ def scan_all_usd_pairs() -> dict:
             for resp_key, ticker in tickers.items():
                 rk = resp_key.upper()
                 if inp in rk or rk in inp or inp == rk:
-                    pi = usd_pairs[input_pair]
+                    pi = eligible[input_pair]
                     try:
                         bid = float(ticker["b"][0])
                         ask = float(ticker["a"][0])
@@ -148,54 +244,67 @@ def scan_all_usd_pairs() -> dict:
                         if vwap_24h > 0:
                             pi.volatility_pct = (high_24h - low_24h) / vwap_24h * 100
                         vol_24h = float(ticker["v"][1])
-                        pi.volume_24h = vol_24h * pi.price  # USD volume
+                        pi.volume_24h = vol_24h * pi.price  # approximate USD volume
                     except (KeyError, IndexError, ValueError, TypeError):
                         pass
                     break
 
-    _pair_cache = usd_pairs
+    # Step 4: Compute composite scores
+    for pi in eligible.values():
+        pi.score = compute_score(pi)
+
+    _pair_cache = eligible
     _cache_time = time.time()
-    logger.info("Scan complete: %d pairs with ticker data", len(usd_pairs))
+    logger.info("Scan complete: %d pairs with ticker data", len(eligible))
 
     # Persist to Supabase (best-effort, never fails the scanner)
     try:
         import supabase_store
         pairs_rows = [
             {**pi.to_dict(), "scanned_at": _cache_time}
-            for pi in usd_pairs.values()
+            for pi in eligible.values()
         ]
         supabase_store.save_pairs(pairs_rows)
     except Exception as e:
         logger.debug("Supabase pairs save skipped: %s", e)
 
-    return usd_pairs
+    return eligible
+
+
+# Backward-compat alias
+scan_all_usd_pairs = scan_all_pairs
 
 
 def get_ranked_pairs(min_volume_usd: float = 1000) -> list:
     """
-    Return cached pairs filtered by min volume, sorted by volatility descending.
+    Return cached pairs filtered by min volume, sorted by composite score.
     Returns list of PairInfo objects.
     """
-    pairs = scan_all_usd_pairs()
+    pairs = scan_all_pairs()
     ranked = [
         pi for pi in pairs.values()
         if pi.volume_24h >= min_volume_usd and pi.price > 0
     ]
-    ranked.sort(key=lambda p: p.volatility_pct, reverse=True)
+    ranked.sort(key=lambda p: p.score, reverse=True)
     return ranked
 
 
-def get_display_name(pair_name: str, altname: str = "") -> str:
-    """Generate a human-readable display name like 'DOGE/USD'."""
+def get_display_name(pair_name: str, altname: str = "",
+                     quote: str = "") -> str:
+    """Generate a human-readable display name like 'DOGE/USD' or 'ETH/EUR'."""
     name = altname or pair_name
-    # Strip trailing "USD" and add slash
-    for suffix in ("USD", "ZUSD"):
+    # Try common quote suffixes (longest first to avoid partial matches)
+    for suffix, display_q in (
+        ("ZUSD", "USD"), ("ZJPY", "JPY"), ("ZEUR", "EUR"), ("ZGBP", "GBP"),
+        ("USDT", "USDT"), ("USDC", "USDC"), ("DOGE", "DOGE"),
+        ("USD", "USD"), ("JPY", "JPY"), ("EUR", "EUR"), ("GBP", "GBP"),
+    ):
         if name.upper().endswith(suffix):
             base = name[:-len(suffix)]
             # Strip leading X/Z if present (Kraken convention)
             if len(base) > 3 and base[0] in ("X", "Z"):
                 base = base[1:]
-            return f"{base}/USD"
+            return f"{base}/{display_q}"
     return name
 
 
@@ -232,7 +341,7 @@ def auto_configure(info: PairInfo) -> "config.PairConfig":
 
     refresh_pct = round(entry_pct * 2, 2)
 
-    display = get_display_name(info.pair, info.altname)
+    display = get_display_name(info.pair, info.altname, info.quote)
 
     # Determine min volume from Kraken metadata
     min_volume = info.ordermin if info.ordermin > 0 else 1.0
@@ -242,6 +351,8 @@ def auto_configure(info: PairInfo) -> "config.PairConfig":
     for prefix in ("X", "Z"):
         if len(base_clean) > 3 and base_clean.startswith(prefix):
             base_clean = base_clean[1:]
+
+    recovery_mode = getattr(info, "recovery_mode", "lottery") or "lottery"
 
     return config.PairConfig(
         pair=info.pair,
@@ -256,4 +367,5 @@ def auto_configure(info: PairInfo) -> "config.PairConfig":
         price_decimals=info.pair_decimals,
         volume_decimals=info.lot_decimals,
         filter_strings=[base_clean, info.base],
+        recovery_mode=recovery_mode,
     )

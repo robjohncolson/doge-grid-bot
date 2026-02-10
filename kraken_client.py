@@ -410,15 +410,17 @@ def get_open_orders() -> dict:
     return result.get("open", {})
 
 
-def place_order(side: str, volume: float, price: float, pair: str = None) -> str:
+def place_order(side: str, volume: float, price: float, pair: str = None,
+                ordertype: str = "limit") -> str:
     """
-    Place a limit order on Kraken.
+    Place an order on Kraken.
 
     Args:
-        side:   "buy" or "sell"
-        volume: Amount of DOGE to buy/sell
-        price:  Limit price in USD
-        pair:   Trading pair (defaults to config.PAIR)
+        side:      "buy" or "sell"
+        volume:    Amount of asset to buy/sell
+        price:     Limit price (ignored for market orders)
+        pair:      Trading pair (defaults to config.PAIR)
+        ordertype: "limit" (default) or "market"
 
     Returns:
         Transaction ID (txid) of the placed order, or a simulated ID in dry run.
@@ -428,20 +430,22 @@ def place_order(side: str, volume: float, price: float, pair: str = None) -> str
     if config.DRY_RUN:
         # Generate a fake txid for dry-run tracking
         fake_txid = f"DRY-{side[0].upper()}-{int(time.time() * 1000)}"
+        label = "market" if ordertype == "market" else "limit"
         logger.info(
-            "[DRY RUN] Would place %s limit %s %s @ $%s ($%.4f)",
-            pair, side, volume, price, volume * price,
+            "[DRY RUN] Would place %s %s %s %s @ $%s ($%.4f)",
+            pair, label, side, volume, price, volume * price,
         )
         return fake_txid
 
     params = {
         "pair": pair,
         "type": side,          # "buy" or "sell"
-        "ordertype": "limit",
-        "price": f"{price:.8f}",
+        "ordertype": ordertype,
         "volume": f"{volume:.8f}",
         # "oflags": "post",    # Uncomment to force post-only (maker) orders
     }
+    if ordertype == "limit":
+        params["price"] = f"{price:.8f}"
 
     result = _private_request(ADD_ORDER_PATH, params)
 
