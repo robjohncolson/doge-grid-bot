@@ -921,6 +921,8 @@ def _check_s2_break_glass(state: PairState,
 
     spread_pct = (sell_exit.price - buy_exit.price) / state.market_price * 100
     if spread_pct < cfg.s2_max_spread_pct:
+        # Spread tolerable -- reset timer so it measures continuous bad-spread duration
+        state = replace(state, s2_entered_at=state.now)
         return state, actions
 
     # Phase 3: Identify worse trade (larger distance from market)
