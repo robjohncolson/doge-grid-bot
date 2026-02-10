@@ -2569,6 +2569,69 @@ def _pair_exit_price(entry_fill: float, current_price: float,
         return round(min(from_entry, from_market), decimals)
 
 
+def reprice_thin_exits(state: GridState, current_price: float) -> int:
+    """One-time pass: cancel and re-place exits whose profit margin is below
+    the current profit floor.  Returns count of exits repriced.
+
+    For sell exits (Trade B): margin = (exit - buy_cost) / buy_cost
+    For buy exits  (Trade A): margin = (sell_cost - exit) / sell_cost
+    """
+    if current_price <= 0:
+        return 0
+
+    fee_floor = config.ROUND_TRIP_FEE_PCT + 0.20
+    floor_pct = max(config.VOLATILITY_PROFIT_FLOOR, fee_floor, state.profit_pct)
+    repriced = 0
+
+    for o in list(state.grid_orders):
+        if o.status != "open" or o.order_role != "exit":
+            continue
+
+        # Compute the exit's current margin from its matched entry
+        if o.side == "sell" and o.matched_buy_price:
+            margin = (o.price - o.matched_buy_price) / o.matched_buy_price * 100.0
+        elif o.side == "buy" and getattr(o, "matched_sell_price", None):
+            margin = (o.matched_sell_price - o.price) / o.matched_sell_price * 100.0
+        else:
+            continue  # no cost basis, can't evaluate
+
+        if margin >= floor_pct:
+            continue  # already wide enough
+
+        # Cancel the thin exit
+        entry_price = o.matched_buy_price if o.side == "sell" else o.matched_sell_price
+        tid = getattr(o, "trade_id", None)
+        cyc = getattr(o, "cycle", 0)
+
+        if config.DRY_RUN:
+            o.status = "cancelled"
+        else:
+            ok = kraken_client.cancel_order(o.txid)
+            if not ok:
+                logger.warning("REPRICE [%s]: failed to cancel %s exit %s",
+                               state.pair_display, o.side, o.txid)
+                continue
+            o.status = "cancelled"
+
+        # Place new exit at the correct (wider) price
+        new_price = _pair_exit_price(entry_price, current_price, o.side, state)
+
+        new_o = _place_pair_order(
+            state, o.side, new_price, "exit",
+            matched_buy=o.matched_buy_price if o.side == "sell" else None,
+            matched_sell=getattr(o, "matched_sell_price", None) if o.side == "buy" else None,
+            trade_id=tid, cycle=cyc)
+        if new_o:
+            new_o.entry_filled_at = getattr(o, "entry_filled_at", 0.0)
+            repriced += 1
+            logger.info(
+                "REPRICE [%s]: %s exit [%s.%d] $%.6f (%.2f%%) -> $%.6f (%.2f%%)",
+                state.pair_display, o.side.upper(), tid, cyc,
+                o.price, margin, new_price, floor_pct)
+
+    return repriced
+
+
 def compute_unrealized_pnl(state: GridState, current_price: float) -> dict:
     """
     Compute mark-to-market unrealized P&L for open exit orders.

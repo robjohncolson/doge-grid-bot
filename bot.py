@@ -1800,6 +1800,20 @@ def run():
 
         grid_strategy.check_daily_reset(state)
 
+    # --- Phase 3b: One-time reprice thin exits to new profit floor ---
+    for pair_name, state in _bot_states.items():
+        try:
+            ticker = kraken_client.get_ticker(state.pair_name)
+            cp = float(ticker.get("c", [0])[0]) if ticker else 0
+            if cp > 0:
+                n = grid_strategy.reprice_thin_exits(state, cp)
+                if n:
+                    logger.info("[%s] Repriced %d thin exits to %.2f%% floor",
+                                pair_name, n, state.profit_pct)
+                    grid_strategy.save_state(state)
+        except Exception as e:
+            logger.warning("[%s] Exit reprice failed: %s", pair_name, e)
+
     # --- Phase 4: Main loop ---
     _rebalance_capital_budgets()  # set per-pair budgets on startup
     logger.info("Entering main loop (poll every %ds, %d pair(s))...",
