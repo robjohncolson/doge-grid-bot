@@ -549,6 +549,7 @@ saving txid to state (e.g. crash between placement and save).
 | `consecutive_losses_b` | Entry backoff: consecutive losing cycles for Trade B (§16.1) |
 | `last_volatility_adjust` | Volatility auto-adjust: timestamp of last profit target change (§16.2) |
 | `pair_profit_pct` | Per-pair profit target (may be auto-adjusted by volatility engine) |
+| `recovery_mode` | Per-pair recovery mode: "lottery" (default) or "liquidate" (§17.3, stored in PairConfig) |
 
 ## 7. Fill Pair Cycling (The Profit Engine)
 
@@ -611,6 +612,7 @@ When that sell fills at $0.0900:
 | MAIN_LOOP | RECOVERY_FILL | [pair] recovery order fills on Kraken | book delayed round-trip profit |
 | MAIN_LOOP | VOL_ADJUST | [pair] stats engine ran + median_range changed | auto-adjust profit_pct (§16.2) |
 | MAIN_LOOP | AI_AUTO | AI safe action + consensus | auto-execute widen_entry/widen_spacing (§16.3) |
+| MAIN_LOOP | FORCE_LIQ | [pair] orphan exit + recovery_mode=liquidate | market-close position, book loss, re-enter (§17.4) |
 | SHUTDOWN | EXIT | always | save, cancel orders, notify |
 
 ## 9. Pair Strategy State Machine (`STRATEGY_MODE=pair`)
@@ -1344,11 +1346,25 @@ CHECK_S2_BREAK_GLASS (runs only when pair_state == S2)
 
 ### 12.4 Orphan → Recovery Pipeline
 
-When an exit is orphaned (removed from the active pair state machine
-but left on the Kraken book), it becomes a recovery order.
+When an exit is orphaned, `_orphan_exit()` dispatches based on
+the pair's `recovery_mode` setting (§17.3):
 
 ```
-ORPHAN EXIT
+_orphan_exit(state, order, price, reason)
+    │
+    ├── recovery_mode = state.pair_config.recovery_mode
+    │
+    ├── "lottery" (default, safe quotes: USD/JPY)
+    │     └── _orphan_exit_lottery() — original behavior
+    │
+    └── "liquidate" (non-safe quotes: EUR/GBP/USDT/USDC/DOGE)
+          └── _force_liquidate_exit() — market-close immediately (§17.4)
+```
+
+#### Lottery Mode (default)
+
+```
+ORPHAN EXIT (lottery)
     │
     ├── Remove order from active pair tracking
     │
@@ -1359,6 +1375,29 @@ ORPHAN EXIT
     │     }
     │
     ├── Place new entry for that side (engine resumes)
+    │
+    └── State recalculated by _compute_pair_state()
+```
+
+#### Force Liquidation Mode
+
+```
+FORCE LIQUIDATE EXIT
+    │
+    ├── Cancel stranded limit exit on Kraken
+    │
+    ├── Place market order (same side) to close position
+    │     FAIL → fall back to lottery mode
+    │
+    ├── Book realized P&L (approximate at current price):
+    │     sell exit: gross = (current - entry) × volume
+    │     buy exit:  gross = (entry - current) × volume
+    │     net = gross - estimated fees
+    │     state.total_profit_usd += net
+    │
+    ├── Remove from grid_orders (NO recovery order created)
+    │
+    ├── Place fresh entry for that side
     │
     └── State recalculated by _compute_pair_state()
 ```
@@ -1638,20 +1677,26 @@ Active pair configs survive restarts via dual persistence:
 
 ### 14.4 Pair Scanner & Supabase Pairs Table
 
-`pair_scanner.py` scans all Kraken USD pairs hourly:
+`pair_scanner.py` scans all eligible Kraken pairs hourly across multiple
+quote currencies (§17). `scan_all_usd_pairs()` is a backward-compat alias.
 
 ```
-scan_all_usd_pairs()
+scan_all_pairs()
     │
     ├── GET AssetPairs (1 public call)
-    ├── Filter to USD-quoted, online, non-darkpool
-    ├── GET Tickers in batches of 30 (public, ~21 calls for ~630 pairs)
+    ├── Filter to eligible quote currencies (§17.1), online, non-darkpool
+    ├── Tag each pair with recovery_mode (§17.3):
+    │     safe quotes (USD, JPY) → "lottery"
+    │     acceptable quotes (EUR, GBP, USDT, USDC, DOGE) → "liquidate"
+    ├── GET Tickers in batches of 30 (public, ~40 calls for ~1200 pairs)
     ├── Enrich: price, volatility, spread, volume
+    ├── Compute composite score per pair (§17.2)
     ├── Cache results (TTL: 1 hour)
     └── Persist to Supabase `pairs` table (best-effort, bulk upsert)
 ```
 
-`auto_configure(PairInfo)` maps volatility to trading parameters:
+`auto_configure(PairInfo)` maps volatility to trading parameters and
+propagates `recovery_mode` from scanner classification:
 
 | Volatility | Entry % | Profit % |
 |------------|---------|----------|
@@ -1749,18 +1794,22 @@ navigates to a non-first pair's detail view:
 
 ### 15.4 Scanner Modal
 
-The scanner modal shows all qualifying Kraken USD pairs (~600) with
-sortable column headers:
+The scanner modal shows all qualifying Kraken pairs across multiple
+quote currencies (~1200) with sortable column headers:
 
 | Column | Sort Key | Default Direction |
 |--------|----------|-------------------|
 | Pair | `display` | Ascending (A→Z) |
+| Score | `score` | Descending (**default sort**) |
 | Price | `price` | Descending |
 | Volatility | `volatility_pct` | Descending |
 | 24h Vol | `volume_24h` | Descending |
 | Spread | `spread_pct` | Descending |
 | Fee | `fee_maker` | Descending |
 
+- **Score** = composite grid-bot-friendliness score 0-100 (§17.2)
+- **"F" badge** shown next to non-safe pairs (`recovery_mode: "liquidate"`)
+  indicating force-liquidation on orphan exit instead of lottery tickets
 - Click same column → toggle asc/desc
 - Click new column → string keys default asc, numeric keys default desc
 - Active sort column highlighted with ▲/▼ arrow indicator
@@ -1835,7 +1884,8 @@ LOSS COUNTER (per trade leg: consecutive_losses_a / consecutive_losses_b)
 #### Where Backoff Is Applied
 
 ```
-_orphan_exit()
+_orphan_exit() → dispatches to _orphan_exit_lottery() or _force_liquidate_exit()
+    │  Both branches apply backoff:
     │  a_pct, b_pct = compute_entry_distances(state)   # asymmetry
     │  a_pct = get_backoff_entry_pct(a_pct, losses_a)  # backoff on top
     │  b_pct = get_backoff_entry_pct(b_pct, losses_b)
@@ -1931,3 +1981,148 @@ See §11 for full details. Summary:
 | AI auto-execute + pending approval | Auto-execute bypasses approval flow. Existing pending approvals unaffected. |
 | Grid rebuild | Backoff does NOT apply (rebuild is intentional). Volatility adjust persists. |
 | All features disabled | Set `ENTRY_BACKOFF_ENABLED=false`, `VOLATILITY_AUTO_PROFIT=false`, `AI_AUTO_EXECUTE=false` |
+
+## 17. Swarm Scanner Phase 2 — Multi-Quote, Scoring, Force Liquidation
+
+The scanner supports multiple quote currencies, ranks pairs by composite
+score instead of raw volatility, enforces diversity caps, and dispatches
+orphaned exits to different recovery strategies based on quote safety.
+
+### 17.1 Multi-Quote Scanning
+
+The scanner accepts two configurable sets of quote currencies:
+
+| Set | Env Var | Default | Recovery Mode |
+|-----|---------|---------|---------------|
+| Safe quotes | `SWARM_SAFE_QUOTES` | `USD,JPY` | `lottery` |
+| Acceptable quotes | `SWARM_ACCEPTABLE_QUOTES` | `EUR,GBP,USDT,USDC,DOGE` | `liquidate` |
+
+Kraken prefixes some currencies with "Z" (ZUSD, ZJPY, ZEUR, ZGBP).
+`_build_quote_sets()` auto-expands each symbol to include both forms
+(e.g. "USD" → {"USD", "ZUSD"}).
+
+`ALL_QUOTES = SAFE_QUOTES | ACCEPTABLE_QUOTES` — pairs not matching
+any quote in this set are excluded from the scan.
+
+### 17.2 Composite Scoring
+
+`compute_score(PairInfo) → float (0-100)` replaces raw volatility sort.
+
+| Component | Weight | How |
+|-----------|--------|-----|
+| Volume | 30% | `log10(volume_24h_usd) / 7 × 100`, capped at 100 |
+| Spread efficiency | 30% | `(min_profit / spread) × 25` when spread < min_profit, else 0 |
+| Volatility fit | 40% | 100 in sweet spot (0.5%-3.0%), linear penalty outside |
+
+Where `min_profit = 2 × fee_maker + 0.10`.
+
+```
+compute_score(pi):
+    vol_score = min(100, log10(max(volume_24h, 1)) / 7 * 100)
+
+    if spread_pct < min_profit:
+        spread_eff = min(100, min_profit / max(spread_pct, 0.01) * 25)
+    else:
+        spread_eff = 0
+
+    if 0.5 <= volatility <= 3.0:
+        range_score = 100
+    elif volatility < 0.5:
+        range_score = volatility / 0.5 * 100
+    else:
+        range_score = max(0, 100 - (volatility - 3.0) * 10)
+
+    return vol_score * 0.30 + spread_eff * 0.30 + range_score * 0.40
+```
+
+### 17.3 Recovery Mode
+
+Each pair's `PairConfig` carries a `recovery_mode` field:
+
+| Mode | Quote Currencies | Orphan Behavior |
+|------|-----------------|-----------------|
+| `lottery` | USD, JPY | Exit stays on Kraken book as lottery ticket (original §12.4) |
+| `liquidate` | EUR, GBP, USDT, USDC, DOGE | Market-sell immediately, book loss (§17.4) |
+
+The mode is set at scan time by `_recovery_mode_for_quote()` and flows
+through `auto_configure()` → `PairConfig` → `GridState.pair_config`.
+
+Persisted in `PairConfig.to_dict()` / `from_dict()` with default `"lottery"`
+for backward compatibility.
+
+### 17.4 Force Liquidation (`_force_liquidate_exit`)
+
+For pairs with `recovery_mode == "liquidate"`, stranded exits are
+market-closed instead of left as lottery tickets:
+
+```
+_force_liquidate_exit(state, order, current_price, reason)
+    │
+    ├── Cancel stranded limit exit on Kraken
+    │
+    ├── Place MARKET order (same side, same volume)
+    │     ordertype="market" (kraken_client.place_order)
+    │     │
+    │     FAIL → fall back to _orphan_exit_lottery()
+    │
+    ├── Book P&L at approximate fill price:
+    │     sell exit: net = (current - entry) × vol - fees
+    │     buy exit:  net = (entry - current) × vol - fees
+    │
+    ├── Remove from grid_orders
+    │
+    ├── Place fresh entry (same as lottery mode)
+    │
+    └── Reset reprice/refresh counters for that side
+```
+
+**Key difference from lottery mode**: No `RecoveryOrder` is created.
+Capital is freed immediately rather than sitting on the book. This is
+appropriate for non-USD pairs where the exit denominated in EUR/GBP/etc
+is less likely to recover and ties up capital in an illiquid position.
+
+### 17.5 Diversity Cap
+
+`select_top_pairs(scored, n=50, max_per_base=SWARM_MAX_PER_BASE)`
+prevents concentration in a single base asset:
+
+```
+select_top_pairs(scored_list):
+    │
+    ├── Sort by score descending
+    │
+    ├── For each pair:
+    │     base_count[base] < max_per_base?
+    │       YES → include, increment count
+    │       NO  → skip
+    │
+    └── Stop at n pairs
+```
+
+Default `SWARM_MAX_PER_BASE = 2`: at most 2 BTC/X pairs, 2 ETH/X pairs, etc.
+
+### 17.6 Config Parameters
+
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| `SWARM_SAFE_QUOTES` | `USD,JPY` | Quote currencies using lottery recovery |
+| `SWARM_ACCEPTABLE_QUOTES` | `EUR,GBP,USDT,USDC,DOGE` | Quote currencies using force liquidation |
+| `SWARM_MIN_VOLUME_USD` | `100000` | Minimum 24h volume for scanner results |
+| `SWARM_MAX_SPREAD_PCT` | `0.30` | Maximum spread for eligibility |
+| `SWARM_MAX_PER_BASE` | `2` | Diversity cap: max pairs per base asset |
+
+### 17.7 API Changes
+
+`/api/swarm/available` response now includes per-pair:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `score` | float | Composite score 0-100 (§17.2) |
+| `recovery_mode` | str | `"lottery"` or `"liquidate"` (§17.3) |
+
+`kraken_client.place_order()` now accepts optional `ordertype` parameter:
+
+| Value | Behavior |
+|-------|----------|
+| `"limit"` (default) | Standard limit order, `price` required |
+| `"market"` | Market order, `price` ignored by Kraken |
