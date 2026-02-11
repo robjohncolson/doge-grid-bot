@@ -753,6 +753,19 @@ class BotRuntime:
 
     def _poll_order_status(self) -> None:
         # Query active + recovery txids once per loop.
+        def _to_float(value: Any) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return 0.0
+
+        def _first_positive(row: dict, *keys: str) -> float:
+            for k in keys:
+                v = _to_float(row.get(k))
+                if v > 0:
+                    return v
+            return 0.0
+
         tx_map: dict[str, tuple[int, str, int]] = {}
         for sid, slot in self.slots.items():
             for o in slot.state.orders:
@@ -786,17 +799,32 @@ class BotRuntime:
             if status == "closed":
                 if txid in self.seen_fill_txids:
                     continue
-                self.seen_fill_txids.add(txid)
 
-                price = float(row.get("price") or row.get("avg_price") or 0.0)
-                volume = float(row.get("vol_exec") or row.get("vol") or 0.0)
-                fee = float(row.get("fee") or 0.0)
+                volume = _first_positive(row, "vol_exec", "vol")
+                # Kraken can report limit price as 0 for closed orders; prefer executed/avg prices.
+                price = _first_positive(row, "price_exec", "avg_price", "price")
+                if price <= 0 and volume > 0:
+                    cost = _to_float(row.get("cost"))
+                    if cost > 0:
+                        price = cost / volume
+                fee = _to_float(row.get("fee"))
                 if volume <= 0 or price <= 0:
+                    logger.warning(
+                        "closed order %s missing fill details (status=%s price=%s avg=%s exec=%s vol_exec=%s vol=%s)",
+                        txid,
+                        status,
+                        row.get("price"),
+                        row.get("avg_price"),
+                        row.get("price_exec"),
+                        row.get("vol_exec"),
+                        row.get("vol"),
+                    )
                     continue
 
                 if kind == "order":
                     o = sm.find_order(self.slots[sid].state, local_id)
                     if not o:
+                        logger.warning("closed order %s not found in slot %s local_id=%s", txid, sid, local_id)
                         continue
                     supabase_store.save_fill(
                         {
@@ -821,9 +849,11 @@ class BotRuntime:
                         timestamp=_now(),
                     )
                     self._apply_event(sid, ev, "fill", {"txid": txid, "price": price, "volume": volume})
+                    self.seen_fill_txids.add(txid)
                 else:
                     r = next((x for x in self.slots[sid].state.recovery_orders if x.recovery_id == local_id), None)
                     if not r:
+                        logger.warning("closed recovery %s not found in slot %s recovery_id=%s", txid, sid, local_id)
                         continue
                     ev = sm.RecoveryFillEvent(
                         recovery_id=local_id,
@@ -835,6 +865,7 @@ class BotRuntime:
                         timestamp=_now(),
                     )
                     self._apply_event(sid, ev, "recovery_fill", {"txid": txid, "price": price, "volume": volume})
+                    self.seen_fill_txids.add(txid)
 
             elif status in ("canceled", "expired"):
                 if kind == "order":
