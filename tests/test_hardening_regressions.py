@@ -217,6 +217,31 @@ class BotEventLogTests(unittest.TestCase):
                 self.assertAlmostEqual(ev.price, 0.1, places=8)
                 self.assertIn("TX1", rt.seen_fill_txids)
 
+    def test_min_size_wait_state_does_not_halt(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        rt.constraints = {
+            "price_decimals": 6,
+            "volume_decimals": 0,
+            "min_volume": 13.0,
+            "min_cost_usd": 0.0,
+        }
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    orders=(),
+                ),
+            )
+        }
+        with mock.patch.object(config, "ORDER_SIZE_USD", 0.5):
+            self.assertTrue(rt._is_min_size_wait_state(0, ["S0 must be exactly A sell entry + B buy entry"]))
+            with mock.patch.object(rt, "halt") as halt_mock:
+                rt._validate_slot(0)
+                halt_mock.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

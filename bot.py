@@ -840,8 +840,40 @@ class BotRuntime:
         st = self.slots[slot_id].state
         violations = sm.check_invariants(st)
         if violations:
+            # Hotfix: if order size is intentionally below Kraken minimum, slot may
+            # legally sit in an empty/incomplete S0 waiting state. Do not hard halt.
+            if self._is_min_size_wait_state(slot_id, violations):
+                logger.info(
+                    "Slot %s in min-size wait state; skipping invariant halt (%s)",
+                    slot_id,
+                    violations[0],
+                )
+                return
             self.halt(f"slot {slot_id} invariant violation: {violations[0]}")
             logger.error("Slot %s invariant violations: %s", slot_id, violations)
+
+    def _is_min_size_wait_state(self, slot_id: int, violations: list[str]) -> bool:
+        if not violations:
+            return False
+        if any(v != "S0 must be exactly A sell entry + B buy entry" for v in violations):
+            return False
+
+        slot = self.slots[slot_id]
+        st = slot.state
+        if sm.derive_phase(st) != "S0":
+            return False
+        if any(o.role == "exit" for o in st.orders):
+            return False
+
+        target_usd = self._slot_order_size_usd(slot)
+        market = st.market_price or self.last_price
+        if market <= 0:
+            return False
+
+        min_vol = float(self.constraints.get("min_volume", 13.0))
+        min_cost = float(self.constraints.get("min_cost_usd", 0.0))
+        required_usd = max(min_cost, min_vol * market)
+        return target_usd < required_usd
 
     # ------------------ Commands ------------------
 
@@ -1178,7 +1210,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
-        if self.path.startswith("/api/status"):
+        if self.path.startswith("/api/status") or self.path.startswith("/api/swarm/status"):
             if _RUNTIME is None:
                 self._send_json({"error": "runtime not ready"}, 503)
                 return
