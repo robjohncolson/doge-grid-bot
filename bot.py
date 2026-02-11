@@ -1145,14 +1145,31 @@ class BotRuntime:
     # ------------------ API status ------------------
 
     def status_payload(self) -> dict:
+        def _unrealized_pnl(exit_side: str, entry_price: float, market_price: float, volume: float) -> float:
+            if entry_price <= 0 or market_price <= 0 or volume <= 0:
+                return 0.0
+            # buy exit closes a short (profit as market falls), sell exit closes a long.
+            if exit_side == "buy":
+                return (entry_price - market_price) * volume
+            return (market_price - entry_price) * volume
+
         with self.lock:
             now = _now()
             slots = []
+            total_unrealized_profit = 0.0
             for sid in sorted(self.slots.keys()):
                 st = self.slots[sid].state
                 phase = sm.derive_phase(st)
+                slot_unrealized_profit = 0.0
                 open_orders = []
                 for o in st.orders:
+                    if o.role == "exit":
+                        slot_unrealized_profit += _unrealized_pnl(
+                            exit_side=o.side,
+                            entry_price=o.entry_price,
+                            market_price=st.market_price,
+                            volume=o.volume,
+                        )
                     open_orders.append({
                         "local_id": o.local_id,
                         "side": o.side,
@@ -1166,6 +1183,12 @@ class BotRuntime:
                 recs = []
                 for r in st.recovery_orders:
                     dist = abs(r.price - st.market_price) / st.market_price * 100.0 if st.market_price > 0 else 0.0
+                    slot_unrealized_profit += _unrealized_pnl(
+                        exit_side=r.side,
+                        entry_price=r.entry_price,
+                        market_price=st.market_price,
+                        volume=r.volume,
+                    )
                     recs.append({
                         "recovery_id": r.recovery_id,
                         "trade_id": r.trade_id,
@@ -1179,6 +1202,8 @@ class BotRuntime:
                         "distance_pct": dist,
                     })
                 cycles = list(st.completed_cycles[-20:])
+                slot_realized_doge = st.total_profit / st.market_price if st.market_price > 0 else 0.0
+                slot_unrealized_doge = slot_unrealized_profit / st.market_price if st.market_price > 0 else 0.0
                 slots.append({
                     "slot_id": sid,
                     "phase": phase,
@@ -1186,18 +1211,27 @@ class BotRuntime:
                     "cycle_a": st.cycle_a,
                     "cycle_b": st.cycle_b,
                     "total_profit": st.total_profit,
+                    "total_profit_doge": slot_realized_doge,
+                    "unrealized_profit": slot_unrealized_profit,
+                    "unrealized_profit_doge": slot_unrealized_doge,
                     "today_realized_loss": st.today_realized_loss,
+                    "total_round_trips": st.total_round_trips,
                     "order_size_usd": self._slot_order_size_usd(self.slots[sid]),
                     "profit_pct_runtime": st.profit_pct_runtime,
                     "open_orders": open_orders,
                     "recovery_orders": recs,
                     "recent_cycles": [c.__dict__ for c in reversed(cycles)],
                 })
+                total_unrealized_profit += slot_unrealized_profit
 
             total_profit = sum(s.state.total_profit for s in self.slots.values())
             total_loss = sum(s.state.today_realized_loss for s in self.slots.values())
+            total_round_trips = sum(s.state.total_round_trips for s in self.slots.values())
             total_orphans = sum(len(s.state.recovery_orders) for s in self.slots.values())
             top_phase = slots[0]["phase"] if slots else "S0"
+            pnl_ref_price = self.last_price if self.last_price > 0 else (slots[0]["market_price"] if slots else 0.0)
+            total_profit_doge = total_profit / pnl_ref_price if pnl_ref_price > 0 else 0.0
+            total_unrealized_doge = total_unrealized_profit / pnl_ref_price if pnl_ref_price > 0 else 0.0
 
             return {
                 "mode": self.mode,
@@ -1210,8 +1244,13 @@ class BotRuntime:
                 "top_phase": top_phase,
                 "slot_count": len(self.slots),
                 "total_profit": total_profit,
+                "total_profit_doge": total_profit_doge,
+                "total_unrealized_profit": total_unrealized_profit,
+                "total_unrealized_doge": total_unrealized_doge,
                 "today_realized_loss": total_loss,
+                "total_round_trips": total_round_trips,
                 "total_orphans": total_orphans,
+                "pnl_reference_price": pnl_ref_price,
                 "slots": slots,
             }
 

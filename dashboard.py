@@ -178,7 +178,10 @@ DASHBOARD_HTML = """<!doctype html>
         <h3 style=\"margin-top:14px\">Summary</h3>
         <div class=\"row\"><span class=\"k\">Pair</span><span id=\"pair\" class=\"v mono\"></span></div>
         <div class=\"row\"><span class=\"k\">Slots</span><span id=\"slotCount\" class=\"v\"></span></div>
-        <div class=\"row\"><span class=\"k\">Total PnL</span><span id=\"totalPnl\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Round Trips</span><span id=\"totalTrips\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Realized PnL (USD)</span><span id=\"totalPnl\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Realized PnL (DOGE eq)</span><span id=\"totalPnlDoge\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Unrealized PnL</span><span id=\"totalUnrealized\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Today Loss</span><span id=\"todayLoss\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Orphans</span><span id=\"orphans\" class=\"v\"></span></div>
       </div>
@@ -190,6 +193,9 @@ DASHBOARD_HTML = """<!doctype html>
 
         <div class=\"row\"><span class=\"k\">Order Size USD</span><span id=\"orderUsd\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Runtime Profit %</span><span id=\"runtimeProfit\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Slot Realized</span><span id=\"slotRealized\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Slot Unrealized</span><span id=\"slotUnrealized\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Slot Round Trips</span><span id=\"slotTrips\" class=\"v\"></span></div>
 
         <h3 style=\"margin-top:12px\">Open Orders</h3>
         <table>
@@ -255,7 +261,11 @@ DASHBOARD_HTML = """<!doctype html>
 
       document.getElementById('pair').textContent = s.pair;
       document.getElementById('slotCount').textContent = s.slot_count;
-      document.getElementById('totalPnl').textContent = `$${fmt(s.total_profit, 4)}`;
+      document.getElementById('totalTrips').textContent = s.total_round_trips ?? 0;
+      document.getElementById('totalPnl').textContent = `$${fmt(s.total_profit, 6)}`;
+      document.getElementById('totalPnlDoge').textContent = `${fmt(s.total_profit_doge, 3)} DOGE`;
+      document.getElementById('totalUnrealized').textContent =
+        `$${fmt(s.total_unrealized_profit, 6)} (${fmt(s.total_unrealized_doge, 3)} DOGE)`;
       document.getElementById('todayLoss').textContent = `$${fmt(s.today_realized_loss, 4)}`;
       document.getElementById('orphans').textContent = s.total_orphans;
     }
@@ -289,6 +299,11 @@ DASHBOARD_HTML = """<!doctype html>
 
       document.getElementById('orderUsd').textContent = `$${fmt(slot.order_size_usd, 4)}`;
       document.getElementById('runtimeProfit').textContent = `${fmt(slot.profit_pct_runtime, 3)}%`;
+      document.getElementById('slotRealized').textContent =
+        `$${fmt(slot.total_profit, 6)} (${fmt(slot.total_profit_doge, 3)} DOGE)`;
+      document.getElementById('slotUnrealized').textContent =
+        `$${fmt(slot.unrealized_profit, 6)} (${fmt(slot.unrealized_profit_doge, 3)} DOGE)`;
+      document.getElementById('slotTrips').textContent = slot.total_round_trips ?? 0;
 
       const ob = document.getElementById('ordersBody');
       ob.innerHTML = '';
