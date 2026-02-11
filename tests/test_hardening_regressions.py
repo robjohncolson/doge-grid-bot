@@ -1,232 +1,221 @@
-import json
 import unittest
 from unittest import mock
 
 import bot
 import config
-import grid_strategy
+import state_machine as sm
 
 
-class HardeningRegressionTests(unittest.TestCase):
-    def setUp(self):
-        self._orig_bot_states = bot._bot_states
-        self._orig_current_prices = bot._current_prices
-        self._orig_web_pending = bot._web_config_pending
+class DogeV1StateMachineTests(unittest.TestCase):
+    def _cfg(self) -> sm.EngineConfig:
+        return sm.EngineConfig(
+            entry_pct=0.2,
+            profit_pct=1.0,
+            refresh_pct=1.0,
+            order_size_usd=2.0,
+            price_decimals=6,
+            volume_decimals=0,
+            min_volume=13.0,
+            min_cost_usd=0.0,
+            maker_fee_pct=0.25,
+            s1_orphan_after_sec=600,
+            s2_orphan_after_sec=1800,
+            loss_backoff_start=3,
+            loss_cooldown_start=5,
+            loss_cooldown_sec=900,
+        )
 
-    def tearDown(self):
-        bot._bot_states = self._orig_bot_states
-        bot._current_prices = self._orig_current_prices
-        bot._web_config_pending = self._orig_web_pending
+    def test_s0_invariants_hold(self):
+        st = sm.PairState(market_price=0.1, now=1000)
+        cfg = self._cfg()
+        st, a = sm.add_entry_order(st, cfg, "sell", "A", 1, order_size_usd=2.0)
+        st, b = sm.add_entry_order(st, cfg, "buy", "B", 1, order_size_usd=2.0)
+        self.assertIsNotNone(a)
+        self.assertIsNotNone(b)
+        self.assertEqual(sm.derive_phase(st), "S0")
+        self.assertEqual(sm.check_invariants(st), [])
 
-    def test_pair_config_from_dict_restores_persisted_fields(self):
-        payload = {
-            "pair": "XBTUSD",
-            "display": "XBT/USD",
-            "entry_pct": 0.35,
-            "profit_pct": 1.25,
-            "refresh_pct": 0.9,
-            "order_size_usd": 7.5,
-            "recovery_mode": "liquidate",
-            "capital_budget_usd": 42.0,
-            "slot_count": 3,
+    def test_entry_fill_preserves_volume_for_exit(self):
+        st = sm.PairState(market_price=0.1, now=1000)
+        cfg = self._cfg()
+        st, action = sm.add_entry_order(st, cfg, "buy", "B", 1, order_size_usd=2.7)
+        self.assertIsNotNone(action)
+        order = st.orders[0]
+
+        fill = sm.FillEvent(
+            order_local_id=order.local_id,
+            txid="TX1",
+            side="buy",
+            price=order.price,
+            volume=27.0,
+            fee=0.01,
+            timestamp=1010,
+        )
+        st2, actions = sm.transition(st, fill, cfg, order_size_usd=2.7)
+        self.assertEqual(len([o for o in st2.orders if o.role == "exit"]), 1)
+        exit_order = [o for o in st2.orders if o.role == "exit"][0]
+        self.assertEqual(exit_order.volume, 27.0)
+        self.assertTrue(any(isinstance(x, sm.PlaceOrderAction) and x.role == "exit" for x in actions))
+
+    def test_s1_timeout_orphans_stale_exit(self):
+        st = sm.PairState(
+            market_price=101.0,
+            now=1000,
+            orders=(
+                sm.OrderState(
+                    local_id=1,
+                    side="buy",
+                    role="exit",
+                    price=100.0,
+                    volume=13.0,
+                    trade_id="A",
+                    cycle=1,
+                    txid="TX-A-EXIT",
+                    entry_price=101.5,
+                    entry_fee=0.02,
+                    entry_filled_at=300.0,
+                ),
+                sm.OrderState(
+                    local_id=2,
+                    side="buy",
+                    role="entry",
+                    price=99.5,
+                    volume=13.0,
+                    trade_id="B",
+                    cycle=1,
+                    txid="TX-B-ENTRY",
+                    placed_at=900.0,
+                ),
+            ),
+            cycle_a=1,
+            cycle_b=1,
+            next_order_id=3,
+            next_recovery_id=1,
+        )
+        cfg = self._cfg()
+
+        st2, actions = sm.transition(st, sm.TimerTick(timestamp=1000.0), cfg, order_size_usd=2.0)
+        self.assertEqual(len(st2.recovery_orders), 1)
+        self.assertTrue(any(isinstance(x, sm.OrphanOrderAction) for x in actions))
+
+    def test_s2_timeout_orphans_worse_leg(self):
+        st = sm.PairState(
+            market_price=0.11,
+            now=4000,
+            s2_entered_at=2000,
+            orders=(
+                sm.OrderState(
+                    local_id=1,
+                    side="buy",
+                    role="exit",
+                    price=0.10,
+                    volume=13.0,
+                    trade_id="A",
+                    cycle=1,
+                    txid="TX-A",
+                    entry_price=0.112,
+                    entry_fee=0.01,
+                    entry_filled_at=1900,
+                ),
+                sm.OrderState(
+                    local_id=2,
+                    side="sell",
+                    role="exit",
+                    price=0.13,
+                    volume=13.0,
+                    trade_id="B",
+                    cycle=1,
+                    txid="TX-B",
+                    entry_price=0.108,
+                    entry_fee=0.01,
+                    entry_filled_at=1900,
+                ),
+            ),
+            cycle_a=1,
+            cycle_b=1,
+            next_order_id=3,
+            next_recovery_id=1,
+        )
+        cfg = self._cfg()
+
+        st2, actions = sm.transition(st, sm.TimerTick(timestamp=4005.0), cfg, order_size_usd=2.0)
+        self.assertTrue(any(isinstance(x, sm.OrphanOrderAction) for x in actions))
+        # Worse leg is the sell exit at 0.13 (farther from market 0.11).
+        rec = st2.recovery_orders[0]
+        self.assertEqual(rec.side, "sell")
+        self.assertEqual(rec.trade_id, "B")
+
+    def test_compute_order_volume_waits_below_minimum(self):
+        cfg = self._cfg()
+        vol = sm.compute_order_volume(price=1.0, cfg=cfg, order_size_usd=5.0)
+        self.assertIsNone(vol)
+
+
+class BotEventLogTests(unittest.TestCase):
+    @mock.patch("supabase_store.save_event")
+    def test_event_id_is_monotonic(self, save_event):
+        rt = bot.BotRuntime()
+        rt.next_event_id = 100
+        rt._log_event(0, "S0", "S1b", "fill", {"txid": "A"})
+        rt._log_event(0, "S1b", "S0", "fill", {"txid": "B"})
+
+        self.assertEqual(save_event.call_count, 2)
+        first = save_event.call_args_list[0].args[0]
+        second = save_event.call_args_list[1].args[0]
+        self.assertEqual(first["event_id"], 100)
+        self.assertEqual(second["event_id"], 101)
+        self.assertEqual(rt.next_event_id, 102)
+
+    def test_loop_private_budget_caps_query_batch(self):
+        rt = bot.BotRuntime()
+        with mock.patch.object(config, "MAX_API_CALLS_PER_LOOP", 2):
+            rt.begin_loop()
+            rt.loop_private_calls = 1
+            with mock.patch("kraken_client.query_orders_batched", return_value={}) as q:
+                rt._query_orders_batched([f"TX{i}" for i in range(120)], batch_size=50)
+                q.assert_called_once()
+                bounded = q.call_args.kwargs["txids"] if "txids" in q.call_args.kwargs else q.call_args.args[0]
+                self.assertEqual(len(bounded), 50)
+            rt.end_loop()
+
+    @mock.patch("supabase_store.save_fill")
+    def test_replay_missed_fills_aggregates_and_applies_once(self, _save_fill):
+        rt = bot.BotRuntime()
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    orders=(
+                        sm.OrderState(
+                            local_id=1,
+                            side="buy",
+                            role="entry",
+                            price=0.0998,
+                            volume=13.0,
+                            trade_id="B",
+                            cycle=1,
+                            txid="TX1",
+                            placed_at=900.0,
+                        ),
+                    ),
+                ),
+            )
         }
-        pc = config.PairConfig.from_dict(payload)
-        self.assertEqual(pc.pair, "XBTUSD")
-        self.assertEqual(pc.order_size_usd, 7.5)
-        self.assertEqual(pc.refresh_pct, 0.9)
-        self.assertEqual(pc.recovery_mode, "liquidate")
-        self.assertEqual(pc.capital_budget_usd, 42.0)
-        self.assertEqual(pc.slot_count, 3)
-
-    def test_build_pairs_parses_recovery_and_slot_fields(self):
-        pairs_env = json.dumps([
-            {
-                "pair": "XBTUSD",
-                "display": "XBT/USD",
-                "entry_pct": 0.3,
-                "profit_pct": 1.2,
-                "recovery_mode": "liquidate",
-                "capital_budget_usd": 55.5,
-                "slot_count": 4,
-            }
-        ])
-        with mock.patch.dict(config.os.environ, {"PAIRS": pairs_env}, clear=False):
-            pairs = config._build_pairs()
-
-        self.assertIn("XBTUSD", pairs)
-        pc = pairs["XBTUSD"]
-        self.assertEqual(pc.recovery_mode, "liquidate")
-        self.assertEqual(pc.capital_budget_usd, 55.5)
-        self.assertEqual(pc.slot_count, 4)
-
-    def test_state_store_key_is_slot_aware(self):
-        state = grid_strategy.GridState(
-            pair_config=config.PairConfig("XDGUSD", "DOGE/USD", 0.2, 1.0)
-        )
-        self.assertEqual(grid_strategy.state_store_key(state), "XDGUSD")
-        state.slot_id = 2
-        self.assertEqual(grid_strategy.state_store_key(state), "XDGUSD#2")
-
-    def test_restore_state_snapshot_applies_runtime_overrides(self):
-        state = grid_strategy.GridState(
-            pair_config=config.PairConfig("XDGUSD", "DOGE/USD", 0.2, 1.0)
-        )
-        snapshot = {
-            "center_price": 0.1234,
-            "pair_state": "S1b",
-            "cycle_a": 5,
-            "cycle_b": 6,
-            "pair_entry_pct": 0.55,
-            "pair_profit_pct": 1.75,
-            "consecutive_losses_a": 3,
-            "consecutive_losses_b": 1,
-            "recovery_orders": [
-                {
-                    "txid": "TX123",
-                    "side": "sell",
-                    "price": 0.1300,
-                    "volume": 10.0,
-                    "trade_id": "B",
-                    "cycle": 6,
-                    "entry_price": 0.1200,
-                    "reason": "timeout",
-                }
-            ],
-            "slot_id": 1,
-            "winding_down": True,
+        history = {
+            "T1": {"ordertxid": "TX1", "pair": "XDGUSD", "vol": "5", "cost": "0.5000", "fee": "0.001", "time": 1001},
+            "T2": {"ordertxid": "TX1", "pair": "XDGUSD", "vol": "8", "cost": "0.8000", "fee": "0.0016", "time": 1002},
         }
-        restored = grid_strategy.restore_state_snapshot(
-            state, snapshot, source="test"
-        )
-        self.assertTrue(restored)
-        self.assertEqual(state.center_price, 0.1234)
-        self.assertEqual(state.pair_state, "S1b")
-        self.assertEqual(state.cycle_a, 5)
-        self.assertEqual(state.cycle_b, 6)
-        self.assertEqual(state.entry_pct, 0.55)
-        self.assertEqual(state.profit_pct, 1.75)
-        self.assertEqual(state.consecutive_losses_a, 3)
-        self.assertEqual(state.consecutive_losses_b, 1)
-        self.assertEqual(len(state.recovery_orders), 1)
-        self.assertEqual(state.slot_id, 1)
-        self.assertTrue(state.winding_down)
-
-    def test_apply_web_config_targets_selected_pair(self):
-        st_a = grid_strategy.GridState(
-            pair_config=config.PairConfig("XDGUSD", "DOGE/USD", 0.2, 1.0)
-        )
-        st_b = grid_strategy.GridState(
-            pair_config=config.PairConfig("XBTUSD", "XBT/USD", 0.3, 1.2)
-        )
-        bot._bot_states = {"XDGUSD": st_a, "XBTUSD": st_b}
-        bot._current_prices = {"XDGUSD": 0.1, "XBTUSD": 43000.0}
-        bot._web_config_pending = {"pair": "XBTUSD", "entry_pct": 0.65}
-
-        with mock.patch.object(config, "STRATEGY_MODE", "pair"):
-            with mock.patch.object(
-                grid_strategy, "replace_entries_at_distance"
-            ) as replace_entries:
-                bot._apply_web_config()
-                replace_entries.assert_called_once_with(st_b, 43000.0)
-
-        self.assertEqual(st_a.entry_pct, 0.2)
-        self.assertEqual(st_b.entry_pct, 0.65)
-
-    def test_capture_rollover_summary_uses_pre_reset_counters(self):
-        st_a = grid_strategy.GridState(
-            pair_config=config.PairConfig("XDGUSD", "DOGE/USD", 0.2, 1.0)
-        )
-        st_b = grid_strategy.GridState(
-            pair_config=config.PairConfig("XBTUSD", "XBT/USD", 0.3, 1.2)
-        )
-        st_c = grid_strategy.GridState(
-            pair_config=config.PairConfig("SOLUSD", "SOL/USD", 0.3, 1.2)
-        )
-
-        st_a.today_date = "2026-02-09"
-        st_a.round_trips_today = 2
-        st_a.today_profit_usd = 1.25
-        st_a.today_fees_usd = 0.10
-        st_a.total_profit_usd = 5.0
-        st_a.total_round_trips = 20
-
-        st_b.today_date = "2026-02-09"
-        st_b.round_trips_today = 1
-        st_b.today_profit_usd = 0.75
-        st_b.today_fees_usd = 0.05
-        st_b.total_profit_usd = 3.0
-        st_b.total_round_trips = 10
-
-        st_c.today_date = "2026-02-10"  # already current day
-        st_c.round_trips_today = 4
-        st_c.today_profit_usd = 0.50
-        st_c.today_fees_usd = 0.02
-        st_c.total_profit_usd = 2.0
-        st_c.total_round_trips = 8
-
-        bot._bot_states = {"XDGUSD": st_a, "XBTUSD": st_b, "SOLUSD": st_c}
-        summary = bot._capture_rollover_summary(
-            current_utc_date="2026-02-10",
-            last_daily_summary_date="",
-        )
-
-        self.assertIsNotNone(summary)
-        self.assertEqual(summary["date"], "2026-02-09")
-        self.assertEqual(summary["trades"], 3)
-        self.assertAlmostEqual(summary["profit"], 2.0, places=8)
-        self.assertAlmostEqual(summary["fees"], 0.15, places=8)
-        self.assertAlmostEqual(summary["total_profit"], 10.0, places=8)
-        self.assertEqual(summary["total_trips"], 38)
-
-    def test_place_pair_order_respects_volume_override(self):
-        st = grid_strategy.GridState(
-            pair_config=config.PairConfig(
-                "XDGUSD", "DOGE/USD", 0.2, 1.0, min_volume=13, volume_decimals=0
-            )
-        )
-        with mock.patch.object(grid_strategy.kraken_client, "place_order", return_value="TX123") as place_order:
-            o = grid_strategy._place_pair_order(
-                st, "sell", 0.10, "exit", trade_id="B", cycle=7, volume_override=53
-            )
-        self.assertIsNotNone(o)
-        self.assertEqual(o.volume, 53.0)
-        place_order.assert_called_once_with(
-            side="sell", volume=53.0, price=0.10, pair="XDGUSD"
-        )
-
-    def test_handle_pair_fill_uses_filled_volume_for_exit(self):
-        st = grid_strategy.GridState(
-            pair_config=config.PairConfig(
-                "XDGUSD", "DOGE/USD", 0.2, 1.0, min_volume=13, volume_decimals=0
-            )
-        )
-        filled = grid_strategy.GridOrder(level=-1, side="buy", price=0.10, volume=53.0)
-        filled.order_role = "entry"
-        filled.trade_id = "B"
-        filled.cycle = 4
-
-        with mock.patch.object(grid_strategy, "_place_pair_order", return_value=mock.Mock()) as place_mock:
-            with mock.patch.object(grid_strategy.supabase_store, "save_fill"):
-                grid_strategy.handle_pair_fill(st, [filled], current_price=0.10)
-
-        self.assertEqual(place_mock.call_count, 1)
-        self.assertEqual(place_mock.call_args.kwargs.get("volume_override"), 53.0)
-
-    def test_build_pair_with_position_uses_fill_volume_for_exit(self):
-        st = grid_strategy.GridState(
-            pair_config=config.PairConfig(
-                "XDGUSD", "DOGE/USD", 0.2, 1.0, min_volume=13, volume_decimals=0
-            )
-        )
-        last_fill = {"side": "buy", "price": 0.10, "volume": 53.0, "profit": 0}
-        with mock.patch.object(grid_strategy, "_place_pair_order", return_value=mock.Mock()) as place_mock:
-            grid_strategy._build_pair_with_position(st, last_fill, current_price=0.10)
-
-        self.assertGreaterEqual(place_mock.call_count, 1)
-        first_call = place_mock.call_args_list[0]
-        first_kwargs = first_call.kwargs
-        self.assertEqual(first_kwargs.get("volume_override"), 53.0)
-        self.assertEqual(first_call.args[3], "exit")
+        with mock.patch.object(rt, "_get_trades_history", return_value=history):
+            with mock.patch.object(rt, "_apply_event") as apply_event:
+                rt._replay_missed_fills(open_orders={})
+                apply_event.assert_called_once()
+                ev = apply_event.call_args.args[1]
+                self.assertEqual(ev.txid, "TX1")
+                self.assertAlmostEqual(ev.volume, 13.0, places=8)
+                self.assertAlmostEqual(ev.price, 0.1, places=8)
+                self.assertIn("TX1", rt.seen_fill_txids)
 
 
 if __name__ == "__main__":

@@ -1,2933 +1,1293 @@
 """
-bot.py -- Main loop for the DOGE grid trading bot.
+DOGE Bot v1 runtime.
 
-This is the entry point.  It ties together all the modules:
-  config.py        -> settings
-  kraken_client.py -> API calls
-  grid_strategy.py -> trading logic
-  ai_advisor.py    -> hourly market analysis
-  notifier.py      -> Telegram alerts
-
-LIFECYCLE:
-  1. Load config, print banner
-  2. Fetch current DOGE price
-  3. Build initial grid around that price
-  4. Enter main loop:
-     a. Fetch price
-     b. Check for fills -> place replacement orders
-     c. Check risk limits -> pause/stop if needed
-     d. Run AI advisor (hourly)
-     e. Check daily reset (midnight UTC)
-     f. Check accumulation sweep
-     g. Sleep POLL_INTERVAL_SECONDS
-  5. On SIGTERM/SIGINT -> cancel all orders -> exit
-
-GRACEFUL SHUTDOWN:
-  Railway sends SIGTERM when restarting/redeploying.
-  We MUST cancel all open orders before exiting, or they'll
-  sit on Kraken's order book with no bot managing them.
-
-HEALTH CHECK:
-  A tiny HTTP server runs in a background thread on HEALTH_PORT.
-  Railway pings this to know the process is alive.
-  Returns JSON with bot status.
+Ground-up DOGE/USD slot-based pair state machine runtime:
+- DOGE-only (Kraken XDGUSD)
+- Supabase as single source of truth
+- reducer-driven state transitions
+- simplified orphaning (S1 timeout + S2 timeout)
+- Telegram commands + dashboard controls
 """
 
-import sys
-import signal
-import time
-import logging
-import threading
+from __future__ import annotations
+
 import json
-import os
-import queue
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from socketserver import ThreadingMixIn
-from urllib.parse import urlparse, parse_qs
-import csv
-import io
+import logging
+import signal
+import threading
+import time
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from math import ceil
+from socketserver import ThreadingMixIn
+from statistics import median
+from typing import Any
 
 import config
-import kraken_client
-import grid_strategy
-import ai_advisor
-import notifier
 import dashboard
-import stats_engine
-import telegram_menu
+import kraken_client
+import notifier
+import state_machine as sm
 import supabase_store
-import pair_scanner
-
-# ---------------------------------------------------------------------------
-# Logging setup
-# ---------------------------------------------------------------------------
-
-def setup_logging():
-    """
-    Configure logging with a clear, human-readable format.
-    Logs go to both stdout (for Railway's log viewer) and a file.
-    """
-    log_level = getattr(logging, config.LOG_LEVEL.upper(), logging.INFO)
-
-    # Format: timestamp [LEVEL] module -- message
-    formatter = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(name)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-    # Console handler (stdout -- Railway captures this)
-    console = logging.StreamHandler(sys.stdout)
-    console.setFormatter(formatter)
-    console.setLevel(log_level)
-
-    # File handler (local backup)
-    os.makedirs(config.LOG_DIR, exist_ok=True)
-    file_handler = logging.FileHandler(
-        os.path.join(config.LOG_DIR, "bot.log"),
-        encoding="utf-8",
-    )
-    file_handler.setFormatter(formatter)
-    file_handler.setLevel(log_level)
-
-    # Root logger
-    root = logging.getLogger()
-    root.setLevel(log_level)
-    root.addHandler(console)
-    root.addHandler(file_handler)
 
 
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Health check HTTP server
-# ---------------------------------------------------------------------------
-
-# Global reference so the health handler can read bot state
-# Maps pair_name -> GridState (e.g. {"XDGUSD": state, "SOLUSD": state})
-_bot_states: dict = {}
-_current_prices: dict = {}   # pair_name -> latest price
-_bot_healthy = True
-_bot_start_time = 0.0
-
-# Pending AI approval -- only one at a time
-# Keys: action (str), message_id (int), created_at (float), recommendation (dict)
-_pending_approval: dict = None
-
-# How long (seconds) before a pending approval expires
-APPROVAL_TIMEOUT = 600  # 10 minutes
-
-# Fixed step for spacing adjustments -- prevents extreme values
-SPACING_STEP_PCT = 0.25
-
-# Step for entry distance adjustments (smaller than spacing to fine-tune)
-ENTRY_STEP_PCT = 0.1
-
-# Pending web config changes -- written by HTTP thread, read by main loop
-_web_config_pending: dict = {}
-
-# OHLC candle cache for stats engine -- per pair
-_ohlc_caches: dict = {}       # pair_name -> list
-_ohlc_last_fetches: dict = {} # pair_name -> float
+def setup_logging() -> None:
+    level = getattr(logging, config.LOG_LEVEL.upper(), logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+    )
 
 
-# Swarm management queues (thread-safe via queue.Queue)
-_swarm_pending_adds: queue.Queue = queue.Queue()
-_swarm_pending_removes: queue.Queue = queue.Queue()
-_swarm_pending_multipliers: queue.Queue = queue.Queue()
-
-# Free-orphans dedup lock -- prevents concurrent soft/hard free operations
-_free_orphans_in_progress = False
-_free_orphans_lock = threading.Lock()
-
-# OHLC round-robin index for throttled fetching
-_ohlc_robin_idx = 0
+def _now() -> float:
+    return time.time()
 
 
-def _first_state():
-    """Return the first (or only) pair's state for backward-compatible code paths."""
-    if not _bot_states:
-        return None
-    return next(iter(_bot_states.values()))
+def _usd_balance(balance: dict) -> float:
+    for key in ("ZUSD", "USD"):
+        if key in balance:
+            try:
+                return float(balance.get(key, 0.0))
+            except (TypeError, ValueError):
+                return 0.0
+    return 0.0
 
 
-def _first_pair_name():
-    """Return the first pair name."""
-    if not _bot_states:
-        return config.PAIR
-    return next(iter(_bot_states))
+def _doge_balance(balance: dict) -> float:
+    for key in ("XXDG", "XDG", "DOGE"):
+        if key in balance:
+            try:
+                return float(balance.get(key, 0.0))
+            except (TypeError, ValueError):
+                return 0.0
+    return 0.0
 
 
-def _get_price(pair_name: str) -> float:
-    """Get latest known price for a pair (resolves slot keys to base pair)."""
-    return _current_prices.get(_base_pair(pair_name), 0.0)
+@dataclass
+class SlotRuntime:
+    slot_id: int
+    state: sm.PairState
 
 
-def _base_pair(key: str) -> str:
-    """Strip slot suffix: 'XDGUSD#2' -> 'XDGUSD', 'XDGUSD' -> 'XDGUSD'."""
-    return key.split("#")[0] if "#" in key else key
+class BotRuntime:
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.started_at = _now()
+        self.running = True
+
+        self.mode = "INIT"  # INIT | RUNNING | PAUSED | HALTED
+        self.pause_reason = ""
+
+        self.pair = config.PAIR
+        self.pair_display = config.PAIR_DISPLAY
+        self.entry_pct = float(config.PAIR_ENTRY_PCT)
+        self.profit_pct = float(config.PAIR_PROFIT_PCT)
+
+        self.constraints = {
+            "price_decimals": 6,
+            "volume_decimals": 0,
+            "min_volume": 13.0,
+            "min_cost_usd": 0.0,
+        }
+        self.maker_fee_pct = float(config.MAKER_FEE_PCT)
+        self.taker_fee_pct = float(config.MAKER_FEE_PCT)
+
+        self.slots: dict[int, SlotRuntime] = {}
+        self.next_slot_id = 1
+
+        self.next_event_id = 1
+        self.seen_fill_txids: set[str] = set()
+
+        self.price_history: list[tuple[float, float]] = []
+        self.last_price = 0.0
+        self.last_price_ts = 0.0
+
+        self.consecutive_api_errors = 0
+        self.enforce_loop_budget = False
+        self.loop_private_calls = 0
+        self._loop_balance_cache: dict | None = None
+
+    # ------------------ Config/State ------------------
+
+    def _engine_cfg(self, slot: SlotRuntime) -> sm.EngineConfig:
+        return sm.EngineConfig(
+            entry_pct=self.entry_pct,
+            profit_pct=self.profit_pct,
+            refresh_pct=config.PAIR_REFRESH_PCT,
+            order_size_usd=self._slot_order_size_usd(slot),
+            price_decimals=int(self.constraints.get("price_decimals", 6)),
+            volume_decimals=int(self.constraints.get("volume_decimals", 0)),
+            min_volume=float(self.constraints.get("min_volume", 13.0)),
+            min_cost_usd=float(self.constraints.get("min_cost_usd", 0.0)),
+            maker_fee_pct=float(self.maker_fee_pct),
+            stale_price_max_age_sec=float(config.STALE_PRICE_MAX_AGE_SEC),
+            s1_orphan_after_sec=float(config.S1_ORPHAN_AFTER_SEC),
+            s2_orphan_after_sec=float(config.S2_ORPHAN_AFTER_SEC),
+            loss_backoff_start=int(config.LOSS_BACKOFF_START),
+            loss_cooldown_start=int(config.LOSS_COOLDOWN_START),
+            loss_cooldown_sec=float(config.LOSS_COOLDOWN_SEC),
+            backoff_factor=float(config.ENTRY_BACKOFF_FACTOR),
+            backoff_max_multiplier=float(config.ENTRY_BACKOFF_MAX_MULTIPLIER),
+        )
+
+    def _slot_order_size_usd(self, slot: SlotRuntime) -> float:
+        # Independent compounding per slot.
+        return max(float(config.ORDER_SIZE_USD), float(config.ORDER_SIZE_USD) + slot.state.total_profit)
+
+    def _global_snapshot(self) -> dict:
+        return {
+            "version": "doge-v1",
+            "saved_at": _now(),
+            "mode": self.mode,
+            "pause_reason": self.pause_reason,
+            "entry_pct": self.entry_pct,
+            "profit_pct": self.profit_pct,
+            "pair": self.pair,
+            "pair_display": self.pair_display,
+            "next_slot_id": self.next_slot_id,
+            "next_event_id": self.next_event_id,
+            "seen_fill_txids": list(self.seen_fill_txids)[-5000:],
+            "last_price": self.last_price,
+            "last_price_ts": self.last_price_ts,
+            "constraints": self.constraints,
+            "maker_fee_pct": self.maker_fee_pct,
+            "taker_fee_pct": self.taker_fee_pct,
+            "slots": {str(sid): sm.to_dict(slot.state) for sid, slot in self.slots.items()},
+        }
+
+    def _save_snapshot(self) -> None:
+        supabase_store.save_state(self._global_snapshot(), pair="__v1__")
+
+    def _load_snapshot(self) -> None:
+        snap = supabase_store.load_state(pair="__v1__") or {}
+        if not snap:
+            return
+
+        self.mode = snap.get("mode", "INIT")
+        self.pause_reason = snap.get("pause_reason", "")
+        self.entry_pct = float(snap.get("entry_pct", self.entry_pct))
+        self.profit_pct = float(snap.get("profit_pct", self.profit_pct))
+        self.next_slot_id = int(snap.get("next_slot_id", 1))
+        self.next_event_id = int(snap.get("next_event_id", 1))
+        self.seen_fill_txids = set(snap.get("seen_fill_txids", []))
+        self.last_price = float(snap.get("last_price", 0.0))
+        self.last_price_ts = float(snap.get("last_price_ts", 0.0))
+
+        self.constraints = snap.get("constraints", self.constraints) or self.constraints
+        self.maker_fee_pct = float(snap.get("maker_fee_pct", self.maker_fee_pct))
+        self.taker_fee_pct = float(snap.get("taker_fee_pct", self.taker_fee_pct))
+
+        self.slots = {}
+        for sid_text, raw_state in (snap.get("slots", {}) or {}).items():
+            sid = int(sid_text)
+            self.slots[sid] = SlotRuntime(slot_id=sid, state=sm.from_dict(raw_state))
+
+    def _log_event(
+        self,
+        slot_id: int,
+        from_state: str,
+        to_state: str,
+        event_type: str,
+        details: dict,
+    ) -> None:
+        event_id = self.next_event_id
+        self.next_event_id += 1
+        row = {
+            "event_id": event_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "pair": self.pair,
+            "slot_id": slot_id,
+            "from_state": from_state,
+            "to_state": to_state,
+            "event_type": event_type,
+            "details": details,
+        }
+        supabase_store.save_event(row)
+
+    # ------------------ Loop API Budget ------------------
+
+    def begin_loop(self) -> None:
+        self.enforce_loop_budget = True
+        self.loop_private_calls = 0
+        self._loop_balance_cache = None
+
+    def end_loop(self) -> None:
+        self.enforce_loop_budget = False
+        self._loop_balance_cache = None
+
+    def _consume_private_budget(self, units: int, reason: str) -> bool:
+        if units <= 0:
+            return True
+        if not self.enforce_loop_budget:
+            return True
+        limit = max(1, int(config.MAX_API_CALLS_PER_LOOP))
+        if self.loop_private_calls + units > limit:
+            logger.warning(
+                "Loop private API budget exhausted (%d/%d), skipping %s",
+                self.loop_private_calls,
+                limit,
+                reason,
+            )
+            return False
+        self.loop_private_calls += units
+        return True
+
+    def _get_open_orders(self) -> dict:
+        if not self._consume_private_budget(1, "get_open_orders"):
+            return {}
+        return kraken_client.get_open_orders()
+
+    def _get_trades_history(self, start: float | None = None) -> dict:
+        if not self._consume_private_budget(1, "get_trades_history"):
+            return {}
+        return kraken_client.get_trades_history(start=start)
+
+    def _query_orders_batched(self, txids: list[str], batch_size: int = 50) -> dict:
+        if not txids:
+            return {}
+        if not self.enforce_loop_budget:
+            return kraken_client.query_orders_batched(txids, batch_size=batch_size)
+
+        limit = max(1, int(config.MAX_API_CALLS_PER_LOOP))
+        remaining = limit - self.loop_private_calls
+        if remaining <= 0:
+            logger.warning("Loop private API budget exhausted, skipping query_orders")
+            return {}
+        max_txids = remaining * batch_size
+        bounded = txids[:max_txids]
+        units = ceil(len(bounded) / batch_size)
+        self.loop_private_calls += units
+        return kraken_client.query_orders_batched(bounded, batch_size=batch_size)
+
+    def _place_order(self, *, side: str, volume: float, price: float, userref: int) -> str | None:
+        if not self._consume_private_budget(1, "place_order"):
+            return None
+        return kraken_client.place_order(
+            side=side,
+            volume=volume,
+            price=price,
+            pair=self.pair,
+            ordertype="limit",
+            post_only=True,
+            userref=userref,
+        )
+
+    def _cancel_order(self, txid: str) -> bool:
+        if not txid:
+            return False
+        if not self._consume_private_budget(1, "cancel_order"):
+            return False
+        return kraken_client.cancel_order(txid)
+
+    # ------------------ Lifecycle ------------------
+
+    def initialize(self) -> None:
+        logger.info("============================================================")
+        logger.info("  DOGE STATE-MACHINE BOT v1")
+        logger.info("============================================================")
+
+        supabase_store.start_writer_thread()
+
+        # Fetch latest exchange constraints + fees.
+        self.constraints = kraken_client.get_pair_constraints(self.pair)
+        self.maker_fee_pct, self.taker_fee_pct = kraken_client.get_fee_rates(self.pair)
+
+        # Restore runtime snapshot.
+        self._load_snapshot()
+
+        # Ensure at least slot 0 exists.
+        if not self.slots:
+            ts = _now()
+            self.slots[0] = SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.0,
+                    now=ts,
+                    profit_pct_runtime=self.profit_pct,
+                ),
+            )
+            self.next_slot_id = 1
+
+        # Get initial market price.
+        self._refresh_price(strict=True)
+
+        # Push price into all slots.
+        for sid, slot in self.slots.items():
+            self.slots[sid].state = replace(
+                slot.state,
+                market_price=self.last_price,
+                now=self.last_price_ts,
+                last_price_update_at=self.last_price_ts,
+                profit_pct_runtime=self.profit_pct,
+            )
+
+        # Reconcile + exactly-once replay for missed fills after restart.
+        open_orders = self._reconcile_open_orders()
+        self._replay_missed_fills(open_orders)
+
+        # Ensure each slot has active entries/exits after reconciliation/replay.
+        for sid in sorted(self.slots.keys()):
+            self._ensure_slot_bootstrapped(sid)
+
+        if self.mode not in ("PAUSED", "HALTED"):
+            self.mode = "RUNNING"
+
+        self._save_snapshot()
+        notifier._send_message(
+            f"<b>DOGE v1 started</b>\n"
+            f"pair: {self.pair_display}\n"
+            f"slots: {len(self.slots)}\n"
+            f"maker fee: {self.maker_fee_pct:.3f}%\n"
+            f"min vol: {self.constraints.get('min_volume')}"
+        )
+
+    def shutdown(self, reason: str) -> None:
+        with self.lock:
+            self.running = False
+            self.mode = "HALTED"
+            self.pause_reason = reason
+            self._save_snapshot()
+        notifier._send_message(f"<b>DOGE v1 stopped</b>\nreason: {reason}")
+
+    # ------------------ Pause/Halt ------------------
+
+    def pause(self, reason: str) -> None:
+        if self.mode != "PAUSED":
+            self.mode = "PAUSED"
+            self.pause_reason = reason
+            notifier.notify_risk_event("pause", reason, self.pair_display)
+
+    def resume(self) -> None:
+        self.mode = "RUNNING"
+        self.pause_reason = ""
+        self.consecutive_api_errors = 0
+        notifier.notify_risk_event("resume", "Resumed by operator", self.pair_display)
+
+    def halt(self, reason: str) -> None:
+        self.mode = "HALTED"
+        self.pause_reason = reason
+        notifier.notify_error(f"HALTED: {reason}")
+
+    # ------------------ Market / Stats ------------------
+
+    def _refresh_price(self, strict: bool = False) -> None:
+        try:
+            px = float(kraken_client.get_price(pair=self.pair))
+            ts = _now()
+            self.last_price = px
+            self.last_price_ts = ts
+            self.price_history.append((ts, px))
+            self.price_history = [(t, p) for (t, p) in self.price_history if ts - t <= 86400]
+            supabase_store.queue_price_point(ts, px, pair=self.pair)
+            self.consecutive_api_errors = 0
+        except Exception as e:
+            self.consecutive_api_errors += 1
+            logger.warning("Price refresh failed (%d): %s", self.consecutive_api_errors, e)
+            if strict:
+                raise
+            if self.consecutive_api_errors >= config.MAX_CONSECUTIVE_ERRORS:
+                self.pause(f"{self.consecutive_api_errors} consecutive API errors")
+
+    def _price_age_sec(self) -> float:
+        if self.last_price_ts <= 0:
+            return 1e9
+        return max(0.0, _now() - self.last_price_ts)
+
+    def _volatility_profit_pct(self) -> float:
+        # Volatility-aware runtime target from rolling absolute returns.
+        samples = [p for _, p in self.price_history[-180:]]
+        if len(samples) < 12:
+            return self.profit_pct
+
+        ranges = []
+        for i in range(1, len(samples)):
+            prev = samples[i - 1]
+            cur = samples[i]
+            if prev > 0:
+                ranges.append(abs(cur - prev) / prev * 100.0)
+        if not ranges:
+            return self.profit_pct
+
+        med_range = median(ranges) * 2.0
+        target = med_range * float(config.VOLATILITY_PROFIT_FACTOR)
+        target = max(float(config.VOLATILITY_PROFIT_FLOOR), target)
+        target = min(float(config.VOLATILITY_PROFIT_CEILING), target)
+
+        # Never below fee floor.
+        fee_floor = self.maker_fee_pct * 2.0 + 0.1
+        target = max(target, fee_floor)
+        return round(target, 4)
+
+    # ------------------ Startup/Reconcile ------------------
+
+    def _reconcile_open_orders(self) -> dict:
+        try:
+            open_orders = self._get_open_orders()
+        except Exception as e:
+            logger.warning("Open-order reconciliation failed: %s", e)
+            return {}
+
+        known = 0
+        dropped = 0
+        for sid, slot in self.slots.items():
+            st = slot.state
+            kept = []
+            for o in st.orders:
+                if not o.txid:
+                    # Unbound pending order from old crash, drop and let bootstrap rebuild.
+                    dropped += 1
+                    continue
+                if o.txid in open_orders:
+                    kept.append(o)
+                    known += 1
+                else:
+                    # Keep it for one loop so closed status can be picked by QueryOrders.
+                    kept.append(o)
+            self.slots[sid].state = replace(st, orders=tuple(kept))
+
+        logger.info("Reconciliation: %d tracked open orders (dropped %d unbound)", known, dropped)
+        return open_orders
+
+    def _replay_missed_fills(self, open_orders: dict) -> None:
+        """
+        Exactly-once restart replay:
+        - look for tracked txids no longer open
+        - aggregate Kraken trades history by ordertxid
+        - emit synthetic fill events once
+        """
+        tracked: dict[str, tuple[int, str, int, str, str, int]] = {}
+        for sid, slot in self.slots.items():
+            for o in slot.state.orders:
+                if o.txid:
+                    tracked[o.txid] = (sid, "order", o.local_id, o.side, o.trade_id, o.cycle)
+            for r in slot.state.recovery_orders:
+                if r.txid:
+                    tracked[r.txid] = (sid, "recovery", r.recovery_id, r.side, r.trade_id, r.cycle)
+
+        candidates = [
+            txid for txid in tracked.keys()
+            if txid not in open_orders and txid not in self.seen_fill_txids
+        ]
+        if not candidates:
+            return
+
+        # 7-day replay window is enough for crash/redeploy recovery.
+        start_ts = _now() - 7 * 86400
+        try:
+            history = self._get_trades_history(start=start_ts)
+        except Exception as e:
+            logger.warning("TradesHistory replay failed: %s", e)
+            return
+        if not history:
+            return
+
+        grouped: dict[str, list[dict]] = {}
+        for row in history.values():
+            order_txid = row.get("ordertxid", "")
+            if order_txid not in tracked:
+                continue
+            pair_name = str(row.get("pair", "")).upper()
+            if pair_name and self.pair not in pair_name and self.pair.replace("USD", "/USD") not in pair_name:
+                continue
+            grouped.setdefault(order_txid, []).append(row)
+
+        replays = 0
+        for txid, rows in grouped.items():
+            if txid in self.seen_fill_txids:
+                continue
+            sid, kind, local_id, side, trade_id, cycle = tracked[txid]
+
+            total_vol = 0.0
+            total_cost = 0.0
+            total_fee = 0.0
+            last_time = 0.0
+            for r in rows:
+                try:
+                    vol = float(r.get("vol", 0.0))
+                    fee = float(r.get("fee", 0.0))
+                    cost = float(r.get("cost", 0.0))
+                    t = float(r.get("time", 0.0))
+                except (TypeError, ValueError):
+                    continue
+                total_vol += vol
+                total_cost += cost
+                total_fee += fee
+                if t > last_time:
+                    last_time = t
+            if total_vol <= 0:
+                continue
+            avg_price = total_cost / total_vol if total_cost > 0 else 0.0
+            if avg_price <= 0:
+                continue
+
+            self.seen_fill_txids.add(txid)
+            if kind == "order":
+                supabase_store.save_fill(
+                    {
+                        "time": last_time or _now(),
+                        "side": side,
+                        "price": avg_price,
+                        "volume": total_vol,
+                        "profit": 0.0,
+                        "fees": total_fee,
+                    },
+                    pair=self.pair,
+                    trade_id=trade_id,
+                    cycle=cycle,
+                )
+                ev = sm.FillEvent(
+                    order_local_id=local_id,
+                    txid=txid,
+                    side=side,
+                    price=avg_price,
+                    volume=total_vol,
+                    fee=total_fee,
+                    timestamp=last_time or _now(),
+                )
+                self._apply_event(sid, ev, "fill_replay", {"txid": txid, "price": avg_price, "volume": total_vol})
+            else:
+                ev = sm.RecoveryFillEvent(
+                    recovery_id=local_id,
+                    txid=txid,
+                    side=side,
+                    price=avg_price,
+                    volume=total_vol,
+                    fee=total_fee,
+                    timestamp=last_time or _now(),
+                )
+                self._apply_event(sid, ev, "recovery_fill_replay", {"txid": txid, "price": avg_price, "volume": total_vol})
+            replays += 1
+
+        if replays:
+            logger.info("Replayed %d missed fills from trade history", replays)
+
+    def _ensure_slot_bootstrapped(self, slot_id: int) -> None:
+        slot = self.slots[slot_id]
+        if slot.state.orders:
+            return
+
+        balance = self._safe_balance()
+        usd = _usd_balance(balance)
+        doge = _doge_balance(balance)
+        market = self.last_price
+
+        min_vol = float(self.constraints.get("min_volume", 13.0))
+        min_cost = float(self.constraints.get("min_cost_usd", 0.0))
+        if min_cost <= 0 and market > 0:
+            min_cost = min_vol * market
+
+        cfg = self._engine_cfg(slot)
+
+        # Normal bootstrap: both sides available.
+        if doge >= min_vol and usd >= min_cost:
+            st = slot.state
+            actions: list[sm.Action] = []
+            st, a1 = sm.add_entry_order(st, cfg, side="sell", trade_id="A", cycle=st.cycle_a, order_size_usd=self._slot_order_size_usd(slot), reason="bootstrap_A")
+            if a1:
+                actions.append(a1)
+            st, a2 = sm.add_entry_order(st, cfg, side="buy", trade_id="B", cycle=st.cycle_b, order_size_usd=self._slot_order_size_usd(slot), reason="bootstrap_B")
+            if a2:
+                actions.append(a2)
+            self.slots[slot_id].state = replace(st, long_only=False, short_only=False)
+            if actions:
+                self._execute_actions(slot_id, actions, "bootstrap")
+            else:
+                logger.info(
+                    "slot %s bootstrap waiting: target order size $%.4f below Kraken minimum constraints",
+                    slot_id,
+                    self._slot_order_size_usd(slot),
+                )
+            return
+
+        # Symmetric auto-reseed.
+        if usd < min_cost and doge >= 2 * min_vol:
+            st = replace(slot.state, short_only=True, long_only=False)
+            target_usd = market * (2 * min_vol)
+            st, a = sm.add_entry_order(st, cfg, side="sell", trade_id="A", cycle=st.cycle_a, order_size_usd=target_usd, reason="reseed_usd")
+            self.slots[slot_id].state = st
+            if a:
+                self._execute_actions(slot_id, [a], "bootstrap_reseed_usd")
+            else:
+                logger.info("slot %s reseed_usd waiting: computed order below minimum", slot_id)
+            return
+
+        if doge < min_vol and usd >= 2 * min_cost:
+            st = replace(slot.state, long_only=True, short_only=False)
+            target_usd = market * (2 * min_vol)
+            st, a = sm.add_entry_order(st, cfg, side="buy", trade_id="B", cycle=st.cycle_b, order_size_usd=target_usd, reason="reseed_doge")
+            self.slots[slot_id].state = st
+            if a:
+                self._execute_actions(slot_id, [a], "bootstrap_reseed_doge")
+            else:
+                logger.info("slot %s reseed_doge waiting: computed order below minimum", slot_id)
+            return
+
+        # Graceful degradation fallback: place whichever side can run.
+        if doge >= min_vol:
+            st = replace(slot.state, short_only=True, long_only=False)
+            st, a = sm.add_entry_order(st, cfg, side="sell", trade_id="A", cycle=st.cycle_a, order_size_usd=market * min_vol, reason="fallback_short_only")
+            self.slots[slot_id].state = st
+            if a:
+                self._execute_actions(slot_id, [a], "fallback_short_only")
+            else:
+                logger.info("slot %s fallback_short_only waiting: computed order below minimum", slot_id)
+            return
+
+        if usd >= min_cost:
+            st = replace(slot.state, long_only=True, short_only=False)
+            st, a = sm.add_entry_order(st, cfg, side="buy", trade_id="B", cycle=st.cycle_b, order_size_usd=market * min_vol, reason="fallback_long_only")
+            self.slots[slot_id].state = st
+            if a:
+                self._execute_actions(slot_id, [a], "fallback_long_only")
+            else:
+                logger.info("slot %s fallback_long_only waiting: computed order below minimum", slot_id)
+            return
+
+        self.pause(f"slot {slot_id} cannot bootstrap: insufficient USD and DOGE")
+
+    # ------------------ Exchange IO ------------------
+
+    def _safe_balance(self) -> dict:
+        if self._loop_balance_cache is not None:
+            return dict(self._loop_balance_cache)
+        if not self._consume_private_budget(1, "get_balance"):
+            return {}
+        try:
+            bal = kraken_client.get_balance()
+            if self.enforce_loop_budget:
+                self._loop_balance_cache = dict(bal)
+            return bal
+        except Exception as e:
+            logger.warning("Balance query failed: %s", e)
+            return {}
+
+    def _apply_event(self, slot_id: int, event: sm.Event, event_type: str, details: dict) -> None:
+        slot = self.slots[slot_id]
+        cfg = self._engine_cfg(slot)
+        old_phase = sm.derive_phase(slot.state)
+        order_size = self._slot_order_size_usd(slot)
+
+        new_state, actions = sm.transition(slot.state, event, cfg, order_size_usd=order_size)
+        self.slots[slot_id].state = new_state
+        new_phase = sm.derive_phase(new_state)
+
+        self._log_event(
+            slot_id=slot_id,
+            from_state=old_phase,
+            to_state=new_phase,
+            event_type=event_type,
+            details=details,
+        )
+
+        self._execute_actions(slot_id, actions, event_type)
+        self._validate_slot(slot_id)
+
+    def _execute_actions(self, slot_id: int, actions: list[sm.Action], source: str) -> None:
+        if not actions:
+            return
+
+        slot = self.slots[slot_id]
+        for action in actions:
+            if isinstance(action, sm.PlaceOrderAction):
+                # Pause/HALT blocks new entry placement; exits still allowed to reduce state risk.
+                if self.mode in ("PAUSED", "HALTED") and action.role == "entry":
+                    slot.state = sm.remove_order(slot.state, action.local_id)
+                    continue
+                if self._price_age_sec() > config.STALE_PRICE_MAX_AGE_SEC:
+                    self.pause("stale price data > 60s")
+                    slot.state = sm.remove_order(slot.state, action.local_id)
+                    continue
+
+                try:
+                    txid = self._place_order(
+                        side=action.side,
+                        volume=action.volume,
+                        price=action.price,
+                        userref=(slot_id * 1_000_000 + action.local_id),
+                    )
+                    if not txid:
+                        slot.state = sm.remove_order(slot.state, action.local_id)
+                        continue
+                    slot.state = sm.apply_order_txid(slot.state, action.local_id, txid)
+                except Exception as e:
+                    logger.warning("slot %s place failed %s.%s: %s", slot_id, action.trade_id, action.cycle, e)
+                    slot.state = sm.remove_order(slot.state, action.local_id)
+                    self.consecutive_api_errors += 1
+                    if self.consecutive_api_errors >= config.MAX_CONSECUTIVE_ERRORS:
+                        self.pause(f"{self.consecutive_api_errors} consecutive API errors")
+
+            elif isinstance(action, sm.CancelOrderAction):
+                if action.txid:
+                    try:
+                        self._cancel_order(action.txid)
+                    except Exception as e:
+                        logger.warning("cancel failed %s: %s", action.txid, e)
+
+            elif isinstance(action, sm.OrphanOrderAction):
+                # Orphan keeps order live on Kraken as lottery ticket.
+                pass
+
+            elif isinstance(action, sm.BookCycleAction):
+                text = (
+                    f"<b>{self.pair_display} {action.trade_id}.{action.cycle}</b> "
+                    f"net ${action.net_profit:.4f} "
+                    f"(gross ${action.gross_profit:.4f}, fees ${action.fees:.4f})"
+                    f"{' [recovery]' if action.from_recovery else ''}"
+                )
+                notifier._send_message(text)
+
+    def _poll_order_status(self) -> None:
+        # Query active + recovery txids once per loop.
+        tx_map: dict[str, tuple[int, str, int]] = {}
+        for sid, slot in self.slots.items():
+            for o in slot.state.orders:
+                if o.txid:
+                    tx_map[o.txid] = (sid, "order", o.local_id)
+            for r in slot.state.recovery_orders:
+                if r.txid:
+                    tx_map[r.txid] = (sid, "recovery", r.recovery_id)
+
+        if not tx_map:
+            return
+
+        try:
+            info = self._query_orders_batched(list(tx_map.keys()))
+            if not info:
+                return
+            self.consecutive_api_errors = 0
+        except Exception as e:
+            self.consecutive_api_errors += 1
+            logger.warning("query_orders failed (%d): %s", self.consecutive_api_errors, e)
+            if self.consecutive_api_errors >= config.MAX_CONSECUTIVE_ERRORS:
+                self.pause(f"{self.consecutive_api_errors} consecutive API errors")
+            return
+
+        for txid, row in info.items():
+            status = row.get("status", "")
+            if txid not in tx_map:
+                continue
+            sid, kind, local_id = tx_map[txid]
+
+            if status == "closed":
+                if txid in self.seen_fill_txids:
+                    continue
+                self.seen_fill_txids.add(txid)
+
+                price = float(row.get("price") or row.get("avg_price") or 0.0)
+                volume = float(row.get("vol_exec") or row.get("vol") or 0.0)
+                fee = float(row.get("fee") or 0.0)
+                if volume <= 0 or price <= 0:
+                    continue
+
+                if kind == "order":
+                    o = sm.find_order(self.slots[sid].state, local_id)
+                    if not o:
+                        continue
+                    supabase_store.save_fill(
+                        {
+                            "time": _now(),
+                            "side": o.side,
+                            "price": price,
+                            "volume": volume,
+                            "profit": 0.0,
+                            "fees": fee,
+                        },
+                        pair=self.pair,
+                        trade_id=o.trade_id,
+                        cycle=o.cycle,
+                    )
+                    ev = sm.FillEvent(
+                        order_local_id=local_id,
+                        txid=txid,
+                        side=o.side,
+                        price=price,
+                        volume=volume,
+                        fee=fee,
+                        timestamp=_now(),
+                    )
+                    self._apply_event(sid, ev, "fill", {"txid": txid, "price": price, "volume": volume})
+                else:
+                    r = next((x for x in self.slots[sid].state.recovery_orders if x.recovery_id == local_id), None)
+                    if not r:
+                        continue
+                    ev = sm.RecoveryFillEvent(
+                        recovery_id=local_id,
+                        txid=txid,
+                        side=r.side,
+                        price=price,
+                        volume=volume,
+                        fee=fee,
+                        timestamp=_now(),
+                    )
+                    self._apply_event(sid, ev, "recovery_fill", {"txid": txid, "price": price, "volume": volume})
+
+            elif status in ("canceled", "expired"):
+                if kind == "order":
+                    st = self.slots[sid].state
+                    if sm.find_order(st, local_id):
+                        self.slots[sid].state = sm.remove_order(st, local_id)
+                else:
+                    st = self.slots[sid].state
+                    self.slots[sid].state = sm.remove_recovery(st, local_id)
+
+    # ------------------ Invariants ------------------
+
+    def _validate_slot(self, slot_id: int) -> None:
+        st = self.slots[slot_id].state
+        violations = sm.check_invariants(st)
+        if violations:
+            self.halt(f"slot {slot_id} invariant violation: {violations[0]}")
+            logger.error("Slot %s invariant violations: %s", slot_id, violations)
+
+    # ------------------ Commands ------------------
+
+    def add_slot(self) -> tuple[bool, str]:
+        if self.mode == "HALTED":
+            return False, "bot halted"
+        sid = self.next_slot_id
+        self.next_slot_id += 1
+        st = sm.PairState(
+            market_price=self.last_price,
+            now=_now(),
+            profit_pct_runtime=self.profit_pct,
+        )
+        self.slots[sid] = SlotRuntime(slot_id=sid, state=st)
+        self._ensure_slot_bootstrapped(sid)
+        self._save_snapshot()
+        return True, f"slot {sid} added"
+
+    def set_entry_pct(self, value: float) -> tuple[bool, str]:
+        if value < 0.05:
+            return False, "entry_pct must be >= 0.05"
+        self.entry_pct = float(value)
+        self._save_snapshot()
+        return True, f"entry_pct set to {self.entry_pct:.3f}%"
+
+    def set_profit_pct(self, value: float) -> tuple[bool, str]:
+        fee_floor = self.maker_fee_pct * 2.0 + 0.1
+        if value < fee_floor:
+            return False, f"profit_pct must be >= {fee_floor:.3f}%"
+        self.profit_pct = float(value)
+        self._save_snapshot()
+        return True, f"profit_pct set to {self.profit_pct:.3f}%"
+
+    def soft_close(self, slot_id: int, recovery_id: int) -> tuple[bool, str]:
+        slot = self.slots.get(slot_id)
+        if not slot:
+            return False, f"unknown slot {slot_id}"
+
+        rec = next((r for r in slot.state.recovery_orders if r.recovery_id == recovery_id), None)
+        if not rec:
+            return False, f"unknown recovery id {recovery_id}"
+
+        # Soft close = cancel old orphan and re-place nearer to market.
+        if rec.txid:
+            try:
+                self._cancel_order(rec.txid)
+            except Exception as e:
+                logger.warning("soft close cancel failed %s: %s", rec.txid, e)
+
+        side = rec.side
+        if side == "sell":
+            new_price = round(self.last_price * (1 + self.entry_pct / 100.0), self.constraints["price_decimals"])
+        else:
+            new_price = round(self.last_price * (1 - self.entry_pct / 100.0), self.constraints["price_decimals"])
+
+        try:
+            txid = self._place_order(
+                side=side,
+                volume=rec.volume,
+                price=new_price,
+                userref=(slot_id * 1_000_000 + 900_000 + recovery_id),
+            )
+            if not txid:
+                return False, "soft-close skipped: API loop budget exceeded"
+        except Exception as e:
+            return False, f"soft-close placement failed: {e}"
+
+        patched = []
+        for r in slot.state.recovery_orders:
+            if r.recovery_id == recovery_id:
+                patched.append(replace(r, price=new_price, txid=txid, reason="soft_close"))
+            else:
+                patched.append(r)
+        slot.state = replace(slot.state, recovery_orders=tuple(patched))
+        self._save_snapshot()
+        return True, f"soft-close repriced recovery {recovery_id}"
+
+    def soft_close_next(self) -> tuple[bool, str]:
+        oldest: tuple[int, sm.RecoveryOrder] | None = None
+        for sid, slot in self.slots.items():
+            for r in slot.state.recovery_orders:
+                if oldest is None or r.orphaned_at < oldest[1].orphaned_at:
+                    oldest = (sid, r)
+        if not oldest:
+            return False, "no recovery orders"
+        return self.soft_close(oldest[0], oldest[1].recovery_id)
+
+    def status_text(self) -> str:
+        lines = [
+            f"mode: {self.mode}",
+            f"pair: {self.pair_display}",
+            f"price: ${self.last_price:.6f}",
+            f"price_age: {self._price_age_sec():.1f}s",
+            f"entry_pct: {self.entry_pct:.3f}%",
+            f"profit_pct: {self.profit_pct:.3f}%",
+            f"slots: {len(self.slots)}",
+        ]
+        for sid in sorted(self.slots.keys()):
+            st = self.slots[sid].state
+            lines.append(
+                f"slot {sid}: {sm.derive_phase(st)} A.{st.cycle_a} B.{st.cycle_b} "
+                f"orders={len(st.orders)} orphans={len(st.recovery_orders)} pnl=${st.total_profit:.4f}"
+            )
+        return "\n".join(lines)
+
+    # ------------------ Loop ------------------
+
+    def run_loop_once(self) -> None:
+        with self.lock:
+            if self.mode == "HALTED":
+                self._save_snapshot()
+                return
+
+            self._refresh_price(strict=False)
+            if self._price_age_sec() > config.STALE_PRICE_MAX_AGE_SEC:
+                self.pause("stale price data > 60s")
+
+            runtime_profit = self._volatility_profit_pct()
+
+            # Tick slots with latest price and timer.
+            for sid in sorted(self.slots.keys()):
+                st = self.slots[sid].state
+                self.slots[sid].state = replace(st, profit_pct_runtime=runtime_profit)
+
+                ev_price = sm.PriceTick(price=self.last_price, timestamp=_now())
+                self._apply_event(sid, ev_price, "price_tick", {"price": self.last_price})
+
+                ev_timer = sm.TimerTick(timestamp=_now())
+                self._apply_event(sid, ev_timer, "timer_tick", {})
+
+                # If a slot drained its active orders, bootstrap it again.
+                self._ensure_slot_bootstrapped(sid)
+
+            self._poll_order_status()
+
+            # Pressure notice for orphan growth.
+            total_orphans = sum(len(s.state.recovery_orders) for s in self.slots.values())
+            if total_orphans and total_orphans % int(config.ORPHAN_PRESSURE_WARN_AT) == 0:
+                notifier._send_message(f"<b>Orphan pressure</b>\n{total_orphans} recovery orders on book")
+
+            self._save_snapshot()
+
+    # ------------------ Telegram ------------------
+
+    def poll_telegram(self) -> None:
+        callbacks, commands = notifier.poll_updates()
+
+        for cb in callbacks:
+            data = cb.get("data", "")
+            if data.startswith("sc:"):
+                # soft-close callback: sc:<slot>:<recovery>
+                try:
+                    _, s, r = data.split(":", 2)
+                    ok, msg = self.soft_close(int(s), int(r))
+                except Exception as e:
+                    ok, msg = False, f"bad soft-close callback: {e}"
+                notifier.answer_callback(cb.get("callback_id", ""), msg)
+
+        for cmd in commands:
+            text = (cmd.get("text") or "").strip()
+            parts = text.split()
+            head = parts[0].lower() if parts else ""
+
+            ok = True
+            msg = ""
+
+            if head == "/pause":
+                self.pause("paused by operator")
+                msg = "paused"
+            elif head == "/resume":
+                self.resume()
+                msg = "running"
+            elif head == "/add_slot":
+                ok, msg = self.add_slot()
+            elif head == "/status":
+                msg = self.status_text()
+            elif head == "/help":
+                msg = (
+                    "Commands:\n"
+                    "/pause\n/resume\n/add_slot\n/status\n/help\n"
+                    "/soft_close [slot_id recovery_id]\n"
+                    "/set_entry_pct <value>\n"
+                    "/set_profit_pct <value>"
+                )
+            elif head == "/set_entry_pct":
+                if len(parts) < 2:
+                    ok, msg = False, "usage: /set_entry_pct <value>"
+                else:
+                    try:
+                        ok, msg = self.set_entry_pct(float(parts[1]))
+                    except ValueError:
+                        ok, msg = False, "invalid value"
+            elif head == "/set_profit_pct":
+                if len(parts) < 2:
+                    ok, msg = False, "usage: /set_profit_pct <value>"
+                else:
+                    try:
+                        ok, msg = self.set_profit_pct(float(parts[1]))
+                    except ValueError:
+                        ok, msg = False, "invalid value"
+            elif head == "/soft_close":
+                if len(parts) == 3:
+                    try:
+                        ok, msg = self.soft_close(int(parts[1]), int(parts[2]))
+                    except ValueError:
+                        ok, msg = False, "usage: /soft_close <slot_id> <recovery_id>"
+                else:
+                    # Interactive list via inline buttons.
+                    rows = []
+                    for sid in sorted(self.slots.keys()):
+                        for r in self.slots[sid].state.recovery_orders[:12]:
+                            rows.append([{"text": f"slot {sid} / #{r.recovery_id} {r.side} {r.trade_id}.{r.cycle}", "callback_data": f"sc:{sid}:{r.recovery_id}"}])
+                    if not rows:
+                        ok, msg = False, "no recovery orders"
+                    else:
+                        notifier.send_with_buttons("Select recovery to soft-close:", rows)
+                        ok, msg = True, "sent picker"
+            else:
+                ok, msg = False, "unknown command"
+
+            notifier._send_message(("OK: " if ok else "ERR: ") + msg)
+
+    # ------------------ API status ------------------
+
+    def status_payload(self) -> dict:
+        with self.lock:
+            now = _now()
+            slots = []
+            for sid in sorted(self.slots.keys()):
+                st = self.slots[sid].state
+                phase = sm.derive_phase(st)
+                open_orders = []
+                for o in st.orders:
+                    open_orders.append({
+                        "local_id": o.local_id,
+                        "side": o.side,
+                        "role": o.role,
+                        "trade_id": o.trade_id,
+                        "cycle": o.cycle,
+                        "volume": o.volume,
+                        "price": o.price,
+                        "txid": o.txid,
+                    })
+                recs = []
+                for r in st.recovery_orders:
+                    dist = abs(r.price - st.market_price) / st.market_price * 100.0 if st.market_price > 0 else 0.0
+                    recs.append({
+                        "recovery_id": r.recovery_id,
+                        "trade_id": r.trade_id,
+                        "cycle": r.cycle,
+                        "side": r.side,
+                        "price": r.price,
+                        "volume": r.volume,
+                        "txid": r.txid,
+                        "reason": r.reason,
+                        "age_sec": max(0.0, now - r.orphaned_at),
+                        "distance_pct": dist,
+                    })
+                cycles = list(st.completed_cycles[-20:])
+                slots.append({
+                    "slot_id": sid,
+                    "phase": phase,
+                    "market_price": st.market_price,
+                    "cycle_a": st.cycle_a,
+                    "cycle_b": st.cycle_b,
+                    "total_profit": st.total_profit,
+                    "today_realized_loss": st.today_realized_loss,
+                    "order_size_usd": self._slot_order_size_usd(self.slots[sid]),
+                    "profit_pct_runtime": st.profit_pct_runtime,
+                    "open_orders": open_orders,
+                    "recovery_orders": recs,
+                    "recent_cycles": [c.__dict__ for c in reversed(cycles)],
+                })
+
+            total_profit = sum(s.state.total_profit for s in self.slots.values())
+            total_loss = sum(s.state.today_realized_loss for s in self.slots.values())
+            total_orphans = sum(len(s.state.recovery_orders) for s in self.slots.values())
+            top_phase = slots[0]["phase"] if slots else "S0"
+
+            return {
+                "mode": self.mode,
+                "pause_reason": self.pause_reason,
+                "pair": self.pair_display,
+                "entry_pct": self.entry_pct,
+                "profit_pct": self.profit_pct,
+                "price": self.last_price,
+                "price_age_sec": self._price_age_sec(),
+                "top_phase": top_phase,
+                "slot_count": len(self.slots),
+                "total_profit": total_profit,
+                "today_realized_loss": total_loss,
+                "total_orphans": total_orphans,
+                "slots": slots,
+            }
 
 
-def _slot_key(pair_name: str, slot_id: int) -> str:
-    """Build slot key: slot 0 = 'XDGUSD', slot N = 'XDGUSD#N'."""
-    return f"{pair_name}#{slot_id}" if slot_id > 0 else pair_name
-
-
-def _get_slots_for_pair(pair_name: str) -> list:
-    """Return all (key, state) tuples for slots of a base pair."""
-    base = _base_pair(pair_name)
-    return [(k, st) for k, st in _bot_states.items() if _base_pair(k) == base]
+_RUNTIME: BotRuntime | None = None
 
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
-    """HTTPServer that handles each request in a new thread (for SSE)."""
     daemon_threads = True
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
-    """
-    HTTP handler for the web dashboard, JSON API, and legacy health check.
-    Replaces the old HealthHandler with full dashboard routes.
-    """
+    def log_message(self, fmt: str, *args: Any) -> None:  # noqa: D401
+        logger.info("HTTP %s - %s", self.address_string(), fmt % args)
 
-    def do_GET(self):
-        """Route GET requests."""
-        parsed = urlparse(self.path)
-        path = parsed.path
-        if path == "/":
-            self._send_html(dashboard.DASHBOARD_HTML)
-        elif path == "/api/status":
-            self._handle_api_status()
-        elif path == "/api/stats":
-            self._handle_api_stats()
-        elif path == "/api/stream":
-            self._handle_sse()
-        elif path.startswith("/api/export/"):
-            self._handle_export()
-        elif path == "/api/swarm/status":
-            self._handle_swarm_status()
-        elif path == "/api/swarm/available":
-            self._handle_swarm_available()
-        elif path == "/health":
-            self._handle_health()
-        else:
-            self._send_json({"error": "not found"}, 404)
-
-    def do_POST(self):
-        """Route POST requests."""
-        parsed = urlparse(self.path)
-        path = parsed.path
-        if path == "/api/config":
-            self._handle_api_config()
-        elif path == "/api/swarm/add":
-            self._handle_swarm_add()
-        elif path == "/api/swarm/remove":
-            self._handle_swarm_remove()
-        elif path == "/api/swarm/multiplier":
-            self._handle_swarm_multiplier()
-        elif path == "/api/swarm/free-orphans":
-            self._handle_swarm_free_orphans()
-        elif path == "/api/ai/analyze-trade":
-            self._handle_ai_analyze_trade()
-        else:
-            self._send_json({"error": "not found"}, 404)
-
-    def _handle_api_status(self):
-        """GET /api/status -- full state snapshot for the dashboard."""
-        if not _bot_states:
-            self._send_json({"error": "bot not initialized"}, 503)
-            return
-
-        # Support ?pair= query param; default to first pair
-        parsed = urlparse(self.path)
-        params = parse_qs(parsed.query)
-        pair_name = params.get("pair", [_first_pair_name()])[0]
-        state = _bot_states.get(pair_name, _first_state())
-        current_price = _get_price(state.pair_name)
-        if not current_price and state.price_history:
-            current_price = state.price_history[-1][1]
-        elif not current_price:
-            current_price = state.center_price
-
-        data = dashboard.serialize_state(state, current_price)
-        # Add list of configured pairs for dashboard pair selector (base pairs only)
-        seen = set()
-        configured = []
-        for pn, st in _bot_states.items():
-            bp = _base_pair(pn)
-            if bp not in seen:
-                seen.add(bp)
-                configured.append({"pair": bp, "display": st.pair_display})
-        data["configured_pairs"] = configured
-        self._send_json(data)
-
-    def _handle_api_stats(self):
-        """GET /api/stats -- stats engine results only."""
-        state = _first_state()
-        if not state:
-            self._send_json({"error": "bot not initialized"}, 503)
-            return
-        self._send_json(state.stats_results or {})
-
-    def _handle_health(self):
-        """GET /health -- legacy Railway health check (backwards compatible)."""
-        status = {
-            "status": "healthy" if _bot_healthy else "unhealthy",
-            "mode": "dry_run" if config.DRY_RUN else "live",
-            "uptime_seconds": int(time.time() - _bot_start_time) if _bot_start_time else 0,
-            "pairs": list({st.pair_display for st in _bot_states.values()}) if _bot_states else [config.PAIR_DISPLAY],
-        }
-        if _bot_states:
-            # Aggregate across all pairs
-            total_profit = sum(st.total_profit_usd for st in _bot_states.values())
-            total_trips = sum(st.total_round_trips for st in _bot_states.values())
-            today_trips = sum(st.round_trips_today for st in _bot_states.values())
-            total_open = sum(
-                len([o for o in st.grid_orders if o.status == "open"])
-                for st in _bot_states.values()
-            )
-            any_paused = any(st.is_paused for st in _bot_states.values())
-            total_doge = sum(st.doge_accumulated for st in _bot_states.values())
-            status.update({
-                "total_profit": round(total_profit, 4),
-                "total_round_trips": total_trips,
-                "today_round_trips": today_trips,
-                "open_orders": total_open,
-                "is_paused": any_paused,
-                "doge_accumulated": round(total_doge, 2),
-            })
-        self._send_json(status)
-
-    def _handle_sse(self):
-        """GET /api/stream -- Server-Sent Events stream of bot state."""
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.send_header("Access-Control-Allow-Origin", "*")
+    def _send_json(self, data: dict, code: int = 200) -> None:
+        payload = json.dumps(data).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
+        self.wfile.write(payload)
 
+    def _read_json(self) -> dict:
+        n = int(self.headers.get("Content-Length", "0") or "0")
+        if n <= 0:
+            return {}
+        raw = self.rfile.read(n)
         try:
-            while True:
-                state = _first_state()
-                if not state:
-                    data = json.dumps({"error": "bot not initialized"})
-                else:
-                    current_price = _get_price(state.pair_name)
-                    if not current_price and state.price_history:
-                        current_price = state.price_history[-1][1]
-                    elif not current_price:
-                        current_price = state.center_price
-                    data = json.dumps(dashboard.serialize_state(state, current_price))
+            return json.loads(raw.decode("utf-8"))
+        except Exception:
+            return {}
 
-                self.wfile.write(f"data: {data}\n\n".encode("utf-8"))
-                self.wfile.flush()
-                time.sleep(3)
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
-            pass
-
-    def _handle_export(self):
-        """Route /api/export/* requests."""
-        parsed = urlparse(self.path)
-        parts = parsed.path.strip("/").split("/")  # ["api", "export", "<type>"]
-        params = parse_qs(parsed.query)
-        fmt = params.get("format", ["json"])[0].lower()
-
-        if len(parts) < 3:
-            self._send_json({"error": "missing export type"}, 400)
+    def do_GET(self) -> None:  # noqa: N802
+        global _RUNTIME
+        if self.path == "/" or self.path.startswith("/?"):
+            body = dashboard.DASHBOARD_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
 
-        export_type = parts[2]
-        if export_type == "fills":
-            self._export_fills(fmt)
-        elif export_type == "stats":
-            self._export_stats(fmt)
-        elif export_type == "trades":
-            self._export_trades(fmt)
-        else:
-            self._send_json({"error": f"unknown export type: {export_type}"}, 404)
-
-    def _export_fills(self, fmt):
-        """Export recent fills as CSV or JSON."""
-        state = _first_state()
-        if not state:
-            self._send_json({"error": "bot not initialized"}, 503)
+        if self.path.startswith("/api/status"):
+            if _RUNTIME is None:
+                self._send_json({"error": "runtime not ready"}, 503)
+                return
+            self._send_json(_RUNTIME.status_payload())
             return
 
-        fills = []
-        for f in state.recent_fills:
-            fills.append({
-                "time": datetime.fromtimestamp(f.get("time", 0), tz=timezone.utc).isoformat() if f.get("time") else "",
-                "side": f["side"],
-                "price": round(f["price"], 6),
-                "volume": round(f["volume"], 2),
-                "profit": round(f.get("profit", 0), 4),
-                "fees": round(f.get("fees", 0), 4),
-                "trade_id": f.get("trade_id", ""),
-                "cycle": f.get("cycle", ""),
-                "order_role": f.get("order_role", ""),
-            })
+        self._send_json({"error": "not found"}, 404)
 
-        if fmt == "csv":
-            self._send_csv_data(fills, ["time", "side", "price", "volume", "profit", "fees", "trade_id", "cycle", "order_role"], "fills.csv")
-        else:
-            self._send_json(fills)
-
-    def _export_stats(self, fmt):
-        """Export stats results as CSV or JSON."""
-        state = _first_state()
-        if not state:
-            self._send_json({"error": "bot not initialized"}, 503)
+    def do_POST(self) -> None:  # noqa: N802
+        global _RUNTIME
+        if not self.path.startswith("/api/action"):
+            self._send_json({"error": "not found"}, 404)
+            return
+        if _RUNTIME is None:
+            self._send_json({"error": "runtime not ready"}, 503)
             return
 
-        results = state.stats_results or {}
-        if fmt == "csv":
-            rows = []
-            for name, r in results.items():
-                if name == "overall_health":
-                    continue
-                if isinstance(r, dict):
-                    rows.append({
-                        "analyzer": name,
-                        "verdict": r.get("verdict", ""),
-                        "confidence": r.get("confidence", ""),
-                        "summary": r.get("summary", ""),
-                    })
-            self._send_csv_data(rows, ["analyzer", "verdict", "confidence", "summary"], "stats.csv")
-        else:
-            self._send_json(results)
+        body = self._read_json()
+        action = (body.get("action") or "").strip()
 
-    def _export_trades(self, fmt):
-        """Export trade history from logs/trades.csv."""
-        filepath = os.path.join(config.LOG_DIR, "trades.csv")
-        if not os.path.exists(filepath):
-            if fmt == "csv":
-                self._send_csv_raw("", "trades.csv")
+        with _RUNTIME.lock:
+            ok = True
+            msg = "ok"
+            if action == "pause":
+                _RUNTIME.pause("paused from dashboard")
+                msg = "paused"
+            elif action == "resume":
+                _RUNTIME.resume()
+                msg = "running"
+            elif action == "add_slot":
+                ok, msg = _RUNTIME.add_slot()
+            elif action == "set_entry_pct":
+                ok, msg = _RUNTIME.set_entry_pct(float(body.get("value", 0)))
+            elif action == "set_profit_pct":
+                ok, msg = _RUNTIME.set_profit_pct(float(body.get("value", 0)))
+            elif action == "soft_close":
+                ok, msg = _RUNTIME.soft_close(int(body.get("slot_id", 0)), int(body.get("recovery_id", 0)))
+            elif action == "soft_close_next":
+                ok, msg = _RUNTIME.soft_close_next()
             else:
-                self._send_json([])
-            return
+                ok, msg = False, f"unknown action: {action}"
+            _RUNTIME._save_snapshot()
 
-        try:
-            with open(filepath, "r", newline="", encoding="utf-8") as f:
-                content = f.read()
-        except Exception as e:
-            self._send_json({"error": str(e)}, 500)
-            return
+        self._send_json({"ok": ok, "message": msg}, 200 if ok else 400)
 
-        if fmt == "csv":
-            self._send_csv_raw(content, "trades.csv")
-        else:
-            rows = []
+
+def start_http_server() -> ThreadingHTTPServer | None:
+    if config.HEALTH_PORT <= 0:
+        return None
+    server = ThreadingHTTPServer(("0.0.0.0", int(config.HEALTH_PORT)), DashboardHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True, name="dashboard-server")
+    thread.start()
+    logger.info("Dashboard server started on :%s", config.HEALTH_PORT)
+    return server
+
+
+def run() -> None:
+    global _RUNTIME
+    setup_logging()
+
+    rt = BotRuntime()
+    _RUNTIME = rt
+
+    def _handle_signal(signum, _frame):
+        logger.info("Signal %s received", signum)
+        rt.shutdown(f"signal {signum}")
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, _handle_signal)
+
+    server = None
+    try:
+        rt.initialize()
+        server = start_http_server()
+
+        poll = max(5, int(config.POLL_INTERVAL_SECONDS))
+        logger.info("Entering main loop (every %ss)", poll)
+
+        while rt.running:
+            loop_start = _now()
             try:
-                reader = csv.DictReader(io.StringIO(content))
-                for row in reader:
-                    rows.append(row)
+                with rt.lock:
+                    rt.begin_loop()
+                    rt.run_loop_once()
+                    rt.poll_telegram()
+                    rt.end_loop()
+            except Exception as e:
+                logger.exception("Main loop error: %s", e)
+                rt.consecutive_api_errors += 1
+                with rt.lock:
+                    rt.end_loop()
+                if rt.consecutive_api_errors >= config.MAX_CONSECUTIVE_ERRORS:
+                    rt.pause(f"loop errors: {rt.consecutive_api_errors}")
+
+            elapsed = _now() - loop_start
+            sleep_for = max(0.2, poll - elapsed)
+            time.sleep(sleep_for)
+
+    finally:
+        if server is not None:
+            try:
+                server.shutdown()
             except Exception:
                 pass
-            self._send_json(rows)
+        if _RUNTIME is not None:
+            _RUNTIME.shutdown("process exit")
 
-    def _send_csv_data(self, rows, fieldnames, filename):
-        """Serialize list of dicts to CSV and send with download header."""
-        output = io.StringIO()
-        writer = csv.DictWriter(output, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-        self._send_csv_raw(output.getvalue(), filename)
-
-    def _send_csv_raw(self, content, filename):
-        """Send raw CSV string with Content-Disposition header."""
-        body = content.encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/csv; charset=utf-8")
-        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    # ---------------------------------------------------------------
-    # Swarm API endpoints
-    # ---------------------------------------------------------------
-
-    def _handle_swarm_status(self):
-        """GET /api/swarm/status -- aggregate stats + per-pair compact summaries.
-
-        Slots are grouped by base pair. Each base pair shows aggregated P&L
-        and a slots array with per-slot detail.
-        """
-        if not _bot_states:
-            self._send_json({"error": "bot not initialized"}, 503)
-            return
-
-        # Group slots by base pair
-        grouped = {}  # base_pair -> list of (key, state)
-        for pn, st in _bot_states.items():
-            bp = _base_pair(pn)
-            grouped.setdefault(bp, []).append((pn, st))
-
-        pairs_list = []
-        for bp, slot_list in grouped.items():
-            # Use slot 0 for display/config values
-            primary_st = slot_list[0][1]
-            cp = _get_price(bp)
-            slot_count = len(slot_list)
-
-            # Per-slot details
-            slots_detail = []
-            agg_today_pnl = 0.0
-            agg_total_pnl = 0.0
-            agg_trips_today = 0
-            agg_total_trips = 0
-            agg_open = 0
-            agg_seed = 0.0
-            agg_recovery = 0
-            any_long_only = False
-            any_paused = False
-
-            for sk, st in slot_list:
-                open_count = sum(1 for o in st.grid_orders if o.status == "open")
-                agg_today_pnl += st.today_profit_usd
-                agg_total_pnl += st.total_profit_usd
-                agg_trips_today += st.round_trips_today
-                agg_total_trips += st.total_round_trips
-                agg_open += open_count
-                agg_seed += st.seed_cost_usd
-                agg_recovery += len(st.recovery_orders)
-                if st.long_only:
-                    any_long_only = True
-                if st.is_paused:
-                    any_paused = True
-                slots_detail.append({
-                    "slot_id": st.slot_id,
-                    "pair_state": st.pair_state,
-                    "today_pnl": round(st.today_profit_usd, 4),
-                    "total_pnl": round(st.total_profit_usd, 4),
-                    "winding_down": st.winding_down,
-                })
-
-            pairs_list.append({
-                "pair": bp,
-                "display": primary_st.pair_display,
-                "price": round(cp, 8),
-                "pair_state": " ".join(s["pair_state"] for s in slots_detail),
-                "today_pnl": round(agg_today_pnl, 4),
-                "total_pnl": round(agg_total_pnl, 4),
-                "trips_today": agg_trips_today,
-                "total_trips": agg_total_trips,
-                "open_orders": agg_open,
-                "entry_pct": primary_st.entry_pct,
-                "profit_pct": primary_st.profit_pct,
-                "multiplier": slot_count,
-                "slot_count": slot_count,
-                "slots": slots_detail,
-                "long_only": any_long_only,
-                "paused": any_paused,
-                "seed_cost": round(agg_seed, 4),
-                "recovery_count": agg_recovery,
-                "net_profit": round(agg_total_pnl - agg_seed, 4),
-                "peak_slot_count": primary_st.pair_config.peak_slot_count if primary_st.pair_config else 1,
-            })
-
-        _compute_portfolio_value()  # refresh cached balances for per-pair asset values
-        total_seed = sum(st.seed_cost_usd for st in _bot_states.values())
-        total_trade_pnl = sum(st.total_profit_usd for st in _bot_states.values())
-        bot_net_pnl = round(total_trade_pnl - total_seed, 4)
-        # Count unique base pairs for the active_pairs display
-        unique_bases = len(grouped)
-        agg = {
-            "active_pairs": unique_bases,
-            "today_profit": round(sum(st.today_profit_usd for st in _bot_states.values()), 4),
-            "total_profit": round(total_trade_pnl, 4),
-            "trips_today": sum(st.round_trips_today for st in _bot_states.values()),
-            "total_trips": sum(st.total_round_trips for st in _bot_states.values()),
-            "bot_net_pnl": bot_net_pnl,
-            "total_seed_cost": round(total_seed, 4),
-            "total_recovery": sum(len(st.recovery_orders) for st in _bot_states.values()),
-            "slot_profit_threshold": config.SLOT_PROFIT_THRESHOLD,
-        }
-
-        # Add per-pair asset balance value (reuse cached balances)
-        balances = _portfolio_balances
-        if balances:
-            for item in pairs_list:
-                bp = item["pair"]
-                # Use primary slot (slot 0) for filter_strings lookup
-                st = _bot_states.get(bp) or (grouped.get(bp, [(None, None)])[0][1])
-                if st and st.pair_config and st.pair_config.filter_strings:
-                    asset_val = 0.0
-                    for fs in st.pair_config.filter_strings:
-                        for key in [fs, "X" + fs]:
-                            if key in balances:
-                                asset_val = float(balances[key]) * item["price"]
-                                break
-                        if asset_val > 0:
-                            break
-                    item["asset_value"] = round(asset_val, 4)
-
-        self._send_json({"aggregate": agg, "pairs": pairs_list})
-
-    def _handle_swarm_available(self):
-        """GET /api/swarm/available -- pair scanner results (all qualifying)."""
-        try:
-            ranked = pair_scanner.get_ranked_pairs(min_volume_usd=1000)
-        except Exception as e:
-            self._send_json({"error": str(e)}, 500)
-            return
-
-        active_set = {_base_pair(k) for k in _bot_states}
-        result = []
-        for pi in ranked:
-            result.append({
-                "pair": pi.pair,
-                "altname": pi.altname,
-                "base": pi.base,
-                "display": pair_scanner.get_display_name(pi.pair, pi.altname,
-                                                         pi.quote),
-                "price": round(pi.price, 8),
-                "volatility_pct": round(pi.volatility_pct, 2),
-                "volume_24h": round(pi.volume_24h, 0),
-                "spread_pct": round(pi.spread_pct, 3),
-                "fee_maker": pi.fee_maker,
-                "ordermin": pi.ordermin,
-                "score": getattr(pi, "score", 0),
-                "recovery_mode": getattr(pi, "recovery_mode", "lottery"),
-                "active": pi.pair in active_set,
-            })
-        self._send_json(result)
-
-    def _handle_swarm_add(self):
-        """POST /api/swarm/add -- queue a pair for addition."""
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length)) if length > 0 else {}
-        except (ValueError, json.JSONDecodeError):
-            self._send_json({"error": "invalid JSON"}, 400)
-            return
-
-        pair_name = body.get("pair", "")
-        if not pair_name:
-            self._send_json({"error": "missing 'pair' field"}, 400)
-            return
-
-        if pair_name in _bot_states:
-            self._send_json({"error": f"{pair_name} already active"}, 400)
-            return
-
-        # Look up pair info from scanner cache
-        all_pairs = pair_scanner.scan_all_pairs()
-        info = all_pairs.get(pair_name)
-        if not info:
-            self._send_json({"error": f"unknown pair: {pair_name}"}, 404)
-            return
-
-        pc = pair_scanner.auto_configure(info)
-        _swarm_pending_adds.put(pc)
-        self._send_json({"ok": True, "pair": pair_name, "display": pc.display})
-
-    def _handle_swarm_remove(self):
-        """POST /api/swarm/remove -- queue a pair for removal."""
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length)) if length > 0 else {}
-        except (ValueError, json.JSONDecodeError):
-            self._send_json({"error": "invalid JSON"}, 400)
-            return
-
-        pair_name = body.get("pair", "")
-        if not pair_name:
-            self._send_json({"error": "missing 'pair' field"}, 400)
-            return
-
-        bp = _base_pair(pair_name)
-        if bp not in _bot_states:
-            self._send_json({"error": f"{bp} not active"}, 400)
-            return
-
-        _swarm_pending_removes.put(bp)
-        self._send_json({"ok": True, "pair": bp})
-
-    def _handle_swarm_multiplier(self):
-        """POST /api/swarm/multiplier -- set target slot count for a pair.
-
-        The multiplier value (1-5) now means the number of independent
-        A/B trade slots to run concurrently on this pair.
-        """
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length)) if length > 0 else {}
-        except (ValueError, json.JSONDecodeError):
-            self._send_json({"error": "invalid JSON"}, 400)
-            return
-
-        pair_name = body.get("pair", "")
-        mult = body.get("multiplier", 1)
-        if not pair_name:
-            self._send_json({"error": "missing 'pair' field"}, 400)
-            return
-        try:
-            mult = int(mult)
-            if mult < 1 or mult > 5:
-                self._send_json({"error": "slot count must be 1-5"}, 400)
-                return
-        except (ValueError, TypeError):
-            self._send_json({"error": "multiplier must be a number"}, 400)
-            return
-
-        # Resolve base pair (dashboard always sends base pair name)
-        bp = _base_pair(pair_name)
-        if bp not in _bot_states:
-            self._send_json({"error": f"{bp} not active"}, 400)
-            return
-
-        _swarm_pending_multipliers.put((bp, mult))
-        self._send_json({"ok": True, "pair": bp, "slot_count": mult})
-
-    def _handle_swarm_free_orphans(self):
-        """POST /api/swarm/free-orphans -- soft or hard free recovery tickets.
-
-        Body: {"mode": "soft"} (default) or {"mode": "hard"}
-        Soft: replace with tight limits 0.2% from market (real fills)
-        Hard: cancel outright and book theoretical loss
-        """
-        global _free_orphans_in_progress
-
-        if not _bot_states:
-            self._send_json({"error": "bot not initialized"}, 503)
-            return
-
-        with _free_orphans_lock:
-            if _free_orphans_in_progress:
-                self._send_json({"error": "already in progress"}, 429)
-                return
-            _free_orphans_in_progress = True
-
-        try:
-            try:
-                length = int(self.headers.get("Content-Length", 0))
-                body = json.loads(self.rfile.read(length)) if length > 0 else {}
-            except (ValueError, json.JSONDecodeError):
-                body = {}
-
-            hard_mode = body.get("mode", "soft") == "hard"
-            total_ok = 0
-            total_failed = 0
-            details = []
-
-            for pair_name, state in _bot_states.items():
-                if not state.recovery_orders:
-                    continue
-                price = _get_price(pair_name)
-
-                if hard_mode:
-                    result = grid_strategy.cancel_all_recovery(state, price)
-                    ok = result["cancelled"]
-                    fail = result["failed"]
-                    loss = result["total_loss"]
-                else:
-                    result = grid_strategy.soft_free_recovery(state, price)
-                    ok = result["replaced"]
-                    fail = result["failed"]
-                    loss = 0.0  # no immediate loss; booked when fills arrive
-
-                grid_strategy.save_state(state)
-                total_ok += ok
-                total_failed += fail
-                if ok or fail:
-                    details.append({
-                        "pair": state.pair_display,
-                        "ok": ok,
-                        "failed": fail,
-                        "loss": round(loss, 4),
-                    })
-
-            mode_label = "hard" if hard_mode else "soft"
-            logger.info("FREE ORPHANS (web/%s): %d ok, %d failed",
-                         mode_label, total_ok, total_failed)
-            self._send_json({
-                "ok": True,
-                "mode": mode_label,
-                "total_ok": total_ok,
-                "total_failed": total_failed,
-                "details": details,
-            })
-        finally:
-            with _free_orphans_lock:
-                _free_orphans_in_progress = False
-
-    def _handle_ai_analyze_trade(self):
-        """POST /api/ai/analyze-trade -- AI analysis of a losing trade."""
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length)) if length > 0 else {}
-        except (ValueError, json.JSONDecodeError):
-            self._send_json({"error": "invalid JSON"}, 400)
-            return
-
-        result = ai_advisor.analyze_trade(body)
-        self._send_json(result)
-
-    def _handle_api_config(self):
-        """POST /api/config -- validate and queue config changes."""
-        global _web_config_pending
-
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length)) if length > 0 else {}
-        except (ValueError, json.JSONDecodeError):
-            self._send_json({"error": "invalid JSON"}, 400)
-            return
-
-        errors = []
-        queued = []
-        pending = {}
-
-        # Optional target pair (for multi-pair detail controls)
-        if "pair" in body:
-            raw_pair = body.get("pair")
-            if not isinstance(raw_pair, str) or not raw_pair.strip():
-                errors.append("pair must be a non-empty string")
-            else:
-                target_pair = _base_pair(raw_pair.strip())
-                if target_pair not in _bot_states:
-                    errors.append(f"pair not active: {target_pair}")
-                else:
-                    pending["pair"] = target_pair
-
-        # Validate spacing
-        if "spacing" in body:
-            val = body["spacing"]
-            try:
-                val = float(val)
-                floor = config.ROUND_TRIP_FEE_PCT + 0.1
-                if val < floor:
-                    errors.append(f"spacing must be >= {floor:.2f}% (fees + 0.1%)")
-                else:
-                    pending["spacing"] = round(val, 4)
-                    queued.append("spacing")
-            except (ValueError, TypeError):
-                errors.append("spacing must be a number")
-
-        # Validate ratio
-        if "ratio" in body:
-            val = body["ratio"]
-            if isinstance(val, str) and val.lower() == "auto":
-                pending["ratio"] = "auto"
-                queued.append("ratio=auto")
-            else:
-                try:
-                    val = float(val)
-                    if val < 0.25 or val > 0.75:
-                        errors.append("ratio must be between 0.25 and 0.75")
-                    else:
-                        pending["ratio"] = round(val, 4)
-                        queued.append("ratio")
-                except (ValueError, TypeError):
-                    errors.append("ratio must be a number or 'auto'")
-
-        # Validate entry_pct (pair mode)
-        if "entry_pct" in body:
-            val = body["entry_pct"]
-            try:
-                val = float(val)
-                if val < 0.05:
-                    errors.append("entry_pct must be >= 0.05%")
-                else:
-                    pending["entry_pct"] = round(val, 4)
-                    queued.append("entry_pct")
-            except (ValueError, TypeError):
-                errors.append("entry_pct must be a number")
-
-        # AI check (manual trigger)
-        if "ai_check" in body:
-            pending["ai_check"] = True
-            queued.append("ai_check")
-
-        if errors:
-            self._send_json({"error": "; ".join(errors)}, 400)
-            return
-
-        if not queued:
-            self._send_json({"error": "no valid fields provided"}, 400)
-            return
-
-        # Thread-safe: assign a new dict (atomic in CPython)
-        _web_config_pending = pending
-        self._send_json({"ok": True, "queued": queued})
-
-    def _send_json(self, data, status=200):
-        """Send a JSON response."""
-        body = json.dumps(data, indent=2).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _send_html(self, html):
-        """Send an HTML response."""
-        body = html.encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, format, *args):
-        """Suppress default HTTP logging (too noisy)."""
-        pass
-
-
-def start_health_server():
-    """Start the health check HTTP server in a daemon thread."""
-    if config.HEALTH_PORT <= 0:
-        logger.info("Health check server disabled")
-        return None
-
-    try:
-        server = ThreadingHTTPServer(("0.0.0.0", config.HEALTH_PORT), DashboardHandler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        logger.info("Health check server running on port %d", config.HEALTH_PORT)
-        return server
-    except Exception as e:
-        logger.warning("Failed to start health server on port %d: %s", config.HEALTH_PORT, e)
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Graceful shutdown
-# ---------------------------------------------------------------------------
-
-_shutdown_requested = False
-
-
-def _signal_handler(signum, frame):
-    """
-    Handle SIGTERM (Railway) and SIGINT (Ctrl+C).
-    Sets a flag that the main loop checks -- we don't exit immediately
-    because we need to cancel orders first.
-    """
-    global _shutdown_requested
-    sig_name = signal.Signals(signum).name if hasattr(signal, 'Signals') else str(signum)
-    logger.info("Received %s -- initiating graceful shutdown...", sig_name)
-    _shutdown_requested = True
-
-
-def setup_signal_handlers():
-    """Register signal handlers for graceful shutdown."""
-    signal.signal(signal.SIGINT, _signal_handler)
-    signal.signal(signal.SIGTERM, _signal_handler)
-    # SIGBREAK is Windows' equivalent of SIGTERM in some contexts
-    if hasattr(signal, "SIGBREAK"):
-        signal.signal(signal.SIGBREAK, _signal_handler)
-
-
-# ---------------------------------------------------------------------------
-# Web config integration
-# ---------------------------------------------------------------------------
-
-def _apply_web_config():
-    """
-    Check for pending web config changes and apply them.
-    Called from the main loop each iteration (main thread only).
-    """
-    global _web_config_pending
-
-    if not _web_config_pending:
-        return
-
-    # Copy + clear (atomic read in CPython)
-    pending = _web_config_pending
-    _web_config_pending = {}
-    target_pair = _base_pair(pending.get("pair", "")) if pending.get("pair") else ""
-    if target_pair:
-        state = _bot_states.get(target_pair)
-        if not state:
-            logger.warning("Web dashboard: target pair %s is not active; skipping update", target_pair)
-            return
-    else:
-        state = _first_state()
-        if not state:
-            return
-        target_pair = state.pair_name
-
-    current_price = _get_price(target_pair)
-    if current_price <= 0:
-        if state.price_history:
-            current_price = state.price_history[-1][1]
-        else:
-            current_price = state.center_price
-
-    needs_rebuild = False
-
-    # Apply spacing
-    if "spacing" in pending:
-        if config.STRATEGY_MODE == "pair":
-            old = state.profit_pct
-            state.profit_pct = pending["spacing"]
-            logger.info(
-                "[%s] Web dashboard: profit target %.2f%% -> %.2f%% (applies to next exit)",
-                target_pair, old, state.profit_pct,
-            )
-        else:
-            old = config.GRID_SPACING_PCT
-            config.GRID_SPACING_PCT = pending["spacing"]
-            logger.info(
-                "[%s] Web dashboard: spacing %.2f%% -> %.2f%%",
-                target_pair, old, config.GRID_SPACING_PCT,
-            )
-            needs_rebuild = True
-
-    # Apply ratio
-    if "ratio" in pending:
-        val = pending["ratio"]
-        if val == "auto":
-            state.trend_ratio_override = None
-            grid_strategy.update_trend_ratio(state)
-            logger.info("[%s] Web dashboard: ratio set to auto (%.2f)", target_pair, state.trend_ratio)
-            needs_rebuild = True
-        else:
-            state.trend_ratio = val
-            state.trend_ratio_override = val
-            logger.info("[%s] Web dashboard: ratio manually set to %.2f", target_pair, val)
-            needs_rebuild = True
-
-    # Apply entry_pct (pair mode)
-    if "entry_pct" in pending:
-        old = state.entry_pct
-        state.entry_pct = pending["entry_pct"]
-        logger.info(
-            "[%s] Web dashboard: entry distance %.2f%% -> %.2f%%",
-            target_pair, old, state.entry_pct,
-        )
-        if config.STRATEGY_MODE == "pair":
-            grid_strategy.replace_entries_at_distance(state, current_price)
-        else:
-            needs_rebuild = True
-
-    # AI check (manual trigger, no rebuild)
-    if "ai_check" in pending:
-        state.last_ai_check = 0
-        logger.info("[%s] Web dashboard: AI check requested", target_pair)
-
-    # Rebuild grid if spacing or ratio changed
-    if needs_rebuild:
-        grid_strategy.cancel_grid(state)
-        orders = grid_strategy.build_grid(state, current_price)
-        logger.info(
-            "[%s] Web dashboard: grid rebuilt -- %d orders around $%.6f",
-            target_pair, len(orders), current_price,
-        )
-
-
-# ---------------------------------------------------------------------------
-# AI approval workflow
-# ---------------------------------------------------------------------------
-
-def _set_pending_approval(action: str, message_id: int, recommendation: dict):
-    """
-    Store a pending approval.  Overwrites any previous pending approval
-    (new recommendation supersedes the old one).
-    """
-    global _pending_approval
-
-    # If there's already a pending approval, expire it
-    if _pending_approval:
-        old_action = _pending_approval["action"]
-        old_msg_id = _pending_approval["message_id"]
-        logger.info("New recommendation overwrites pending '%s'", old_action)
-        ai_advisor.log_approval_decision(old_action, "expired")
-        notifier.edit_message_text(
-            old_msg_id,
-            f"🧠 <b>AI Council</b> -- <i>{old_action}</i>\n\n"
-            f"<s>Expired</s> (superseded by new recommendation)",
-        )
-
-    _pending_approval = {
-        "action": action,
-        "message_id": message_id,
-        "created_at": time.time(),
-        "recommendation": recommendation,
-    }
-    logger.info("Pending approval set: %s (msg_id=%d)", action, message_id)
-
-
-def _check_approval_expiry():
-    """Expire the pending approval if it's older than APPROVAL_TIMEOUT."""
-    global _pending_approval
-
-    if not _pending_approval:
-        return
-
-    age = time.time() - _pending_approval["created_at"]
-    if age >= APPROVAL_TIMEOUT:
-        action = _pending_approval["action"]
-        msg_id = _pending_approval["message_id"]
-        logger.info("Approval expired for '%s' after %ds", action, int(age))
-        ai_advisor.log_approval_decision(action, "expired")
-        notifier.edit_message_text(
-            msg_id,
-            f"🧠 <b>AI Council</b> -- <i>{action}</i>\n\n"
-            f"<s>Expired</s> (no response in {APPROVAL_TIMEOUT // 60} min)",
-        )
-        _pending_approval = None
-
-
-def _poll_and_handle_callbacks(state: grid_strategy.GridState, current_price: float):
-    """
-    Poll Telegram for button presses and text commands, then handle them.
-    """
-    global _pending_approval
-
-    callbacks, commands = notifier.poll_updates()
-
-    # Handle text commands
-    if commands:
-        _handle_text_commands(state, current_price, commands)
-
-    if not callbacks:
-        return
-
-    for cb in callbacks:
-        data = cb["data"]            # e.g. "approve:widen_spacing"
-        cb_msg_id = cb["message_id"]
-        callback_id = cb["callback_id"]
-
-        # Menu navigation callbacks (m:screen)
-        if data.startswith("m:"):
-            screen = data[2:]
-            _handle_menu_nav(state, current_price, screen, cb_msg_id, callback_id)
-            continue
-
-        # Menu action callbacks (ma:action)
-        if data.startswith("ma:"):
-            action = data[3:]
-            _handle_menu_action(state, current_price, action, cb_msg_id, callback_id)
-            continue
-
-        # Only process if it matches the pending approval's message
-        if not _pending_approval or cb_msg_id != _pending_approval["message_id"]:
-            notifier.answer_callback(callback_id, "No pending action for this message")
-            continue
-
-        parts = data.split(":", 1)
-        if len(parts) != 2:
-            notifier.answer_callback(callback_id, "Invalid callback")
-            continue
-
-        decision, action = parts  # "approve" or "skip", and the action name
-
-        if decision == "approve":
-            notifier.answer_callback(callback_id, f"Approved: {action}")
-            logger.info("User APPROVED action: %s", action)
-            ai_advisor.log_approval_decision(action, "approved")
-
-            # Execute the action
-            _execute_approved_action(state, action, current_price)
-
-            # Update the message to show it was approved
-            notifier.edit_message_text(
-                cb_msg_id,
-                f"🧠 <b>AI Council</b> -- <i>{action}</i>\n\n"
-                f"Approved and executed.",
-            )
-            _pending_approval = None
-
-        elif decision == "skip":
-            notifier.answer_callback(callback_id, "Skipped")
-            logger.info("User SKIPPED action: %s", action)
-            ai_advisor.log_approval_decision(action, "skipped")
-
-            notifier.edit_message_text(
-                cb_msg_id,
-                f"🧠 <b>AI Council</b> -- <i>{action}</i>\n\n"
-                f"<s>Skipped</s> by user.",
-            )
-            _pending_approval = None
-
-        else:
-            notifier.answer_callback(callback_id, "Unknown decision")
-
-
-def _execute_approved_action(state: grid_strategy.GridState, action: str,
-                             current_price: float):
-    """
-    Execute an approved AI recommendation.
-
-    Actions:
-      widen_spacing   -> increase GRID_SPACING_PCT by 0.25%, rebuild grid
-      tighten_spacing -> decrease GRID_SPACING_PCT by 0.25% (floor at fees+0.1%), rebuild grid
-      pause           -> pause the bot
-      reset_grid      -> cancel and rebuild grid at current price
-    """
-    # Normalize AI prompt aliases to handler names
-    ACTION_ALIASES = {"widen_profit": "widen_spacing", "tighten_profit": "tighten_spacing"}
-    action = ACTION_ALIASES.get(action, action)
-
-    if action == "widen_spacing":
-        if config.STRATEGY_MODE == "pair":
-            old = state.profit_pct
-            state.profit_pct = round(old + SPACING_STEP_PCT, 4)
-            logger.info("Profit target widened: %.2f%% -> %.2f%%", old, state.profit_pct)
-            grid_strategy.cancel_grid(state)
-            orders = grid_strategy.build_grid(state, current_price)
-            notifier._send_message(
-                f"Profit target widened: {old:.2f}% -> {state.profit_pct:.2f}%\n"
-                f"Pair rebuilt: {len(orders)} orders around ${current_price:.6f}"
-            )
-        else:
-            old = config.GRID_SPACING_PCT
-            config.GRID_SPACING_PCT = round(old + SPACING_STEP_PCT, 4)
-            logger.info("Spacing widened: %.2f%% -> %.2f%%", old, config.GRID_SPACING_PCT)
-            grid_strategy.cancel_grid(state)
-            orders = grid_strategy.build_grid(state, current_price)
-            notifier._send_message(
-                f"Spacing widened: {old:.2f}% -> {config.GRID_SPACING_PCT:.2f}%\n"
-                f"Grid rebuilt: {len(orders)} orders around ${current_price:.6f}"
-            )
-
-    elif action == "tighten_spacing":
-        floor = config.ROUND_TRIP_FEE_PCT + 0.1
-        if config.STRATEGY_MODE == "pair":
-            old = state.profit_pct
-            new_val = round(old - SPACING_STEP_PCT, 4)
-            if new_val < floor:
-                logger.warning(
-                    "Cannot tighten below %.2f%% (fees+0.1%%). Current: %.2f%%",
-                    floor, old,
-                )
-                notifier._send_message(
-                    f"Cannot tighten profit target below {floor:.2f}% "
-                    f"(round-trip fees + 0.1%%). Current: {old:.2f}%"
-                )
-                return
-            state.profit_pct = new_val
-            logger.info("Profit target tightened: %.2f%% -> %.2f%%", old, new_val)
-            grid_strategy.cancel_grid(state)
-            orders = grid_strategy.build_grid(state, current_price)
-            notifier._send_message(
-                f"Profit target tightened: {old:.2f}% -> {new_val:.2f}%\n"
-                f"Pair rebuilt: {len(orders)} orders around ${current_price:.6f}"
-            )
-        else:
-            old = config.GRID_SPACING_PCT
-            new_spacing = round(old - SPACING_STEP_PCT, 4)
-            if new_spacing < floor:
-                logger.warning(
-                    "Cannot tighten below %.2f%% (fees+0.1%%). Current: %.2f%%",
-                    floor, old,
-                )
-                notifier._send_message(
-                    f"Cannot tighten spacing below {floor:.2f}% "
-                    f"(round-trip fees + 0.1%%). Current: {old:.2f}%"
-                )
-                return
-            config.GRID_SPACING_PCT = new_spacing
-            logger.info("Spacing tightened: %.2f%% -> %.2f%%", old, config.GRID_SPACING_PCT)
-            grid_strategy.cancel_grid(state)
-            orders = grid_strategy.build_grid(state, current_price)
-            notifier._send_message(
-                f"Spacing tightened: {old:.2f}% -> {config.GRID_SPACING_PCT:.2f}%\n"
-                f"Grid rebuilt: {len(orders)} orders around ${current_price:.6f}"
-            )
-
-    elif action == "pause":
-        state.is_paused = True
-        state.pause_reason = "AI advisor (user approved)"
-        logger.info("Bot paused by approved AI recommendation")
-        notifier.notify_risk_event("pause", "Paused by approved AI recommendation")
-
-    elif action == "widen_entry":
-        old = state.entry_pct
-        state.entry_pct = round(old + ENTRY_STEP_PCT, 4)
-        logger.info("Entry distance widened: %.2f%% -> %.2f%%", old, state.entry_pct)
-        grid_strategy.cancel_grid(state)
-        orders = grid_strategy.build_grid(state, current_price)
-        notifier._send_message(
-            f"Entry distance widened: {old:.2f}% -> {state.entry_pct:.2f}%\n"
-            f"Pair rebuilt: {len(orders)} orders around ${current_price:.6f}"
-        )
-
-    elif action == "tighten_entry":
-        old = state.entry_pct
-        new_val = round(old - ENTRY_STEP_PCT, 4)
-        floor = 0.05
-        if new_val < floor:
-            logger.warning(
-                "Cannot tighten entry below %.2f%%. Current: %.2f%%",
-                floor, old,
-            )
-            notifier._send_message(
-                f"Cannot tighten entry below {floor:.2f}%. Current: {old:.2f}%"
-            )
-            return
-        state.entry_pct = new_val
-        logger.info("Entry distance tightened: %.2f%% -> %.2f%%", old, new_val)
-        grid_strategy.cancel_grid(state)
-        orders = grid_strategy.build_grid(state, current_price)
-        notifier._send_message(
-            f"Entry distance tightened: {old:.2f}% -> {new_val:.2f}%\n"
-            f"Pair rebuilt: {len(orders)} orders around ${current_price:.6f}"
-        )
-
-    elif action == "reset_grid":
-        logger.info("Resetting grid by approved AI recommendation")
-        grid_strategy.cancel_grid(state)
-        orders = grid_strategy.build_grid(state, current_price)
-        notifier.notify_grid_built(current_price, len(orders))
-
-    else:
-        logger.warning("Unknown approved action: %s -- ignoring", action)
-
-
-# ---------------------------------------------------------------------------
-# Telegram text commands
-# ---------------------------------------------------------------------------
-
-def _handle_text_commands(state: grid_strategy.GridState, current_price: float,
-                          commands: list):
-    """
-    Dispatch Telegram text commands (e.g. /status, /interval 600).
-    Each command gets a reply message sent back to Telegram.
-    """
-    for cmd in commands:
-        text = cmd["text"].strip()
-        parts = text.split(None, 1)  # split on first whitespace
-        command = parts[0].lower()
-        # Strip @botname suffix (e.g. /help@MyBot)
-        if "@" in command:
-            command = command.split("@")[0]
-        arg = parts[1].strip() if len(parts) > 1 else ""
-
-        logger.info("Telegram command: %s (arg=%r)", command, arg)
-
-        if command == "/interval":
-            _cmd_interval(arg)
-        elif command == "/check":
-            _cmd_check(state)
-        elif command == "/status":
-            _cmd_status(state, current_price)
-        elif command == "/spacing":
-            _cmd_spacing(state, current_price, arg)
-        elif command == "/ratio":
-            _cmd_ratio(state, current_price, arg)
-        elif command == "/stats":
-            _cmd_stats(state)
-        elif command == "/menu":
-            _cmd_menu()
-        elif command == "/resetbackoff":
-            _cmd_resetbackoff(state)
-        elif command == "/freeorphans":
-            _cmd_freeorphans(arg)
-        elif command == "/help":
-            _cmd_help()
-        else:
-            notifier._send_message(f"Unknown command: <code>{command}</code>\nSend /help for available commands.")
-
-
-def _cmd_interval(arg: str):
-    """Handle /interval -- inform user AI is now manual-only."""
-    notifier._send_message("AI polling is now manual-only. Use /check to trigger.")
-
-
-def _cmd_check(state: grid_strategy.GridState):
-    """Handle /check -- trigger immediate AI advisor check."""
-    state.last_ai_check = 0
-    notifier._send_message("AI check will run next cycle (~30s)")
-    logger.info("Immediate AI check requested via Telegram")
-
-
-def _cmd_status(state: grid_strategy.GridState, current_price: float):
-    """Handle /status -- reply with current bot status."""
-    summary = grid_strategy.get_status_summary(state, current_price)
-    # Wrap in <pre> for monospace formatting in Telegram
-    notifier._send_message(f"<pre>{summary}</pre>")
-
-
-def _cmd_spacing(state: grid_strategy.GridState, current_price: float, arg: str):
-    """Handle /spacing <pct> -- set grid spacing and rebuild grid."""
-    try:
-        new_spacing = float(arg)
-    except (ValueError, TypeError):
-        notifier._send_message("Usage: /spacing &lt;percent&gt;\nExample: /spacing 1.5")
-        return
-
-    floor = config.ROUND_TRIP_FEE_PCT + 0.1
-    if new_spacing < floor:
-        notifier._send_message(
-            f"Spacing must be >= {floor:.2f}% (fees + 0.1%).\n"
-            f"Current: {config.GRID_SPACING_PCT:.2f}%"
-        )
-        return
-
-    old = config.GRID_SPACING_PCT
-    config.GRID_SPACING_PCT = round(new_spacing, 4)
-    logger.info("GRID_SPACING_PCT changed %.2f%% -> %.2f%% via Telegram", old, new_spacing)
-
-    grid_strategy.cancel_grid(state)
-    orders = grid_strategy.build_grid(state, current_price)
-
-    notifier._send_message(
-        f"Spacing: {old:.2f}% -> {config.GRID_SPACING_PCT:.2f}%\n"
-        f"Grid rebuilt: {len(orders)} orders around ${current_price:.6f}"
-    )
-
-
-def _cmd_ratio(state: grid_strategy.GridState, current_price: float, arg: str):
-    """
-    Handle /ratio command.
-      /ratio        -- show current ratio and fill counts
-      /ratio <0-1>  -- manually set ratio and rebuild
-      /ratio auto   -- clear manual override, return to fill-based
-    """
-    if not arg:
-        # Show current ratio info
-        now = time.time()
-        cutoff = now - grid_strategy.TREND_WINDOW_SECONDS
-        buy_count = sum(1 for f in state.recent_fills
-                        if f.get("time", 0) > cutoff and f["side"] == "buy")
-        sell_count = sum(1 for f in state.recent_fills
-                         if f.get("time", 0) > cutoff and f["side"] == "sell")
-        total_grid = config.GRID_LEVELS * 2
-        n_buys = max(2, min(total_grid - 2, round(total_grid * state.trend_ratio)))
-        n_sells = total_grid - n_buys
-        src = "manual" if state.trend_ratio_override is not None else "auto"
-        notifier._send_message(
-            f"<b>Trend Ratio</b> [{src}]\n\n"
-            f"Ratio: {state.trend_ratio:.2f} ({state.trend_ratio:.0%} buy / {1-state.trend_ratio:.0%} sell)\n"
-            f"Grid split: {n_buys}B + {n_sells}S\n"
-            f"12h fills: {buy_count} buys, {sell_count} sells ({buy_count+sell_count} total)"
-        )
-        return
-
-    if arg.lower() == "auto":
-        state.trend_ratio_override = None
-        grid_strategy.update_trend_ratio(state)
-        logger.info("Trend ratio set to auto (%.2f) via Telegram", state.trend_ratio)
-        grid_strategy.cancel_grid(state)
-        orders = grid_strategy.build_grid(state, current_price)
-        notifier._send_message(
-            f"Ratio set to auto ({state.trend_ratio:.2f})\n"
-            f"Grid rebuilt: {len(orders)} orders around ${current_price:.6f}"
-        )
-        return
-
-    try:
-        value = float(arg)
-    except (ValueError, TypeError):
-        notifier._send_message(
-            "Usage:\n"
-            "/ratio -- show current ratio\n"
-            "/ratio &lt;0.25-0.75&gt; -- set manual ratio\n"
-            "/ratio auto -- return to fill-based"
-        )
-        return
-
-    if value < 0.25 or value > 0.75:
-        notifier._send_message("Ratio must be between 0.25 and 0.75.")
-        return
-
-    state.trend_ratio = value
-    state.trend_ratio_override = value
-    logger.info("Trend ratio manually set to %.2f via Telegram", value)
-
-    grid_strategy.cancel_grid(state)
-    orders = grid_strategy.build_grid(state, current_price)
-    notifier._send_message(
-        f"Ratio manually set to {value:.2f}\n"
-        f"Grid rebuilt: {len(orders)} orders around ${current_price:.6f}"
-    )
-
-
-def _cmd_stats(state: grid_strategy.GridState):
-    """Handle /stats -- show statistical analysis results."""
-    results = state.stats_results
-    if not results:
-        notifier._send_message("Stats engine hasn't run yet. Wait ~60s for first analysis.")
-        return
-
-    lines = ["<b>Statistical Advisory Board</b>\n"]
-
-    health = results.get("overall_health", {})
-    if health:
-        lines.append(f"Overall: <b>{health.get('verdict', 'N/A').upper()}</b>")
-        lines.append(f"{health.get('summary', '')}\n")
-
-    for name in ("profitability", "fill_asymmetry", "grid_exceedance",
-                 "fill_rate", "random_walk"):
-        r = results.get(name)
-        if not r:
-            continue
-        label = name.replace("_", " ").title()
-        verdict = r.get("verdict", "?").replace("_", " ").upper()
-        lines.append(f"<b>{label}</b>: {verdict}")
-        lines.append(f"  {r.get('summary', '')}")
-
-    notifier._send_message("\n".join(lines))
-
-
-def _cmd_resetbackoff(state: grid_strategy.GridState):
-    """Handle /resetbackoff -- clear consecutive loss counters."""
-    old_a = state.consecutive_losses_a
-    old_b = state.consecutive_losses_b
-    state.consecutive_losses_a = 0
-    state.consecutive_losses_b = 0
-    grid_strategy.save_state(state)
-    logger.info("Backoff counters reset via Telegram (was A=%d, B=%d)", old_a, old_b)
-    notifier._send_message(
-        f"Backoff counters reset to 0.\n"
-        f"Was: A={old_a} losses, B={old_b} losses\n"
-        f"Entry distance returns to base: {state.entry_pct:.2f}%"
-    )
-
-
-def _cmd_freeorphans(arg: str = ""):
-    """Handle /freeorphans -- soft-close recovery tickets (or 'hard' to cancel outright)."""
-    global _free_orphans_in_progress
-
-    if not _bot_states:
-        notifier._send_message("No active pairs.")
-        return
-
-    with _free_orphans_lock:
-        if _free_orphans_in_progress:
-            notifier._send_message("Free orphans already in progress, skipping.")
-            return
-        _free_orphans_in_progress = True
-
-    try:
-        hard_mode = arg.strip().lower() == "hard"
-        total_ok = 0
-        total_failed = 0
-        lines = []
-
-        for pair_name, state in _bot_states.items():
-            if not state.recovery_orders:
-                continue
-            price = _get_price(pair_name)
-            count = len(state.recovery_orders)
-
-            if hard_mode:
-                result = grid_strategy.cancel_all_recovery(state, price)
-                ok = result["cancelled"]
-                fail = result["failed"]
-                detail = f"${result['total_loss']:.4f}"
-            else:
-                result = grid_strategy.soft_free_recovery(state, price)
-                ok = result["replaced"]
-                fail = result["failed"]
-                skip = result["skipped"]
-                detail = f"{skip} already tight" if skip else "tightened"
-
-            grid_strategy.save_state(state)
-            total_ok += ok
-            total_failed += fail
-            if ok or fail:
-                lines.append(
-                    f"  {state.pair_display}: {ok}/{count} {'cancelled' if hard_mode else 'replaced'}"
-                    + (f", {fail} failed" if fail else "")
-                    + f" ({detail})"
-                )
-
-        if not lines:
-            notifier._send_message("No recovery tickets to free.")
-            return
-
-        mode_label = "Hard Free" if hard_mode else "Soft Free"
-        action_label = "cancelled" if hard_mode else "moved to 0.2% from market"
-        summary = (
-            f"<b>{mode_label} Orphans</b>\n\n"
-            + "\n".join(lines)
-            + f"\n\nTotal: {total_ok} {action_label}"
-            + (f", {total_failed} failed" if total_failed else "")
-        )
-        logger.info("FREE ORPHANS (%s): %d ok, %d failed",
-                    "hard" if hard_mode else "soft", total_ok, total_failed)
-        notifier._send_message(summary)
-    finally:
-        with _free_orphans_lock:
-            _free_orphans_in_progress = False
-
-
-def _cmd_help():
-    """Handle /help -- list available commands."""
-    notifier._send_message(
-        "<b>Bot Commands</b>\n\n"
-        "/status -- Current bot status\n"
-        "/menu -- Interactive button menu\n"
-        "/interval &lt;sec&gt; -- Set AI check interval (60-86400)\n"
-        "/check -- Trigger AI check next cycle\n"
-        "/spacing &lt;pct&gt; -- Set grid spacing % and rebuild\n"
-        "/ratio -- Show/set trend ratio (asymmetric grid)\n"
-        "/stats -- Statistical analysis results\n"
-        "/resetbackoff -- Clear entry backoff counters\n"
-        "/freeorphans -- Soft-close orphans (tight limits near market)\n"
-        "/freeorphans hard -- Hard cancel orphans (book theoretical loss)\n"
-        "/help -- This message"
-    )
-
-
-def _cmd_menu():
-    """Handle /menu -- send interactive button menu."""
-    text, keyboard = telegram_menu.build_main_menu()
-    notifier.send_with_buttons(text, keyboard)
-
-
-def _handle_menu_nav(state: grid_strategy.GridState, current_price: float,
-                     screen: str, message_id: int, callback_id: str):
-    """Navigate to a menu screen by editing the existing message."""
-    if screen == "main":
-        text, keyboard = telegram_menu.build_main_menu()
-    elif screen == "status":
-        text, keyboard = telegram_menu.build_status_screen(state, current_price)
-    elif screen == "grid":
-        text, keyboard = telegram_menu.build_grid_screen(state, current_price)
-    elif screen == "stats":
-        text, keyboard = telegram_menu.build_stats_screen(state)
-    elif screen == "settings":
-        text, keyboard = telegram_menu.build_settings_screen(state)
-    else:
-        notifier.answer_callback(callback_id, "Unknown screen")
-        return
-
-    notifier.answer_callback(callback_id)
-    # Build reply_markup in Telegram API format
-    reply_markup = {"inline_keyboard": [
-        [{"text": b["text"], "callback_data": b["callback_data"]} for b in row]
-        for row in keyboard
-    ]}
-    notifier.edit_message_text(message_id, text, reply_markup=reply_markup)
-
-
-def _handle_menu_action(state: grid_strategy.GridState, current_price: float,
-                        action: str, message_id: int, callback_id: str):
-    """Execute a settings action from the menu, then refresh the settings screen."""
-    if action == "spacing_up":
-        if config.STRATEGY_MODE == "pair":
-            old = state.profit_pct
-            state.profit_pct = round(old + SPACING_STEP_PCT, 4)
-            notifier.answer_callback(callback_id, f"Profit: {old:.2f}% -> {state.profit_pct:.2f}%")
-            logger.info("Menu: profit target widened %.2f%% -> %.2f%%", old, state.profit_pct)
-        else:
-            old = config.GRID_SPACING_PCT
-            config.GRID_SPACING_PCT = round(old + SPACING_STEP_PCT, 4)
-            notifier.answer_callback(callback_id, f"Spacing: {old:.2f}% -> {config.GRID_SPACING_PCT:.2f}%")
-            logger.info("Menu: spacing widened %.2f%% -> %.2f%%", old, config.GRID_SPACING_PCT)
-        grid_strategy.cancel_grid(state)
-        grid_strategy.build_grid(state, current_price)
-
-    elif action == "spacing_down":
-        floor = config.ROUND_TRIP_FEE_PCT + 0.1
-        if config.STRATEGY_MODE == "pair":
-            old = state.profit_pct
-            new_val = round(old - SPACING_STEP_PCT, 4)
-            if new_val < floor:
-                notifier.answer_callback(callback_id, f"Can't go below {floor:.2f}%")
-                return
-            state.profit_pct = new_val
-            notifier.answer_callback(callback_id, f"Profit: {old:.2f}% -> {new_val:.2f}%")
-            logger.info("Menu: profit target tightened %.2f%% -> %.2f%%", old, new_val)
-        else:
-            old = config.GRID_SPACING_PCT
-            new_val = round(old - SPACING_STEP_PCT, 4)
-            if new_val < floor:
-                notifier.answer_callback(callback_id, f"Can't go below {floor:.2f}%")
-                return
-            config.GRID_SPACING_PCT = new_val
-            notifier.answer_callback(callback_id, f"Spacing: {old:.2f}% -> {new_val:.2f}%")
-            logger.info("Menu: spacing tightened %.2f%% -> %.2f%%", old, new_val)
-        grid_strategy.cancel_grid(state)
-        grid_strategy.build_grid(state, current_price)
-
-    elif action == "ratio_auto":
-        state.trend_ratio_override = None
-        grid_strategy.update_trend_ratio(state)
-        notifier.answer_callback(callback_id, f"Ratio auto: {state.trend_ratio:.2f}")
-        logger.info("Menu: ratio set to auto (%.2f)", state.trend_ratio)
-        grid_strategy.cancel_grid(state)
-        grid_strategy.build_grid(state, current_price)
-
-    elif action == "entry_up":
-        old = state.entry_pct
-        state.entry_pct = round(old + ENTRY_STEP_PCT, 4)
-        notifier.answer_callback(callback_id, f"Entry: {old:.2f}% -> {state.entry_pct:.2f}%")
-        logger.info("Menu: entry distance widened %.2f%% -> %.2f%%", old, state.entry_pct)
-        grid_strategy.cancel_grid(state)
-        grid_strategy.build_grid(state, current_price)
-
-    elif action == "entry_down":
-        old = state.entry_pct
-        new_val = round(old - ENTRY_STEP_PCT, 4)
-        floor = 0.05
-        if new_val < floor:
-            notifier.answer_callback(callback_id, f"Can't go below {floor:.2f}%")
-            return
-        state.entry_pct = new_val
-        notifier.answer_callback(callback_id, f"Entry: {old:.2f}% -> {new_val:.2f}%")
-        logger.info("Menu: entry distance tightened %.2f%% -> %.2f%%", old, new_val)
-        grid_strategy.cancel_grid(state)
-        grid_strategy.build_grid(state, current_price)
-
-    elif action == "ai_check":
-        state.last_ai_check = 0
-        notifier.answer_callback(callback_id, "AI check queued")
-        logger.info("Menu: immediate AI check requested")
-
-    else:
-        notifier.answer_callback(callback_id, "Unknown action")
-        return
-
-    # Refresh settings screen
-    text, keyboard = telegram_menu.build_settings_screen(state)
-    reply_markup = {"inline_keyboard": [
-        [{"text": b["text"], "callback_data": b["callback_data"]} for b in row]
-        for row in keyboard
-    ]}
-    notifier.edit_message_text(message_id, text, reply_markup=reply_markup)
-
-
-# ---------------------------------------------------------------------------
-# Active pairs persistence (Step 6)
-# ---------------------------------------------------------------------------
-
-ACTIVE_PAIRS_FILE = os.path.join(config.LOG_DIR, "active_pairs.json")
-
-
-def _save_active_pairs():
-    """Save the active pair list to disk and Supabase.
-
-    Only saves one PairConfig per base pair (with slot_count),
-    skipping slot entries (XDGUSD#1, etc.).
-    """
-    pairs_data = []
-    seen_bases = set()
-    for pair_name, state in _bot_states.items():
-        bp = _base_pair(pair_name)
-        if bp in seen_bases:
-            continue
-        seen_bases.add(bp)
-        if state.pair_config:
-            pairs_data.append(state.pair_config.to_dict())
-    try:
-        os.makedirs(config.LOG_DIR, exist_ok=True)
-        tmp_path = ACTIVE_PAIRS_FILE + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(pairs_data, f, indent=2)
-        os.replace(tmp_path, ACTIVE_PAIRS_FILE)  # Atomic on both Windows and POSIX
-        logger.debug("Saved %d active pairs to %s", len(pairs_data), ACTIVE_PAIRS_FILE)
-    except Exception as e:
-        logger.error("Failed to save active pairs: %s", e)
-    # Also save to Supabase
-    supabase_store.save_state({"active_pairs": pairs_data}, pair="__swarm__")
-
-
-def _load_active_pairs() -> list:
-    """Load active pairs from file, returns list of PairConfig dicts (or empty)."""
-    if os.path.exists(ACTIVE_PAIRS_FILE):
-        try:
-            with open(ACTIVE_PAIRS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list) and data:
-                logger.info("Loaded %d active pairs from %s", len(data), ACTIVE_PAIRS_FILE)
-                return data
-        except Exception as e:
-            logger.warning("Failed to load active pairs file: %s", e)
-
-    # Try Supabase
-    sb = supabase_store.load_state(pair="__swarm__")
-    if sb and "active_pairs" in sb:
-        data = sb["active_pairs"]
-        if isinstance(data, list) and data:
-            logger.info("Loaded %d active pairs from Supabase", len(data))
-            return data
-
-    return []
-
-
-# ---------------------------------------------------------------------------
-# Portfolio value (balance-based P&L)
-# ---------------------------------------------------------------------------
-
-_portfolio_cache: tuple = (0.0, None)   # (timestamp, value)
-_portfolio_balances: dict | None = None  # raw balances from last fetch
-
-def _compute_portfolio_value() -> float | None:
-    """Compute total portfolio value from actual Kraken balances + current prices.
-
-    Caches the result for 30 seconds to avoid hammering the private API.
-    Also stores raw balances in _portfolio_balances for per-pair asset lookups.
-    """
-    global _portfolio_cache, _portfolio_balances
-    now = time.time()
-    if _portfolio_cache[1] is not None and now - _portfolio_cache[0] < 30:
-        return _portfolio_cache[1]
-
-    try:
-        balances = kraken_client.get_balance()
-    except Exception:
-        return _portfolio_cache[1]  # return stale value on error
-
-    _portfolio_balances = balances
-    total = 0.0
-    for asset, amount_str in balances.items():
-        amount = float(amount_str)
-        if amount < 0.0001:
-            continue
-        if asset in ("ZUSD", "USD"):
-            total += amount
-            continue
-        # Match asset to an active trading pair to get its price
-        for pn, st in _bot_states.items():
-            if not st.pair_config:
-                continue
-            fs = st.pair_config.filter_strings or []
-            if asset in fs or any(asset == "X" + f or asset == f.lstrip("X") for f in fs):
-                price = _current_prices.get(_base_pair(pn), 0)
-                if price > 0:
-                    total += amount * price
-                break
-
-    total = round(total, 2)
-    _portfolio_cache = (now, total)
-    return total
-
-
-# ---------------------------------------------------------------------------
-# Dynamic pair add/remove (Step 3d)
-# ---------------------------------------------------------------------------
-
-def _rebalance_capital_budgets():
-    """No-op.  Capital budgets are fully off; minimum order sizes are the safety net."""
-    return
-
-
-def _capture_rollover_summary(current_utc_date: str, last_daily_summary_date: str):
-    """Build a pre-reset daily summary snapshot if any pair is rolling over."""
-    rollover_dates = sorted({
-        st.today_date for st in _bot_states.values()
-        if st.today_date and st.today_date != current_utc_date
-    })
-    if not rollover_dates:
-        return None
-
-    rollover_date = rollover_dates[-1]
-    if len(rollover_dates) > 1:
-        logger.warning("Mixed rollover dates detected across pairs: %s", rollover_dates)
-    if rollover_date == last_daily_summary_date:
-        return None
-
-    rollover_states = [
-        st for st in _bot_states.values()
-        if st.today_date == rollover_date
-    ]
-    return {
-        "date": rollover_date,
-        "trades": sum(st.round_trips_today for st in rollover_states),
-        "profit": sum(st.today_profit_usd for st in rollover_states),
-        "fees": sum(st.today_fees_usd for st in rollover_states),
-        "doge_accumulated": sum(st.doge_accumulated for st in _bot_states.values()),
-        "total_profit": sum(st.total_profit_usd for st in _bot_states.values()),
-        "total_trips": sum(st.total_round_trips for st in _bot_states.values()),
-    }
-
-
-def _add_pair(pair_config: config.PairConfig):
-    """Add a new trading pair to the live bot."""
-    pair_name = pair_config.pair
-    if pair_name in _bot_states:
-        logger.warning("Pair %s already active, skipping add", pair_name)
-        return
-
-    # Floor profit_pct so it always covers actual round-trip fees
-    min_profit = round(2 * config.MAKER_FEE_PCT + 0.10, 2)
-    if pair_config.profit_pct < min_profit:
-        logger.info("Pair %s: profit_pct %.2f%% < fee floor %.2f%%, correcting",
-                     pair_config.display, pair_config.profit_pct, min_profit)
-        pair_config.profit_pct = min_profit
-
-    state = grid_strategy.GridState(pair_config=pair_config)
-    _bot_states[pair_name] = state
-    config.PAIRS[pair_name] = pair_config
-    _current_prices.setdefault(pair_name, 0.0)
-    _ohlc_caches[pair_name] = []
-    _ohlc_last_fetches[pair_name] = 0.0
-
-    # Try to load saved state
-    local_loaded = grid_strategy.load_state(state)
-    if not local_loaded:
-        _restore_from_supabase(state)
-
-    # Fetch initial price (use batch cache if available)
-    price = _current_prices.get(pair_name, 0.0)
-    if price <= 0:
-        try:
-            price = kraken_client.get_price(pair=pair_name)
-            _current_prices[pair_name] = price
-        except Exception as e:
-            logger.error("Failed to fetch price for new pair %s: %s", pair_name, e)
-            # Remove failed pair
-            _bot_states.pop(pair_name, None)
-            config.PAIRS.pop(pair_name, None)
-            return
-
-    grid_strategy.record_price(state, price)
-
-    # Build grid
-    adopted = grid_strategy.reconcile_on_startup(state, price)
-    if adopted > 0:
-        logger.info("[%s] Reconciliation adopted %d orders", pair_name, adopted)
-    orders = grid_strategy.build_grid(state, price)
-    deduped = grid_strategy.enforce_pair_order_limit(state)
-    grid_strategy.check_daily_reset(state)
-
-    logger.info("Added pair %s (%s): %d orders @ $%.6f",
-                pair_config.display, pair_name, len(orders), price)
-    _rebalance_capital_budgets()
-    _save_active_pairs()
-
-
-def _remove_pair(pair_name: str):
-    """Remove a trading pair and all its slots from the live bot."""
-    bp = _base_pair(pair_name)
-
-    # Remove all non-primary slots first
-    for sk, st in list(_get_slots_for_pair(bp)):
-        if sk != bp:
-            _remove_slot(sk)
-
-    if bp not in _bot_states:
-        logger.warning("Pair %s not active, skipping remove", bp)
-        return
-
-    state = _bot_states[bp]
-
-    # Cancel all orders
-    cancelled = grid_strategy.cancel_grid(state)
-    logger.info("[%s] Cancelled %d orders for removal", bp, cancelled)
-
-    # Save final state
-    grid_strategy.save_state(state)
-
-    # Clean up
-    _bot_states.pop(bp, None)
-    config.PAIRS.pop(bp, None)
-    _current_prices.pop(bp, None)
-    _ohlc_caches.pop(bp, None)
-    _ohlc_last_fetches.pop(bp, None)
-
-    logger.info("Removed pair %s", bp)
-    _rebalance_capital_budgets()
-    _save_active_pairs()
-
-
-def _add_slot(pair_config: config.PairConfig, slot_id: int,
-              price: float, claimed_txids: set = None):
-    """Add one additional trade slot for a pair.
-
-    Creates a new GridState with its own independent A/B state machine.
-    The slot shares the same PairConfig (copy) and price feed as slot 0.
-    """
-    import copy
-    base_pair = pair_config.pair
-    sk = _slot_key(base_pair, slot_id)
-    if sk in _bot_states:
-        logger.warning("Slot %s already exists, skipping", sk)
-        return
-
-    # Each slot gets its own PairConfig copy (independent profit tracking)
-    slot_pc = copy.copy(pair_config)
-    state = grid_strategy.GridState(pair_config=slot_pc)
-    state.slot_id = slot_id
-
-    _bot_states[sk] = state
-
-    # Try to load saved state (from prior run)
-    local_loaded = grid_strategy.load_state(state)
-    if not local_loaded:
-        _restore_from_supabase(state)
-
-    grid_strategy.record_price(state, price)
-
-    # Reconcile, excluding txids already claimed by other slots
-    adopted = grid_strategy.reconcile_on_startup(state, price,
-                                                  claimed_txids=claimed_txids)
-    if adopted > 0:
-        logger.info("[%s] Slot reconciliation adopted %d orders", sk, adopted)
-
-    # Build grid for this slot
-    orders = grid_strategy.build_grid(state, price)
-    grid_strategy.enforce_pair_order_limit(state)
-    grid_strategy.check_daily_reset(state)
-
-    logger.info("Added slot %s: %d orders @ $%.6f", sk, len(orders), price)
-
-
-def _remove_slot(slot_key: str):
-    """Remove a slot: cancel remaining orders, save state, clean up."""
-    state = _bot_states.get(slot_key)
-    if not state:
-        return
-
-    # Cancel all remaining orders for this slot
-    cancelled = grid_strategy.cancel_grid(state)
-    logger.info("[%s] Cancelled %d orders for slot removal", slot_key, cancelled)
-
-    # Save final state
-    grid_strategy.save_state(state)
-
-    # Delete state file
-    state_path = grid_strategy._state_file_path(state)
-    try:
-        if os.path.exists(state_path):
-            os.remove(state_path)
-            logger.info("Deleted state file: %s", state_path)
-    except Exception as e:
-        logger.warning("Failed to delete slot state file %s: %s", state_path, e)
-
-    # Remove from _bot_states
-    _bot_states.pop(slot_key, None)
-    logger.info("Removed slot %s", slot_key)
-
-
-def _get_claimed_txids(base_pair: str) -> set:
-    """Collect all txids already adopted by existing slots of a base pair."""
-    claimed = set()
-    for sk, st in _get_slots_for_pair(base_pair):
-        for o in st.grid_orders:
-            if o.status == "open" and o.txid:
-                claimed.add(o.txid)
-        for r in st.recovery_orders:
-            if r.txid:
-                claimed.add(r.txid)
-    return claimed
-
-
-def _process_swarm_queue():
-    """Process pending swarm add/remove/multiplier requests (called from main loop)."""
-    # Drain queues (thread-safe)
-    adds = []
-    while not _swarm_pending_adds.empty():
-        try:
-            adds.append(_swarm_pending_adds.get_nowait())
-        except queue.Empty:
-            break
-    removes = []
-    while not _swarm_pending_removes.empty():
-        try:
-            removes.append(_swarm_pending_removes.get_nowait())
-        except queue.Empty:
-            break
-    mults = []
-    while not _swarm_pending_multipliers.empty():
-        try:
-            mults.append(_swarm_pending_multipliers.get_nowait())
-        except queue.Empty:
-            break
-
-    for pc in adds:
-        try:
-            _add_pair(pc)
-        except Exception as e:
-            logger.error("Failed to add pair %s: %s", pc.pair, e)
-
-    for pair_name in removes:
-        try:
-            _remove_pair(pair_name)
-        except Exception as e:
-            logger.error("Failed to remove pair %s: %s", pair_name, e)
-
-    # Process slot count changes (multiplier = target slot count)
-    for base_pair, target_slots in mults:
-        try:
-            target_slots = int(target_slots)
-            current_slots = _get_slots_for_pair(base_pair)
-            current_count = len(current_slots)
-
-            if target_slots == current_count:
-                continue
-
-            # Update PairConfig slot_count + peak high-water mark
-            primary_st = _bot_states.get(base_pair)
-            if primary_st and primary_st.pair_config:
-                primary_st.pair_config.slot_count = target_slots
-                if target_slots > primary_st.pair_config.peak_slot_count:
-                    primary_st.pair_config.peak_slot_count = target_slots
-
-            if target_slots > current_count:
-                # Scale up: add new slots
-                price = _get_price(base_pair)
-                if price <= 0:
-                    logger.error("[%s] Cannot add slots: no price data", base_pair)
-                    continue
-                claimed = _get_claimed_txids(base_pair)
-                for sid in range(current_count, target_slots):
-                    _add_slot(primary_st.pair_config, sid, price, claimed)
-                    # Update claimed txids with newly adopted orders
-                    new_sk = _slot_key(base_pair, sid)
-                    new_st = _bot_states.get(new_sk)
-                    if new_st:
-                        for o in new_st.grid_orders:
-                            if o.status == "open" and o.txid:
-                                claimed.add(o.txid)
-                logger.info("[%s] Scaled up: %d -> %d slots",
-                            base_pair, current_count, target_slots)
-
-            else:
-                # Scale down: wind down excess slots (highest IDs first)
-                # Never wind down slot 0
-                slot_states = sorted(current_slots, key=lambda x: -x[1].slot_id)
-                to_remove = current_count - target_slots
-                removed = 0
-                for sk, st in slot_states:
-                    if removed >= to_remove:
-                        break
-                    if st.slot_id == 0:
-                        continue  # Never wind down slot 0
-                    # Mark as winding down: cancel entries, keep exits
-                    st.winding_down = True
-                    for o in st.grid_orders:
-                        if o.status == "open" and o.order_role == "entry" and o.txid:
-                            try:
-                                kraken_client.cancel_order(o.txid)
-                                o.status = "cancelled"
-                                logger.info("[%s] Wind-down: cancelled entry %s",
-                                            sk, o.txid)
-                            except Exception as e:
-                                logger.warning("[%s] Failed to cancel entry: %s", sk, e)
-                    grid_strategy.save_state(st)
-                    removed += 1
-                logger.info("[%s] Winding down %d slots (%d -> %d target)",
-                            base_pair, removed, current_count, target_slots)
-
-            _rebalance_capital_budgets()
-            _save_active_pairs()
-        except Exception as e:
-            logger.error("Failed to adjust slots for %s: %s", base_pair, e)
-
-
-def _auto_slot_check():
-    """Scale slots up based on accumulated net profit per base pair.
-
-    target = min(1 + floor(net_profit / threshold), MAX_AUTO_SLOTS)
-    Never shrinks below peak_slot_count (high-water mark).
-    """
-    threshold = config.SLOT_PROFIT_THRESHOLD
-    if threshold <= 0:
-        return
-
-    # Group by base pair
-    grouped = {}
-    for pn, st in _bot_states.items():
-        bp = _base_pair(pn)
-        grouped.setdefault(bp, []).append((pn, st))
-
-    for bp, slot_list in grouped.items():
-        primary_st = _bot_states.get(bp)
-        if not primary_st or not primary_st.pair_config:
-            continue
-
-        # Aggregate net profit across all slots of this pair
-        net_profit = sum(st.total_profit_usd - st.seed_cost_usd
-                         for _, st in slot_list)
-
-        target = min(1 + int(net_profit / threshold),
-                     config.MAX_AUTO_SLOTS)
-        target = max(target, 1)
-
-        # Never shrink below peak
-        peak = primary_st.pair_config.peak_slot_count
-        target = max(target, peak)
-
-        current_count = len(slot_list)
-        if target <= current_count:
-            continue
-
-        # Update peak high-water mark
-        primary_st.pair_config.peak_slot_count = target
-
-        # Scale up via the multiplier queue (reuses existing logic)
-        _swarm_pending_multipliers.put((bp, target))
-        logger.info("[%s] Auto-slot: net $%.2f -> %d slots (was %d, peak %d)",
-                    bp, net_profit, target, current_count, peak)
-
-
-# ---------------------------------------------------------------------------
-# Main bot logic
-# ---------------------------------------------------------------------------
-
-def _restore_from_supabase(state: grid_strategy.GridState):
-    """Restore a single pair's state from Supabase cloud."""
-    pair_name = state.pair_name
-    state_key = grid_strategy.state_store_key(state)
-    sb_state = supabase_store.load_state(pair=state_key)
-    # Backward compatibility: pre-slot snapshots were keyed by base pair only.
-    if not sb_state and state.slot_id > 0:
-        sb_state = supabase_store.load_state(pair=pair_name)
-        if sb_state:
-            logger.info("[%s] Loaded legacy slot state from key=%s", state_key, pair_name)
-    if not sb_state:
-        return False
-    return grid_strategy.restore_state_snapshot(
-        state, sb_state, source=f"Supabase:{state_key}"
-    )
-
-
-def run():
-    """
-    Main bot entry point.  Runs the complete lifecycle:
-    init -> build grid -> loop -> shutdown.
-
-    Supports multiple pairs: iterates sequentially over each configured pair
-    per cycle.  Rate limit budget: ~15 API calls per 30s cycle, safe for 3-4 pairs.
-    """
-    global _bot_states, _current_prices, _bot_healthy, _bot_start_time
-    global _ohlc_caches, _ohlc_last_fetches
-
-    # --- Phase 1: Initialize ---
-    setup_logging()
-    setup_signal_handlers()
-    config.print_banner()
-
-    _bot_start_time = time.time()
-
-    # Load active pairs from persistence (overrides PAIRS env var if found)
-    saved_pairs = _load_active_pairs()
-    if saved_pairs:
-        config.PAIRS = {}
-        for pd in saved_pairs:
-            pc = config.PairConfig.from_dict(pd)
-            # Persisted snapshots may carry old per-pair sizing from prior
-            # deployments; force runtime sizing back to the global base.
-            if abs(pc.order_size_usd - config.ORDER_SIZE_USD) >= 1e-9:
-                logger.info(
-                    "Pair %s: resetting saved order_size_usd $%.2f -> base $%.2f",
-                    pc.display, pc.order_size_usd, config.ORDER_SIZE_USD,
-                )
-                pc.order_size_usd = config.ORDER_SIZE_USD
-            config.PAIRS[pc.pair] = pc
-        logger.info("Restored %d pairs from active_pairs persistence", len(config.PAIRS))
-
-    # Create one GridState per configured pair
-    min_profit = round(2 * config.MAKER_FEE_PCT + 0.10, 2)
-    for pair_name, pc in config.PAIRS.items():
-        # Floor profit_pct so it always covers actual round-trip fees
-        if pc.profit_pct < min_profit:
-            logger.info("Pair %s: profit_pct %.2f%% < fee floor %.2f%%, correcting",
-                         pc.display, pc.profit_pct, min_profit)
-            pc.profit_pct = min_profit
-        state = grid_strategy.GridState(pair_config=pc)
-        _bot_states[pair_name] = state
-        _current_prices[pair_name] = 0.0
-        _ohlc_caches[pair_name] = []
-        _ohlc_last_fetches[pair_name] = 0.0
-        logger.info("Initialized state for %s (%s)", pc.display, pair_name)
-
-    # Start Supabase persistence (one writer thread for all pairs)
-    supabase_store.start_writer_thread()
-
-    # Restore state per pair (local file first, then Supabase)
-    for pair_name, state in _bot_states.items():
-        local_loaded = grid_strategy.load_state(state)
-        if not local_loaded:
-            _restore_from_supabase(state)
-        # Restore fills and price history from Supabase
-        sb_fills = supabase_store.load_fills(pair=pair_name)
-        if sb_fills:
-            state.recent_fills = sb_fills
-            logger.info("[%s] Restored %d fills from Supabase", pair_name, len(sb_fills))
-        sb_prices = supabase_store.load_price_history(since=time.time() - 86400, pair=pair_name)
-        if sb_prices:
-            state.price_history = sb_prices
-            logger.info("[%s] Restored %d price samples from Supabase", pair_name, len(sb_prices))
-        # Retroactive P&L reconstruction from fills (once per state)
-        if config.STRATEGY_MODE == "pair" and not state._pnl_migrated:
-            grid_strategy.migrate_pnl_from_fills(state)
-            grid_strategy.save_state(state)
-
-    # Start health check server (Railway expects a listening port)
-    health_server = start_health_server()
-
-    # --- Phase 2: Fetch initial prices (batch) ---
-    all_pair_names = list(_bot_states.keys())
-    logger.info("Fetching initial prices for %d pair(s)...", len(all_pair_names))
-    try:
-        batch_prices = kraken_client.get_prices(all_pair_names)
-        for pair_name, price in batch_prices.items():
-            _current_prices[pair_name] = price
-            state = _bot_states[pair_name]
-            grid_strategy.record_price(state, price)
-            logger.info("[%s] Price: $%.6f", state.pair_display, price)
-        # Check for pairs that didn't get prices
-        missing = [pn for pn in all_pair_names if _current_prices.get(pn, 0) <= 0]
-        if missing:
-            logger.warning("No price data for %d pair(s): %s -- retrying individually",
-                           len(missing), missing[:5])
-            for pn in missing:
-                try:
-                    price = kraken_client.get_price(pair=pn)
-                    _current_prices[pn] = price
-                    grid_strategy.record_price(_bot_states[pn], price)
-                    logger.info("[%s] Price (fallback): $%.6f", _bot_states[pn].pair_display, price)
-                except Exception as e:
-                    logger.error("[%s] Failed to fetch price: %s", pn, e)
-    except Exception as e:
-        logger.error("Batch price fetch failed, falling back to individual: %s", e)
-        for pair_name, state in _bot_states.items():
-            try:
-                price = kraken_client.get_price(pair=pair_name)
-                _current_prices[pair_name] = price
-                grid_strategy.record_price(state, price)
-            except Exception as e2:
-                logger.error("[%s] Failed to fetch price: %s", pair_name, e2)
-                notifier.notify_error(f"Bot failed to start {state.pair_display}: cannot fetch price\n{e2}")
-                return
-
-    # --- Phase 2b: Validation guardrails ---
-    first_price = _current_prices[_first_pair_name()]
-    if not grid_strategy.validate_config(first_price):
-        logger.critical("Pre-flight validation FAILED -- refusing to start")
-        notifier.notify_error("Bot refused to start: validation failed (check logs)")
-        return
-
-    # Log startup (no Telegram notification -- reduce deploy spam)
-    pair_labels = ", ".join(st.pair_display for st in _bot_states.values())
-    logger.info("Bot started: %s @ $%.6f", pair_labels, first_price)
-
-    # --- Phase 2c: Startup reconciliation + build grid per pair ---
-    for pair_name, state in list(_bot_states.items()):
-        current_price = _current_prices.get(_base_pair(pair_name), 0.0)
-        adopted = grid_strategy.reconcile_on_startup(state, current_price)
-        if adopted > 0:
-            logger.info("[%s] Reconciliation adopted %d orders", pair_name, adopted)
-
-        logger.info("[%s] Building initial grid...", state.pair_display)
-        orders = grid_strategy.build_grid(state, current_price)
-        logger.info("[%s] Grid built: %d orders placed", state.pair_display, len(orders))
-
-        # Enforce pair invariant: cancel duplicate (side, role) orders
-        deduped = grid_strategy.enforce_pair_order_limit(state)
-        if deduped:
-            logger.info("[%s] Pair dedup: cancelled %d duplicate orders", pair_name, deduped)
-
-        grid_strategy.check_daily_reset(state)
-
-        # Create additional slots if slot_count > 1
-        if state.pair_config and state.pair_config.slot_count > 1:
-            claimed = _get_claimed_txids(pair_name)
-            for sid in range(1, state.pair_config.slot_count):
-                _add_slot(state.pair_config, sid, current_price, claimed)
-                # Update claimed txids with newly adopted orders
-                new_sk = _slot_key(pair_name, sid)
-                new_st = _bot_states.get(new_sk)
-                if new_st:
-                    for o in new_st.grid_orders:
-                        if o.status == "open" and o.txid:
-                            claimed.add(o.txid)
-            logger.info("[%s] Created %d total slots",
-                        pair_name, state.pair_config.slot_count)
-
-    # --- Phase 3b: One-time reprice thin exits to new profit floor ---
-    for pair_name, state in _bot_states.items():
-        try:
-            ticker = kraken_client.get_ticker(state.pair_name)
-            cp = float(ticker.get("c", [0])[0]) if ticker else 0
-            if cp > 0:
-                n = grid_strategy.reprice_thin_exits(state, cp)
-                if n:
-                    logger.info("[%s] Repriced %d thin exits to %.2f%% floor",
-                                pair_name, n, config.VOLATILITY_PROFIT_FLOOR)
-                    grid_strategy.save_state(state)
-        except Exception as e:
-            logger.warning("[%s] Exit reprice failed: %s", pair_name, e)
-
-    # --- Phase 3c: Log actual Kraken balances (fidelity check) ---
-    try:
-        balances = kraken_client.get_balance()
-        # Filter to non-zero balances
-        held = {k: float(v) for k, v in balances.items() if float(v) > 0.0001}
-        logger.info("BALANCE CHECK: %s", held)
-    except Exception as e:
-        logger.warning("Balance check failed: %s", e)
-
-    # --- Phase 4: Main loop ---
-    _rebalance_capital_budgets()  # set per-pair budgets on startup
-    logger.info("Entering main loop (poll every %ds, %d pair(s))...",
-                config.POLL_INTERVAL_SECONDS, len(_bot_states))
-    last_daily_summary_date = ""
-    _global_consecutive_errors = 0
-    swarm_limit_notified = False
-
-    while not _shutdown_requested:
-        try:
-            loop_start = time.time()
-            all_paused = True
-            should_stop_global = False
-
-            # ============================================================
-            # Batch operations (before per-pair loop)
-            # ============================================================
-
-            # 4a-batch: Fetch all prices in 1-2 public API calls
-            # Deduplicate by base pair (slots share the same price)
-            base_pairs = list({_base_pair(k): k for k in _bot_states}.keys())
-            try:
-                batch_prices = kraken_client.get_prices(base_pairs)
-                price_now = time.time()
-                for bp, price in batch_prices.items():
-                    _current_prices[bp] = price
-                    # Fan out to all slots of this base pair
-                    for sk, st in _get_slots_for_pair(bp):
-                        grid_strategy.record_price(st, price)
-                        st.last_price_update_at = price_now
-                        st.consecutive_errors = 0
-                    supabase_store.queue_price_point(time.time(), price, pair=bp)
-                _global_consecutive_errors = 0
-            except Exception as e:
-                _global_consecutive_errors += 1
-                logger.error("Batch price fetch failed (%d/%d): %s",
-                             _global_consecutive_errors, config.MAX_CONSECUTIVE_ERRORS, e)
-                if _global_consecutive_errors >= config.MAX_CONSECUTIVE_ERRORS:
-                    logger.critical("Too many consecutive errors -- stopping bot")
-                    notifier.notify_risk_event("error", f"Max errors reached: {e}")
-                    should_stop_global = True
-
-            # 4a-batch: Collect all open txids and batch query (1-2 private calls)
-            batch_query_ok = False
-            if not should_stop_global and not config.DRY_RUN:
-                all_txids = {}  # txid -> pair_name
-                for pn, st in _bot_states.items():
-                    for o in st.grid_orders:
-                        if o.status == "open" and o.txid:
-                            all_txids[o.txid] = pn
-                    # Include recovery order txids for fill detection
-                    for r in st.recovery_orders:
-                        if r.txid:
-                            all_txids[r.txid] = pn
-                if all_txids:
-                    # Budget check: need ~1 call per 50 txids + 2 margin
-                    batches_needed = (len(all_txids) + 49) // 50
-                    if kraken_client.budget_available() < batches_needed + 2:
-                        logger.warning(
-                            "Skipping batch order query: budget %.1f < %d needed",
-                            kraken_client.budget_available(), batches_needed + 2)
-                    else:
-                        try:
-                            batch_order_info = kraken_client.query_orders_batched(list(all_txids.keys()))
-                            # Distribute results to per-pair caches
-                            per_pair_info = {}
-                            for txid, info in batch_order_info.items():
-                                pn = all_txids.get(txid)
-                                if pn:
-                                    per_pair_info.setdefault(pn, {})[txid] = info
-                            for pn, info_dict in per_pair_info.items():
-                                _bot_states[pn]._cached_order_info = info_dict
-                            batch_query_ok = True
-                        except Exception as e:
-                            logger.error("Batch order query failed: %s", e)
-
-            if should_stop_global:
-                break
-
-            # Global swarm daily loss check
-            total_today_loss = sum(
-                st.today_loss_usd for st in _bot_states.values())
-            if total_today_loss >= config.SWARM_DAILY_LOSS_LIMIT:
-                for pname, st in list(_bot_states.items()):
-                    if _base_pair(pname) in config.SWARM_EXEMPT_PAIRS:
-                        continue  # DOGE keeps running (including slots)
-                    if not st.is_paused:
-                        st.is_paused = True
-                        st.pause_reason = (
-                            f"Swarm daily loss limit: "
-                            f"${total_today_loss:.2f} >= "
-                            f"${config.SWARM_DAILY_LOSS_LIMIT:.2f}")
-                        grid_strategy.cancel_grid(st)
-                        grid_strategy.save_state(st)
-                        logger.warning(
-                            "[%s] SWARM PAUSED: %s", pname, st.pause_reason)
-                if not swarm_limit_notified:
-                    notifier.notify_risk_event(
-                        "swarm_daily_limit",
-                        f"Swarm daily loss ${total_today_loss:.2f} hit limit "
-                        f"${config.SWARM_DAILY_LOSS_LIMIT:.2f}. "
-                        f"Exempt: {config.SWARM_EXEMPT_PAIRS}")
-                    swarm_limit_notified = True
-
-            # Capture a pre-reset snapshot so daily summary reflects
-            # yesterday's actual counters, not zeroed post-reset values.
-            utc_today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            rollover_summary = _capture_rollover_summary(
-                utc_today, last_daily_summary_date
-            )
-
-            # ============================================================
-            # Per-pair operations (iterate snapshot -- dict may change from wind-down)
-            # ============================================================
-            _slots_to_remove = []  # Collect completed wind-downs for post-loop removal
-            for pair_name, state in list(_bot_states.items()):
-              try:
-                current_price = _get_price(pair_name)
-                if current_price <= 0:
-                    continue  # No price data this cycle
-
-                # Wind-down check: if slot is winding down and has no open orders
-                # and no recovery orders, mark for removal after loop
-                if state.winding_down:
-                    open_orders = [o for o in state.grid_orders if o.status == "open"]
-                    if not open_orders and not state.recovery_orders:
-                        _slots_to_remove.append(pair_name)
-                        continue  # Skip trading for this slot
-
-                # --- 4b: Check daily reset ---
-                grid_strategy.check_daily_reset(state)
-
-                # --- 4c: Check risk limits (per-pair) ---
-                should_stop, should_pause, reason = grid_strategy.check_risk_limits(
-                    state, current_price
-                )
-
-                if should_stop:
-                    logger.critical("[%s] STOP triggered: %s", pair_name, reason)
-                    notifier.notify_risk_event("stop_floor", reason, pair_display=state.pair_display)
-                    should_stop_global = True
-                    break
-
-                if should_pause and not state.is_paused:
-                    state.is_paused = True
-                    state.pause_reason = reason
-                    grid_strategy.cancel_grid(state)
-                    grid_strategy.save_state(state)
-                    logger.warning("[%s] PAUSED: %s", pair_name, reason)
-                    notifier.notify_risk_event("daily_limit", reason, pair_display=state.pair_display)
-
-                if state.is_paused:
-                    logger.debug("[%s] Paused: %s", pair_name, state.pause_reason)
-                    continue  # Skip trading for this pair
-
-                all_paused = False
-
-                # --- 4d: Check for fills ---
-                filled = grid_strategy.check_fills(state, current_price)
-
-                if filled:
-                    logger.info("[%s] Detected %d fill(s)", pair_name, len(filled))
-                    grid_strategy.handle_fills(state, filled, current_price)
-
-                    if config.STRATEGY_MODE != "pair":
-                        grid_strategy.update_trend_ratio(state)
-
-                    if config.STRATEGY_MODE != "pair" and abs(state.trend_ratio - state.last_build_ratio) >= 0.2:
-                        logger.info(
-                            "[%s] Trend ratio drift: %.2f -> %.2f -- rebuilding",
-                            pair_name, state.last_build_ratio, state.trend_ratio,
-                        )
-                        grid_strategy.cancel_grid(state)
-                        orders = grid_strategy.build_grid(state, current_price)
-                        notifier.notify_grid_built(current_price, len(orders), pair_display=state.pair_display)
-
-                    for fill_data in state.recent_fills[-len(filled):]:
-                        if fill_data.get("profit", 0) != 0:
-                            notifier.notify_round_trip(
-                                side=fill_data["side"],
-                                price=fill_data["price"],
-                                volume=fill_data["volume"],
-                                profit=fill_data["profit"],
-                                total_profit=state.today_profit_usd,
-                                trip_count=state.total_round_trips,
-                                pair_display=state.pair_display,
-                                trade_id=fill_data.get("trade_id"),
-                                cycle=fill_data.get("cycle"),
-                                entry_price=fill_data.get("entry_price"),
-                            )
-
-                    grid_strategy.prune_completed_orders(state)
-                    grid_strategy.save_state(state)
-
-                # --- 4d2: Exit lifecycle + recovery (Section 12) ---
-                if config.STRATEGY_MODE == "pair" and config.RECOVERY_ENABLED:
-                    lifecycle_changed = False
-                    # Recompute pair_state from live orders (fixes stale state after restart)
-                    # Only correct if we got fresh order data this cycle
-                    if batch_query_ok:
-                        fresh_state = grid_strategy._compute_pair_state(state)
-                        if fresh_state != state.pair_state:
-                            logger.info("[%s] pair_state corrected: %s -> %s",
-                                        pair_name, state.pair_state, fresh_state)
-                            state.pair_state = fresh_state
-                            lifecycle_changed = True
-                    else:
-                        logger.debug("[%s] Skipping pair_state correction (stale data)",
-                                     pair_name)
-                    # Exit drift check: orphan exits too far from market
-                    if grid_strategy.check_exit_drift(state, current_price):
-                        lifecycle_changed = True
-                    # S1 rebalance: orphan stranded exit to restore S0 balance
-                    if grid_strategy.check_s1_rebalance(state, current_price):
-                        lifecycle_changed = True
-                    # Order-status-dependent checks: skip when batch query failed (stale data)
-                    if batch_query_ok:
-                        # Check for surprise fills on recovery orders
-                        cached_info = getattr(state, "_cached_order_info", None) or {}
-                        if grid_strategy.check_recovery_fills(state, cached_info):
-                            lifecycle_changed = True
-                        # S1a/S1b: reprice stale exits (Section 12.2)
-                        if grid_strategy.check_stale_exits(state, current_price):
-                            lifecycle_changed = True
-                        # S2: break-glass protocol (Section 12.3)
-                        if grid_strategy.check_s2_break_glass(state, current_price):
-                            lifecycle_changed = True
-                        # Fallback: orphan exits past orphan threshold
-                        if grid_strategy.check_recovery_timeout(state, current_price):
-                            lifecycle_changed = True
-                    else:
-                        logger.debug("[%s] Skipping order-dependent lifecycle checks (stale data)",
-                                     pair_name)
-                    if lifecycle_changed:
-                        grid_strategy.save_state(state)
-
-                # --- 4e: Check grid drift ---
-                if grid_strategy.check_grid_drift(state, current_price):
-                    old_center = state.center_price
-                    drift_pct = abs(current_price - old_center) / old_center * 100.0
-
-                    logger.info("[%s] Resetting grid: drift %.2f%% from $%.6f to $%.6f",
-                                pair_name, drift_pct, old_center, current_price)
-
-                    grid_strategy.cancel_grid(state)
-                    orders = grid_strategy.build_grid(state, current_price)
-
-                    notifier.notify_grid_reset(old_center, current_price, drift_pct, pair_display=state.pair_display)
-                    notifier.notify_grid_built(current_price, len(orders), pair_display=state.pair_display)
-
-              except Exception as pair_err:
-                state.consecutive_errors += 1
-                logger.error("[%s] Per-pair error (%d consecutive): %s",
-                             pair_name, state.consecutive_errors, pair_err, exc_info=True)
-                if state.consecutive_errors >= config.MAX_CONSECUTIVE_ERRORS:
-                    state.is_paused = True
-                    state.pause_reason = f"Too many errors: {pair_err}"
-                    logger.warning("[%s] Auto-paused after %d consecutive errors",
-                                   pair_name, state.consecutive_errors)
-
-            # End per-pair loop
-
-            if rollover_summary:
-                last_daily_summary_date = rollover_summary["date"]
-                swarm_limit_notified = False  # reset for new day
-                notifier.notify_daily_summary(
-                    date=rollover_summary["date"],
-                    trades=rollover_summary["trades"],
-                    profit=rollover_summary["profit"],
-                    fees=rollover_summary["fees"],
-                    doge_accumulated=rollover_summary["doge_accumulated"],
-                    total_profit=rollover_summary["total_profit"],
-                    total_trips=rollover_summary["total_trips"],
-                )
-
-            # Remove completed wind-down slots
-            for sk in _slots_to_remove:
-                try:
-                    _remove_slot(sk)
-                    logger.info("Slot %s wind-down complete, removed", sk)
-                    # Update primary pair's slot_count
-                    bp = _base_pair(sk)
-                    primary = _bot_states.get(bp)
-                    if primary and primary.pair_config:
-                        actual = len(_get_slots_for_pair(bp))
-                        primary.pair_config.slot_count = actual
-                    _rebalance_capital_budgets()
-                    _save_active_pairs()
-                except Exception as e:
-                    logger.error("Failed to remove wound-down slot %s: %s", sk, e)
-
-            if should_stop_global:
-                break
-
-            if all_paused and _bot_states:
-                logger.debug("All pairs paused -- waiting for daily reset")
-                time.sleep(config.POLL_INTERVAL_SECONDS)
-                continue
-
-            # ============================================================
-            # Global operations (once per cycle, after all pairs)
-            # ============================================================
-            now = time.time()
-
-            # --- 4f: Run AI advisor (hourly, using first pair's context) ---
-            ai_state = _first_state()
-            ai_price = _current_prices.get(_first_pair_name(), 0.0)
-            if ai_state and ai_state.last_ai_check == 0:
-                ai_state.last_ai_check = now
-                ai_pair = _first_pair_name()
-
-                # Force-refresh stats before AI call
-                try:
-                    ohlc_last = _ohlc_last_fetches.get(ai_pair, 0.0)
-                    if now - ohlc_last >= 300:
-                        try:
-                            _ohlc_caches[ai_pair] = kraken_client.get_ohlc(pair=ai_pair, interval=5)
-                            _ohlc_last_fetches[ai_pair] = now
-                        except Exception as e:
-                            logger.debug("OHLC fetch failed: %s", e)
-                    ai_state.stats_results = stats_engine.run_all(
-                        ai_state, ai_price, _ohlc_caches.get(ai_pair, []))
-                    ai_state.stats_last_run = now
-                except Exception as e:
-                    logger.debug("Stats refresh before AI failed: %s", e)
-
-                price_changes = grid_strategy.get_price_changes(ai_state, ai_price)
-                _, _, spread_pct = kraken_client.get_spread(pair=ai_pair)
-
-                hour_ago = now - 3600
-                recent_count = len([
-                    f for f in ai_state.recent_fills
-                    if f.get("time", 0) > hour_ago
-                ])
-
-                if config.STRATEGY_MODE == "pair":
-                    def _serialize_trade(trade_id, st):
-                        orders = [o for o in st.grid_orders
-                                  if getattr(o, 'trade_id', None) == trade_id and o.status == "open"]
-                        cyc_attr = f"cycle_{trade_id.lower()}"
-                        if not orders:
-                            return {"cycle": getattr(st, cyc_attr, 1), "leg": "idle"}
-                        o = orders[0]
-                        return {
-                            "cycle": o.cycle,
-                            "leg": o.order_role,
-                            "side": o.side,
-                            "price": o.price,
-                        }
-
-                    upnl = grid_strategy.compute_unrealized_pnl(ai_state, ai_price)
-                    ps = getattr(ai_state, "pair_stats", None)
-                    market_data = {
-                        "market": {
-                            "price": ai_price,
-                            "pair_display": ai_state.pair_display,
-                            "change_1h_pct": price_changes["1h"],
-                            "change_4h_pct": price_changes["4h"],
-                            "change_24h_pct": price_changes["24h"],
-                            "spread_pct": spread_pct,
-                            "fills_last_hour": recent_count,
-                        },
-                        "strategy": {
-                            "entry_pct": ai_state.entry_pct,
-                            "profit_pct": ai_state.profit_pct,
-                            "refresh_pct": ai_state.refresh_pct,
-                            "order_size_usd": ai_state.order_size_usd,
-                        },
-                        "state": {
-                            "pair_state": ai_state.pair_state,
-                            "trade_a": _serialize_trade("A", ai_state),
-                            "trade_b": _serialize_trade("B", ai_state),
-                        },
-                        "performance": ps.to_dict() if ps else {},
-                        "risk": {
-                            "capital": config.STARTING_CAPITAL,
-                            "stop_floor": ai_state.stop_floor,
-                            "daily_loss_limit": ai_state.daily_loss_limit,
-                            "today_loss_usd": ai_state.today_loss_usd,
-                            "today_profit_usd": ai_state.today_profit_usd,
-                            "total_profit_usd": ai_state.total_profit_usd,
-                            "unrealized_pnl_usd": upnl["total_unrealized"],
-                        },
-                    }
-                    logger.debug("AI council payload: %s", json.dumps(market_data, default=str))
-                else:
-                    market_data = {
-                        "price": ai_price,
-                        "pair_display": ai_state.pair_display,
-                        "change_1h": price_changes["1h"],
-                        "change_4h": price_changes["4h"],
-                        "change_24h": price_changes["24h"],
-                        "spread_pct": spread_pct,
-                        "recent_fills": recent_count,
-                        "grid_center": ai_state.center_price,
-                    }
-
-                stats_context = stats_engine.format_for_ai(ai_state.stats_results)
-                recommendation = ai_advisor.get_recommendation(market_data, stats_context)
-                ai_state.ai_recommendation = ai_advisor.format_recommendation(recommendation)
-                ai_state._last_ai_result = recommendation
-
-                action = recommendation.get("action", "continue")
-                consensus_type = recommendation.get("consensus_type")
-
-                # Auto-execute safe (conservative) actions without approval
-                AI_SAFE_ACTIONS = {"widen_entry", "widen_spacing"}
-                if (config.AI_AUTO_EXECUTE
-                        and action in AI_SAFE_ACTIONS
-                        and consensus_type in ("majority", "condition_fallback")):
-                    logger.info(
-                        "AI AUTO-EXECUTE: %s (consensus=%s)",
-                        action, consensus_type,
-                    )
-                    _execute_approved_action(ai_state, action, ai_price)
-                    notifier._send_message(
-                        f"AI AUTO-EXECUTE: {action}\n"
-                        f"Consensus: {consensus_type}\n"
-                        f"Reason: {recommendation.get('reason', '')}"
-                    )
-                    ai_advisor.log_approval_decision(action, "auto-executed")
-                else:
-                    msg_id = notifier.notify_ai_recommendation(recommendation, ai_price)
-                    if action != "continue" and msg_id:
-                        _set_pending_approval(action, msg_id, recommendation)
-
-            # --- 4f2: Poll for approval callbacks & check expiry ---
-            _check_approval_expiry()
-            # Use first pair for Telegram callbacks (commands/menus operate on first pair)
-            first_st = _first_state()
-            first_price = _current_prices.get(_first_pair_name(), 0.0)
-            if first_st:
-                _poll_and_handle_callbacks(first_st, first_price)
-
-            # --- 4f3: Apply web dashboard config changes ---
-            _apply_web_config()
-
-            # --- 4f4: Run stats engine (OHLC throttled: max 3 per cycle) ---
-            # Deduplicate OHLC by base pair (slots share candles)
-            ohlc_base_pairs = list({_base_pair(k) for k in _bot_states
-                                    if now - _ohlc_last_fetches.get(_base_pair(k), 0) >= 300})
-            ohlc_fetched = 0
-            MAX_OHLC_PER_CYCLE = 3
-            # Round-robin: start from where we left off
-            if ohlc_base_pairs:
-                global _ohlc_robin_idx
-                for _ in range(len(ohlc_base_pairs)):
-                    if ohlc_fetched >= MAX_OHLC_PER_CYCLE:
-                        break
-                    idx = _ohlc_robin_idx % len(ohlc_base_pairs)
-                    _ohlc_robin_idx += 1
-                    bp = ohlc_base_pairs[idx]
-                    try:
-                        candles = kraken_client.get_ohlc(pair=bp, interval=5)
-                        _ohlc_caches[bp] = candles
-                        _ohlc_last_fetches[bp] = now
-                        ohlc_fetched += 1
-                    except Exception as e:
-                        logger.debug("[%s] OHLC fetch failed: %s", bp, e)
-
-            for pair_name, state in _bot_states.items():
-                if now - state.stats_last_run >= 60:
-                    state.stats_last_run = now
-                    try:
-                        bp = _base_pair(pair_name)
-                        cp = _get_price(pair_name)
-                        state.stats_results = stats_engine.run_all(
-                            state, cp, _ohlc_caches.get(bp, [])
-                        )
-                        # Volatility auto-adjust profit target
-                        if config.STRATEGY_MODE == "pair":
-                            adjusted = grid_strategy.adjust_profit_from_volatility(
-                                state, state.stats_results)
-                            if adjusted:
-                                notifier._send_message(
-                                    f"[{state.pair_display}] Volatility auto-adjust: "
-                                    f"profit target -> {state.profit_pct:.2f}%"
-                                )
-                                grid_strategy.save_state(state)
-                    except Exception as e:
-                        logger.debug("[%s] Stats engine error: %s", pair_name, e)
-
-            # --- 4g: Check accumulation (aggregate across pairs, execute on first) ---
-            if first_st:
-                excess = grid_strategy.check_accumulation(first_st)
-                if excess > 0:
-                    doge_bought = grid_strategy.execute_accumulation(
-                        first_st, excess, first_price
-                    )
-                    if doge_bought > 0:
-                        notifier.notify_accumulation(
-                            excess, doge_bought,
-                            first_st.doge_accumulated, first_price,
-                        )
-
-            # --- 4h: Periodic status log + state save ---
-            if int(now) % 300 < config.POLL_INTERVAL_SECONDS:
-                for pair_name, state in _bot_states.items():
-                    cp = _get_price(pair_name)
-                    logger.info(grid_strategy.get_status_summary(state, cp))
-                    grid_strategy.save_state(state)
-
-            # --- 4h2: Process swarm add/remove/multiplier queue ---
-            _process_swarm_queue()
-
-            # --- 4h3: Auto-slot scaling (profits fund additional slots) ---
-            _auto_slot_check()
-
-            # --- 4i: Sleep until next poll ---
-            elapsed = time.time() - loop_start
-            if elapsed > config.POLL_INTERVAL_SECONDS:
-                logger.warning("Cycle overrun: %.1fs elapsed (target %ds)",
-                               elapsed, config.POLL_INTERVAL_SECONDS)
-            sleep_time = max(0, config.POLL_INTERVAL_SECONDS - elapsed)
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-
-        except KeyboardInterrupt:
-            logger.info("KeyboardInterrupt caught")
-            break
-
-        except Exception as e:
-            _global_consecutive_errors += 1
-            logger.error("Main loop error (%d/%d): %s",
-                         _global_consecutive_errors, config.MAX_CONSECUTIVE_ERRORS, e,
-                         exc_info=True)
-
-            if _global_consecutive_errors >= config.MAX_CONSECUTIVE_ERRORS:
-                logger.critical("Too many errors -- stopping bot")
-                notifier.notify_error(f"Bot stopping: too many errors\nLast: {e}")
-                break
-
-            time.sleep(5)
-
-    # --- Phase 5: Graceful shutdown ---
-    logger.info("Shutting down...")
-    _bot_healthy = False
-
-    total_profit = 0.0
-    total_trips = 0
-    total_fees = 0.0
-    total_doge = 0.0
-
-    for pair_name, state in _bot_states.items():
-        grid_strategy.save_state(state)
-        if not _shutdown_requested:
-            # Only cancel orders on error-limit shutdown (no restart expected).
-            # On SIGTERM (deploy/restart), leave orders on Kraken -- the new
-            # instance will re-adopt them via reconciliation.
-            logger.info("[%s] Cancelling open orders (error shutdown)...", pair_name)
-            cancelled = grid_strategy.cancel_grid(state)
-            logger.info("[%s] Cancelled %d orders", pair_name, cancelled)
-        else:
-            logger.info("[%s] Signal shutdown -- leaving orders on Kraken for re-adopt",
-                        pair_name)
-        total_profit += state.total_profit_usd
-        total_trips += state.total_round_trips
-        total_fees += state.total_fees_usd
-        total_doge += state.doge_accumulated
-
-    logger.info("Final state (all pairs):")
-    logger.info("  Total profit: $%.4f", total_profit)
-    logger.info("  Total round trips: %d", total_trips)
-    logger.info("  Total fees: $%.4f", total_fees)
-    logger.info("  DOGE accumulated: %.2f", total_doge)
-
-    shutdown_reason = "Signal received" if _shutdown_requested else "Error limit reached"
-    notifier.notify_shutdown(shutdown_reason)
-
-    if health_server:
-        health_server.shutdown()
-
-    logger.info("Bot stopped. Goodbye!")
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     run()

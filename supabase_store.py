@@ -234,6 +234,16 @@ def save_state(snapshot: dict, pair: str = "XDGUSD"):
     }))
 
 
+def save_event(event: dict):
+    """
+    Queue a structured transition/event log row.
+    Expected table: bot_events.
+    """
+    if not _enabled():
+        return
+    _write_queue.append(("bot_events", dict(event)))
+
+
 def save_pairs(pairs_list: list):
     """Queue a batch of scanned pair rows for persistence to the pairs table."""
     if not _enabled():

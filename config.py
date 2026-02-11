@@ -80,7 +80,7 @@ SUPABASE_KEY: str = _env("SUPABASE_KEY", "")
 #
 # Set to False ONLY after you've watched dry-run results for several days
 # and are confident the strategy works.
-DRY_RUN: bool = _env("DRY_RUN", True, bool)
+DRY_RUN: bool = _env("DRY_RUN", False, bool)
 
 # ---------------------------------------------------------------------------
 # Trading pair
@@ -115,7 +115,7 @@ CAPITAL_BUDGET_MODE: str = _env("CAPITAL_BUDGET_MODE", "off", str)
 # pair trades at its Kraken minimum volume.  calculate_volume_for_price()
 # floors to each pair's min_volume, so this just needs to be <= the cheapest
 # pair's minimum cost.  Profits fund additional slots instead of compounding.
-ORDER_SIZE_USD: float = _env("ORDER_SIZE_USD", 0.50, float)
+ORDER_SIZE_USD: float = _env("ORDER_SIZE_USD", 2.00, float)
 
 # ---------------------------------------------------------------------------
 # Grid geometry
@@ -197,7 +197,7 @@ GRID_DRIFT_RESET_PCT: float = _env("GRID_DRIFT_RESET_PCT", 5.0, float)
 
 # Maximum consecutive API errors before the bot gives up.
 # Protects against Kraken outages or network issues draining your rate limit.
-MAX_CONSECUTIVE_ERRORS: int = _env("MAX_CONSECUTIVE_ERRORS", 10, int)
+MAX_CONSECUTIVE_ERRORS: int = _env("MAX_CONSECUTIVE_ERRORS", 5, int)
 
 # ---------------------------------------------------------------------------
 # Timing
@@ -251,6 +251,31 @@ STATE_FILE: str = os.path.join(LOG_DIR, "state.json")
 # We run a tiny HTTP server that returns bot status as JSON.
 # Set to 0 to disable.
 HEALTH_PORT: int = _env("PORT", _env("HEALTH_PORT", 8080, int), int)
+
+# ---------------------------------------------------------------------------
+# DOGE v1 state-machine runtime controls
+# ---------------------------------------------------------------------------
+
+# Maximum accepted staleness of market data; new order placement is blocked
+# and trading is paused if the latest price is older than this.
+STALE_PRICE_MAX_AGE_SEC: int = _env("STALE_PRICE_MAX_AGE_SEC", 60, int)
+
+# Simplified exit lifecycle:
+# - S1 stale exit: orphan after this age when market has moved away.
+S1_ORPHAN_AFTER_SEC: int = _env("S1_ORPHAN_AFTER_SEC", 600, int)   # 10 min
+# - S2 deadlock: orphan worse exit after this age.
+S2_ORPHAN_AFTER_SEC: int = _env("S2_ORPHAN_AFTER_SEC", 1800, int)  # 30 min
+
+# Entry anti-loss behavior:
+# - At N consecutive losses, widen entry distance (backoff).
+# - At M consecutive losses, stop placing new entries for cooldown seconds.
+LOSS_BACKOFF_START: int = _env("LOSS_BACKOFF_START", 3, int)
+LOSS_COOLDOWN_START: int = _env("LOSS_COOLDOWN_START", 5, int)
+LOSS_COOLDOWN_SEC: int = _env("LOSS_COOLDOWN_SEC", 900, int)       # 15 min
+
+# Soft operational limits.
+MAX_API_CALLS_PER_LOOP: int = _env("MAX_API_CALLS_PER_LOOP", 10, int)
+ORPHAN_PRESSURE_WARN_AT: int = _env("ORPHAN_PRESSURE_WARN_AT", 100, int)
 
 # ---------------------------------------------------------------------------
 # AI council settings

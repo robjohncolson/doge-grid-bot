@@ -48,6 +48,7 @@ QUERY_ORDERS_PATH = "/0/private/QueryOrders"
 BALANCE_PATH = "/0/private/Balance"
 TRADE_BALANCE_PATH = "/0/private/TradeBalance"
 TRADES_HISTORY_PATH = "/0/private/TradesHistory"
+TRADE_VOLUME_PATH = "/0/private/TradeVolume"
 
 # ---------------------------------------------------------------------------
 # Rate-limit tracking (thread-safe with circuit breaker)
@@ -499,7 +500,8 @@ def get_open_orders() -> dict:
 
 
 def place_order(side: str, volume: float, price: float, pair: str = None,
-                ordertype: str = "limit") -> str:
+                ordertype: str = "limit", post_only: bool = True,
+                userref: int | None = None) -> str:
     """
     Place an order on Kraken.
 
@@ -530,10 +532,13 @@ def place_order(side: str, volume: float, price: float, pair: str = None,
         "type": side,          # "buy" or "sell"
         "ordertype": ordertype,
         "volume": f"{volume:.8f}",
-        # "oflags": "post",    # Uncomment to force post-only (maker) orders
     }
     if ordertype == "limit":
         params["price"] = f"{price:.8f}"
+        if post_only:
+            params["oflags"] = "post"
+    if userref is not None:
+        params["userref"] = str(int(userref))
 
     result = _private_request(ADD_ORDER_PATH, params)
 
@@ -653,3 +658,64 @@ def get_trades_history(start: float = None) -> dict:
         params["start"] = str(int(start))
     result = _private_request(TRADES_HISTORY_PATH, params)
     return result.get("trades", {})
+
+
+def get_fee_rates(pair: str = None) -> tuple[float, float]:
+    """
+    Return (maker_fee_pct, taker_fee_pct) for the account's current fee tier.
+    Falls back to config defaults on failure.
+    """
+    pair = pair or config.PAIR
+    if config.DRY_RUN:
+        return config.MAKER_FEE_PCT, config.MAKER_FEE_PCT
+
+    try:
+        result = _private_request(TRADE_VOLUME_PATH, {
+            "pair": pair,
+            "fee-info": "true",
+        })
+        fees = result.get("fees", {})
+        if fees:
+            fee_row = next(iter(fees.values()))
+            maker = float(fee_row.get("fee_maker", fee_row.get("fee", config.MAKER_FEE_PCT)))
+            taker = float(fee_row.get("fee", maker))
+            return maker, taker
+    except Exception as e:
+        logger.warning("Failed to fetch fee rates for %s: %s", pair, e)
+    return config.MAKER_FEE_PCT, config.MAKER_FEE_PCT
+
+
+def get_pair_constraints(pair: str = None) -> dict:
+    """
+    Fetch pair precision and minimum size/cost constraints from AssetPairs.
+    Returns a normalized dict with safe defaults.
+    """
+    pair = pair or config.PAIR
+    result = get_asset_pairs(pair=pair)
+    row = None
+    if result:
+        if pair in result:
+            row = result[pair]
+        else:
+            row = next(iter(result.values()))
+    row = row or {}
+
+    # Kraken field names:
+    # - pair_decimals: price precision
+    # - lot_decimals: volume precision
+    # - ordermin: minimum base volume
+    # - costmin: minimum notional in quote currency
+    pair_decimals = int(row.get("pair_decimals", 6))
+    volume_decimals = int(row.get("lot_decimals", 0))
+    min_volume = float(row.get("ordermin", 13.0))
+    min_cost = row.get("costmin")
+    min_cost_usd = float(min_cost) if min_cost not in (None, "") else 0.0
+
+    return {
+        "pair": pair,
+        "display": row.get("wsname", config.PAIR_DISPLAY),
+        "price_decimals": pair_decimals,
+        "volume_decimals": volume_decimals,
+        "min_volume": min_volume,
+        "min_cost_usd": min_cost_usd,
+    }
