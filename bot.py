@@ -935,20 +935,37 @@ class BotRuntime:
     def _is_bootstrap_pending_state(self, slot_id: int, violations: list[str]) -> bool:
         if not violations:
             return False
-        if any(v != "S0 must be exactly A sell entry + B buy entry" for v in violations):
+        allowed = {
+            "S0 must be exactly A sell entry + B buy entry",
+            "S0 long_only must be exactly one buy entry",
+            "S0 short_only must be exactly one sell entry",
+        }
+        if any(v not in allowed for v in violations):
             return False
         st = self.slots[slot_id].state
         if sm.derive_phase(st) != "S0":
             return False
         entries = [o for o in st.orders if o.role == "entry"]
         exits = [o for o in st.orders if o.role == "exit"]
+        if exits or len(entries) > 1:
+            return False
         # Recoverable startup/placement gap: allow empty/one-entry S0 briefly.
-        return len(exits) == 0 and len(entries) <= 1
+        if not entries:
+            return True
+        if st.long_only and entries[0].side != "buy":
+            return False
+        if st.short_only and entries[0].side != "sell":
+            return False
+        return True
 
     def _normalize_slot_mode(self, slot_id: int) -> None:
         st = self.slots[slot_id].state
         entries = [o for o in st.orders if o.role == "entry"]
         exits = [o for o in st.orders if o.role == "exit"]
+        if not entries and not exits:
+            # Prevent stale snapshot flags from causing false S0 single-sided halts.
+            self.slots[slot_id].state = replace(st, long_only=False, short_only=False)
+            return
         if exits:
             # Degraded S1 states are legal when only one exit side survives
             # (e.g., loop API budget skipped replacing the missing entry).

@@ -397,6 +397,23 @@ class BotEventLogTests(unittest.TestCase):
         self.assertFalse(rt.slots[0].state.long_only)
         self.assertFalse(rt.slots[0].state.short_only)
 
+    def test_normalize_slot_mode_clears_flags_when_slot_empty(self):
+        rt = bot.BotRuntime()
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    long_only=True,
+                    short_only=False,
+                ),
+            )
+        }
+        rt._normalize_slot_mode(0)
+        self.assertFalse(rt.slots[0].state.long_only)
+        self.assertFalse(rt.slots[0].state.short_only)
+
     def test_normalize_slot_mode_tracks_single_sided_exit(self):
         rt = bot.BotRuntime()
         rt.slots = {
@@ -451,6 +468,24 @@ class BotEventLogTests(unittest.TestCase):
         rt._normalize_slot_mode(0)
         self.assertFalse(rt.slots[0].state.long_only)
         self.assertTrue(rt.slots[0].state.short_only)
+        with mock.patch.object(rt, "halt") as halt_mock:
+            rt._validate_slot(0)
+            halt_mock.assert_not_called()
+
+    def test_validate_slot_skips_bootstrap_pending_for_empty_single_sided_s0(self):
+        rt = bot.BotRuntime()
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    long_only=True,
+                    short_only=False,
+                ),
+            )
+        }
+
         with mock.patch.object(rt, "halt") as halt_mock:
             rt._validate_slot(0)
             halt_mock.assert_not_called()
