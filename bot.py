@@ -164,27 +164,33 @@ class BotRuntime:
 
     def _load_snapshot(self) -> None:
         snap = supabase_store.load_state(pair="__v1__") or {}
-        if not snap:
-            return
+        if snap:
+            self.mode = snap.get("mode", "INIT")
+            self.pause_reason = snap.get("pause_reason", "")
+            self.entry_pct = float(snap.get("entry_pct", self.entry_pct))
+            self.profit_pct = float(snap.get("profit_pct", self.profit_pct))
+            self.next_slot_id = int(snap.get("next_slot_id", 1))
+            self.next_event_id = int(snap.get("next_event_id", 1))
+            self.seen_fill_txids = set(snap.get("seen_fill_txids", []))
+            self.last_price = float(snap.get("last_price", 0.0))
+            self.last_price_ts = float(snap.get("last_price_ts", 0.0))
 
-        self.mode = snap.get("mode", "INIT")
-        self.pause_reason = snap.get("pause_reason", "")
-        self.entry_pct = float(snap.get("entry_pct", self.entry_pct))
-        self.profit_pct = float(snap.get("profit_pct", self.profit_pct))
-        self.next_slot_id = int(snap.get("next_slot_id", 1))
-        self.next_event_id = int(snap.get("next_event_id", 1))
-        self.seen_fill_txids = set(snap.get("seen_fill_txids", []))
-        self.last_price = float(snap.get("last_price", 0.0))
-        self.last_price_ts = float(snap.get("last_price_ts", 0.0))
+            self.constraints = snap.get("constraints", self.constraints) or self.constraints
+            self.maker_fee_pct = float(snap.get("maker_fee_pct", self.maker_fee_pct))
+            self.taker_fee_pct = float(snap.get("taker_fee_pct", self.taker_fee_pct))
 
-        self.constraints = snap.get("constraints", self.constraints) or self.constraints
-        self.maker_fee_pct = float(snap.get("maker_fee_pct", self.maker_fee_pct))
-        self.taker_fee_pct = float(snap.get("taker_fee_pct", self.taker_fee_pct))
+            self.slots = {}
+            for sid_text, raw_state in (snap.get("slots", {}) or {}).items():
+                sid = int(sid_text)
+                self.slots[sid] = SlotRuntime(slot_id=sid, state=sm.from_dict(raw_state))
 
-        self.slots = {}
-        for sid_text, raw_state in (snap.get("slots", {}) or {}).items():
-            sid = int(sid_text)
-            self.slots[sid] = SlotRuntime(slot_id=sid, state=sm.from_dict(raw_state))
+        # Startup rebase: if snapshot lagged behind queued event writes before a
+        # restart, avoid duplicate-key collisions on bot_events(event_id).
+        db_max_event_id = supabase_store.load_max_event_id()
+        if db_max_event_id >= self.next_event_id:
+            old = self.next_event_id
+            self.next_event_id = db_max_event_id + 1
+            logger.info("Rebased next_event_id from %d to %d using Supabase max", old, self.next_event_id)
 
     def _log_event(
         self,

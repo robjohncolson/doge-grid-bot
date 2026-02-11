@@ -244,6 +244,26 @@ def save_event(event: dict):
     _write_queue.append(("bot_events", dict(event)))
 
 
+def load_max_event_id() -> int:
+    """
+    Return the highest bot_events.event_id currently persisted.
+    Returns 0 when unavailable.
+    """
+    if not _enabled():
+        return 0
+    result = _request(
+        "GET",
+        "/rest/v1/bot_events",
+        params={"select": "event_id", "order": "event_id.desc", "limit": "1"},
+    )
+    if isinstance(result, list) and result:
+        try:
+            return int(result[0].get("event_id") or 0)
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
 def save_pairs(pairs_list: list):
     """Queue a batch of scanned pair rows for persistence to the pairs table."""
     if not _enabled():
@@ -435,6 +455,20 @@ def _flush_queue():
                 logger.debug("Supabase: pairs upsert failed (%d rows)", len(pair_rows))
             else:
                 logger.debug("Supabase: upserted %d pairs", len(pair_rows))
+        elif table == "bot_events":
+            # Keep event writes resilient across crash/restart windows where the
+            # last event_id snapshot may lag the DB by a few rows.
+            result = _request(
+                "POST",
+                "/rest/v1/bot_events",
+                body=rows,
+                params={"on_conflict": "event_id"},
+                upsert=True,
+            )
+            if result is None:
+                logger.debug("Supabase: bot_events upsert failed (%d rows)", len(rows))
+            else:
+                logger.debug("Supabase: upserted %d rows into bot_events", len(rows))
         else:
             # Bulk insert
             result = _request("POST", f"/rest/v1/{table}", body=rows)
