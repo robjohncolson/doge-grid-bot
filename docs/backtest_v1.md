@@ -31,6 +31,17 @@ python3 backtest_v1.py \
   --end 2026-01-01
 ```
 
+If bootstrap fails from low order size, enable automatic floor:
+
+```bash
+python3 backtest_v1.py \
+  --pair XDGUSD \
+  --interval 1440 \
+  --start 2025-01-01 \
+  --end 2026-01-01 \
+  --auto-floor
+```
+
 Run on local candles:
 
 ```bash
@@ -65,6 +76,7 @@ This runs 9 independent slot state machines over the same market path.
 - `--profit-pct`
 - `--refresh-pct`
 - `--maker-fee-pct`
+- `--auto-floor`
 
 Fallback exchange constraints (for offline CSV environments):
 
@@ -78,3 +90,4 @@ Fallback exchange constraints (for offline CSV environments):
 - Intrabar path is deterministic: `open -> nearer extreme -> other extreme -> close`.
 - This is historical replay, not full order-book microstructure simulation.
 - For strategy tuning, compare runs across multiple intervals and date ranges.
+- Kraken OHLC retention is interval-limited; for deep history, prefer `--csv`.

@@ -308,10 +308,26 @@ class BacktestRunner:
         violations = sm.check_invariants(state)
         if not violations:
             return
+        if self._is_runtime_recoverable_gap(state, violations):
+            return
         for v in violations:
             self.invariant_violations.append(f"slot={slot_id} {context}: {v}")
         if self.strict_invariants:
             raise RuntimeError(self.invariant_violations[-1])
+
+    @staticmethod
+    def _is_runtime_recoverable_gap(state: sm.PairState, violations: list[str]) -> bool:
+        # Match runtime hotfix behavior: tolerate temporary/incomplete S0 during
+        # bootstrap/placement gaps instead of treating as fatal.
+        if any(v != "S0 must be exactly A sell entry + B buy entry" for v in violations):
+            return False
+        if sm.derive_phase(state) != "S0":
+            return False
+        exits = [o for o in state.orders if o.role == "exit"]
+        if exits:
+            return False
+        entries = [o for o in state.orders if o.role == "entry"]
+        return len(entries) <= 1
 
     def _apply_event(self, slot_id: int, event: sm.Event, context: str) -> None:
         st = self.states[slot_id]
@@ -356,8 +372,13 @@ class BacktestRunner:
             actions.append(buy_action)
 
         if not actions:
+            required = _required_bootstrap_order_size_usd(initial_price, self.cfg)
             raise RuntimeError(
-                "Bootstrap produced no orders. Increase --order-size-usd or check pair constraints."
+                "Bootstrap produced no orders: "
+                f"order_size_usd=${order_size:.4f}, required~${required:.4f} "
+                f"(min_volume={self.cfg.min_volume}, min_cost_usd={self.cfg.min_cost_usd}, "
+                f"entry_pct={self.cfg.entry_pct}%). "
+                "Increase --order-size-usd or use --auto-floor."
             )
 
         if sell_action and buy_action:
@@ -560,6 +581,63 @@ def _default_start_ts() -> int:
     return int(time.time()) - 365 * 24 * 3600
 
 
+def _required_bootstrap_order_size_usd(market_price: float, cfg: sm.EngineConfig) -> float:
+    """
+    Estimate the minimum order_size_usd required to place both bootstrap entries.
+
+    We use the stricter side (sell entry price, which is above market) and account
+    for round-to-nearest volume precision used by compute_order_volume().
+    """
+    if market_price <= 0:
+        return max(0.0, float(cfg.min_cost_usd))
+
+    def can_bootstrap_two_sided(order_size_usd: float) -> bool:
+        st = sm.PairState(market_price=market_price, now=0.0, profit_pct_runtime=cfg.profit_pct)
+        st, a = sm.add_entry_order(
+            st,
+            cfg,
+            side="sell",
+            trade_id="A",
+            cycle=st.cycle_a,
+            order_size_usd=order_size_usd,
+            reason="probe",
+        )
+        st, b = sm.add_entry_order(
+            st,
+            cfg,
+            side="buy",
+            trade_id="B",
+            cycle=st.cycle_b,
+            order_size_usd=order_size_usd,
+            reason="probe",
+        )
+        return a is not None and b is not None
+
+    low = 0.0
+    high = max(
+        float(cfg.min_cost_usd),
+        float(cfg.min_volume) * market_price * (1.0 + cfg.entry_pct / 100.0),
+        1e-9,
+    )
+
+    for _ in range(50):
+        if can_bootstrap_two_sided(high):
+            break
+        high *= 2.0
+    else:
+        return high
+
+    for _ in range(70):
+        mid = (low + high) / 2.0
+        if can_bootstrap_two_sided(mid):
+            high = mid
+        else:
+            low = mid
+
+    # Keep a tiny safety margin to avoid floating-point edge ties.
+    return round(high * (1.0 + 1e-8), 10)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Historical replay backtest for state_machine v1")
     p.add_argument("--pair", default=config.PAIR, help="Kraken pair, e.g. XDGUSD")
@@ -580,6 +658,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--volume-decimals", type=int, default=0, help="Fallback volume precision if Kraken constraints unavailable")
     p.add_argument("--min-volume", type=float, default=13.0, help="Fallback Kraken minimum base volume")
     p.add_argument("--min-cost-usd", type=float, default=0.0, help="Fallback Kraken minimum notional")
+    p.add_argument("--auto-floor", action="store_true", default=False, help="Auto-raise order size to bootstrap minimum if needed")
 
     p.add_argument("--strict-invariants", action="store_true", default=False, help="Stop at first invariant violation")
     p.add_argument("--json-out", default="", help="Optional JSON summary output path")
@@ -623,7 +702,34 @@ def main() -> None:
         )
 
     if len(candles) < 2:
-        raise SystemExit("Need at least 2 candles for backtest")
+        if args.csv:
+            raise SystemExit("Need at least 2 candles in CSV for backtest")
+        raise SystemExit(
+            "Need at least 2 candles for backtest. "
+            "Requested range may be outside Kraken OHLC retention for this interval. "
+            "Try a more recent --start, a larger --interval, or use --csv."
+        )
+
+    effective_order_size_usd = float(args.order_size_usd)
+    required_bootstrap_usd = _required_bootstrap_order_size_usd(candles[0].open, cfg)
+    if effective_order_size_usd + 1e-12 < required_bootstrap_usd:
+        if args.auto_floor:
+            print(
+                "info: auto-floor enabled; "
+                f"order_size_usd raised from ${effective_order_size_usd:.4f} "
+                f"to ${required_bootstrap_usd:.4f} "
+                f"(first_price=${candles[0].open:.6f})"
+            )
+            effective_order_size_usd = required_bootstrap_usd
+        else:
+            raise SystemExit(
+                "order-size too small for bootstrap: "
+                f"--order-size-usd=${effective_order_size_usd:.4f}, "
+                f"required~${required_bootstrap_usd:.4f} "
+                f"(first_price=${candles[0].open:.6f}, "
+                f"min_volume={cfg.min_volume}, min_cost_usd={cfg.min_cost_usd}). "
+                "Increase --order-size-usd or pass --auto-floor."
+            )
 
     runner = BacktestRunner(
         candles=candles,
@@ -631,12 +737,15 @@ def main() -> None:
         pair=args.pair,
         interval_min=max(1, int(args.interval)),
         slots=max(1, int(args.slots)),
-        base_order_size_usd=float(args.order_size_usd),
+        base_order_size_usd=effective_order_size_usd,
         maker_fee_pct=float(args.maker_fee_pct),
         strict_invariants=bool(args.strict_invariants),
     )
 
-    stats = runner.run()
+    try:
+        stats = runner.run()
+    except RuntimeError as e:
+        raise SystemExit(str(e)) from e
     _print_summary(stats)
 
     if args.json_out:

@@ -98,6 +98,8 @@ Use the v1 historical replay runner:
 python3 backtest_v1.py --pair XDGUSD --interval 15 --start 2025-01-01 --end 2026-01-01
 ```
 
+If order sizing is below bootstrap minimum for that period, add `--auto-floor`.
+
 Or replay a local candle CSV:
 
 ```bash
