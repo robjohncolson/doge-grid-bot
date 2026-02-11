@@ -235,6 +235,15 @@ def derive_phase(state: PairState) -> PairPhase:
     return "S0"
 
 
+def _clear_s2_flag_if_not_s2(state: PairState) -> PairState:
+    """Ensure s2_entered_at is only set while phase is S2."""
+    if state.s2_entered_at is None:
+        return state
+    if derive_phase(state) == "S2":
+        return state
+    return replace(state, s2_entered_at=None)
+
+
 def _round_price(price: float, cfg: EngineConfig) -> float:
     return round(price, cfg.price_decimals)
 
@@ -761,6 +770,8 @@ def transition(state: PairState, event: Event, cfg: EngineConfig, order_size_usd
     if isinstance(event, TimerTick):
         st = replace(st, now=event.timestamp)
         phase = derive_phase(st)
+        if phase != "S2" and st.s2_entered_at is not None:
+            st = replace(st, s2_entered_at=None)
 
         # S1 stale exit orphaning after fixed timeout if market moved away.
         if phase in ("S1a", "S1b"):
@@ -838,6 +849,7 @@ def transition(state: PairState, event: Event, cfg: EngineConfig, order_size_usd
                     reason="entry_fill_exit",
                 )
             )
+            st = _clear_s2_flag_if_not_s2(st)
             return st, actions
 
         # Exit filled -> complete cycle.
@@ -854,6 +866,7 @@ def transition(state: PairState, event: Event, cfg: EngineConfig, order_size_usd
             st, cfg, trade_id=order.trade_id, order_size_usd=order_size_usd, reason="cycle_complete"
         )
         actions.extend(follow_actions)
+        st = _clear_s2_flag_if_not_s2(st)
         return st, actions
 
     if isinstance(event, RecoveryFillEvent):
@@ -878,11 +891,13 @@ def transition(state: PairState, event: Event, cfg: EngineConfig, order_size_usd
         st, cycle_record, book_action = _book_cycle(st, pseudo_order, event.price, event.fee, event.timestamp, from_recovery=True)
         st = _update_loss_counters(st, rec.trade_id, cycle_record.net_profit, cfg)
         actions.append(book_action)
+        st = _clear_s2_flag_if_not_s2(st)
         return st, actions
 
     if isinstance(event, RecoveryCancelEvent):
         st = replace(st, now=event.timestamp)
         st = replace(st, recovery_orders=tuple(r for r in st.recovery_orders if r.recovery_id != event.recovery_id))
+        st = _clear_s2_flag_if_not_s2(st)
         return st, actions
 
     return st, actions

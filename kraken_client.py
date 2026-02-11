@@ -352,20 +352,51 @@ def get_spread(pair: str = None) -> tuple:
     return bid, ask, spread_pct
 
 
+def get_ohlc_page(pair: str = None, interval: int = 60, since: int | None = None) -> tuple[list, int | None]:
+    """
+    Get one OHLC page from Kraken.
+
+    Args:
+        pair: Kraken pair symbol (e.g., XDGUSD).
+        interval: Candle interval in minutes.
+        since: Optional unix timestamp cursor for pagination.
+
+    Returns:
+        (candles, last_cursor) where:
+          - candles is list of [time, open, high, low, close, vwap, volume, count]
+          - last_cursor is Kraken's `last` cursor for the next page (or None)
+    """
+    pair = pair or config.PAIR
+    params = {"pair": pair, "interval": interval}
+    if since is not None:
+        params["since"] = str(int(since))
+
+    result = _public_request("/0/public/OHLC", params)
+    candles = []
+    for key, value in result.items():
+        if key == "last":
+            continue
+        if isinstance(value, list):
+            candles = value
+            break
+
+    last = result.get("last")
+    try:
+        last_cursor = int(last) if last is not None else None
+    except (TypeError, ValueError):
+        last_cursor = None
+    return candles, last_cursor
+
+
 def get_ohlc(pair: str = None, interval: int = 60) -> list:
     """
-    Get OHLC (candle) data.  interval is in minutes.
+    Get OHLC (candle) data. interval is in minutes.
     Common values: 1, 5, 15, 30, 60, 240, 1440.
 
     Returns a list of [time, open, high, low, close, vwap, volume, count].
     """
-    pair = pair or config.PAIR
-    result = _public_request("/0/public/OHLC", {"pair": pair, "interval": interval})
-    # Result has the pair data and a "last" key
-    for key, value in result.items():
-        if key != "last" and isinstance(value, list):
-            return value
-    return []
+    candles, _ = get_ohlc_page(pair=pair, interval=interval, since=None)
+    return candles
 
 
 def get_asset_pairs(pair: str = None) -> dict:

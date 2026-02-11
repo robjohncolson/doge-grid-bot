@@ -145,6 +145,60 @@ class DogeV1StateMachineTests(unittest.TestCase):
         self.assertEqual(rec.side, "sell")
         self.assertEqual(rec.trade_id, "B")
 
+    def test_fill_clears_s2_flag_after_leaving_s2(self):
+        st = sm.PairState(
+            market_price=0.11,
+            now=2000.0,
+            s2_entered_at=1500.0,
+            orders=(
+                sm.OrderState(
+                    local_id=1,
+                    side="buy",
+                    role="exit",
+                    price=0.10,
+                    volume=13.0,
+                    trade_id="A",
+                    cycle=1,
+                    txid="TX-A-EXIT",
+                    entry_price=0.112,
+                    entry_fee=0.01,
+                    entry_filled_at=1400.0,
+                ),
+                sm.OrderState(
+                    local_id=2,
+                    side="sell",
+                    role="exit",
+                    price=0.13,
+                    volume=13.0,
+                    trade_id="B",
+                    cycle=1,
+                    txid="TX-B-EXIT",
+                    entry_price=0.108,
+                    entry_fee=0.01,
+                    entry_filled_at=1400.0,
+                ),
+            ),
+            cycle_a=1,
+            cycle_b=1,
+            next_order_id=3,
+            next_recovery_id=1,
+        )
+        cfg = self._cfg()
+        fill = sm.FillEvent(
+            order_local_id=2,
+            txid="TX-B-EXIT",
+            side="sell",
+            price=0.13,
+            volume=13.0,
+            fee=0.01,
+            timestamp=2010.0,
+        )
+
+        st2, _ = sm.transition(st, fill, cfg, order_size_usd=2.0)
+        self.assertEqual(sm.derive_phase(st2), "S1a")
+        self.assertIsNone(st2.s2_entered_at)
+        self.assertEqual(sm.check_invariants(st2), [])
+
     def test_compute_order_volume_waits_below_minimum(self):
         cfg = self._cfg()
         vol = sm.compute_order_volume(price=1.0, cfg=cfg, order_size_usd=5.0)

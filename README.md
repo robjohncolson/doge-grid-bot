@@ -90,6 +90,22 @@ You'll receive notifications for:
 | `AI_ADVISOR_INTERVAL` | `3600` | Seconds between AI checks |
 | `LOG_LEVEL` | `INFO` | Python log level |
 
+## Backtesting (v1)
+
+Use the v1 historical replay runner:
+
+```bash
+python3 backtest_v1.py --pair XDGUSD --interval 15 --start 2025-01-01 --end 2026-01-01
+```
+
+Or replay a local candle CSV:
+
+```bash
+python3 backtest_v1.py --csv data/XDGUSD_15m.csv --pair XDGUSD --interval 15
+```
+
+Full guide: `docs/backtest_v1.md`.
+
 ## Deploy to Railway
 
 ### Option A: Railway CLI
