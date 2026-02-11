@@ -138,6 +138,13 @@ class BotRuntime:
         # Independent compounding per slot.
         return max(float(config.ORDER_SIZE_USD), float(config.ORDER_SIZE_USD) + slot.state.total_profit)
 
+    def _minimum_bootstrap_requirements(self, market_price: float) -> tuple[float, float]:
+        min_vol = float(self.constraints.get("min_volume", 13.0))
+        min_cost = float(self.constraints.get("min_cost_usd", 0.0))
+        if min_cost <= 0 and market_price > 0:
+            min_cost = min_vol * market_price
+        return min_vol, min_cost
+
     def _global_snapshot(self) -> dict:
         return {
             "version": "doge-v1",
@@ -581,10 +588,7 @@ class BotRuntime:
         doge = _doge_balance(balance)
         market = self.last_price
 
-        min_vol = float(self.constraints.get("min_volume", 13.0))
-        min_cost = float(self.constraints.get("min_cost_usd", 0.0))
-        if min_cost <= 0 and market > 0:
-            min_cost = min_vol * market
+        min_vol, min_cost = self._minimum_bootstrap_requirements(market)
 
         cfg = self._engine_cfg(slot)
 
@@ -654,6 +658,82 @@ class BotRuntime:
             return
 
         self.pause(f"slot {slot_id} cannot bootstrap: insufficient USD and DOGE")
+
+    def _auto_repair_degraded_slot(self, slot_id: int) -> None:
+        if self.mode != "RUNNING":
+            return
+
+        slot = self.slots[slot_id]
+        st = slot.state
+        if not (st.long_only or st.short_only):
+            return
+
+        phase = sm.derive_phase(st)
+        entries = [o for o in st.orders if o.role == "entry"]
+        exits = [o for o in st.orders if o.role == "exit"]
+
+        market = st.market_price or self.last_price
+        if market <= 0:
+            return
+        min_vol, min_cost = self._minimum_bootstrap_requirements(market)
+
+        balance = self._safe_balance()
+        usd = _usd_balance(balance)
+        doge = _doge_balance(balance)
+        cfg = self._engine_cfg(slot)
+        order_size = self._slot_order_size_usd(slot)
+
+        repaired_state = st
+        actions: list[sm.PlaceOrderAction] = []
+
+        def _queue_entry(
+            side: str,
+            trade_id: str,
+            cycle: int,
+            reason: str,
+        ) -> None:
+            nonlocal repaired_state
+            repaired_state, action = sm.add_entry_order(
+                repaired_state,
+                cfg,
+                side=side,
+                trade_id=trade_id,
+                cycle=cycle,
+                order_size_usd=order_size,
+                reason=reason,
+            )
+            if action:
+                actions.append(action)
+
+        if phase == "S0":
+            has_buy_entry = any(o.side == "buy" for o in entries)
+            has_sell_entry = any(o.side == "sell" for o in entries)
+            if st.long_only and has_buy_entry and not has_sell_entry and doge >= min_vol:
+                _queue_entry("sell", "A", st.cycle_a, "auto_repair_s0_sell")
+            elif st.short_only and has_sell_entry and not has_buy_entry and usd >= min_cost:
+                _queue_entry("buy", "B", st.cycle_b, "auto_repair_s0_buy")
+        elif phase == "S1a":
+            has_buy_exit = any(o.side == "buy" for o in exits)
+            has_buy_entry = any(o.side == "buy" for o in entries)
+            if st.short_only and has_buy_exit and not has_buy_entry and usd >= min_cost:
+                _queue_entry("buy", "B", st.cycle_b, "auto_repair_s1a_buy")
+        elif phase == "S1b":
+            has_sell_exit = any(o.side == "sell" for o in exits)
+            has_sell_entry = any(o.side == "sell" for o in entries)
+            if st.long_only and has_sell_exit and not has_sell_entry and doge >= min_vol:
+                _queue_entry("sell", "A", st.cycle_a, "auto_repair_s1b_sell")
+
+        if not actions:
+            return
+
+        self.slots[slot_id].state = repaired_state
+        self._execute_actions(slot_id, list(actions), "auto_repair")
+
+        post = self.slots[slot_id].state
+        if any(sm.find_order(post, action.local_id) is not None for action in actions):
+            self.slots[slot_id].state = replace(post, long_only=False, short_only=False)
+            self._validate_slot(slot_id)
+            logger.info("slot %s auto-repaired degraded %s state", slot_id, phase)
 
     # ------------------ Exchange IO ------------------
 
@@ -975,6 +1055,11 @@ class BotRuntime:
                     self.slots[slot_id].state = replace(st, long_only=True, short_only=False)
                 elif exit_side == "buy":
                     self.slots[slot_id].state = replace(st, long_only=False, short_only=True)
+            elif len(exits) == 2:
+                self.slots[slot_id].state = replace(st, long_only=False, short_only=False)
+            elif len(exits) == 1 and len(entries) == 1 and entries[0].side == exits[0].side:
+                # Normal S1 shape (exit + same-side entry) should not keep degraded flags.
+                self.slots[slot_id].state = replace(st, long_only=False, short_only=False)
             return
         buy_entries = [o for o in entries if o.side == "buy"]
         sell_entries = [o for o in entries if o.side == "sell"]
@@ -1116,6 +1201,9 @@ class BotRuntime:
 
                 # If a slot drained its active orders, bootstrap it again.
                 self._ensure_slot_bootstrapped(sid)
+                # When a slot is in one-sided fallback, try to restore normal mode
+                # as soon as balances and API budget allow.
+                self._auto_repair_degraded_slot(sid)
 
             self._poll_order_status()
 
@@ -1271,6 +1359,8 @@ class BotRuntime:
                 slots.append({
                     "slot_id": sid,
                     "phase": phase,
+                    "long_only": st.long_only,
+                    "short_only": st.short_only,
                     "market_price": st.market_price,
                     "cycle_a": st.cycle_a,
                     "cycle_b": st.cycle_b,

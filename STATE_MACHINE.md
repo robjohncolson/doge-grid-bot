@@ -70,6 +70,7 @@ Per iteration in `bot.py`:
    - Apply `PriceTick`
    - Apply `TimerTick`
    - Call `_ensure_slot_bootstrapped(slot_id)`
+   - Call `_auto_repair_degraded_slot(slot_id)` to restore missing entry legs when fundable
 6. Poll status for all tracked order txids (`_poll_order_status`).
 7. Emit orphan-pressure notification at `ORPHAN_PRESSURE_WARN_AT` multiples.
 8. Persist snapshot (`save_state` to `bot_state`).
@@ -241,6 +242,12 @@ Budget and failure handling:
 - On entry placement exception containing `insufficient funds`:
   - failed sell entry -> switch to `long_only`
   - failed buy entry -> switch to `short_only`
+
+Degraded self-heal behavior:
+
+- Runtime continuously attempts to repair one-sided `S0`/`S1` slots when mode is `RUNNING`
+- Repair is attempted only when the missing side is currently fundable (`USD` or `DOGE` minimum)
+- On successful repair placement, `long_only`/`short_only` flags are cleared for that slot
 
 ## 11. Recovery/Orphan Lifecycle
 

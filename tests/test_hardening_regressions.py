@@ -472,6 +472,147 @@ class BotEventLogTests(unittest.TestCase):
             rt._validate_slot(0)
             halt_mock.assert_not_called()
 
+    def test_normalize_slot_mode_clears_flags_for_non_degraded_s1(self):
+        rt = bot.BotRuntime()
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    orders=(
+                        sm.OrderState(
+                            local_id=1,
+                            side="buy",
+                            role="exit",
+                            price=0.0992,
+                            volume=13.0,
+                            trade_id="A",
+                            cycle=1,
+                            txid="TX-A-EXIT",
+                            placed_at=999.0,
+                            entry_price=0.1008,
+                        ),
+                        sm.OrderState(
+                            local_id=2,
+                            side="buy",
+                            role="entry",
+                            price=0.0998,
+                            volume=13.0,
+                            trade_id="B",
+                            cycle=1,
+                            txid="TX-B-ENTRY",
+                            placed_at=999.0,
+                        ),
+                    ),
+                    long_only=False,
+                    short_only=True,
+                ),
+            )
+        }
+
+        rt._normalize_slot_mode(0)
+        self.assertFalse(rt.slots[0].state.long_only)
+        self.assertFalse(rt.slots[0].state.short_only)
+
+    def test_auto_repair_degraded_s0_adds_missing_entry(self):
+        rt = bot.BotRuntime()
+        rt.mode = "RUNNING"
+        rt.last_price = 0.1
+        rt.constraints = {
+            "price_decimals": 6,
+            "volume_decimals": 0,
+            "min_volume": 13.0,
+            "min_cost_usd": 0.0,
+        }
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    orders=(
+                        sm.OrderState(
+                            local_id=1,
+                            side="buy",
+                            role="entry",
+                            price=0.0998,
+                            volume=13.0,
+                            trade_id="B",
+                            cycle=1,
+                            txid="TX-B-ENTRY",
+                            placed_at=999.0,
+                        ),
+                    ),
+                    long_only=True,
+                    short_only=False,
+                    next_order_id=2,
+                ),
+            )
+        }
+
+        with mock.patch.object(rt, "_safe_balance", return_value={"ZUSD": "50.0", "XXDG": "1000.0"}):
+            with mock.patch.object(rt, "_execute_actions") as exec_actions:
+                rt._auto_repair_degraded_slot(0)
+                exec_actions.assert_called_once()
+
+        sides = [o.side for o in rt.slots[0].state.orders if o.role == "entry"]
+        self.assertIn("buy", sides)
+        self.assertIn("sell", sides)
+        self.assertFalse(rt.slots[0].state.long_only)
+        self.assertFalse(rt.slots[0].state.short_only)
+
+    def test_auto_repair_degraded_s1a_adds_missing_entry(self):
+        rt = bot.BotRuntime()
+        rt.mode = "RUNNING"
+        rt.last_price = 0.1
+        rt.constraints = {
+            "price_decimals": 6,
+            "volume_decimals": 0,
+            "min_volume": 13.0,
+            "min_cost_usd": 0.0,
+        }
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    orders=(
+                        sm.OrderState(
+                            local_id=1,
+                            side="buy",
+                            role="exit",
+                            price=0.0992,
+                            volume=13.0,
+                            trade_id="A",
+                            cycle=1,
+                            txid="TX-A-EXIT",
+                            placed_at=999.0,
+                            entry_price=0.1008,
+                        ),
+                    ),
+                    cycle_a=2,
+                    cycle_b=4,
+                    long_only=False,
+                    short_only=True,
+                    next_order_id=2,
+                ),
+            )
+        }
+
+        with mock.patch.object(rt, "_safe_balance", return_value={"ZUSD": "50.0", "XXDG": "1000.0"}):
+            with mock.patch.object(rt, "_execute_actions") as exec_actions:
+                rt._auto_repair_degraded_slot(0)
+                exec_actions.assert_called_once()
+
+        buy_entries = [o for o in rt.slots[0].state.orders if o.role == "entry" and o.side == "buy"]
+        self.assertEqual(len(buy_entries), 1)
+        self.assertEqual(buy_entries[0].trade_id, "B")
+        self.assertEqual(buy_entries[0].cycle, 4)
+        self.assertFalse(rt.slots[0].state.long_only)
+        self.assertFalse(rt.slots[0].state.short_only)
+
     def test_validate_slot_skips_bootstrap_pending_for_empty_single_sided_s0(self):
         rt = bot.BotRuntime()
         rt.slots = {
