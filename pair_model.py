@@ -15,11 +15,18 @@ See the mapping table at the bottom of this docstring:
     _repriced_exit      -> _repriced_exit
     _compute_thresholds -> compute_exit_thresholds
     _entry_distances    -> compute_entry_distances
+    _compute_volume     -> calculate_volume_for_price
     _handle_buy_fill    -> handle_pair_fill (buy cases)
     _handle_sell_fill   -> handle_pair_fill (sell cases)
     _check_stale_exits  -> check_stale_exits
     _check_s2_break     -> check_s2_break_glass
     check_invariants    -> STATE_MACHINE.md invariants
+
+Key sizing semantics (matches production):
+    - order_size_usd is always the global base ($0.50)
+    - _compute_volume floors to min_volume (Kraken minimum per pair)
+    - Exit orders use the filled entry's volume (volume_override),
+      not a recalculated volume from order_size_usd
 """
 
 from __future__ import annotations
@@ -41,7 +48,7 @@ class ModelConfig:
     entry_pct: float = 0.2           # Distance from market for entries (%)
     profit_pct: float = 1.0          # Profit target from entry (%)
     refresh_pct: float = 1.0         # Max drift before entry refresh (%)
-    order_size_usd: float = 3.5      # Dollar value per order
+    order_size_usd: float = 0.50     # Dollar value per order (floors to Kraken min)
     price_decimals: int = 6          # Decimal places for price rounding
     volume_decimals: int = 0         # Decimal places for volume rounding
     min_volume: float = 13.0         # Kraken minimum order volume
@@ -58,7 +65,6 @@ class ModelConfig:
     max_consecutive_refreshes: int = 3
     refresh_cooldown_sec: float = 300.0
     fee_margin: float = 0.003        # 0.3% breakeven margin for repricing
-    next_entry_multiplier: float = 1.0
     # Entry backoff after consecutive losses
     entry_backoff_enabled: bool = True
     entry_backoff_factor: float = 0.5
@@ -179,9 +185,6 @@ class PairState:
     mean_net_profit: float | None = None
     mean_duration_sec: float | None = None
 
-    # Entry multiplier
-    next_entry_multiplier: float = 1.0
-
     # Long-only mode (no sell entries -- spot pairs without inventory)
     long_only: bool = False
 
@@ -206,9 +209,10 @@ def derive_phase(state: PairState) -> Phase:
     return Phase.S0
 
 
-def _compute_volume(price: float, cfg: ModelConfig, multiplier: float = 1.0) -> float:
-    """Compute order volume from USD size and price."""
-    raw = cfg.order_size_usd / price * multiplier
+def _compute_volume(price: float, cfg: ModelConfig) -> float:
+    """Compute order volume from USD size and price.
+    Always floors to cfg.min_volume (Kraken minimum)."""
+    raw = cfg.order_size_usd / price
     if cfg.volume_decimals == 0:
         vol = max(round(raw), cfg.min_volume)
     else:
@@ -224,17 +228,16 @@ def make_initial_state(market_price: float, now: float, cfg: ModelConfig,
     In long-only mode, only the buy entry is placed (no sell entry)."""
     a_pct, b_pct = cfg.entry_pct, cfg.entry_pct
     buy_price = round(market_price * (1 - b_pct / 100), cfg.price_decimals)
-    buy_vol = _compute_volume(buy_price, cfg, cfg.next_entry_multiplier)
+    buy_vol = _compute_volume(buy_price, cfg)
     orders = [OrderState(Side.BUY, Role.ENTRY, buy_price, buy_vol, "B", 1)]
     if not long_only:
         sell_price = round(market_price * (1 + a_pct / 100), cfg.price_decimals)
-        sell_vol = _compute_volume(sell_price, cfg, cfg.next_entry_multiplier)
+        sell_vol = _compute_volume(sell_price, cfg)
         orders.insert(0, OrderState(Side.SELL, Role.ENTRY, sell_price, sell_vol, "A", 1))
     return PairState(
         market_price=market_price,
         now=now,
         orders=tuple(orders),
-        next_entry_multiplier=cfg.next_entry_multiplier,
         long_only=long_only,
     )
 
@@ -454,9 +457,9 @@ def _handle_buy_fill(state: PairState, event: BuyFill,
     if not buy_entry:
         return state, actions  # No matching order
 
-    # Entry fill: place sell exit
+    # Entry fill: place sell exit using filled volume (volume_override)
     exit_price = _exit_price(event.price, state.market_price, Side.SELL, cfg)
-    exit_vol = buy_entry.volume
+    exit_vol = event.volume  # Use fill volume, not recalculated
     fee = event.price * event.volume * cfg.maker_fee_pct / 100.0
 
     new_exit = OrderState(
@@ -466,17 +469,13 @@ def _handle_buy_fill(state: PairState, event: BuyFill,
         matched_entry_price=event.price,
     )
 
-    # Reset multiplier if > 1
-    new_mult = 1.0 if state.next_entry_multiplier > 1.0 else state.next_entry_multiplier
-
     orders = _remove_order(state.orders, buy_entry) + (new_exit,)
     actions.append(PlaceOrder(Side.SELL, Role.EXIT, exit_price, exit_vol,
                               "B", state.cycle_b, event.price))
 
     new_state = replace(state,
                         orders=orders,
-                        total_fees=state.total_fees + fee,
-                        next_entry_multiplier=new_mult)
+                        total_fees=state.total_fees + fee)
     return new_state, actions
 
 
@@ -495,9 +494,9 @@ def _handle_sell_fill(state: PairState, event: SellFill,
     if not sell_entry:
         return state, actions
 
-    # Entry fill: place buy exit
+    # Entry fill: place buy exit using filled volume (volume_override)
     exit_price = _exit_price(event.price, state.market_price, Side.BUY, cfg)
-    exit_vol = sell_entry.volume
+    exit_vol = event.volume  # Use fill volume, not recalculated
     fee = event.price * event.volume * cfg.maker_fee_pct / 100.0
 
     new_exit = OrderState(
@@ -507,16 +506,13 @@ def _handle_sell_fill(state: PairState, event: SellFill,
         matched_entry_price=event.price,
     )
 
-    new_mult = 1.0 if state.next_entry_multiplier > 1.0 else state.next_entry_multiplier
-
     orders = _remove_order(state.orders, sell_entry) + (new_exit,)
     actions.append(PlaceOrder(Side.BUY, Role.EXIT, exit_price, exit_vol,
                               "A", state.cycle_a, event.price))
 
     new_state = replace(state,
                         orders=orders,
-                        total_fees=state.total_fees + fee,
-                        next_entry_multiplier=new_mult)
+                        total_fees=state.total_fees + fee)
     return new_state, actions
 
 
@@ -575,7 +571,7 @@ def _complete_round_trip_a(state: PairState, buy_exit: OrderState,
         if tid == "A":
             a_pct = _backoff_entry_pct(a_pct, new_losses_a, cfg)
         new_sell_price = round(state.market_price * (1 + a_pct / 100), cfg.price_decimals)
-        new_sell_vol = _compute_volume(new_sell_price, cfg, state.next_entry_multiplier)
+        new_sell_vol = _compute_volume(new_sell_price, cfg)
 
         new_entry = OrderState(Side.SELL, Role.ENTRY, new_sell_price, new_sell_vol,
                                "A", new_cycle_a)
@@ -656,7 +652,7 @@ def _complete_round_trip_b(state: PairState, sell_exit: OrderState,
     if tid == "B":
         b_pct = _backoff_entry_pct(b_pct, new_losses_b, cfg)
     new_buy_price = round(state.market_price * (1 - b_pct / 100), cfg.price_decimals)
-    new_buy_vol = _compute_volume(new_buy_price, cfg, state.next_entry_multiplier)
+    new_buy_vol = _compute_volume(new_buy_price, cfg)
     new_cycle_b = sell_exit.cycle + 1
 
     new_entry = OrderState(Side.BUY, Role.ENTRY, new_buy_price, new_buy_vol,
@@ -758,7 +754,7 @@ def _orphan_exit(state: PairState, order: OrderState, cfg: ModelConfig,
         # Trade B sell exit orphaned -> place buy entry
         new_cycle = state.cycle_b + 1
         price = round(state.market_price * (1 - b_pct / 100), cfg.price_decimals)
-        vol = _compute_volume(price, cfg, state.next_entry_multiplier)
+        vol = _compute_volume(price, cfg)
         new_entry = OrderState(Side.BUY, Role.ENTRY, price, vol, "B", new_cycle)
         orders = orders + (new_entry,)
         actions.append(PlaceOrder(Side.BUY, Role.ENTRY, price, vol, "B", new_cycle))
@@ -778,7 +774,7 @@ def _orphan_exit(state: PairState, order: OrderState, cfg: ModelConfig,
         new_cycle = state.cycle_a + 1
         if not state.long_only:
             price = round(state.market_price * (1 + a_pct / 100), cfg.price_decimals)
-            vol = _compute_volume(price, cfg, state.next_entry_multiplier)
+            vol = _compute_volume(price, cfg)
             new_entry = OrderState(Side.SELL, Role.ENTRY, price, vol, "A", new_cycle)
             orders = orders + (new_entry,)
             actions.append(PlaceOrder(Side.SELL, Role.ENTRY, price, vol, "A", new_cycle))
@@ -1089,7 +1085,7 @@ def _check_entry_refresh(state: PairState,
         else:
             new_price = round(state.market_price * (1 + a_pct / 100), cfg.price_decimals)
 
-        new_vol = _compute_volume(new_price, cfg, state.next_entry_multiplier)
+        new_vol = _compute_volume(new_price, cfg)
         actions.append(CancelOrder(o, "stale entry refresh"))
         new_entry = OrderState(o.side, Role.ENTRY, new_price, new_vol,
                                o.trade_id, o.cycle)
@@ -1602,7 +1598,6 @@ def from_state_json(path: str = "logs/state.json") -> tuple[PairState, ModelConf
         refresh_cooldown_until_a=snap.get("refresh_cooldown_until_a", 0.0),
         refresh_cooldown_until_b=snap.get("refresh_cooldown_until_b", 0.0),
         median_cycle_duration=median,
-        next_entry_multiplier=snap.get("next_entry_multiplier", 1.0),
         long_only=snap.get("long_only", False),
         consecutive_losses_a=snap.get("consecutive_losses_a", 0),
         consecutive_losses_b=snap.get("consecutive_losses_b", 0),
