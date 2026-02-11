@@ -70,6 +70,12 @@ def serialize_state(state: grid_strategy.GridState, current_price: float) -> dic
 
     # -- Effective capital --
     effective_capital = config.STARTING_CAPITAL + max(0, state.total_profit_usd)
+    # Actual order cost at current price after pair min-volume floor.
+    actual_order_volume = (
+        grid_strategy.calculate_volume_for_price(current_price, state)
+        if current_price > 0 else 0.0
+    )
+    actual_order_cost = round(actual_order_volume * current_price, 4) if current_price > 0 else 0.0
 
     # -- Recent fills (last 50, newest first) --
     recent = []
@@ -146,6 +152,8 @@ def serialize_state(state: grid_strategy.GridState, current_price: float) -> dic
         "config": {
             "strategy_mode": config.STRATEGY_MODE,
             "order_size": state.order_size_usd,
+            "actual_order_cost": actual_order_cost,
+            "actual_order_volume": round(actual_order_volume, 8),
             "grid_levels": config.GRID_LEVELS,
             "spacing_pct": state.profit_pct if is_pair_mode else config.GRID_SPACING_PCT,
             "effective_capital": round(effective_capital, 2),
@@ -342,6 +350,10 @@ a{color:#58a6ff}
 .ps-s2-timer{font-size:11px;color:#8b949e;margin-top:4px}
 .slot-btn{background:#21262d;border:1px solid #30363d;color:#c9d1d9;border-radius:3px;padding:1px 8px;font-size:14px;cursor:pointer;font-weight:700}
 .slot-btn:hover{background:#30363d}
+.slot-tabs{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;margin-top:8px}
+.slot-tab{background:#0d1117;border:1px solid #30363d;color:#8b949e;border-radius:999px;padding:2px 10px;font-size:11px;cursor:pointer}
+.slot-tab:hover{border-color:#58a6ff;color:#c9d1d9}
+.slot-tab-active{background:#1f3a1f;border-color:#238636;color:#3fb950}
 .btn-analyze{background:none;border:1px solid #30363d;color:#8b949e;border-radius:3px;padding:0 5px;font-size:11px;cursor:pointer;margin-left:4px}
 .btn-analyze:hover{color:#58a6ff;border-color:#58a6ff}
 .btn-analyze:disabled{opacity:0.4;cursor:wait}
@@ -614,6 +626,7 @@ a{color:#58a6ff}
     <button class="slot-btn" onclick="adjustSlots(+1)">+</button>
     <span id="ps-slot-info" style="font-size:11px;color:#8b949e;margin-left:8px"></span>
   </div>
+  <div class="slot-tabs" id="ps-slot-tabs" style="display:none"></div>
 </div>
 
 <!-- Recovery Orders Panel (pair mode, conditional) -->
@@ -1519,6 +1532,7 @@ function update(data) {
   // Pair mode detection
   const cfg = data.config;
   const isPair = cfg.strategy_mode === 'pair';
+  if (!detailPair && cfg.pair_name) detailPair = String(cfg.pair_name).split('#')[0];
 
   // Title + section headers (dynamic from pair config)
   const base = (cfg.pair_display || 'DOGE/USD').split('/')[0];
@@ -1597,8 +1611,10 @@ function update(data) {
 
     // Slot controls (populated from swarm data)
     const slotEl = document.getElementById('ps-slots');
-    if (detailPair && swarmData) {
-      const pInfo = (swarmData.pairs || []).find(function(x){ return x.pair === detailPair; });
+    const tabsEl = document.getElementById('ps-slot-tabs');
+    const basePair = detailPair || (cfg.pair_name ? String(cfg.pair_name).split('#')[0] : null);
+    if (basePair && swarmData) {
+      const pInfo = (swarmData.pairs || []).find(function(x){ return x.pair === basePair; });
       if (pInfo) {
         const sc = pInfo.slot_count || pInfo.multiplier || 1;
         document.getElementById('ps-slot-count').textContent = sc;
@@ -1609,11 +1625,37 @@ function update(data) {
         document.getElementById('ps-slot-info').textContent =
           sc < 5 ? 'Next at $' + fmt(nextAt, 2) + ' ($' + fmt(toGo, 2) + ' to go)' : 'Max slots';
         slotEl.style.display = '';
+
+        const slots = Array.isArray(pInfo.slots) ? pInfo.slots.slice() : [];
+        slots.sort(function(a, b) { return (a.slot_id || 0) - (b.slot_id || 0); });
+        if (sc > 1 && slots.length > 1) {
+          const slotExists = slots.some(function(s) { return (s.slot_id || 0) === detailSlot; });
+          if (!slotExists) detailSlot = 0;
+          let tabsHtml = '';
+          for (const s of slots) {
+            const sid = s.slot_id || 0;
+            const active = sid === detailSlot ? ' slot-tab-active' : '';
+            const stateTxt = s.pair_state || 'S0';
+            const wd = s.winding_down ? ' WD' : '';
+            tabsHtml += '<button class="slot-tab' + active + '" onclick="switchSlot(' + sid + ')">#'
+              + sid + ' (' + stateTxt + ')' + wd + '</button>';
+          }
+          tabsEl.innerHTML = tabsHtml;
+          tabsEl.style.display = '';
+        } else {
+          detailSlot = 0;
+          tabsEl.innerHTML = '';
+          tabsEl.style.display = 'none';
+        }
       } else {
         slotEl.style.display = 'none';
+        tabsEl.innerHTML = '';
+        tabsEl.style.display = 'none';
       }
     } else {
       slotEl.style.display = 'none';
+      tabsEl.innerHTML = '';
+      tabsEl.style.display = 'none';
     }
 
     // Trade A/B panels
@@ -1834,7 +1876,7 @@ function update(data) {
              + '<td>' + fmt(c.volume, 2) + '</td>'
              + '<td>' + dur + '</td>'
              + '<td class="' + pcls + '">' + fmtUSD(c.net_profit)
-             + (c.net_profit < 0 ? ' <button class="btn-analyze" onclick="analyzeTrade(this,' + JSON.stringify(JSON.stringify(c)) + ')" title="AI analysis">?</button>' : '')
+             + (c.net_profit < 0 ? ' <button class="btn-analyze" onclick="analyzeTrade(this,' + JSON.stringify(JSON.stringify(c)).replace(/"/g, '&quot;') + ')" title="AI analysis">?</button>' : '')
              + '</td></tr>';
     }
     cb.innerHTML = crows || '<tr><td colspan="8" style="text-align:center;color:#8b949e">No completed cycles yet</td></tr>';
@@ -1900,10 +1942,12 @@ function update(data) {
   // Params
   // Order size with slot + profit context
   {
-    const pInfo = swarmData && detailPair ? (swarmData.pairs || []).find(function(x){ return x.pair === detailPair; }) : null;
+    const basePair = detailPair || (cfg.pair_name ? String(cfg.pair_name).split('#')[0] : null);
+    const pInfo = swarmData && basePair ? (swarmData.pairs || []).find(function(x){ return x.pair === basePair; }) : null;
     const sc = pInfo ? (pInfo.slot_count || 1) : 1;
     const np = pInfo ? (pInfo.net_profit || 0) : 0;
-    document.getElementById('p-size').textContent = '$' + fmt(cfg.order_size, 2) + ' base \u00d7 ' + sc + ' slot' + (sc > 1 ? 's' : '') + ' | Profit: ' + fmtUSD(np);
+    const actualCost = cfg.actual_order_cost || cfg.order_size;
+    document.getElementById('p-size').textContent = '$' + fmt(actualCost, 2) + '/order \u00d7 ' + sc + ' slot' + (sc > 1 ? 's' : '') + ' | Profit: ' + fmtUSD(np);
   }
   document.getElementById('p-levels-row').style.display = isPair ? 'none' : '';
   if (!isPair) {
@@ -2082,6 +2126,7 @@ let scannerCacheTime = 0;
 let scannerSortKey = 'score';
 let scannerSortAsc = false;
 let detailPair = null;
+let detailSlot = 0;
 
 function isMultiPair() {
   // Determined from swarm status or configured_pairs
@@ -2091,6 +2136,7 @@ function isMultiPair() {
 function showSwarmView() {
   swarmMode = true;
   detailPair = null;
+  detailSlot = 0;
   document.getElementById('swarm-view').style.display = 'block';
   document.getElementById('detail-view').style.display = 'none';
   pollSwarm();
@@ -2098,6 +2144,8 @@ function showSwarmView() {
 
 function showDetailView(pair) {
   swarmMode = false;
+  if (pair && pair !== detailPair) detailSlot = 0;
+  if (!pair) detailSlot = 0;
   detailPair = pair;
   document.getElementById('swarm-view').style.display = 'none';
   document.getElementById('detail-view').style.display = 'block';
@@ -2210,6 +2258,13 @@ async function analyzeTrade(btn, cycleJson) {
   }
 }
 
+function switchSlot(slotId) {
+  const sid = Math.max(0, parseInt(slotId, 10) || 0);
+  if (sid === detailSlot) return;
+  detailSlot = sid;
+  poll();
+}
+
 async function adjustSlots(delta) {
   if (!detailPair) return;
   const pInfo = swarmData && (swarmData.pairs || []).find(function(x){ return x.pair === detailPair; });
@@ -2224,6 +2279,10 @@ async function adjustSlots(delta) {
     });
     document.getElementById('ps-slot-count').textContent = target;
     await pollSwarm();
+    const refreshed = swarmData && (swarmData.pairs || []).find(function(x){ return x.pair === detailPair; });
+    const sc = refreshed ? (refreshed.slot_count || refreshed.multiplier || 1) : target;
+    if (detailSlot >= sc) detailSlot = 0;
+    poll();
   } catch(e) {}
 }
 
@@ -2442,7 +2501,10 @@ async function poll() {
   }
   try {
     let url = API;
-    if (detailPair) url = API + '?pair=' + detailPair;
+    if (detailPair) {
+      const pairKey = detailPair + (detailSlot > 0 ? ('#' + detailSlot) : '');
+      url = API + '?pair=' + encodeURIComponent(pairKey);
+    }
     const r = await fetch(url);
     if (r.ok) update(await r.json());
   } catch(e) {}
