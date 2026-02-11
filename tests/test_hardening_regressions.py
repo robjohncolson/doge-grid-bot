@@ -397,6 +397,99 @@ class BotEventLogTests(unittest.TestCase):
         self.assertFalse(rt.slots[0].state.long_only)
         self.assertFalse(rt.slots[0].state.short_only)
 
+    def test_normalize_slot_mode_tracks_single_sided_exit(self):
+        rt = bot.BotRuntime()
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    orders=(
+                        sm.OrderState(
+                            local_id=1,
+                            side="sell",
+                            role="exit",
+                            price=0.1008,
+                            volume=13.0,
+                            trade_id="A",
+                            cycle=1,
+                            txid="TX-A-EXIT",
+                            placed_at=999.0,
+                            entry_price=0.1,
+                        ),
+                    ),
+                ),
+            )
+        }
+
+        rt._normalize_slot_mode(0)
+        self.assertTrue(rt.slots[0].state.long_only)
+        self.assertFalse(rt.slots[0].state.short_only)
+        with mock.patch.object(rt, "halt") as halt_mock:
+            rt._validate_slot(0)
+            halt_mock.assert_not_called()
+
+        rt.slots[0].state = sm.PairState(
+            market_price=0.1,
+            now=1000.0,
+            orders=(
+                sm.OrderState(
+                    local_id=2,
+                    side="buy",
+                    role="exit",
+                    price=0.0992,
+                    volume=13.0,
+                    trade_id="B",
+                    cycle=1,
+                    txid="TX-B-EXIT",
+                    placed_at=999.0,
+                    entry_price=0.1,
+                ),
+            ),
+        )
+        rt._normalize_slot_mode(0)
+        self.assertFalse(rt.slots[0].state.long_only)
+        self.assertTrue(rt.slots[0].state.short_only)
+        with mock.patch.object(rt, "halt") as halt_mock:
+            rt._validate_slot(0)
+            halt_mock.assert_not_called()
+
+    def test_apply_event_normalizes_before_validate_when_no_actions(self):
+        rt = bot.BotRuntime()
+        state = sm.PairState(
+            market_price=0.1,
+            now=1000.0,
+            orders=(
+                sm.OrderState(
+                    local_id=1,
+                    side="sell",
+                    role="exit",
+                    price=0.1008,
+                    volume=13.0,
+                    trade_id="A",
+                    cycle=1,
+                    txid="TX-A-EXIT",
+                    placed_at=999.0,
+                    entry_price=0.1,
+                ),
+            ),
+        )
+        rt.slots = {0: bot.SlotRuntime(slot_id=0, state=state)}
+
+        with mock.patch.object(sm, "transition", return_value=(state, [])):
+            with mock.patch.object(rt, "_log_event"):
+                with mock.patch.object(rt, "halt") as halt_mock:
+                    rt._apply_event(
+                        0,
+                        sm.TimerTick(timestamp=1001.0),
+                        "timer",
+                        {},
+                    )
+                    halt_mock.assert_not_called()
+        self.assertTrue(rt.slots[0].state.long_only)
+        self.assertFalse(rt.slots[0].state.short_only)
+
 
 if __name__ == "__main__":
     unittest.main()

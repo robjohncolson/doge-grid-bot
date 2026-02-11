@@ -690,6 +690,8 @@ class BotRuntime:
         )
 
         self._execute_actions(slot_id, actions, event_type)
+        # Normalize degraded single-sided modes before strict invariant checks.
+        self._normalize_slot_mode(slot_id)
         self._validate_slot(slot_id)
 
     def _execute_actions(self, slot_id: int, actions: list[sm.Action], source: str) -> None:
@@ -948,6 +950,14 @@ class BotRuntime:
         entries = [o for o in st.orders if o.role == "entry"]
         exits = [o for o in st.orders if o.role == "exit"]
         if exits:
+            # Degraded S1 states are legal when only one exit side survives
+            # (e.g., loop API budget skipped replacing the missing entry).
+            if not entries and len(exits) == 1:
+                exit_side = exits[0].side
+                if exit_side == "sell":
+                    self.slots[slot_id].state = replace(st, long_only=True, short_only=False)
+                elif exit_side == "buy":
+                    self.slots[slot_id].state = replace(st, long_only=False, short_only=True)
             return
         buy_entries = [o for o in entries if o.side == "buy"]
         sell_entries = [o for o in entries if o.side == "sell"]
