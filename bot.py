@@ -711,11 +711,20 @@ class BotRuntime:
                     )
                     if not txid:
                         slot.state = sm.remove_order(slot.state, action.local_id)
+                        self._normalize_slot_mode(slot_id)
                         continue
                     slot.state = sm.apply_order_txid(slot.state, action.local_id, txid)
                 except Exception as e:
                     logger.warning("slot %s place failed %s.%s: %s", slot_id, action.trade_id, action.cycle, e)
                     slot.state = sm.remove_order(slot.state, action.local_id)
+                    # Graceful degradation: if an entry fails due insufficient funds,
+                    # switch slot mode to whichever side can keep running.
+                    if action.role == "entry" and "insufficient funds" in str(e).lower():
+                        if action.side == "sell":
+                            slot.state = replace(slot.state, long_only=True, short_only=False)
+                        elif action.side == "buy":
+                            slot.state = replace(slot.state, short_only=True, long_only=False)
+                    self._normalize_slot_mode(slot_id)
                     self.consecutive_api_errors += 1
                     if self.consecutive_api_errors >= config.MAX_CONSECUTIVE_ERRORS:
                         self.pause(f"{self.consecutive_api_errors} consecutive API errors")
@@ -739,6 +748,8 @@ class BotRuntime:
                     f"{' [recovery]' if action.from_recovery else ''}"
                 )
                 notifier._send_message(text)
+
+        self._normalize_slot_mode(slot_id)
 
     def _poll_order_status(self) -> None:
         # Query active + recovery txids once per loop.
@@ -849,6 +860,13 @@ class BotRuntime:
                     violations[0],
                 )
                 return
+            if self._is_bootstrap_pending_state(slot_id, violations):
+                logger.info(
+                    "Slot %s bootstrap pending; skipping invariant halt (%s)",
+                    slot_id,
+                    violations[0],
+                )
+                return
             self.halt(f"slot {slot_id} invariant violation: {violations[0]}")
             logger.error("Slot %s invariant violations: %s", slot_id, violations)
 
@@ -874,6 +892,34 @@ class BotRuntime:
         min_cost = float(self.constraints.get("min_cost_usd", 0.0))
         required_usd = max(min_cost, min_vol * market)
         return target_usd < required_usd
+
+    def _is_bootstrap_pending_state(self, slot_id: int, violations: list[str]) -> bool:
+        if not violations:
+            return False
+        if any(v != "S0 must be exactly A sell entry + B buy entry" for v in violations):
+            return False
+        st = self.slots[slot_id].state
+        if sm.derive_phase(st) != "S0":
+            return False
+        entries = [o for o in st.orders if o.role == "entry"]
+        exits = [o for o in st.orders if o.role == "exit"]
+        # Recoverable startup/placement gap: allow empty/one-entry S0 briefly.
+        return len(exits) == 0 and len(entries) <= 1
+
+    def _normalize_slot_mode(self, slot_id: int) -> None:
+        st = self.slots[slot_id].state
+        entries = [o for o in st.orders if o.role == "entry"]
+        exits = [o for o in st.orders if o.role == "exit"]
+        if exits:
+            return
+        buy_entries = [o for o in entries if o.side == "buy"]
+        sell_entries = [o for o in entries if o.side == "sell"]
+        if len(buy_entries) == 1 and len(sell_entries) == 0:
+            self.slots[slot_id].state = replace(st, long_only=True, short_only=False)
+        elif len(sell_entries) == 1 and len(buy_entries) == 0:
+            self.slots[slot_id].state = replace(st, long_only=False, short_only=True)
+        elif len(sell_entries) == 1 and len(buy_entries) == 1:
+            self.slots[slot_id].state = replace(st, long_only=False, short_only=False)
 
     # ------------------ Commands ------------------
 

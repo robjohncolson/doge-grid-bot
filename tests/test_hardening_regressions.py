@@ -242,6 +242,107 @@ class BotEventLogTests(unittest.TestCase):
                 rt._validate_slot(0)
                 halt_mock.assert_not_called()
 
+    def test_bootstrap_pending_state_does_not_halt(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        rt.constraints = {
+            "price_decimals": 6,
+            "volume_decimals": 0,
+            "min_volume": 13.0,
+            "min_cost_usd": 0.0,
+        }
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    orders=(
+                        sm.OrderState(
+                            local_id=1,
+                            side="sell",
+                            role="entry",
+                            price=0.1002,
+                            volume=13.0,
+                            trade_id="A",
+                            cycle=1,
+                            txid="TX-A-ENTRY",
+                            placed_at=999.0,
+                        ),
+                    ),
+                ),
+            )
+        }
+        with mock.patch.object(config, "ORDER_SIZE_USD", 5.0):
+            self.assertFalse(rt._is_min_size_wait_state(0, ["S0 must be exactly A sell entry + B buy entry"]))
+            self.assertTrue(rt._is_bootstrap_pending_state(0, ["S0 must be exactly A sell entry + B buy entry"]))
+            with mock.patch.object(rt, "halt") as halt_mock:
+                rt._validate_slot(0)
+                halt_mock.assert_not_called()
+
+    def test_normalize_slot_mode_tracks_single_sided_entry(self):
+        rt = bot.BotRuntime()
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    orders=(
+                        sm.OrderState(
+                            local_id=1,
+                            side="buy",
+                            role="entry",
+                            price=0.0998,
+                            volume=13.0,
+                            trade_id="B",
+                            cycle=1,
+                            txid="TX-B-ENTRY",
+                            placed_at=999.0,
+                        ),
+                    ),
+                ),
+            )
+        }
+
+        rt._normalize_slot_mode(0)
+        self.assertTrue(rt.slots[0].state.long_only)
+        self.assertFalse(rt.slots[0].state.short_only)
+
+        rt.slots[0].state = sm.PairState(
+            market_price=0.1,
+            now=1000.0,
+            orders=(
+                sm.OrderState(
+                    local_id=1,
+                    side="sell",
+                    role="entry",
+                    price=0.1002,
+                    volume=13.0,
+                    trade_id="A",
+                    cycle=1,
+                    txid="TX-A-ENTRY",
+                    placed_at=999.0,
+                ),
+                sm.OrderState(
+                    local_id=2,
+                    side="buy",
+                    role="entry",
+                    price=0.0998,
+                    volume=13.0,
+                    trade_id="B",
+                    cycle=1,
+                    txid="TX-B-ENTRY",
+                    placed_at=999.0,
+                ),
+            ),
+            long_only=True,
+            short_only=False,
+        )
+        rt._normalize_slot_mode(0)
+        self.assertFalse(rt.slots[0].state.long_only)
+        self.assertFalse(rt.slots[0].state.short_only)
+
 
 if __name__ == "__main__":
     unittest.main()
