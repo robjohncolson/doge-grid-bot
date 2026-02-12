@@ -289,6 +289,9 @@ FACTORY_HTML = r"""<!doctype html>
     let activeSymptoms = [];
     let activeEffects = new Set();
     let slotEffects = {};
+    let prevStatus = null;
+    let animQueue = [];
+    let lastMachineRectBySlot = {};
 
     function diagnose(status) {
       const symptoms = [];
@@ -443,6 +446,77 @@ FACTORY_HTML = r"""<!doctype html>
       return !!(sfx && sfx.has(effectName));
     }
 
+    function computeDiff(prev, curr) {
+      if (!prev || !curr) return [];
+      const events = [];
+      const prevSlots = {};
+      for (const s of (prev.slots || [])) prevSlots[s.slot_id] = s;
+
+      for (const slot of (curr.slots || [])) {
+        const ps = prevSlots[slot.slot_id];
+        if (!ps) {
+          events.push({type: 'slot_added', slot_id: slot.slot_id});
+          continue;
+        }
+
+        if (ps.phase !== slot.phase) {
+          events.push({type: 'phase_change', slot_id: slot.slot_id, from: ps.phase, to: slot.phase});
+        }
+
+        const prevTxids = new Set((ps.open_orders || []).map((o) => o.txid || ('lid:' + o.local_id)));
+        for (const o of (slot.open_orders || [])) {
+          const key = o.txid || ('lid:' + o.local_id);
+          if (!prevTxids.has(key)) {
+            events.push({type: 'order_placed', slot_id: slot.slot_id, order: o});
+          }
+        }
+
+        const currTxids = new Set((slot.open_orders || []).map((o) => o.txid || ('lid:' + o.local_id)));
+        for (const o of (ps.open_orders || [])) {
+          const key = o.txid || ('lid:' + o.local_id);
+          if (!currTxids.has(key)) {
+            events.push({type: 'order_gone', slot_id: slot.slot_id, order: o});
+          }
+        }
+
+        const prevRecIds = new Set((ps.recovery_orders || []).map((r) => r.recovery_id));
+        for (const r of (slot.recovery_orders || [])) {
+          if (!prevRecIds.has(r.recovery_id)) {
+            events.push({type: 'order_orphaned', slot_id: slot.slot_id, recovery: r});
+          }
+        }
+
+        const prevCycleKeys = new Set((ps.recent_cycles || []).map((c) => c.trade_id + ':' + c.cycle));
+        for (const c of (slot.recent_cycles || [])) {
+          const key = c.trade_id + ':' + c.cycle;
+          if (!prevCycleKeys.has(key)) {
+            events.push({type: 'cycle_completed', slot_id: slot.slot_id, cycle: c});
+          }
+        }
+      }
+
+      const currSlotIds = new Set((curr.slots || []).map((s) => s.slot_id));
+      for (const ps of (prev.slots || [])) {
+        if (!currSlotIds.has(ps.slot_id)) {
+          events.push({type: 'slot_removed', slot_id: ps.slot_id});
+        }
+      }
+
+      return events;
+    }
+
+    function animationDurationMs(evt) {
+      if (evt.type === 'slot_added' || evt.type === 'slot_removed') return 500;
+      if (evt.type === 'phase_change') return 450;
+      if (evt.type === 'order_placed') return 700;
+      if (evt.type === 'order_orphaned') return 800;
+      if (evt.type === 'cycle_completed') return 1500;
+      if (evt.type === 'order_gone') {
+        return (evt.order && evt.order.role === 'exit') ? 1000 : 220;
+      }
+      return 1500;
+    }
+
     function fmt(n, digits = 2) {
       if (n === null || n === undefined || Number.isNaN(Number(n))) return '-';
       return Number(n).toFixed(digits);
@@ -575,7 +649,7 @@ FACTORY_HTML = r"""<!doctype html>
       return COLORS.bad;
     }
 
-    function drawPowerLine(status) {
+    function drawPowerLine(status, nowMs) {
       let color = powerColor(status.price_age_sec);
       if (activeEffects.has('power_dead')) {
         color = 'rgba(84,91,102,0.55)';
@@ -605,6 +679,26 @@ FACTORY_HTML = r"""<!doctype html>
         layout.powerX1,
         y - 11
       );
+
+      const lineLen = Math.max(1, layout.powerX2 - layout.powerX1);
+      let speedPxPerMs = 0;
+      if (!activeEffects.has('power_dead')) {
+        const age = Number(status.price_age_sec || 0);
+        if (age < 10) speedPxPerMs = 0.12;
+        else if (age < 60) speedPxPerMs = 0.055;
+        else speedPxPerMs = 0.015;
+      }
+      if (speedPxPerMs <= 0) return;
+
+      const particles = 7;
+      ctx.fillStyle = color;
+      for (let i = 0; i < particles; i += 1) {
+        const offset = i * (lineLen / particles);
+        const x = layout.powerX1 + ((nowMs * speedPxPerMs + offset) % lineLen);
+        ctx.beginPath();
+        ctx.arc(x, y, 3, 0, Math.PI * 2);
+        ctx.fill();
+      }
     }
 
     function drawChest(box, title, full, subtext, opts = {}) {
@@ -661,7 +755,7 @@ FACTORY_HTML = r"""<!doctype html>
       return clamp(age / timeoutSec, 0, 10);
     }
 
-    function drawMachine(node, status, nowSec) {
+    function drawMachine(node, status, nowMs) {
       const slot = node.slot;
       const phase = String(slot.phase || 'S0');
       const border = slotPhaseColor(phase);
@@ -719,12 +813,12 @@ FACTORY_HTML = r"""<!doctype html>
       let lampColor = COLORS.good;
       if (slot.long_only || slot.short_only) lampColor = COLORS.warn;
       if (hasWarningLamp) {
-        lampColor = (Math.floor(nowSec * 4) % 2 === 0) ? COLORS.warn : COLORS.bad;
+        lampColor = (Math.floor(nowMs / 250) % 2 === 0) ? COLORS.warn : COLORS.bad;
       }
 
       const s2Ratio = phase === 'S2' ? getS2Ratio(slot, status) : null;
       if (s2Ratio !== null && s2Ratio > 0.75) {
-        lampColor = (Math.floor(nowSec * 2) % 2 === 0) ? COLORS.bad : 'rgba(248,81,73,0.35)';
+        lampColor = (Math.floor(nowMs / 500) % 2 === 0) ? COLORS.bad : 'rgba(248,81,73,0.35)';
       }
 
       drawDiamond(node.x + node.w - 18, node.y + 18, 7, lampColor);
@@ -759,6 +853,56 @@ FACTORY_HTML = r"""<!doctype html>
         ctx.setLineDash([]);
       }
 
+      let gearSpeed = 0;
+      if (phase === 'S2') gearSpeed = 0.003;
+      else if (phase === 'S1a' || phase === 'S1b') gearSpeed = 0.001;
+      if (activeEffects.has('power_dead') || activeEffects.has('power_dim')) {
+        gearSpeed *= 0.25;
+      }
+
+      const gearX = node.x + node.w - 38;
+      const gearY = node.y + node.h * 0.5 + 10;
+      const gearAngle = nowMs * gearSpeed;
+      ctx.save();
+      ctx.translate(gearX, gearY);
+      ctx.rotate(gearAngle);
+      ctx.globalAlpha = 0.45;
+      ctx.strokeStyle = border;
+      ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      ctx.arc(0, 0, 8, 0, Math.PI * 2);
+      ctx.stroke();
+      for (let i = 0; i < 6; i += 1) {
+        const a = (Math.PI * 2 * i) / 6;
+        const x1 = Math.cos(a) * 8;
+        const y1 = Math.sin(a) * 8;
+        const x2 = Math.cos(a) * 12;
+        const y2 = Math.sin(a) * 12;
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
+        ctx.stroke();
+      }
+      ctx.restore();
+
+      if (slot.long_only || slot.short_only) {
+        const bobY = node.y - 10 + Math.sin(nowMs * 0.003) * 4;
+        const bx = node.x + node.w - 24;
+        ctx.strokeStyle = COLORS.warn;
+        ctx.lineWidth = 1.8;
+        ctx.beginPath();
+        ctx.arc(bx, bobY, 3, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(bx + 2.4, bobY + 2.4);
+        ctx.lineTo(bx + 8, bobY + 8);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(bx + 6.6, bobY + 8.2);
+        ctx.lineTo(bx + 9.2, bobY + 5.6);
+        ctx.stroke();
+      }
+
       machineRects.push({
         slot_id: slot.slot_id,
         x: node.x,
@@ -768,7 +912,7 @@ FACTORY_HTML = r"""<!doctype html>
       });
     }
 
-    function drawConveyors(nodes) {
+    function drawConveyors(nodes, nowMs) {
       if (!nodes.length) return;
       const first = nodes[0];
       const last = nodes[nodes.length - 1];
@@ -812,6 +956,46 @@ FACTORY_HTML = r"""<!doctype html>
       ctx.moveTo(last.x + last.w + 16, yTop + 15);
       ctx.lineTo(layout.outputChest.x - 14, yTop + 15);
       ctx.stroke();
+
+      const itemSpeed = 0.03; // px/ms
+      for (const node of nodes) {
+        const orders = Array.isArray(node.slot.open_orders) ? node.slot.open_orders : [];
+        const hasEntry = orders.some((o) => o.role === 'entry');
+        const hasExit = orders.some((o) => o.role === 'exit');
+        const stopped = slotHasEffect(node.slot.slot_id, 'conveyor_stop');
+
+        if (hasEntry) {
+          const sx = Math.max(layout.usdChest.x + layout.usdChest.w + 8, node.x - 92);
+          const ex = node.x - 6;
+          const len = Math.max(1, ex - sx);
+          const speed = stopped ? 0 : itemSpeed;
+          const spacing = 42;
+          for (let i = 0; i < 2; i += 1) {
+            const x = sx + ((nowMs * speed + i * spacing) % len);
+            const y = node.y + 30;
+            ctx.fillStyle = 'rgba(88,166,255,0.92)';
+            ctx.beginPath();
+            ctx.arc(x, y, 3, 0, Math.PI * 2);
+            ctx.fill();
+          }
+        }
+
+        if (hasExit) {
+          const sx = node.x + node.w + 6;
+          const ex = Math.max(sx + 1, Math.min(layout.outputChest.x - 10, node.x + node.w + 110));
+          const len = Math.max(1, ex - sx);
+          const speed = stopped ? 0 : itemSpeed;
+          const spacing = 38;
+          for (let i = 0; i < 2; i += 1) {
+            const x = sx + ((nowMs * speed + i * spacing) % len);
+            const y = node.y + 46;
+            ctx.fillStyle = 'rgba(46,160,67,0.94)';
+            ctx.beginPath();
+            ctx.arc(x, y, 3, 0, Math.PI * 2);
+            ctx.fill();
+          }
+        }
+      }
     }
 
     function drawOutputChest(status) {
@@ -841,7 +1025,7 @@ FACTORY_HTML = r"""<!doctype html>
       ctx.fillText(fmt(status.total_profit_doge, 3) + ' DOGE eq', box.x + 10, box.y + 78);
     }
 
-    function drawRecyclingBelt(status) {
+    function drawRecyclingBelt(status, nowMs) {
       const belt = layout.recycle;
       const total = Number(status.total_orphans || 0);
       const overflow = activeEffects.has('belt_overflow');
@@ -866,9 +1050,10 @@ FACTORY_HTML = r"""<!doctype html>
         : Math.min(40, Math.max(0, total));
       const innerX = belt.x + 10;
       const innerW = belt.w - 20;
+      const drift = (nowMs * 0.01) % Math.max(1, innerW);
       for (let i = 0; i < dots; i += 1) {
-        const t = dots <= 1 ? 0.5 : i / (dots - 1);
-        const x = innerX + innerW * t;
+        const base = dots <= 1 ? innerW * 0.5 : i * (innerW / dots);
+        const x = innerX + ((base + drift) % Math.max(1, innerW));
         const y = belt.y + belt.h * 0.5;
         ctx.fillStyle = overflow ? COLORS.bad : (total > 12 ? COLORS.bad : COLORS.warn);
         ctx.beginPath();
@@ -934,6 +1119,130 @@ FACTORY_HTML = r"""<!doctype html>
           drawDiamond(px, py, size, i % 2 === 0 ? COLORS.warn : COLORS.bad);
         }
       }
+    }
+
+    function getMachineRect(slotId) {
+      for (const rect of machineRects) {
+        if (rect.slot_id === slotId) return rect;
+      }
+      return null;
+    }
+
+    function drawEventAnimations(nowMs) {
+      if (!animQueue.length) return;
+      const keep = [];
+
+      for (const anim of animQueue) {
+        const progress = clamp((nowMs - anim.startMs) / anim.durationMs, 0, 1);
+        const alive = progress < 1;
+
+        if (anim.type === 'order_placed') {
+          const rect = getMachineRect(anim.slot_id);
+          if (rect) {
+            const alpha = Math.min(1, progress * 2);
+            ctx.fillStyle = 'rgba(88,166,255,' + alpha.toFixed(3) + ')';
+            ctx.beginPath();
+            ctx.arc(rect.x + rect.w * 0.5, rect.y + 18, 6, 0, Math.PI * 2);
+            ctx.fill();
+          }
+        } else if (anim.type === 'order_gone') {
+          const rect = getMachineRect(anim.slot_id);
+          if (anim.order && anim.order.role === 'exit') {
+            if (rect && layout && layout.outputChest) {
+              const sx = rect.x + rect.w * 0.5;
+              const sy = rect.y + rect.h * 0.5;
+              const tx = layout.outputChest.x + 18;
+              const ty = layout.outputChest.y + 44;
+              const x = sx + (tx - sx) * progress;
+              const y = sy + (ty - sy) * progress;
+              ctx.fillStyle = 'rgba(46,160,67,' + (1 - progress * 0.2).toFixed(3) + ')';
+              ctx.beginPath();
+              ctx.arc(x, y, 5, 0, Math.PI * 2);
+              ctx.fill();
+            }
+          } else if (rect) {
+            const alpha = 1 - progress;
+            ctx.strokeStyle = 'rgba(88,166,255,' + alpha.toFixed(3) + ')';
+            ctx.lineWidth = 3;
+            roundRect(rect.x - 2, rect.y - 2, rect.w + 4, rect.h + 4, 12);
+            ctx.stroke();
+          }
+        } else if (anim.type === 'order_orphaned') {
+          const rect = getMachineRect(anim.slot_id);
+          if (rect && layout && layout.recycle) {
+            const sx = rect.x + rect.w * 0.5;
+            const sy = rect.y + rect.h;
+            const tx = sx;
+            const ty = layout.recycle.y + layout.recycle.h * 0.5;
+            const x = sx + (tx - sx) * progress;
+            const y = sy + (ty - sy) * progress;
+            ctx.fillStyle = 'rgba(210,153,34,' + (1 - progress * 0.1).toFixed(3) + ')';
+            ctx.beginPath();
+            ctx.arc(x, y, 4.5, 0, Math.PI * 2);
+            ctx.fill();
+          }
+        } else if (anim.type === 'cycle_completed') {
+          if (layout && layout.outputChest) {
+            const cx = layout.outputChest.x + 40;
+            const cy = layout.outputChest.y + 46;
+            for (let i = 0; i < 6; i += 1) {
+              const a = (Math.PI * 2 * i) / 6;
+              const r = 6 + progress * 20;
+              const x = cx + Math.cos(a) * r;
+              const y = cy + Math.sin(a) * r;
+              ctx.fillStyle = 'rgba(46,160,67,' + (1 - progress).toFixed(3) + ')';
+              ctx.beginPath();
+              ctx.arc(x, y, 2.3, 0, Math.PI * 2);
+              ctx.fill();
+            }
+            const net = Number(anim.cycle && anim.cycle.net_profit);
+            const txt = Number.isFinite(net) ? ((net >= 0 ? '+' : '') + '$' + fmt(net, 2)) : '+$';
+            ctx.fillStyle = (Number.isFinite(net) && net < 0)
+              ? 'rgba(248,81,73,' + (1 - progress).toFixed(3) + ')'
+              : 'rgba(46,160,67,' + (1 - progress).toFixed(3) + ')';
+            ctx.font = '700 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+            ctx.fillText(txt, cx + 28, cy - progress * 28);
+          }
+        } else if (anim.type === 'phase_change') {
+          const rect = getMachineRect(anim.slot_id);
+          if (rect) {
+            const alpha = 1 - progress;
+            ctx.strokeStyle = 'rgba(88,166,255,' + alpha.toFixed(3) + ')';
+            ctx.lineWidth = 3;
+            roundRect(rect.x - 3, rect.y - 3, rect.w + 6, rect.h + 6, 14);
+            ctx.stroke();
+          }
+        } else if (anim.type === 'slot_added') {
+          const rect = getMachineRect(anim.slot_id);
+          if (rect) {
+            const alpha = 1 - progress;
+            ctx.fillStyle = 'rgba(13,17,23,' + alpha.toFixed(3) + ')';
+            roundRect(rect.x, rect.y, rect.w, rect.h, 12);
+            ctx.fill();
+          }
+        } else if (anim.type === 'slot_removed') {
+          const rect = anim.anchor || getMachineRect(anim.slot_id);
+          if (rect) {
+            const alpha = 1 - progress;
+            const scale = 1 - progress * 0.35;
+            const w = rect.w * scale;
+            const h = rect.h * scale;
+            const x = rect.x + (rect.w - w) * 0.5;
+            const y = rect.y + (rect.h - h) * 0.5;
+            ctx.fillStyle = 'rgba(22,27,34,' + (0.75 * alpha).toFixed(3) + ')';
+            roundRect(x, y, w, h, 12);
+            ctx.fill();
+            ctx.strokeStyle = 'rgba(248,81,73,' + alpha.toFixed(3) + ')';
+            ctx.lineWidth = 2;
+            roundRect(x, y, w, h, 12);
+            ctx.stroke();
+          }
+        }
+
+        if (alive) keep.push(anim);
+      }
+
+      animQueue = keep;
     }
 
     function renderStatusBar(status) {
@@ -1072,7 +1381,7 @@ FACTORY_HTML = r"""<!doctype html>
       ctx.fillRect(0, 0, worldW, worldH);
 
       machineRects = [];
-      drawPowerLine(statusData);
+      drawPowerLine(statusData, nowMs);
 
       const slots = Array.isArray(statusData.slots) ? statusData.slots : [];
       const hasNonLongOnly = slots.length === 0 ? true : slots.some((s) => !s.long_only);
@@ -1096,15 +1405,26 @@ FACTORY_HTML = r"""<!doctype html>
         {flashEmpty: flashDoge, nowMs}
       );
 
-      drawConveyors(layout.positions);
+      drawConveyors(layout.positions, nowMs);
       for (const node of layout.positions) {
-        drawMachine(node, statusData, nowMs / 1000);
+        drawMachine(node, statusData, nowMs);
       }
 
       drawOutputChest(statusData);
-      drawRecyclingBelt(statusData);
+      drawRecyclingBelt(statusData, nowMs);
       drawModeOverlay(nowMs);
       drawCircuitEffects(nowMs);
+      drawEventAnimations(nowMs);
+
+      lastMachineRectBySlot = {};
+      for (const rect of machineRects) {
+        lastMachineRectBySlot[rect.slot_id] = {
+          x: rect.x,
+          y: rect.y,
+          w: rect.w,
+          h: rect.h
+        };
+      }
     }
 
     function scheduleFrame() {
@@ -1134,6 +1454,30 @@ FACTORY_HTML = r"""<!doctype html>
         const res = await fetch('/api/status', {cache: 'no-store'});
         if (!res.ok) throw new Error('status request failed: ' + res.status);
         const next = await res.json();
+        const events = computeDiff(statusData, next);
+        const startMs = performance.now();
+        for (const evt of events) {
+          const anim = {
+            type: evt.type,
+            slot_id: evt.slot_id,
+            order: evt.order || null,
+            recovery: evt.recovery || null,
+            cycle: evt.cycle || null,
+            from: evt.from || null,
+            to: evt.to || null,
+            startMs,
+            durationMs: animationDurationMs(evt)
+          };
+          if (evt.type === 'slot_removed' && lastMachineRectBySlot[evt.slot_id]) {
+            anim.anchor = lastMachineRectBySlot[evt.slot_id];
+          }
+          animQueue.push(anim);
+        }
+        if (animQueue.length > 240) {
+          animQueue = animQueue.slice(animQueue.length - 240);
+        }
+
+        prevStatus = statusData;
         statusData = next;
         layout = computeLayout(next);
         setActiveSymptoms(diagnose(next));
