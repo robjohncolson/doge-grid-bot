@@ -994,6 +994,30 @@ class OpenOrderDriftAlertTests(unittest.TestCase):
         hints = payload["capacity_fill_health"]["blocked_risk_hint"]
         self.assertIn("open_order_drift_persistent", hints)
 
+    def test_open_order_drift_recovery_notifies_once_when_cleared(self):
+        rt = self._runtime_with_one_order()
+        rt._kraken_open_orders_current = 25
+        with mock.patch.object(config, "OPEN_ORDER_DRIFT_ALERT_THRESHOLD", 10):
+            with mock.patch.object(config, "OPEN_ORDER_DRIFT_ALERT_PERSIST_SEC", 300):
+                with mock.patch.object(config, "OPEN_ORDER_DRIFT_ALERT_COOLDOWN_SEC", 900):
+                    with mock.patch("notifier._send_message") as send_mock:
+                        for ts in (1000.0, 1301.0):
+                            rt._kraken_open_orders_ts = ts
+                            rt._maybe_alert_persistent_open_order_drift(now=ts)
+
+                        self.assertEqual(send_mock.call_count, 1)
+                        self.assertIn("Open-order drift persistent", send_mock.call_args_list[0].args[0])
+                        self.assertTrue(rt._open_order_drift_alert_active)
+
+                        rt._kraken_open_orders_current = 5
+                        rt._kraken_open_orders_ts = 1310.0
+                        rt._maybe_alert_persistent_open_order_drift(now=1310.0)
+
+                        self.assertEqual(send_mock.call_count, 2)
+                        self.assertIn("Open-order drift recovered", send_mock.call_args_list[1].args[0])
+                        self.assertFalse(rt._open_order_drift_alert_active)
+                        self.assertIsNone(rt._open_order_drift_over_threshold_since)
+
 
 if __name__ == "__main__":
     unittest.main()

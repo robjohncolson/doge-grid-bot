@@ -117,6 +117,8 @@ class BotRuntime:
         self._kraken_open_orders_ts = 0.0
         self._open_order_drift_over_threshold_since: float | None = None
         self._open_order_drift_last_alert_at = 0.0
+        self._open_order_drift_alert_active = False
+        self._open_order_drift_alert_active_since: float | None = None
 
         # Rolling 24h fill/partial telemetry.
         self._partial_fill_open_events: deque[float] = deque()
@@ -256,6 +258,19 @@ class BotRuntime:
         threshold = max(1, int(config.OPEN_ORDER_DRIFT_ALERT_THRESHOLD))
 
         if abs(drift) < threshold:
+            if self._open_order_drift_alert_active:
+                active_since = self._open_order_drift_alert_active_since or now
+                active_duration_sec = int(max(0.0, now - active_since))
+                notifier._send_message(
+                    "<b>Open-order drift recovered</b>\n"
+                    f"pair: {self.pair_display}\n"
+                    f"kraken_open_orders: {int(kraken_open_orders_current)}\n"
+                    f"internal_open_orders: {internal_open_orders_current}\n"
+                    f"drift: {drift:+d}\n"
+                    f"active_duration: {active_duration_sec}s"
+                )
+            self._open_order_drift_alert_active = False
+            self._open_order_drift_alert_active_since = None
             self._open_order_drift_over_threshold_since = None
             return
 
@@ -275,6 +290,9 @@ class BotRuntime:
             return
 
         self._open_order_drift_last_alert_at = now
+        if not self._open_order_drift_alert_active:
+            self._open_order_drift_alert_active_since = now
+        self._open_order_drift_alert_active = True
         persist_sec = int(max(0.0, float(config.OPEN_ORDER_DRIFT_ALERT_PERSIST_SEC)))
         notifier._send_message(
             "<b>Open-order drift persistent</b>\n"
