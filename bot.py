@@ -1667,42 +1667,87 @@ class BotRuntime:
 
         return True, f"removed {len(removed)} slots: {removed}"
 
-    def cancel_stale_recoveries(self, min_distance_pct: float = 3.0) -> tuple[bool, str]:
-        """Cancel recovery orders farther than min_distance_pct from current market.
+    def cancel_stale_recoveries(self, min_distance_pct: float = 3.0, max_batch: int = 8) -> tuple[bool, str]:
+        """Bulk soft-close recovery orders farther than min_distance_pct from market.
 
-        Unlike soft_close, this does NOT re-place — it simply cancels and removes,
-        freeing both order slots and capital.
+        Reprices them to within entry_pct of market so they fill quickly and
+        book P&L through the normal recovery-fill path.  Processes up to
+        max_batch per call to stay within Kraken rate limits (2 API calls each:
+        cancel old + place new).  Call repeatedly until remaining == 0.
         """
         if self.last_price <= 0:
             return False, "no market price"
 
-        cancelled = 0
-        failed = 0
+        # Collect all stale recoveries across slots.
+        stale: list[tuple[int, sm.RecoveryOrder]] = []
         for sid in sorted(self.slots.keys()):
-            slot = self.slots[sid]
-            keep: list[sm.RecoveryOrder] = []
-            for r in slot.state.recovery_orders:
+            for r in self.slots[sid].state.recovery_orders:
                 distance_pct = abs(r.price - self.last_price) / self.last_price * 100.0
-                if distance_pct < min_distance_pct:
-                    keep.append(r)
-                    continue
-                # Cancel on Kraken
-                if r.txid:
+                if distance_pct >= min_distance_pct:
+                    stale.append((sid, r))
+
+        if not stale:
+            return True, "no stale recoveries"
+
+        batch = stale[:max_batch]
+        remaining = len(stale) - len(batch)
+
+        repriced = 0
+        failed = 0
+
+        # Bypass per-loop budget — this is a user-initiated bulk operation.
+        saved_enforce = self.enforce_loop_budget
+        self.enforce_loop_budget = False
+        try:
+            for sid, rec in batch:
+                slot = self.slots[sid]
+
+                # Cancel old order on Kraken.
+                if rec.txid:
                     try:
-                        self._cancel_order(r.txid)
+                        self._cancel_order(rec.txid)
                     except Exception as e:
-                        logger.warning("cancel_stale_recoveries: cancel %s failed: %s", r.txid, e)
-                        keep.append(r)
+                        logger.warning("cancel_stale: cancel %s failed: %s", rec.txid, e)
                         failed += 1
                         continue
-                cancelled += 1
-            slot.state = replace(slot.state, recovery_orders=tuple(keep))
 
-        if cancelled > 0:
+                # Place new order near market.
+                if rec.side == "sell":
+                    new_price = round(self.last_price * (1 + self.entry_pct / 100.0), self.constraints["price_decimals"])
+                else:
+                    new_price = round(self.last_price * (1 - self.entry_pct / 100.0), self.constraints["price_decimals"])
+
+                try:
+                    txid = self._place_order(
+                        side=rec.side,
+                        volume=rec.volume,
+                        price=new_price,
+                        userref=(sid * 1_000_000 + 900_000 + rec.recovery_id),
+                    )
+                    if not txid:
+                        failed += 1
+                        continue
+                except Exception as e:
+                    logger.warning("cancel_stale: place failed: %s", e)
+                    failed += 1
+                    continue
+
+                # Update recovery in-place with new price/txid.
+                slot.state = replace(slot.state, recovery_orders=tuple(
+                    replace(x, price=new_price, txid=txid, reason="soft_close") if x.recovery_id == rec.recovery_id else x
+                    for x in slot.state.recovery_orders
+                ))
+                repriced += 1
+        finally:
+            self.enforce_loop_budget = saved_enforce
+
+        if repriced > 0:
             self._save_snapshot()
-        msg = f"cancelled {cancelled} stale recovery orders (>{min_distance_pct:.1f}% from market)"
+        msg = f"repriced {repriced} stale recoveries to within {self.entry_pct:.1f}% of market"
         if failed:
-            msg += f", {failed} cancel failures retained"
+            msg += f", {failed} failures"
+        if remaining > 0:
+            msg += f", {remaining} remaining (call again)"
         return True, msg
 
     def reconcile_drift(self) -> tuple[bool, str]:
@@ -2251,6 +2296,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     parsed["min_distance_pct"] = float(body.get("min_distance_pct", 3.0))
                 except (TypeError, ValueError):
                     parsed["min_distance_pct"] = 3.0
+                try:
+                    parsed["max_batch"] = int(body.get("max_batch", 8))
+                except (TypeError, ValueError):
+                    parsed["max_batch"] = 8
             elif action == "remove_slot":
                 try:
                     parsed["slot_id"] = int(body.get("slot_id", -1))
@@ -2288,7 +2337,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 elif action == "soft_close_next":
                     ok, msg = _RUNTIME.soft_close_next()
                 elif action == "cancel_stale_recoveries":
-                    ok, msg = _RUNTIME.cancel_stale_recoveries(float(parsed.get("min_distance_pct", 3.0)))
+                    ok, msg = _RUNTIME.cancel_stale_recoveries(
+                        float(parsed.get("min_distance_pct", 3.0)),
+                        int(parsed.get("max_batch", 8)),
+                    )
                 elif action == "remove_slot":
                     ok, msg = _RUNTIME.remove_slot(int(parsed["slot_id"]))
                 elif action == "remove_slots":
