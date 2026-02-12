@@ -48,30 +48,135 @@ def _now() -> float:
     return time.time()
 
 
-def _usd_balance(balance: dict) -> float:
-    for key in ("ZUSD", "USD"):
+def _asset_balance(balance: dict, aliases: tuple[str, ...]) -> float:
+    """
+    Read balance for an asset across Kraken naming variants.
+
+    Kraken may expose balances as:
+    - legacy keys (e.g. XXDG, ZUSD)
+    - plain keys (e.g. DOGE, USD)
+    - free-balance suffix keys (e.g. XXDG.F, ZUSD.F)
+    """
+    if not isinstance(balance, dict):
+        return 0.0
+
+    for key in aliases:
+        free_key = f"{key}.F"
+        if free_key in balance:
+            try:
+                return float(balance.get(free_key, 0.0))
+            except (TypeError, ValueError):
+                continue
+
+    for key in aliases:
         if key in balance:
             try:
                 return float(balance.get(key, 0.0))
             except (TypeError, ValueError):
-                return 0.0
+                continue
+
     return 0.0
+
+
+def _usd_balance(balance: dict) -> float:
+    return _asset_balance(balance, ("ZUSD", "USD"))
 
 
 def _doge_balance(balance: dict) -> float:
-    for key in ("XXDG", "XDG", "DOGE"):
-        if key in balance:
-            try:
-                return float(balance.get(key, 0.0))
-            except (TypeError, ValueError):
-                return 0.0
-    return 0.0
+    return _asset_balance(balance, ("XXDG", "XDG", "DOGE"))
 
 
 @dataclass
 class SlotRuntime:
     slot_id: int
     state: sm.PairState
+
+
+class CapitalLedger:
+    """Within-loop capital tracker that prevents over-commitment across slots."""
+
+    def __init__(self) -> None:
+        self._synced = False
+        self._usd_from_free = False
+        self._doge_from_free = False
+        self._total_usd = 0.0
+        self._total_doge = 0.0
+        self._committed_usd = 0.0
+        self._committed_doge = 0.0
+        self._loop_placed_usd = 0.0
+        self._loop_placed_doge = 0.0
+
+    @property
+    def available_usd(self) -> float:
+        # With Kraken free-balance keys (`*.F`), total already means available.
+        if self._usd_from_free:
+            return max(0.0, self._total_usd - self._loop_placed_usd)
+        return max(0.0, self._total_usd - self._committed_usd - self._loop_placed_usd)
+
+    @property
+    def available_doge(self) -> float:
+        # With Kraken free-balance keys (`*.F`), total already means available.
+        if self._doge_from_free:
+            return max(0.0, self._total_doge - self._loop_placed_doge)
+        return max(0.0, self._total_doge - self._committed_doge - self._loop_placed_doge)
+
+    def sync(self, balance: dict, slots: dict[int, SlotRuntime]) -> None:
+        """Recompute from scratch at loop start using fresh Kraken balance."""
+        self._usd_from_free = any(k in balance for k in ("ZUSD.F", "USD.F"))
+        self._doge_from_free = any(k in balance for k in ("XXDG.F", "XDG.F", "DOGE.F"))
+        self._total_usd = _usd_balance(balance)
+        self._total_doge = _doge_balance(balance)
+        committed_usd = 0.0
+        committed_doge = 0.0
+        for slot in slots.values():
+            st = slot.state
+            for o in st.orders:
+                if not o.txid:
+                    continue
+                if o.side == "buy":
+                    committed_usd += o.volume * o.price
+                elif o.side == "sell":
+                    committed_doge += o.volume
+            for r in st.recovery_orders:
+                if not r.txid:
+                    continue
+                if r.side == "buy":
+                    committed_usd += r.volume * r.price
+                elif r.side == "sell":
+                    committed_doge += r.volume
+        self._committed_usd = committed_usd
+        self._committed_doge = committed_doge
+        self._loop_placed_usd = 0.0
+        self._loop_placed_doge = 0.0
+        self._synced = True
+
+    def commit_order(self, side: str, price: float, volume: float) -> None:
+        """Deduct capital after a successful order placement within this loop."""
+        if side == "buy":
+            self._loop_placed_usd += volume * price
+        elif side == "sell":
+            self._loop_placed_doge += volume
+
+    def clear(self) -> None:
+        """Reset loop-placed accumulators at end of loop."""
+        self._loop_placed_usd = 0.0
+        self._loop_placed_doge = 0.0
+        self._synced = False
+
+    def snapshot(self) -> dict:
+        return {
+            "synced": self._synced,
+            "usd_from_free": self._usd_from_free,
+            "doge_from_free": self._doge_from_free,
+            "total_usd": self._total_usd,
+            "total_doge": self._total_doge,
+            "committed_usd": self._committed_usd,
+            "committed_doge": self._committed_doge,
+            "loop_placed_usd": self._loop_placed_usd,
+            "loop_placed_doge": self._loop_placed_doge,
+            "available_usd": self.available_usd,
+            "available_doge": self.available_doge,
+        }
 
 
 class BotRuntime:
@@ -98,6 +203,7 @@ class BotRuntime:
         self.taker_fee_pct = float(config.MAKER_FEE_PCT)
 
         self.slots: dict[int, SlotRuntime] = {}
+        self.ledger = CapitalLedger()
         self.next_slot_id = 1
 
         self.next_event_id = 1
@@ -111,6 +217,10 @@ class BotRuntime:
         self.enforce_loop_budget = False
         self.loop_private_calls = 0
         self._loop_balance_cache: dict | None = None
+        self._loop_available_usd: float | None = None
+        self._loop_available_doge: float | None = None
+        self._last_balance_snapshot: dict | None = None
+        self._last_balance_ts = 0.0
 
         # Kraken-first capacity telemetry (pair-filtered open orders).
         self._kraken_open_orders_current: int | None = None
@@ -385,10 +495,21 @@ class BotRuntime:
         self.enforce_loop_budget = True
         self.loop_private_calls = 0
         self._loop_balance_cache = None
+        self._loop_available_usd = None
+        self._loop_available_doge = None
+        # Sync capital ledger with fresh Kraken balance
+        bal = self._safe_balance()
+        if bal:
+            self.ledger.sync(bal, self.slots)
+            self._loop_available_usd = self.ledger.available_usd
+            self._loop_available_doge = self.ledger.available_doge
 
     def end_loop(self) -> None:
         self.enforce_loop_budget = False
         self._loop_balance_cache = None
+        self._loop_available_usd = None
+        self._loop_available_doge = None
+        self.ledger.clear()
 
     def _consume_private_budget(self, units: int, reason: str) -> bool:
         if units <= 0:
@@ -752,8 +873,14 @@ class BotRuntime:
             return
 
         balance = self._safe_balance()
-        usd = _usd_balance(balance)
-        doge = _doge_balance(balance)
+        if balance is None:
+            logger.warning(
+                "slot %s bootstrap deferred: balance unavailable (live+cache unavailable)",
+                slot_id,
+            )
+            return
+        usd = self.ledger.available_usd if self.ledger._synced else _usd_balance(balance)
+        doge = self.ledger.available_doge if self.ledger._synced else _doge_balance(balance)
         market = self.last_price
 
         min_vol, min_cost = self._minimum_bootstrap_requirements(market)
@@ -825,6 +952,16 @@ class BotRuntime:
                 logger.info("slot %s fallback_long_only waiting: computed order below minimum", slot_id)
             return
 
+        logger.warning(
+            "slot %s bootstrap blocked: usd=%.8f doge=%.8f min_cost=%.8f min_vol=%.8f market=%.8f keys=%s",
+            slot_id,
+            usd,
+            doge,
+            min_cost,
+            min_vol,
+            market,
+            sorted(balance.keys()),
+        )
         self.pause(f"slot {slot_id} cannot bootstrap: insufficient USD and DOGE")
 
     def _auto_repair_degraded_slot(self, slot_id: int) -> None:
@@ -846,8 +983,14 @@ class BotRuntime:
         min_vol, min_cost = self._minimum_bootstrap_requirements(market)
 
         balance = self._safe_balance()
-        usd = _usd_balance(balance)
-        doge = _doge_balance(balance)
+        if balance is None:
+            logger.warning(
+                "slot %s auto-repair deferred: balance unavailable (live+cache unavailable)",
+                slot_id,
+            )
+            return
+        usd = self.ledger.available_usd if self.ledger._synced else _usd_balance(balance)
+        doge = self.ledger.available_doge if self.ledger._synced else _doge_balance(balance)
         cfg = self._engine_cfg(slot)
         order_size = self._slot_order_size_usd(slot)
 
@@ -905,19 +1048,77 @@ class BotRuntime:
 
     # ------------------ Exchange IO ------------------
 
-    def _safe_balance(self) -> dict:
+    def _safe_balance(self) -> dict | None:
+        def _fresh_cached_balance(now_ts: float) -> dict | None:
+            if not self._last_balance_snapshot:
+                return None
+            # Cached balance can safely bridge brief API-budget starvation.
+            max_age = max(60.0, float(config.POLL_INTERVAL_SECONDS) * 3.0)
+            if now_ts - self._last_balance_ts > max_age:
+                return None
+            return dict(self._last_balance_snapshot)
+
         if self._loop_balance_cache is not None:
             return dict(self._loop_balance_cache)
+        now_ts = _now()
         if not self._consume_private_budget(1, "get_balance"):
-            return {}
+            return _fresh_cached_balance(now_ts)
         try:
             bal = kraken_client.get_balance()
+            self._last_balance_snapshot = dict(bal)
+            self._last_balance_ts = now_ts
             if self.enforce_loop_budget:
                 self._loop_balance_cache = dict(bal)
             return bal
         except Exception as e:
             logger.warning("Balance query failed: %s", e)
-            return {}
+            return _fresh_cached_balance(now_ts)
+
+    def _seed_loop_available_from_balance(self, balance: dict | None) -> bool:
+        if self._loop_available_usd is not None and self._loop_available_doge is not None:
+            return True
+        if self.ledger._synced:
+            self._loop_available_usd = self.ledger.available_usd
+            self._loop_available_doge = self.ledger.available_doge
+            return True
+        if balance is None:
+            return False
+        self._loop_available_usd = _usd_balance(balance)
+        self._loop_available_doge = _doge_balance(balance)
+        return True
+
+    def _required_notional(self, side: str, volume: float, price: float) -> float:
+        if side == "buy":
+            return max(0.0, float(volume) * float(price))
+        if side == "sell":
+            return max(0.0, float(volume))
+        return 0.0
+
+    def _try_reserve_loop_funds(self, *, side: str, volume: float, price: float) -> bool:
+        if self._loop_available_usd is None or self._loop_available_doge is None:
+            if not self._seed_loop_available_from_balance(self._loop_balance_cache):
+                if not self._seed_loop_available_from_balance(self._safe_balance()):
+                    return False
+
+        req = self._required_notional(side, volume, price)
+        if side == "buy":
+            if (self._loop_available_usd or 0.0) + 1e-12 < req:
+                return False
+            self._loop_available_usd = (self._loop_available_usd or 0.0) - req
+            return True
+        if side == "sell":
+            if (self._loop_available_doge or 0.0) + 1e-12 < req:
+                return False
+            self._loop_available_doge = (self._loop_available_doge or 0.0) - req
+            return True
+        return True
+
+    def _release_loop_reservation(self, *, side: str, volume: float, price: float) -> None:
+        req = self._required_notional(side, volume, price)
+        if side == "buy":
+            self._loop_available_usd = (self._loop_available_usd or 0.0) + req
+        elif side == "sell":
+            self._loop_available_doge = (self._loop_available_doge or 0.0) + req
 
     def _apply_event(self, slot_id: int, event: sm.Event, event_type: str, details: dict) -> None:
         slot = self.slots[slot_id]
@@ -947,6 +1148,16 @@ class BotRuntime:
             return
 
         slot = self.slots[slot_id]
+        def _mark_entry_fallback_for_insufficient_funds(action: sm.PlaceOrderAction) -> None:
+            # Graceful degradation: if an entry cannot be funded now,
+            # switch to the side that can keep running.
+            if action.role != "entry":
+                return
+            if action.side == "sell":
+                slot.state = replace(slot.state, long_only=True, short_only=False)
+            elif action.side == "buy":
+                slot.state = replace(slot.state, short_only=True, long_only=False)
+
         for action in actions:
             if isinstance(action, sm.PlaceOrderAction):
                 # Pause/HALT blocks new entry placement; exits still allowed to reduce state risk.
@@ -958,6 +1169,29 @@ class BotRuntime:
                     slot.state = sm.remove_order(slot.state, action.local_id)
                     continue
 
+                reserved_locally = self._try_reserve_loop_funds(
+                    side=action.side,
+                    volume=action.volume,
+                    price=action.price,
+                )
+                if not reserved_locally:
+                    logger.warning(
+                        "slot %s local-funds check blocked %s %s [%s.%s] vol=%.8f px=%.8f (avail usd=%.8f doge=%.8f)",
+                        slot_id,
+                        action.role,
+                        action.side,
+                        action.trade_id,
+                        action.cycle,
+                        action.volume,
+                        action.price,
+                        self._loop_available_usd or 0.0,
+                        self._loop_available_doge or 0.0,
+                    )
+                    slot.state = sm.remove_order(slot.state, action.local_id)
+                    _mark_entry_fallback_for_insufficient_funds(action)
+                    self._normalize_slot_mode(slot_id)
+                    continue
+
                 try:
                     txid = self._place_order(
                         side=action.side,
@@ -966,20 +1200,29 @@ class BotRuntime:
                         userref=(slot_id * 1_000_000 + action.local_id),
                     )
                     if not txid:
+                        self._release_loop_reservation(
+                            side=action.side,
+                            volume=action.volume,
+                            price=action.price,
+                        )
                         slot.state = sm.remove_order(slot.state, action.local_id)
+                        _mark_entry_fallback_for_insufficient_funds(action)
                         self._normalize_slot_mode(slot_id)
                         continue
                     slot.state = sm.apply_order_txid(slot.state, action.local_id, txid)
+                    self.ledger.commit_order(action.side, action.price, action.volume)
                 except Exception as e:
+                    self._release_loop_reservation(
+                        side=action.side,
+                        volume=action.volume,
+                        price=action.price,
+                    )
                     logger.warning("slot %s place failed %s.%s: %s", slot_id, action.trade_id, action.cycle, e)
                     slot.state = sm.remove_order(slot.state, action.local_id)
                     # Graceful degradation: if an entry fails due insufficient funds,
                     # switch slot mode to whichever side can keep running.
-                    if action.role == "entry" and "insufficient funds" in str(e).lower():
-                        if action.side == "sell":
-                            slot.state = replace(slot.state, long_only=True, short_only=False)
-                        elif action.side == "buy":
-                            slot.state = replace(slot.state, short_only=True, long_only=False)
+                    if "insufficient funds" in str(e).lower():
+                        _mark_entry_fallback_for_insufficient_funds(action)
                     self._normalize_slot_mode(slot_id)
                     self.consecutive_api_errors += 1
                     if self.consecutive_api_errors >= config.MAX_CONSECUTIVE_ERRORS:
@@ -1507,6 +1750,8 @@ class BotRuntime:
             slots = []
             total_unrealized_profit = 0.0
             total_active_orders = 0
+            committed_usd_internal = 0.0
+            committed_doge_internal = 0.0
             for sid in sorted(self.slots.keys()):
                 st = self.slots[sid].state
                 phase = sm.derive_phase(st)
@@ -1521,6 +1766,11 @@ class BotRuntime:
                             market_price=st.market_price,
                             volume=o.volume,
                         )
+                    if o.txid:
+                        if o.side == "buy":
+                            committed_usd_internal += o.volume * o.price
+                        elif o.side == "sell":
+                            committed_doge_internal += o.volume
                     open_orders.append({
                         "local_id": o.local_id,
                         "side": o.side,
@@ -1540,6 +1790,11 @@ class BotRuntime:
                         market_price=st.market_price,
                         volume=r.volume,
                     )
+                    if r.txid:
+                        if r.side == "buy":
+                            committed_usd_internal += r.volume * r.price
+                        elif r.side == "sell":
+                            committed_doge_internal += r.volume
                     recs.append({
                         "recovery_id": r.recovery_id,
                         "trade_id": r.trade_id,
@@ -1583,6 +1838,10 @@ class BotRuntime:
             total_round_trips = sum(s.state.total_round_trips for s in self.slots.values())
             total_orphans = sum(len(s.state.recovery_orders) for s in self.slots.values())
             internal_open_orders_current = total_active_orders + total_orphans
+            last_balance = dict(self._last_balance_snapshot) if self._last_balance_snapshot else {}
+            observed_usd_balance = _usd_balance(last_balance) if last_balance else None
+            observed_doge_balance = _doge_balance(last_balance) if last_balance else None
+            balance_age_sec = (now - self._last_balance_ts) if last_balance else None
             kraken_open_orders_current = self._kraken_open_orders_current
             if kraken_open_orders_current is None:
                 open_orders_current = internal_open_orders_current
@@ -1680,6 +1939,16 @@ class BotRuntime:
                     "p95_fill_seconds_1d": p95_fill_seconds_1d,
                     "status_band": status_band,
                     "blocked_risk_hint": blocked_risk_hint,
+                },
+                "balance_health": {
+                    "usd_observed": observed_usd_balance,
+                    "doge_observed": observed_doge_balance,
+                    "balance_age_sec": balance_age_sec,
+                    "usd_committed_internal": committed_usd_internal,
+                    "doge_committed_internal": committed_doge_internal,
+                    "loop_available_usd": self._loop_available_usd,
+                    "loop_available_doge": self._loop_available_doge,
+                    "ledger": self.ledger.snapshot(),
                 },
                 "slots": slots,
             }
