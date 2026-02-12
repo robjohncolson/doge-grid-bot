@@ -704,6 +704,15 @@ def _refresh_stale_entries(state: PairState, cfg: EngineConfig, order_size_usd: 
         if st.now < cooldown_until:
             continue
 
+        # If cooldown just expired and counter is still at/above threshold,
+        # reset so the next refresh is allowed (counts as 1, not re-trigger).
+        prev_count_check = st.consecutive_refreshes_a if is_a else st.consecutive_refreshes_b
+        if prev_count_check >= cfg.max_consecutive_refreshes and cooldown_until > 0:
+            if is_a:
+                st = replace(st, consecutive_refreshes_a=0, refresh_cooldown_until_a=0.0)
+            else:
+                st = replace(st, consecutive_refreshes_b=0, refresh_cooldown_until_b=0.0)
+
         if o.side == "buy":
             direction = "down" if st.market_price < o.price else "up"
         else:
