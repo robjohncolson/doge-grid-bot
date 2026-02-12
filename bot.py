@@ -115,6 +115,8 @@ class BotRuntime:
         # Kraken-first capacity telemetry (pair-filtered open orders).
         self._kraken_open_orders_current: int | None = None
         self._kraken_open_orders_ts = 0.0
+        self._open_order_drift_over_threshold_since: float | None = None
+        self._open_order_drift_last_alert_at = 0.0
 
         # Rolling 24h fill/partial telemetry.
         self._partial_fill_open_events: deque[float] = deque()
@@ -216,6 +218,72 @@ class BotRuntime:
         ordered = sorted(vals)
         idx = max(0, min(len(ordered) - 1, ceil(0.95 * len(ordered)) - 1))
         return med, float(ordered[idx])
+
+    def _internal_open_order_count(self) -> int:
+        return sum(len(slot.state.orders) + len(slot.state.recovery_orders) for slot in self.slots.values())
+
+    def _open_order_drift_is_persistent(
+        self,
+        *,
+        now: float,
+        internal_open_orders_current: int,
+        kraken_open_orders_current: int | None,
+    ) -> bool:
+        if kraken_open_orders_current is None:
+            return False
+        threshold = max(1, int(config.OPEN_ORDER_DRIFT_ALERT_THRESHOLD))
+        persist_sec = max(0.0, float(config.OPEN_ORDER_DRIFT_ALERT_PERSIST_SEC))
+        telemetry_max_age = max(60.0, float(config.POLL_INTERVAL_SECONDS) * 3.0)
+        if now - self._kraken_open_orders_ts > telemetry_max_age:
+            return False
+        drift = int(kraken_open_orders_current) - internal_open_orders_current
+        if abs(drift) < threshold or self._open_order_drift_over_threshold_since is None:
+            return False
+        return (now - self._open_order_drift_over_threshold_since) >= persist_sec
+
+    def _maybe_alert_persistent_open_order_drift(self, now: float | None = None) -> None:
+        now = now or _now()
+        kraken_open_orders_current = self._kraken_open_orders_current
+        if kraken_open_orders_current is None:
+            return
+        telemetry_max_age = max(60.0, float(config.POLL_INTERVAL_SECONDS) * 3.0)
+        if now - self._kraken_open_orders_ts > telemetry_max_age:
+            self._open_order_drift_over_threshold_since = None
+            return
+
+        internal_open_orders_current = self._internal_open_order_count()
+        drift = int(kraken_open_orders_current) - internal_open_orders_current
+        threshold = max(1, int(config.OPEN_ORDER_DRIFT_ALERT_THRESHOLD))
+
+        if abs(drift) < threshold:
+            self._open_order_drift_over_threshold_since = None
+            return
+
+        if self._open_order_drift_over_threshold_since is None:
+            self._open_order_drift_over_threshold_since = now
+            return
+
+        if not self._open_order_drift_is_persistent(
+            now=now,
+            internal_open_orders_current=internal_open_orders_current,
+            kraken_open_orders_current=kraken_open_orders_current,
+        ):
+            return
+
+        cooldown_sec = max(0.0, float(config.OPEN_ORDER_DRIFT_ALERT_COOLDOWN_SEC))
+        if now - self._open_order_drift_last_alert_at < cooldown_sec:
+            return
+
+        self._open_order_drift_last_alert_at = now
+        persist_sec = int(max(0.0, float(config.OPEN_ORDER_DRIFT_ALERT_PERSIST_SEC)))
+        notifier._send_message(
+            "<b>Open-order drift persistent</b>\n"
+            f"pair: {self.pair_display}\n"
+            f"kraken_open_orders: {int(kraken_open_orders_current)}\n"
+            f"internal_open_orders: {internal_open_orders_current}\n"
+            f"drift: {drift:+d}\n"
+            f"persistence: >= {persist_sec}s"
+        )
 
     def _global_snapshot(self) -> dict:
         return {
@@ -374,6 +442,7 @@ class BotRuntime:
     def _refresh_open_order_telemetry(self) -> None:
         try:
             self._get_open_orders()
+            self._maybe_alert_persistent_open_order_drift()
         except Exception as e:
             logger.debug("Open-order telemetry refresh failed: %s", e)
 
@@ -1526,9 +1595,17 @@ class BotRuntime:
             else:
                 status_band = "normal"
 
+            drift_persistent = self._open_order_drift_is_persistent(
+                now=now,
+                internal_open_orders_current=internal_open_orders_current,
+                kraken_open_orders_current=kraken_open_orders_current,
+            )
+
             blocked_risk_hint: list[str] = []
             if open_orders_source == "internal_fallback":
                 blocked_risk_hint.append("kraken_open_orders_unavailable")
+            if drift_persistent:
+                blocked_risk_hint.append("open_order_drift_persistent")
             if open_order_headroom < 10:
                 blocked_risk_hint.append("near_open_order_cap")
             elif open_order_headroom < 20:

@@ -279,6 +279,11 @@ ORPHAN_PRESSURE_WARN_AT: int = _env("ORPHAN_PRESSURE_WARN_AT", 100, int)
 # Capacity telemetry controls for manual scaling.
 KRAKEN_OPEN_ORDERS_PER_PAIR_LIMIT: int = _env("KRAKEN_OPEN_ORDERS_PER_PAIR_LIMIT", 225, int)
 OPEN_ORDER_SAFETY_RATIO: float = _env("OPEN_ORDER_SAFETY_RATIO", 0.75, float)
+# Alert when Kraken/internal open-order counts diverge for too long.
+# This is a persistence canary, not a one-sample spike alarm.
+OPEN_ORDER_DRIFT_ALERT_THRESHOLD: int = _env("OPEN_ORDER_DRIFT_ALERT_THRESHOLD", 10, int)
+OPEN_ORDER_DRIFT_ALERT_PERSIST_SEC: int = _env("OPEN_ORDER_DRIFT_ALERT_PERSIST_SEC", 600, int)
+OPEN_ORDER_DRIFT_ALERT_COOLDOWN_SEC: int = _env("OPEN_ORDER_DRIFT_ALERT_COOLDOWN_SEC", 1800, int)
 
 # ---------------------------------------------------------------------------
 # AI council settings

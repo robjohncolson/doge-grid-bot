@@ -922,5 +922,78 @@ class DashboardApiHardeningTests(unittest.TestCase):
         self.assertIn(("Content-Type", "text/html; charset=utf-8"), handler.headers)
 
 
+class OpenOrderDriftAlertTests(unittest.TestCase):
+    def _runtime_with_one_order(self) -> bot.BotRuntime:
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        rt.last_price_ts = 1000.0
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    orders=(
+                        sm.OrderState(
+                            local_id=1,
+                            side="buy",
+                            role="entry",
+                            price=0.0998,
+                            volume=13.0,
+                            trade_id="B",
+                            cycle=1,
+                            txid="TX1",
+                            placed_at=999.0,
+                        ),
+                    ),
+                ),
+            )
+        }
+        return rt
+
+    def test_open_order_drift_alert_requires_persistence_and_cooldown(self):
+        rt = self._runtime_with_one_order()
+        rt._kraken_open_orders_current = 25
+        with mock.patch.object(config, "OPEN_ORDER_DRIFT_ALERT_THRESHOLD", 10):
+            with mock.patch.object(config, "OPEN_ORDER_DRIFT_ALERT_PERSIST_SEC", 300):
+                with mock.patch.object(config, "OPEN_ORDER_DRIFT_ALERT_COOLDOWN_SEC", 900):
+                    with mock.patch("notifier._send_message") as send_mock:
+                        for ts in (1000.0, 1299.0, 1301.0, 1500.0):
+                            rt._kraken_open_orders_ts = ts
+                            rt._maybe_alert_persistent_open_order_drift(now=ts)
+                        self.assertEqual(send_mock.call_count, 1)
+
+                        rt._kraken_open_orders_ts = 2205.0
+                        rt._maybe_alert_persistent_open_order_drift(now=2205.0)
+                        self.assertEqual(send_mock.call_count, 2)
+
+    def test_open_order_drift_tracker_resets_after_recovery(self):
+        rt = self._runtime_with_one_order()
+        with mock.patch.object(config, "OPEN_ORDER_DRIFT_ALERT_THRESHOLD", 10):
+            with mock.patch("notifier._send_message"):
+                rt._kraken_open_orders_current = 25
+                rt._kraken_open_orders_ts = 1000.0
+                rt._maybe_alert_persistent_open_order_drift(now=1000.0)
+                self.assertEqual(rt._open_order_drift_over_threshold_since, 1000.0)
+
+                rt._kraken_open_orders_current = 5
+                rt._kraken_open_orders_ts = 1010.0
+                rt._maybe_alert_persistent_open_order_drift(now=1010.0)
+                self.assertIsNone(rt._open_order_drift_over_threshold_since)
+
+    def test_status_payload_exposes_persistent_open_order_drift_hint(self):
+        rt = self._runtime_with_one_order()
+        rt._kraken_open_orders_current = 25
+        rt._kraken_open_orders_ts = 1000.0
+        rt._open_order_drift_over_threshold_since = 600.0
+        with mock.patch.object(config, "OPEN_ORDER_DRIFT_ALERT_THRESHOLD", 10):
+            with mock.patch.object(config, "OPEN_ORDER_DRIFT_ALERT_PERSIST_SEC", 300):
+                with mock.patch("bot._now", return_value=1000.0):
+                    payload = rt.status_payload()
+
+        hints = payload["capacity_fill_health"]["blocked_risk_hint"]
+        self.assertIn("open_order_drift_persistent", hints)
+
+
 if __name__ == "__main__":
     unittest.main()
