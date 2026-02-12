@@ -362,6 +362,7 @@ DASHBOARD_HTML = """<!doctype html>
 |  gg    first slot  -    close next    |
 |  G     last slot   .    refresh       |
 |                    f    factory view  |
+|                    s    api/status   |
 |                    :    command       |
 |                    ?    this help     |
 |                    Esc  close         |
@@ -1074,6 +1075,11 @@ DASHBOARD_HTML = """<!doctype html>
       if (key === 'f') {
         clearChordBuffer();
         window.location.href = '/factory';
+        return true;
+      }
+      if (key === 's') {
+        clearChordBuffer();
+        window.location.href = '/api/status';
         return true;
       }
       if (key === 'Escape') {

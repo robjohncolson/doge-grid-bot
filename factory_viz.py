@@ -379,6 +379,7 @@ FACTORY_HTML = r"""<!doctype html>
 |  gg    first slot  -    close next    |
 |  G     last slot   .    refresh       |
 |                    f    dashboard     |
+|                    s    api/status   |
 |                    :    command       |
 |                    ?    this help     |
 |                    Esc  close         |
@@ -1214,6 +1215,11 @@ FACTORY_HTML = r"""<!doctype html>
       if (key === 'f') {
         clearChordBuffer();
         window.location.href = '/';
+        return true;
+      }
+      if (key === 's') {
+        clearChordBuffer();
+        window.location.href = '/api/status';
         return true;
       }
       if (key === 'Escape') {
