@@ -184,6 +184,16 @@ DASHBOARD_HTML = """<!doctype html>
         <div class=\"row\"><span class=\"k\">Unrealized PnL</span><span id=\"totalUnrealized\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Today Loss</span><span id=\"todayLoss\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Orphans</span><span id=\"orphans\" class=\"v\"></span></div>
+
+        <h3 style=\"margin-top:14px\">Capacity &amp; Fill Health</h3>
+        <div class=\"row\"><span class=\"k\">Status</span><span id=\"cfhBand\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Open Orders</span><span id=\"cfhOpenOrders\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Headroom</span><span id=\"cfhHeadroom\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Slots Runway</span><span id=\"cfhRunway\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Partial Open (1d)</span><span id=\"cfhPartialOpen\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Partial Cancel (1d)</span><span id=\"cfhPartialCancel\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Fill Latency (1d)</span><span id=\"cfhFillLatency\" class=\"v\"></span></div>
+        <div id=\"cfhHints\" class=\"tiny\"></div>
       </div>
 
       <div class=\"panel\">
@@ -268,6 +278,32 @@ DASHBOARD_HTML = """<!doctype html>
         `$${fmt(s.total_unrealized_profit, 6)} (${fmt(s.total_unrealized_doge, 3)} DOGE)`;
       document.getElementById('todayLoss').textContent = `$${fmt(s.today_realized_loss, 4)}`;
       document.getElementById('orphans').textContent = s.total_orphans;
+
+      const cfh = s.capacity_fill_health || {};
+      const band = String(cfh.status_band || '-').toUpperCase();
+      const bandEl = document.getElementById('cfhBand');
+      bandEl.textContent = band;
+      bandEl.style.color = band === 'STOP' ? 'var(--bad)' : band === 'CAUTION' ? 'var(--warn)' : 'var(--good)';
+
+      const utilPct = cfh.open_order_utilization_pct;
+      const utilText = utilPct === null || utilPct === undefined ? '-' : `${fmt(utilPct, 1)}%`;
+      const source = cfh.open_orders_source ? ` ${String(cfh.open_orders_source)}` : '';
+      document.getElementById('cfhOpenOrders').textContent =
+        `${cfh.open_orders_current ?? '-'} / ${cfh.open_orders_safe_cap ?? '-'} (${utilText}${source ? ', ' + source : ''})`;
+      document.getElementById('cfhHeadroom').textContent = String(cfh.open_order_headroom ?? '-');
+      document.getElementById('cfhRunway').textContent = String(cfh.estimated_slots_remaining ?? '-');
+      document.getElementById('cfhPartialOpen').textContent = String(cfh.partial_fill_open_events_1d ?? '-');
+      document.getElementById('cfhPartialCancel').textContent = String(cfh.partial_fill_cancel_events_1d ?? '-');
+
+      const med = cfh.median_fill_seconds_1d;
+      const p95 = cfh.p95_fill_seconds_1d;
+      document.getElementById('cfhFillLatency').textContent =
+        (med === null || med === undefined || p95 === null || p95 === undefined)
+          ? '-'
+          : `${Math.round(Number(med))}s / ${Math.round(Number(p95))}s`;
+
+      const hints = Array.isArray(cfh.blocked_risk_hint) ? cfh.blocked_risk_hint : [];
+      document.getElementById('cfhHints').textContent = hints.length ? `Hints: ${hints.join(', ')}` : '';
     }
 
     function renderSlots(s) {

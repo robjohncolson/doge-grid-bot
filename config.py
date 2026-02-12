@@ -276,6 +276,9 @@ LOSS_COOLDOWN_SEC: int = _env("LOSS_COOLDOWN_SEC", 900, int)       # 15 min
 # Soft operational limits.
 MAX_API_CALLS_PER_LOOP: int = _env("MAX_API_CALLS_PER_LOOP", 10, int)
 ORPHAN_PRESSURE_WARN_AT: int = _env("ORPHAN_PRESSURE_WARN_AT", 100, int)
+# Capacity telemetry controls for manual scaling.
+KRAKEN_OPEN_ORDERS_PER_PAIR_LIMIT: int = _env("KRAKEN_OPEN_ORDERS_PER_PAIR_LIMIT", 225, int)
+OPEN_ORDER_SAFETY_RATIO: float = _env("OPEN_ORDER_SAFETY_RATIO", 0.75, float)
 
 # ---------------------------------------------------------------------------
 # AI council settings

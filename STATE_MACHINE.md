@@ -1,6 +1,6 @@
 # DOGE State-Machine Bot v1
 
-Last updated: 2026-02-11
+Last updated: 2026-02-12
 Primary code references: `bot.py`, `state_machine.py`, `dashboard.py`, `supabase_store.py`
 
 ## 1. Scope
@@ -72,10 +72,11 @@ Per iteration in `bot.py`:
    - Call `_ensure_slot_bootstrapped(slot_id)`
    - Call `_auto_repair_degraded_slot(slot_id)` to restore missing entry legs when fundable
 6. Poll status for all tracked order txids (`_poll_order_status`).
-7. Emit orphan-pressure notification at `ORPHAN_PRESSURE_WARN_AT` multiples.
-8. Persist snapshot (`save_state` to `bot_state`).
-9. Poll Telegram commands.
-10. `end_loop()` resets budget/cache.
+7. Refresh pair open-order telemetry (`_refresh_open_order_telemetry`) when budget allows.
+8. Emit orphan-pressure notification at `ORPHAN_PRESSURE_WARN_AT` multiples.
+9. Persist snapshot (`save_state` to `bot_state`).
+10. Poll Telegram commands.
+11. `end_loop()` resets budget/cache.
 
 ## 5. Pair Phases (`S0`, `S1a`, `S1b`, `S2`)
 
@@ -239,9 +240,16 @@ Budget and failure handling:
 
 - Private API calls are capped per loop (`MAX_API_CALLS_PER_LOOP`)
 - If budget exhausted, place/cancel/query operations are skipped safely
+- Open-order telemetry refresh is also budget-gated and skipped safely when budget is exhausted
 - On entry placement exception containing `insufficient funds`:
   - failed sell entry -> switch to `long_only`
   - failed buy entry -> switch to `short_only`
+
+Partial-fill telemetry (read-only diagnostics):
+
+- During order polling, `status="open"` with `0 < vol_exec < vol` records a partial-open event (deduped per txid until terminal status)
+- During order polling, `status in {"canceled","expired"}` with `vol_exec > 0` records a partial-cancel canary event and logs `PHANTOM_POSITION_CANARY ...`
+- Runtime behavior is intentionally unchanged by these counters; they are exported for operator diagnostics only
 
 Degraded self-heal behavior:
 
@@ -270,6 +278,7 @@ Startup reconciliation (`_reconcile_open_orders`):
 - Retains tracked orders from snapshot
 - Drops unbound local orders with empty txid
 - Counts tracked open txids present on Kraken
+- Updates pair-filtered Kraken open-order cache used by `status_payload()` capacity telemetry
 
 Missed-fill replay (`_replay_missed_fills`):
 
@@ -324,6 +333,42 @@ Supported dashboard actions:
 - `soft_close`
 - `soft_close_next`
 
+### 14.1 `/api/status` Capacity & Fill Health Block
+
+`status_payload()` includes top-level `capacity_fill_health` for manual scaling diagnostics:
+
+- `open_orders_current`
+- `open_orders_source` (`kraken` or `internal_fallback`)
+- `open_orders_internal`
+- `open_orders_kraken` (nullable)
+- `open_orders_drift` (nullable)
+- `open_order_limit_configured` (from `KRAKEN_OPEN_ORDERS_PER_PAIR_LIMIT`)
+- `open_orders_safe_cap` (`limit * OPEN_ORDER_SAFETY_RATIO`, clamped to at least 1)
+- `open_order_headroom`
+- `open_order_utilization_pct`
+- `orders_per_slot_estimate` (nullable)
+- `estimated_slots_remaining`
+- `partial_fill_open_events_1d`
+- `partial_fill_cancel_events_1d`
+- `median_fill_seconds_1d` (nullable)
+- `p95_fill_seconds_1d` (nullable)
+- `status_band` (`normal`, `caution`, `stop`)
+- `blocked_risk_hint` (string list)
+
+`status_band` thresholds:
+
+- `stop` when `open_order_headroom < 10` or `partial_fill_cancel_events_1d > 0`
+- `caution` when `open_order_headroom < 20` (and stop conditions are false)
+- `normal` otherwise
+
+Current `blocked_risk_hint` values:
+
+- `kraken_open_orders_unavailable`
+- `near_open_order_cap`
+- `open_order_caution`
+- `partial_fill_open_pressure`
+- `partial_fill_cancel_detected`
+
 ## 15. Telegram Command Contract
 
 Supported commands:
@@ -352,6 +397,11 @@ Automatic pauses:
 Automatic halt:
 
 - invariant violation not covered by explicit bootstrap/min-size bypasses
+
+Capacity telemetry controls (operator diagnostics only):
+
+- `KRAKEN_OPEN_ORDERS_PER_PAIR_LIMIT` (default `225`)
+- `OPEN_ORDER_SAFETY_RATIO` (default `0.75`)
 
 Signal handling:
 

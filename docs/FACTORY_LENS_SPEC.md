@@ -1,8 +1,13 @@
 # Factory Lens Specification
 
-Version: v0.2.3  
-Date: 2026-02-11  
-Status: Draft (consolidated)
+Version: v0.2.4  
+Date: 2026-02-12  
+Status: Draft (consolidated + runtime bridge alignment)
+
+### Changelog
+
+1. **v0.2.3**: Operating-state split, schema tightening, milestone split (M1a/M1b).
+2. **v0.2.4**: Added compatibility contract for currently-implemented `status.capacity_fill_health` telemetry bridge (manual scaling diagnostics).
 
 ## 1. Purpose
 
@@ -21,7 +26,8 @@ It is intentionally separate from core order execution logic and should not chan
 1. Deterministic diagnosis from runtime payloads.
 2. A text UI (80x24-first) using a factory metaphor.
 3. `/api/diagnosis` endpoint from bot runtime.
-4. Prompt launcher context for engineering remediation.
+4. Compatibility with currently shipped `/api/status.capacity_fill_health` bridge telemetry.
+5. Prompt launcher context for engineering remediation.
 
 ### 2.2 Out of Scope
 
@@ -72,7 +78,7 @@ Compact slot row format:
 
 ## 5. Diagnosis Semantics
 
-Diagnosis uses deterministic rules. No probabilistic confidence score in v0.2.3.
+Diagnosis uses deterministic rules. No probabilistic confidence score in v0.2.4.
 
 Each symptom card includes:
 
@@ -89,7 +95,7 @@ Each symptom card includes:
 11. `visual_signals`
 12. `prompts` (`codex_prompt`, `claude_prompt`) with context cap
 
-## 6. Symptom Taxonomy v0.2.3
+## 6. Symptom Taxonomy v0.2.4
 
 1. `IDLE_NORMAL`
 2. `BELT_JAM`
@@ -114,6 +120,10 @@ Required windows:
 1. 1 minute
 2. 5 minutes
 3. 24 hour event counters where specified
+
+Bridge note:
+
+1. Until `status.telemetry` ships, Lens may consume `capacity_fill_health.partial_fill_open_events_1d`, `capacity_fill_health.partial_fill_cancel_events_1d`, and fill-latency stats as 24h window inputs.
 
 ## 9. Industrial Aesthetic Telemetry Requirements
 
@@ -143,7 +153,42 @@ Prompt payload must be concise and operator-usable:
 
 ## 11. API Contracts
 
-### 11.1 `/api/status` Extension
+### 11.1 `/api/status` Contracts
+
+The runtime now has two layers of status support for Lens:
+
+1. **Implemented bridge (`status.capacity_fill_health`)** for manual scaling diagnostics.
+2. **Future full Lens telemetry (`status.telemetry`)** using schema `factory-lens-telemetry.v1`.
+
+#### 11.1.1 Implemented Bridge: `status.capacity_fill_health`
+
+Current runtime exports:
+
+1. `open_orders_current`
+2. `open_orders_source` (`kraken` or `internal_fallback`)
+3. `open_orders_internal`
+4. `open_orders_kraken` (nullable)
+5. `open_orders_drift` (nullable)
+6. `open_order_limit_configured`
+7. `open_orders_safe_cap`
+8. `open_order_headroom`
+9. `open_order_utilization_pct`
+10. `orders_per_slot_estimate` (nullable)
+11. `estimated_slots_remaining`
+12. `partial_fill_open_events_1d`
+13. `partial_fill_cancel_events_1d`
+14. `median_fill_seconds_1d` (nullable)
+15. `p95_fill_seconds_1d` (nullable)
+16. `status_band` (`normal`, `caution`, `stop`)
+17. `blocked_risk_hint` (string array)
+
+Lens bridge interpretation guidance:
+
+1. `status_band=stop` should escalate at least `warn` severity (or `crit` when paired with `partial_fill_cancel_events_1d > 0`).
+2. `open_orders_source=internal_fallback` should generate a data-quality warning card, not a trading-action card.
+3. `partial_fill_cancel_events_1d > 0` maps to phantom-position risk and should surface a remediation prompt immediately.
+
+#### 11.1.2 Future Full Extension: `status.telemetry`
 
 Add `telemetry` object under status payload using schema `factory-lens-telemetry.v1`.
 
@@ -162,7 +207,7 @@ Compatibility rules:
 2. Lens clients must render unknown `symptom_id`/`signal_code` cards as raw fallback.
 3. Lens clients should show warning banner: `engine newer than client`.
 4. `warnings` is optional; clients must default missing `warnings` to an empty array.
-5. v0.2.3 assumes one diagnosis report per pair (`pair` scoped). Aggregate multi-pair diagnosis endpoints are future work.
+5. v0.2.4 assumes one diagnosis report per pair (`pair` scoped). Aggregate multi-pair diagnosis endpoints are future work.
 
 ## 12. JSON Schema: `status.telemetry` (`factory-lens-telemetry.v1`)
 

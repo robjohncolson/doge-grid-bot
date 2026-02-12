@@ -666,6 +666,116 @@ class BotEventLogTests(unittest.TestCase):
         self.assertTrue(rt.slots[0].state.long_only)
         self.assertFalse(rt.slots[0].state.short_only)
 
+    def test_status_payload_capacity_uses_internal_fallback_when_kraken_unavailable(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    orders=(
+                        sm.OrderState(
+                            local_id=1,
+                            side="buy",
+                            role="entry",
+                            price=0.0998,
+                            volume=13.0,
+                            trade_id="B",
+                            cycle=1,
+                            txid="TX-ENTRY",
+                            placed_at=999.0,
+                        ),
+                    ),
+                    recovery_orders=(
+                        sm.RecoveryOrder(
+                            recovery_id=1,
+                            side="sell",
+                            price=0.1008,
+                            volume=13.0,
+                            trade_id="A",
+                            cycle=1,
+                            entry_price=0.1,
+                            orphaned_at=900.0,
+                            txid="TX-REC",
+                        ),
+                    ),
+                ),
+            )
+        }
+        rt._kraken_open_orders_current = None
+
+        with mock.patch.object(config, "KRAKEN_OPEN_ORDERS_PER_PAIR_LIMIT", 225):
+            with mock.patch.object(config, "OPEN_ORDER_SAFETY_RATIO", 0.75):
+                payload = rt.status_payload()
+        cfh = payload["capacity_fill_health"]
+        self.assertEqual(cfh["open_orders_source"], "internal_fallback")
+        self.assertEqual(cfh["open_orders_internal"], 2)
+        self.assertEqual(cfh["open_orders_current"], 2)
+        self.assertEqual(cfh["open_orders_safe_cap"], 168)
+        self.assertEqual(cfh["open_order_headroom"], 166)
+
+    def test_partial_fill_open_is_counted_once_per_txid(self):
+        rt = bot.BotRuntime()
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    orders=(
+                        sm.OrderState(
+                            local_id=1,
+                            side="buy",
+                            role="entry",
+                            price=0.0998,
+                            volume=13.0,
+                            trade_id="B",
+                            cycle=1,
+                            txid="TX1",
+                            placed_at=999.0,
+                        ),
+                    ),
+                ),
+            )
+        }
+        row = {"status": "open", "vol_exec": "2", "vol": "13"}
+        with mock.patch.object(rt, "_query_orders_batched", return_value={"TX1": row}):
+            rt._poll_order_status()
+            rt._poll_order_status()
+        self.assertEqual(len(rt._partial_fill_open_events), 1)
+
+    def test_partial_fill_cancel_canary_is_counted(self):
+        rt = bot.BotRuntime()
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    orders=(
+                        sm.OrderState(
+                            local_id=1,
+                            side="buy",
+                            role="entry",
+                            price=0.0998,
+                            volume=13.0,
+                            trade_id="B",
+                            cycle=1,
+                            txid="TX1",
+                            placed_at=999.0,
+                        ),
+                    ),
+                ),
+            )
+        }
+        row = {"status": "canceled", "vol_exec": "1", "vol": "13"}
+        with mock.patch.object(rt, "_query_orders_batched", return_value={"TX1": row}):
+            rt._poll_order_status()
+        self.assertEqual(len(rt._partial_fill_cancel_events), 1)
+        self.assertEqual(len(rt.slots[0].state.orders), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

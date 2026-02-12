@@ -11,6 +11,7 @@ Ground-up DOGE/USD slot-based pair state machine runtime:
 
 from __future__ import annotations
 
+from collections import deque
 import json
 import logging
 import signal
@@ -111,6 +112,16 @@ class BotRuntime:
         self.loop_private_calls = 0
         self._loop_balance_cache: dict | None = None
 
+        # Kraken-first capacity telemetry (pair-filtered open orders).
+        self._kraken_open_orders_current: int | None = None
+        self._kraken_open_orders_ts = 0.0
+
+        # Rolling 24h fill/partial telemetry.
+        self._partial_fill_open_events: deque[float] = deque()
+        self._partial_fill_cancel_events: deque[float] = deque()
+        self._fill_durations_1d: deque[tuple[float, float]] = deque()
+        self._partial_open_seen_txids: set[str] = set()
+
     # ------------------ Config/State ------------------
 
     def _engine_cfg(self, slot: SlotRuntime) -> sm.EngineConfig:
@@ -144,6 +155,67 @@ class BotRuntime:
         if min_cost <= 0 and market_price > 0:
             min_cost = min_vol * market_price
         return min_vol, min_cost
+
+    def _order_matches_runtime_pair(self, row: dict) -> bool:
+        # OpenOrders rows typically carry pair under descr.pair.
+        descr = row.get("descr", {}) if isinstance(row, dict) else {}
+        pair_name = ""
+        if isinstance(descr, dict):
+            pair_name = str(descr.get("pair") or descr.get("pairname") or "").upper()
+        if not pair_name and isinstance(row, dict):
+            pair_name = str(row.get("pair") or "").upper()
+        if not pair_name:
+            # If pair metadata is missing, count conservatively.
+            return True
+
+        target = self.pair.upper()
+        target_norm = target.replace("/", "")
+        pair_norm = pair_name.replace("/", "")
+        alt = target.replace("USD", "/USD")
+        return pair_name in {target, alt} or pair_norm == target_norm
+
+    def _count_pair_open_orders(self, open_orders: dict) -> int:
+        if not isinstance(open_orders, dict):
+            return 0
+        count = 0
+        for row in open_orders.values():
+            if not isinstance(row, dict) or self._order_matches_runtime_pair(row):
+                count += 1
+        return count
+
+    def _trim_rolling_telemetry(self, now: float | None = None) -> None:
+        now = now or _now()
+        cutoff = now - 86400.0
+        while self._partial_fill_open_events and self._partial_fill_open_events[0] < cutoff:
+            self._partial_fill_open_events.popleft()
+        while self._partial_fill_cancel_events and self._partial_fill_cancel_events[0] < cutoff:
+            self._partial_fill_cancel_events.popleft()
+        while self._fill_durations_1d and self._fill_durations_1d[0][0] < cutoff:
+            self._fill_durations_1d.popleft()
+
+    def _record_partial_fill_open(self, ts: float | None = None) -> None:
+        ts = ts or _now()
+        self._partial_fill_open_events.append(ts)
+        self._trim_rolling_telemetry(ts)
+
+    def _record_partial_fill_cancel(self, ts: float | None = None) -> None:
+        ts = ts or _now()
+        self._partial_fill_cancel_events.append(ts)
+        self._trim_rolling_telemetry(ts)
+
+    def _record_fill_duration(self, duration_sec: float, ts: float | None = None) -> None:
+        ts = ts or _now()
+        self._fill_durations_1d.append((ts, max(0.0, float(duration_sec))))
+        self._trim_rolling_telemetry(ts)
+
+    def _fill_duration_stats_1d(self) -> tuple[float | None, float | None]:
+        vals = [d for _, d in self._fill_durations_1d if d >= 0]
+        if not vals:
+            return None, None
+        med = float(median(vals))
+        ordered = sorted(vals)
+        idx = max(0, min(len(ordered) - 1, ceil(0.95 * len(ordered)) - 1))
+        return med, float(ordered[idx])
 
     def _global_snapshot(self) -> dict:
         return {
@@ -252,7 +324,10 @@ class BotRuntime:
     def _get_open_orders(self) -> dict:
         if not self._consume_private_budget(1, "get_open_orders"):
             return {}
-        return kraken_client.get_open_orders()
+        out = kraken_client.get_open_orders()
+        self._kraken_open_orders_current = self._count_pair_open_orders(out)
+        self._kraken_open_orders_ts = _now()
+        return out
 
     def _get_trades_history(self, start: float | None = None) -> dict:
         if not self._consume_private_budget(1, "get_trades_history"):
@@ -295,6 +370,12 @@ class BotRuntime:
         if not self._consume_private_budget(1, "cancel_order"):
             return False
         return kraken_client.cancel_order(txid)
+
+    def _refresh_open_order_telemetry(self) -> None:
+        try:
+            self._get_open_orders()
+        except Exception as e:
+            logger.debug("Open-order telemetry refresh failed: %s", e)
 
     # ------------------ Lifecycle ------------------
 
@@ -885,6 +966,7 @@ class BotRuntime:
             sid, kind, local_id = tx_map[txid]
 
             if status == "closed":
+                self._partial_open_seen_txids.discard(txid)
                 if txid in self.seen_fill_txids:
                     continue
 
@@ -914,6 +996,9 @@ class BotRuntime:
                     if not o:
                         logger.warning("closed order %s not found in slot %s local_id=%s", txid, sid, local_id)
                         continue
+                    closed_ts = _now()
+                    if o.placed_at > 0:
+                        self._record_fill_duration(closed_ts - o.placed_at, closed_ts)
                     supabase_store.save_fill(
                         {
                             "time": _now(),
@@ -934,7 +1019,7 @@ class BotRuntime:
                         price=price,
                         volume=volume,
                         fee=fee,
-                        timestamp=_now(),
+                        timestamp=closed_ts,
                     )
                     self._apply_event(sid, ev, "fill", {"txid": txid, "price": price, "volume": volume})
                     self.seen_fill_txids.add(txid)
@@ -955,7 +1040,29 @@ class BotRuntime:
                     self._apply_event(sid, ev, "recovery_fill", {"txid": txid, "price": price, "volume": volume})
                     self.seen_fill_txids.add(txid)
 
+            elif status == "open":
+                vol_exec = _to_float(row.get("vol_exec"))
+                vol = _to_float(row.get("vol"))
+                if vol_exec > 0 and vol > 0 and vol_exec < vol and txid not in self._partial_open_seen_txids:
+                    self._record_partial_fill_open(_now())
+                    self._partial_open_seen_txids.add(txid)
+
             elif status in ("canceled", "expired"):
+                self._partial_open_seen_txids.discard(txid)
+                vol_exec = _to_float(row.get("vol_exec"))
+                vol = _to_float(row.get("vol"))
+                if vol_exec > 0:
+                    self._record_partial_fill_cancel(_now())
+                    logger.warning(
+                        "PHANTOM_POSITION_CANARY txid=%s kind=%s slot=%s local=%s status=%s vol_exec=%.8f vol=%.8f",
+                        txid,
+                        kind,
+                        sid,
+                        local_id,
+                        status,
+                        vol_exec,
+                        vol,
+                    )
                 if kind == "order":
                     st = self.slots[sid].state
                     if sm.find_order(st, local_id):
@@ -1206,6 +1313,8 @@ class BotRuntime:
                 self._auto_repair_degraded_slot(sid)
 
             self._poll_order_status()
+            # Refresh pair open-order telemetry (Kraken source of truth) when budget allows.
+            self._refresh_open_order_telemetry()
 
             # Pressure notice for orphan growth.
             total_orphans = sum(len(s.state.recovery_orders) for s in self.slots.values())
@@ -1307,13 +1416,16 @@ class BotRuntime:
 
         with self.lock:
             now = _now()
+            self._trim_rolling_telemetry(now)
             slots = []
             total_unrealized_profit = 0.0
+            total_active_orders = 0
             for sid in sorted(self.slots.keys()):
                 st = self.slots[sid].state
                 phase = sm.derive_phase(st)
                 slot_unrealized_profit = 0.0
                 open_orders = []
+                total_active_orders += len(st.orders)
                 for o in st.orders:
                     if o.role == "exit":
                         slot_unrealized_profit += _unrealized_pnl(
@@ -1382,6 +1494,49 @@ class BotRuntime:
             total_loss = sum(s.state.today_realized_loss for s in self.slots.values())
             total_round_trips = sum(s.state.total_round_trips for s in self.slots.values())
             total_orphans = sum(len(s.state.recovery_orders) for s in self.slots.values())
+            internal_open_orders_current = total_active_orders + total_orphans
+            kraken_open_orders_current = self._kraken_open_orders_current
+            if kraken_open_orders_current is None:
+                open_orders_current = internal_open_orders_current
+                open_orders_source = "internal_fallback"
+            else:
+                open_orders_current = int(kraken_open_orders_current)
+                open_orders_source = "kraken"
+
+            pair_open_order_limit = max(1, int(config.KRAKEN_OPEN_ORDERS_PER_PAIR_LIMIT))
+            safety_ratio = float(config.OPEN_ORDER_SAFETY_RATIO)
+            safety_ratio = min(1.0, max(0.1, safety_ratio))
+            open_orders_safe_cap = max(1, int(pair_open_order_limit * safety_ratio))
+            open_order_headroom = open_orders_safe_cap - open_orders_current
+            open_order_utilization_pct = (open_orders_current / open_orders_safe_cap * 100.0) if open_orders_safe_cap > 0 else 0.0
+            orders_per_slot_estimate = (open_orders_current / len(self.slots)) if self.slots else None
+            estimated_slots_remaining = 0
+            if orders_per_slot_estimate and orders_per_slot_estimate > 0 and open_order_headroom > 0:
+                estimated_slots_remaining = int(open_order_headroom // orders_per_slot_estimate)
+
+            partial_fill_open_events_1d = len(self._partial_fill_open_events)
+            partial_fill_cancel_events_1d = len(self._partial_fill_cancel_events)
+            median_fill_seconds_1d, p95_fill_seconds_1d = self._fill_duration_stats_1d()
+
+            if partial_fill_cancel_events_1d > 0 or open_order_headroom < 10:
+                status_band = "stop"
+            elif open_order_headroom < 20:
+                status_band = "caution"
+            else:
+                status_band = "normal"
+
+            blocked_risk_hint: list[str] = []
+            if open_orders_source == "internal_fallback":
+                blocked_risk_hint.append("kraken_open_orders_unavailable")
+            if open_order_headroom < 10:
+                blocked_risk_hint.append("near_open_order_cap")
+            elif open_order_headroom < 20:
+                blocked_risk_hint.append("open_order_caution")
+            if partial_fill_open_events_1d > 0:
+                blocked_risk_hint.append("partial_fill_open_pressure")
+            if partial_fill_cancel_events_1d > 0:
+                blocked_risk_hint.append("partial_fill_cancel_detected")
+
             top_phase = slots[0]["phase"] if slots else "S0"
             pnl_ref_price = self.last_price if self.last_price > 0 else (slots[0]["market_price"] if slots else 0.0)
             total_profit_doge = total_profit / pnl_ref_price if pnl_ref_price > 0 else 0.0
@@ -1405,6 +1560,29 @@ class BotRuntime:
                 "total_round_trips": total_round_trips,
                 "total_orphans": total_orphans,
                 "pnl_reference_price": pnl_ref_price,
+                "capacity_fill_health": {
+                    "open_orders_current": open_orders_current,
+                    "open_orders_source": open_orders_source,
+                    "open_orders_internal": internal_open_orders_current,
+                    "open_orders_kraken": kraken_open_orders_current,
+                    "open_orders_drift": (
+                        None
+                        if kraken_open_orders_current is None
+                        else int(kraken_open_orders_current) - internal_open_orders_current
+                    ),
+                    "open_order_limit_configured": pair_open_order_limit,
+                    "open_orders_safe_cap": open_orders_safe_cap,
+                    "open_order_headroom": open_order_headroom,
+                    "open_order_utilization_pct": open_order_utilization_pct,
+                    "orders_per_slot_estimate": orders_per_slot_estimate,
+                    "estimated_slots_remaining": estimated_slots_remaining,
+                    "partial_fill_open_events_1d": partial_fill_open_events_1d,
+                    "partial_fill_cancel_events_1d": partial_fill_cancel_events_1d,
+                    "median_fill_seconds_1d": median_fill_seconds_1d,
+                    "p95_fill_seconds_1d": p95_fill_seconds_1d,
+                    "status_band": status_band,
+                    "blocked_risk_hint": blocked_risk_hint,
+                },
                 "slots": slots,
             }
 
