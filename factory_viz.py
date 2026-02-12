@@ -286,6 +286,162 @@ FACTORY_HTML = r"""<!doctype html>
 
     let rafPending = false;
     let lastFrameMs = 0;
+    let activeSymptoms = [];
+    let activeEffects = new Set();
+    let slotEffects = {};
+
+    function diagnose(status) {
+      const symptoms = [];
+      const slots = Array.isArray(status && status.slots) ? status.slots : [];
+      const cfh = (status && status.capacity_fill_health) || {};
+      const mode = String((status && status.mode) || '');
+      const priceAgeSec = Number((status && status.price_age_sec) || 0);
+      const partialFillCancel = Number(cfh.partial_fill_cancel_events_1d || 0);
+      const statusBand = String(cfh.status_band || '').toLowerCase();
+      const totalOrphans = Number((status && status.total_orphans) || 0);
+      const slotCount = Number((status && status.slot_count) || slots.length || 0);
+      const s2OrphanAfterSecRaw = Number(status && status.s2_orphan_after_sec);
+      const s2OrphanAfterSec = (Number.isFinite(s2OrphanAfterSecRaw) && s2OrphanAfterSecRaw > 0) ? s2OrphanAfterSecRaw : 1800;
+      const nowSec = Date.now() / 1000;
+
+      if (priceAgeSec > 60 || mode === 'HALTED') {
+        symptoms.push({
+          symptom_id: 'POWER_BLACKOUT',
+          severity: 'crit',
+          priority: 1,
+          summary: mode === 'HALTED'
+            ? 'Bot mode HALTED; factory power is offline'
+            : 'Price feed stale for ' + Math.round(priceAgeSec) + 's',
+          affected_slots: [],
+          visual_effects: ['power_dead', 'red_wash', 'alarm_pulse']
+        });
+      }
+
+      if (statusBand === 'stop' || partialFillCancel > 0) {
+        symptoms.push({
+          symptom_id: 'CIRCUIT_TRIP_RISK',
+          severity: 'crit',
+          priority: 2,
+          summary: partialFillCancel > 0
+            ? 'Partial-fill cancel canary triggered (' + partialFillCancel + ' in 1d)'
+            : 'Capacity status band is STOP',
+          affected_slots: [],
+          visual_effects: ['circuit_spark', 'hazard_icon']
+        });
+      }
+
+      if (priceAgeSec > 30 || mode === 'PAUSED') {
+        symptoms.push({
+          symptom_id: 'POWER_BROWNOUT',
+          severity: 'crit',
+          priority: 3,
+          summary: mode === 'PAUSED'
+            ? 'Bot mode PAUSED; throughput reduced'
+            : 'Price feed aging (' + Math.round(priceAgeSec) + 's)',
+          affected_slots: [],
+          visual_effects: ['power_dim', 'amber_wash']
+        });
+      }
+
+      for (const slot of slots) {
+        if (String(slot.phase || '') !== 'S2') continue;
+
+        const entered = Number(slot.s2_entered_at);
+        if (Number.isFinite(entered) && entered > 0) {
+          const elapsed = Math.max(0, nowSec - entered);
+          const ratio = elapsed / s2OrphanAfterSec;
+          if (ratio <= 0.5) continue;
+
+          symptoms.push({
+            symptom_id: 'BELT_JAM',
+            severity: 'warn',
+            priority: 4,
+            summary: 'Slot #' + slot.slot_id + ' stuck in S2 for '
+              + Math.round(elapsed / 60) + 'm (' + Math.round(ratio * 100) + '% of timeout)',
+            affected_slots: [slot.slot_id],
+            visual_effects: ['conveyor_stop', 'warning_lamp']
+          });
+          continue;
+        }
+
+        symptoms.push({
+          symptom_id: 'BELT_JAM',
+          severity: 'warn',
+          priority: 4,
+          summary: 'Slot #' + slot.slot_id + ' in S2 (timing unavailable)',
+          affected_slots: [slot.slot_id],
+          visual_effects: ['conveyor_stop', 'warning_lamp']
+        });
+      }
+
+      for (const slot of slots) {
+        if (!slot.long_only && !slot.short_only) continue;
+        const modeTag = slot.long_only ? '[LO]' : '[SO]';
+        symptoms.push({
+          symptom_id: 'LANE_STARVATION',
+          severity: 'warn',
+          priority: 5,
+          summary: 'Slot #' + slot.slot_id + ' degraded ' + modeTag,
+          affected_slots: [slot.slot_id],
+          visual_effects: ['machine_dark', 'input_flash_empty']
+        });
+      }
+
+      if (slotCount > 0 && totalOrphans > slotCount * 2) {
+        symptoms.push({
+          symptom_id: 'RECOVERY_BACKLOG',
+          severity: 'warn',
+          priority: 6,
+          summary: 'Recovery backlog: ' + totalOrphans + ' orphans across ' + slotCount + ' slots',
+          affected_slots: [],
+          visual_effects: ['belt_overflow']
+        });
+      }
+
+      symptoms.sort((a, b) => a.priority - b.priority);
+
+      if (symptoms.length === 0) {
+        const allS0 = slots.every((slot) => String(slot.phase || '') === 'S0');
+        const noDegraded = slots.every((slot) => !slot.long_only && !slot.short_only);
+        if (allS0 && noDegraded && totalOrphans === 0) {
+          symptoms.push({
+            symptom_id: 'IDLE_NORMAL',
+            severity: 'info',
+            priority: 7,
+            summary: 'Factory running normally',
+            affected_slots: [],
+            visual_effects: []
+          });
+        }
+      }
+
+      return symptoms;
+    }
+
+    function setActiveSymptoms(symptoms) {
+      activeSymptoms = Array.isArray(symptoms) ? symptoms.slice() : [];
+      activeEffects = new Set();
+      slotEffects = {};
+
+      for (const symptom of activeSymptoms) {
+        const effects = Array.isArray(symptom.visual_effects) ? symptom.visual_effects : [];
+        for (const effectName of effects) {
+          activeEffects.add(effectName);
+        }
+        const affected = Array.isArray(symptom.affected_slots) ? symptom.affected_slots : [];
+        for (const slotId of affected) {
+          if (!slotEffects[slotId]) slotEffects[slotId] = new Set();
+          for (const effectName of effects) {
+            slotEffects[slotId].add(effectName);
+          }
+        }
+      }
+    }
+
+    function slotHasEffect(slotId, effectName) {
+      const sfx = slotEffects[slotId];
+      return !!(sfx && sfx.has(effectName));
+    }
 
     function fmt(n, digits = 2) {
       if (n === null || n === undefined || Number.isNaN(Number(n))) return '-';
@@ -420,7 +576,12 @@ FACTORY_HTML = r"""<!doctype html>
     }
 
     function drawPowerLine(status) {
-      const color = powerColor(status.price_age_sec);
+      let color = powerColor(status.price_age_sec);
+      if (activeEffects.has('power_dead')) {
+        color = 'rgba(84,91,102,0.55)';
+      } else if (activeEffects.has('power_dim')) {
+        color = 'rgba(210,153,34,0.65)';
+      }
       const y = layout.powerY;
 
       ctx.strokeStyle = color;
@@ -446,13 +607,23 @@ FACTORY_HTML = r"""<!doctype html>
       );
     }
 
-    function drawChest(box, title, full, subtext) {
+    function drawChest(box, title, full, subtext, opts = {}) {
+      const flashEmpty = !!opts.flashEmpty;
+      const nowMs = Number(opts.nowMs || 0);
+      const flashOn = !flashEmpty || (Math.floor(nowMs / 320) % 2 === 0);
+
       ctx.fillStyle = 'rgba(22,27,34,0.9)';
       roundRect(box.x, box.y, box.w, box.h, 8);
       ctx.fill();
 
       ctx.lineWidth = 2;
-      ctx.strokeStyle = full ? COLORS.good : COLORS.line;
+      if (full) {
+        ctx.strokeStyle = COLORS.good;
+      } else if (flashEmpty) {
+        ctx.strokeStyle = flashOn ? COLORS.warn : 'rgba(210,153,34,0.15)';
+      } else {
+        ctx.strokeStyle = COLORS.line;
+      }
       roundRect(box.x, box.y, box.w, box.h, 8);
       ctx.stroke();
 
@@ -464,7 +635,13 @@ FACTORY_HTML = r"""<!doctype html>
       ctx.fillText('IN', box.x + 10, box.y + 38);
       ctx.fillText('chest', box.x + 10, box.y + 53);
 
-      ctx.fillStyle = full ? 'rgba(46,160,67,0.22)' : 'rgba(139,148,158,0.10)';
+      if (full) {
+        ctx.fillStyle = 'rgba(46,160,67,0.22)';
+      } else if (flashEmpty) {
+        ctx.fillStyle = flashOn ? 'rgba(210,153,34,0.22)' : 'rgba(139,148,158,0.10)';
+      } else {
+        ctx.fillStyle = 'rgba(139,148,158,0.10)';
+      }
       roundRect(box.x + 70, box.y + 12, 32, 56, 5);
       ctx.fill();
 
@@ -490,6 +667,9 @@ FACTORY_HTML = r"""<!doctype html>
       const border = slotPhaseColor(phase);
       const isHover = hoverSlotId === slot.slot_id;
       const isSelected = selectedSlotId === slot.slot_id;
+      const hasWarningLamp = slotHasEffect(slot.slot_id, 'warning_lamp');
+      const hasMachineDark = slotHasEffect(slot.slot_id, 'machine_dark');
+      const hasConveyorStop = slotHasEffect(slot.slot_id, 'conveyor_stop');
 
       ctx.fillStyle = 'rgba(22,27,34,0.94)';
       roundRect(node.x, node.y, node.w, node.h, 12);
@@ -514,6 +694,22 @@ FACTORY_HTML = r"""<!doctype html>
         ctx.fill();
       }
 
+      if (hasMachineDark && (slot.long_only || slot.short_only)) {
+        ctx.fillStyle = 'rgba(0,0,0,0.30)';
+        const innerX = node.x + 8;
+        const innerY = node.y + 34;
+        const innerW = node.w - 16;
+        const darkW = Math.floor(innerW * 0.5);
+        if (slot.long_only) {
+          roundRect(innerX, innerY, darkW, 56, 8);
+          ctx.fill();
+        }
+        if (slot.short_only) {
+          roundRect(innerX + innerW - darkW, innerY, darkW, 56, 8);
+          ctx.fill();
+        }
+      }
+
       ctx.fillStyle = COLORS.ink;
       ctx.font = '700 14px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
       ctx.fillText('#' + slot.slot_id, node.x + 10, node.y + 22);
@@ -522,6 +718,9 @@ FACTORY_HTML = r"""<!doctype html>
 
       let lampColor = COLORS.good;
       if (slot.long_only || slot.short_only) lampColor = COLORS.warn;
+      if (hasWarningLamp) {
+        lampColor = (Math.floor(nowSec * 4) % 2 === 0) ? COLORS.warn : COLORS.bad;
+      }
 
       const s2Ratio = phase === 'S2' ? getS2Ratio(slot, status) : null;
       if (s2Ratio !== null && s2Ratio > 0.75) {
@@ -549,6 +748,15 @@ FACTORY_HTML = r"""<!doctype html>
         ctx.fillStyle = COLORS.bad;
         ctx.font = '10px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
         ctx.fillText('S2 ' + Math.round(s2Ratio * 100) + '%', node.x + node.w - 56, node.y + node.h + 15);
+      }
+
+      if (hasConveyorStop) {
+        ctx.strokeStyle = COLORS.bad;
+        ctx.lineWidth = 1.6;
+        ctx.setLineDash([6, 4]);
+        roundRect(node.x + 8, node.y + node.h - 18, node.w - 16, 12, 6);
+        ctx.stroke();
+        ctx.setLineDash([]);
       }
 
       machineRects.push({
@@ -584,11 +792,20 @@ FACTORY_HTML = r"""<!doctype html>
       ctx.strokeStyle = 'rgba(88,166,255,0.38)';
       for (const node of nodes) {
         const mx = node.x + node.w * 0.5;
+        const isStopped = slotHasEffect(node.slot.slot_id, 'conveyor_stop');
+        if (isStopped) {
+          ctx.strokeStyle = 'rgba(248,81,73,0.95)';
+          ctx.setLineDash([6, 4]);
+        } else {
+          ctx.strokeStyle = 'rgba(88,166,255,0.38)';
+          ctx.setLineDash([]);
+        }
         ctx.beginPath();
         ctx.moveTo(mx, node.y + node.h + 4);
         ctx.lineTo(mx, layout.recycle.y - 4);
         ctx.stroke();
       }
+      ctx.setLineDash([]);
 
       ctx.strokeStyle = 'rgba(88,166,255,0.50)';
       ctx.beginPath();
@@ -627,14 +844,15 @@ FACTORY_HTML = r"""<!doctype html>
     function drawRecyclingBelt(status) {
       const belt = layout.recycle;
       const total = Number(status.total_orphans || 0);
+      const overflow = activeEffects.has('belt_overflow');
 
       ctx.fillStyle = 'rgba(22,27,34,0.8)';
       roundRect(belt.x, belt.y, belt.w, belt.h, 8);
       ctx.fill();
 
-      ctx.strokeStyle = 'rgba(210,153,34,0.70)';
+      ctx.strokeStyle = overflow ? 'rgba(248,81,73,0.88)' : 'rgba(210,153,34,0.70)';
       ctx.lineWidth = 2;
-      ctx.setLineDash([10, 7]);
+      ctx.setLineDash(overflow ? [6, 4] : [10, 7]);
       roundRect(belt.x, belt.y, belt.w, belt.h, 8);
       ctx.stroke();
       ctx.setLineDash([]);
@@ -643,31 +861,78 @@ FACTORY_HTML = r"""<!doctype html>
       ctx.font = '11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
       ctx.fillText('RECYCLING BELT', belt.x + 10, belt.y - 8);
 
-      const dots = Math.min(40, Math.max(0, total));
+      const dots = overflow
+        ? Math.min(72, Math.max(0, total * 2 + 6))
+        : Math.min(40, Math.max(0, total));
       const innerX = belt.x + 10;
       const innerW = belt.w - 20;
       for (let i = 0; i < dots; i += 1) {
         const t = dots <= 1 ? 0.5 : i / (dots - 1);
         const x = innerX + innerW * t;
         const y = belt.y + belt.h * 0.5;
-        ctx.fillStyle = total > 12 ? COLORS.bad : COLORS.warn;
+        ctx.fillStyle = overflow ? COLORS.bad : (total > 12 ? COLORS.bad : COLORS.warn);
         ctx.beginPath();
         ctx.arc(x, y, 4, 0, Math.PI * 2);
         ctx.fill();
       }
     }
 
-    function drawModeOverlay(status) {
-      if (!status || !status.mode) return;
-      if (status.mode === 'PAUSED') {
+    function drawModeOverlay(nowMs) {
+      const hasRedWash = activeEffects.has('red_wash');
+      const hasAmberWash = activeEffects.has('amber_wash') && !hasRedWash;
+      if (hasAmberWash) {
         ctx.fillStyle = 'rgba(210,153,34,0.16)';
         ctx.fillRect(0, 0, worldW, worldH);
-      } else if (status.mode === 'HALTED') {
+      }
+      if (hasRedWash) {
         ctx.fillStyle = 'rgba(248,81,73,0.18)';
         ctx.fillRect(0, 0, worldW, worldH);
+      }
+      if (activeEffects.has('alarm_pulse')) {
+        const pulse = 0.5 + 0.5 * Math.sin(nowMs / 220);
+        const cx = worldW * 0.5;
+        const cy = 96;
+        const radius = 20 + pulse * 6;
+        ctx.strokeStyle = 'rgba(248,81,73,' + (0.45 + pulse * 0.45).toFixed(3) + ')';
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+        ctx.stroke();
         ctx.fillStyle = COLORS.bad;
         ctx.font = '700 22px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
-        ctx.fillText('ALARM', worldW * 0.5 - 42, 90);
+        ctx.fillText('ALARM', cx - 42, cy + 7);
+      }
+    }
+
+    function drawCircuitEffects(nowMs) {
+      const hasSpark = activeEffects.has('circuit_spark');
+      const hasHazard = activeEffects.has('hazard_icon');
+      if (!hasSpark && !hasHazard) return;
+
+      const anchorX = worldW - 220;
+      const anchorY = worldH - 34;
+
+      if (hasHazard) {
+        ctx.fillStyle = 'rgba(248,81,73,0.90)';
+        ctx.beginPath();
+        ctx.moveTo(anchorX, anchorY - 20);
+        ctx.lineTo(anchorX - 14, anchorY + 6);
+        ctx.lineTo(anchorX + 14, anchorY + 6);
+        ctx.closePath();
+        ctx.fill();
+        ctx.fillStyle = '#0d1117';
+        ctx.font = '700 14px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+        ctx.fillText('!', anchorX - 3.5, anchorY + 2);
+      }
+
+      if (hasSpark) {
+        for (let i = 0; i < 7; i += 1) {
+          const phase = nowMs * 0.012 + i * 1.43;
+          const px = anchorX - 126 + i * 20;
+          const py = anchorY - 12 + Math.sin(phase) * 7;
+          const size = 2.4 + Math.abs(Math.sin(phase * 1.7)) * 1.6;
+          drawDiamond(px, py, size, i % 2 === 0 ? COLORS.warn : COLORS.bad);
+        }
       }
     }
 
@@ -687,32 +952,29 @@ FACTORY_HTML = r"""<!doctype html>
       document.getElementById('pairBadge').textContent = String(status.pair || '-');
     }
 
-    function renderNotifStrip(status) {
-      let text = 'Factory running normally';
-      let color = COLORS.good;
-
-      if (status.mode === 'HALTED') {
-        text = 'CRIT POWER_BLACKOUT: mode HALTED';
-        color = COLORS.bad;
-      } else if (status.mode === 'PAUSED') {
-        text = 'WARN POWER_BROWNOUT: mode PAUSED';
-        color = COLORS.warn;
-      } else if (Number(status.price_age_sec || 0) > 60) {
-        text = 'CRIT POWER_BLACKOUT: stale price age ' + Math.round(Number(status.price_age_sec || 0)) + 's';
-        color = COLORS.bad;
-      } else if (Number(status.price_age_sec || 0) > 30) {
-        text = 'WARN POWER_BROWNOUT: aging price age ' + Math.round(Number(status.price_age_sec || 0)) + 's';
-        color = COLORS.warn;
-      } else if (status.capacity_fill_health && status.capacity_fill_health.status_band === 'stop') {
-        text = 'CRIT CIRCUIT_TRIP_RISK: capacity band STOP';
-        color = COLORS.bad;
-      } else if (Number(status.total_orphans || 0) > 0) {
-        text = 'WARN RECOVERY_BACKLOG: orphan exits ' + Number(status.total_orphans || 0);
-        color = COLORS.warn;
+    function renderNotifStrip() {
+      const strip = document.getElementById('notifStrip');
+      if (!activeSymptoms.length) {
+        strip.textContent = '... waiting for diagnosis';
+        strip.style.borderColor = COLORS.line;
+        strip.style.color = COLORS.muted;
+        return;
       }
 
-      const strip = document.getElementById('notifStrip');
-      strip.textContent = text;
+      const top = activeSymptoms[0];
+      if (activeSymptoms.length === 1 && top.symptom_id === 'IDLE_NORMAL') {
+        strip.textContent = 'OK Factory running normally';
+        strip.style.borderColor = COLORS.good;
+        strip.style.color = COLORS.good;
+        return;
+      }
+
+      const icon = top.severity === 'crit' ? '!!' : (top.severity === 'warn' ? '!' : 'OK');
+      const summary = String(top.summary || '');
+      strip.textContent = icon + ' ' + top.symptom_id + ': ' + summary;
+      const color = top.severity === 'crit'
+        ? COLORS.bad
+        : (top.severity === 'warn' ? COLORS.warn : COLORS.good);
       strip.style.borderColor = color;
       strip.style.color = color;
     }
@@ -815,9 +1077,24 @@ FACTORY_HTML = r"""<!doctype html>
       const slots = Array.isArray(statusData.slots) ? statusData.slots : [];
       const hasNonLongOnly = slots.length === 0 ? true : slots.some((s) => !s.long_only);
       const hasNonShortOnly = slots.length === 0 ? true : slots.some((s) => !s.short_only);
+      const flashInputs = activeEffects.has('input_flash_empty');
+      const flashUsd = flashInputs && slots.some((s) => s.short_only);
+      const flashDoge = flashInputs && slots.some((s) => s.long_only);
 
-      drawChest(layout.usdChest, 'USD', hasNonLongOnly, hasNonLongOnly ? 'supply ok' : 'starved');
-      drawChest(layout.dogeChest, 'DOGE', hasNonShortOnly, hasNonShortOnly ? 'supply ok' : 'starved');
+      drawChest(
+        layout.usdChest,
+        'USD',
+        hasNonLongOnly,
+        hasNonLongOnly ? 'supply ok' : 'starved',
+        {flashEmpty: flashUsd, nowMs}
+      );
+      drawChest(
+        layout.dogeChest,
+        'DOGE',
+        hasNonShortOnly,
+        hasNonShortOnly ? 'supply ok' : 'starved',
+        {flashEmpty: flashDoge, nowMs}
+      );
 
       drawConveyors(layout.positions);
       for (const node of layout.positions) {
@@ -826,7 +1103,8 @@ FACTORY_HTML = r"""<!doctype html>
 
       drawOutputChest(statusData);
       drawRecyclingBelt(statusData);
-      drawModeOverlay(statusData);
+      drawModeOverlay(nowMs);
+      drawCircuitEffects(nowMs);
     }
 
     function scheduleFrame() {
@@ -858,13 +1136,14 @@ FACTORY_HTML = r"""<!doctype html>
         const next = await res.json();
         statusData = next;
         layout = computeLayout(next);
+        setActiveSymptoms(diagnose(next));
 
         if (selectedSlotId !== null && !getSlotById(selectedSlotId)) {
           selectedSlotId = null;
         }
 
         renderStatusBar(next);
-        renderNotifStrip(next);
+        renderNotifStrip();
         renderDetailPanel();
 
         if (!refreshStatus._centered) {
