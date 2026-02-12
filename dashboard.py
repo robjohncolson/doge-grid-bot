@@ -357,7 +357,7 @@ DASHBOARD_HTML = """<!doctype html>
 <pre>+- Keybindings -------------------------+
 |                                       |
 |  NAVIGATION        ACTIONS            |
-|  1-9   slot jump   p    pause/resume  |
+|  1-9   slot #jump  p    pause/resume  |
 |  [/]   prev/next   +    add slot      |
 |  gg    first slot  -    close next    |
 |  G     last slot   .    refresh       |
@@ -368,7 +368,7 @@ DASHBOARD_HTML = """<!doctype html>
 |  COMMAND BAR                          |
 |  :pause  :resume  :add  :close        |
 |  :set entry N  :set profit N          |
-|  :jump N                              |
+|  :jump N (slot #)                     |
 |  Tab=complete  up/down=history  Esc=close |
 |                                       |
 +-------------------- Esc to close -----+</pre>
@@ -487,11 +487,12 @@ DASHBOARD_HTML = """<!doctype html>
       renderSelected(state);
     }
 
-    function jumpToSlotIndex(indexOneBased) {
+    function jumpToSlotId(slotId) {
       const slots = getSlots();
       if (!slots.length) return false;
-      if (indexOneBased < 1 || indexOneBased > slots.length) return false;
-      selectedSlot = slots[indexOneBased - 1].slot_id;
+      const slot = slots.find((x) => x.slot_id === slotId);
+      if (!slot) return false;
+      selectedSlot = slot.slot_id;
       applySelectedSlotRender();
       return true;
     }
@@ -549,9 +550,9 @@ DASHBOARD_HTML = """<!doctype html>
 
       if (verb === 'jump') {
         if (tokens.length < 2) return {error: 'usage: :jump <N>'};
-        const slotIndex = parseNonNegativeInt(tokens[1]);
-        if (slotIndex === null || slotIndex <= 0) return {error: 'jump target must be a positive integer'};
-        return {type: 'jump', slotIndex};
+        const slotId = parseNonNegativeInt(tokens[1]);
+        if (slotId === null) return {error: 'jump target must be a non-negative integer'};
+        return {type: 'jump', slotId};
       }
 
       if (verb === 'set') {
@@ -786,10 +787,10 @@ DASHBOARD_HTML = """<!doctype html>
       pushCommandHistory(rawInput);
 
       if (parsed.type === 'jump') {
-        if (!jumpToSlotIndex(parsed.slotIndex)) {
-          showToast(`slot ${parsed.slotIndex} not found`, 'error');
+        if (!jumpToSlotId(parsed.slotId)) {
+          showToast(`slot #${parsed.slotId} not found`, 'error');
         } else {
-          showToast(`jumped to slot ${parsed.slotIndex}`, 'info');
+          showToast(`jumped to slot #${parsed.slotId}`, 'info');
         }
         return;
       }
@@ -1004,7 +1005,10 @@ DASHBOARD_HTML = """<!doctype html>
     function handleNormalModeKey(event) {
       const key = event.key;
       if (/^[1-9]$/.test(key)) {
-        jumpToSlotIndex(Number(key));
+        const slotId = Number(key);
+        if (!jumpToSlotId(slotId)) {
+          showToast(`slot #${slotId} not found`, 'error');
+        }
         clearChordBuffer();
         return;
       }
