@@ -200,6 +200,15 @@ FACTORY_HTML = r"""<!doctype html>
       color: var(--ink);
       font-variant-numeric: tabular-nums;
     }
+    #modeDot {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: var(--line);
+      margin-right: 6px;
+      vertical-align: middle;
+    }
     #addBtn {
       border: 1px solid var(--line);
       border-radius: 8px;
@@ -330,7 +339,7 @@ FACTORY_HTML = r"""<!doctype html>
   <canvas id="factory"></canvas>
 
   <div id="hudTop">
-    <div id="title">Factory Lens F4</div>
+    <div id="title">Factory Lens F5</div>
     <div id="pairBadge">-</div>
     <span id="kbMode">KB NORMAL</span>
   </div>
@@ -347,7 +356,7 @@ FACTORY_HTML = r"""<!doctype html>
   <div id="statusBar">
     <div class="left">
       <span>Capacity <span id="capText" class="value">-</span></span>
-      <span>Band <span id="bandText" class="value">-</span></span>
+      <span><span id="modeDot"></span>Band <span id="bandText" class="value">-</span></span>
       <span>Slots <span id="slotsText" class="value">-</span></span>
       <span>Profit <span id="profitText" class="value">-</span></span>
     </div>
@@ -436,8 +445,15 @@ FACTORY_HTML = r"""<!doctype html>
     let hoverSlotId = null;
     let selectedSlotId = null;
     let machineRects = [];
+    let recoveryDotPositions = [];
+    let tooltipText = '';
+    let tooltipX = 0;
+    let tooltipY = 0;
 
     let dragging = false;
+    let dragFromEmpty = false;
+    let dragStartMs = 0;
+    let dragDistance = 0;
     let dragLastX = 0;
     let dragLastY = 0;
 
@@ -692,9 +708,12 @@ FACTORY_HTML = r"""<!doctype html>
       return Number(n).toFixed(digits);
     }
 
-    function showToast(text) {
+    function showToast(text, type = 'info') {
       const el = document.getElementById('toast');
       el.textContent = String(text || 'ok');
+      if (type === 'success') el.style.borderLeftColor = COLORS.good;
+      else if (type === 'error') el.style.borderLeftColor = COLORS.bad;
+      else el.style.borderLeftColor = COLORS.accent;
       el.style.display = 'block';
       window.clearTimeout(showToast._t);
       showToast._t = window.setTimeout(() => {
@@ -911,11 +930,11 @@ FACTORY_HTML = r"""<!doctype html>
           headers: {'Content-Type': 'application/json'},
           body
         });
-        showToast(out.message || 'ok');
+        showToast(out.message || 'ok', 'success');
         await refreshStatus();
         return true;
       } catch (err) {
-        showToast((err && err.message) ? err.message : 'request failed');
+        showToast((err && err.message) ? err.message : 'request failed', 'error');
         return false;
       }
     }
@@ -1072,7 +1091,7 @@ FACTORY_HTML = r"""<!doctype html>
     async function executeCommand(rawInput) {
       const parsed = parseCommand(rawInput);
       if (parsed.error) {
-        showToast(parsed.error);
+        showToast(parsed.error, 'error');
         return;
       }
       if (parsed.type === 'noop') return;
@@ -1081,9 +1100,9 @@ FACTORY_HTML = r"""<!doctype html>
 
       if (parsed.type === 'jump') {
         if (!jumpToSlotId(parsed.slotId)) {
-          showToast('slot #' + parsed.slotId + ' not found');
+          showToast('slot #' + parsed.slotId + ' not found', 'error');
         } else {
-          showToast('jumped to slot #' + parsed.slotId);
+          showToast('jumped to slot #' + parsed.slotId, 'info');
         }
         return;
       }
@@ -1128,7 +1147,7 @@ FACTORY_HTML = r"""<!doctype html>
       if (/^[1-9]$/.test(key)) {
         const idx = Number(key) - 1;
         if (!jumpToSlotIndex(idx)) {
-          showToast('slot index #' + key + ' not found');
+          showToast('slot index #' + key + ' not found', 'error');
         }
         clearChordBuffer();
         return;
@@ -1266,6 +1285,56 @@ FACTORY_HTML = r"""<!doctype html>
       return Math.max(lo, Math.min(hi, v));
     }
 
+    function pointInBox(x, y, box) {
+      if (!box) return false;
+      return x >= box.x && x <= box.x + box.w && y >= box.y && y <= box.y + box.h;
+    }
+
+    function easeOutBack(t) {
+      const c1 = 1.70158;
+      const c3 = c1 + 1;
+      const p = clamp(t, 0, 1) - 1;
+      return 1 + c3 * p * p * p + c1 * p * p;
+    }
+
+    function hitTestRecoveryDot(worldX, worldY) {
+      for (let i = recoveryDotPositions.length - 1; i >= 0; i -= 1) {
+        const dot = recoveryDotPositions[i];
+        const dx = worldX - dot.x;
+        const dy = worldY - dot.y;
+        if (dx * dx + dy * dy <= 36) return dot;
+      }
+      return null;
+    }
+
+    function drawTooltip() {
+      if (!tooltipText) return;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.font = '12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+      const padX = 8;
+      const padY = 6;
+      const w = Math.ceil(ctx.measureText(tooltipText).width) + padX * 2;
+      const h = 24;
+
+      let x = tooltipX + 14;
+      let y = tooltipY + 16;
+      if (x + w + 8 > viewportW) x = tooltipX - w - 14;
+      if (y + h + 8 > viewportH) y = tooltipY - h - 14;
+      x = clamp(x, 8, viewportW - w - 8);
+      y = clamp(y, 8, viewportH - h - 8);
+
+      ctx.fillStyle = 'rgba(13,17,23,0.95)';
+      roundRect(x, y, w, h, 7);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(88,166,255,0.45)';
+      ctx.lineWidth = 1;
+      roundRect(x, y, w, h, 7);
+      ctx.stroke();
+
+      ctx.fillStyle = COLORS.ink;
+      ctx.fillText(tooltipText, x + padX, y + h - padY - 2);
+    }
+
     function updateCanvasSize() {
       viewportW = window.innerWidth;
       viewportH = window.innerHeight;
@@ -1298,21 +1367,22 @@ FACTORY_HTML = r"""<!doctype html>
 
     function computeLayout(status) {
       const slots = Array.isArray(status && status.slots) ? status.slots : [];
-      const machineW = 140;
-      const machineH = 100;
-      const gap = 40;
-      const maxPerRow = 6;
-      const rowGap = 140;
+      const compact = slots.length >= 20;
+      const machineW = compact ? 90 : 140;
+      const machineH = compact ? 65 : 100;
+      const gap = compact ? 20 : 40;
+      const maxPerRow = compact ? 10 : 6;
+      const rowGap = compact ? 95 : 140;
 
       const cols = Math.max(1, Math.min(maxPerRow, slots.length || 1));
       const rows = Math.max(1, Math.ceil((slots.length || 1) / maxPerRow));
 
-      const leftPad = 230;
-      const topPad = 140;
+      const leftPad = compact ? 180 : 230;
+      const topPad = compact ? 116 : 140;
 
       const machineBandW = cols * machineW + (cols - 1) * gap;
-      worldW = Math.max(800, leftPad + machineBandW + 330);
-      worldH = Math.max(500, topPad + rows * machineH + (rows - 1) * rowGap + 230);
+      worldW = Math.max(compact ? 900 : 800, leftPad + machineBandW + (compact ? 250 : 330));
+      worldH = Math.max(compact ? 520 : 500, topPad + rows * machineH + (rows - 1) * rowGap + (compact ? 200 : 230));
 
       const positions = [];
       for (let i = 0; i < slots.length; i += 1) {
@@ -1338,9 +1408,12 @@ FACTORY_HTML = r"""<!doctype html>
         powerX2: worldW - 30,
         usdChest: {x: 44, y: firstY, w: 112, h: 82},
         dogeChest: {x: 44, y: secondY, w: 112, h: 82},
-        outputChest: {x: worldW - 178, y: firstY + 40, w: 120, h: 92},
-        recycle: {x: 220, y: worldH - 110, w: Math.max(360, worldW - 440), h: 36},
-        positions
+        outputChest: {x: worldW - 178, y: firstY + (compact ? 26 : 40), w: 120, h: 92},
+        recycle: {x: compact ? 180 : 220, y: worldH - 110, w: Math.max(compact ? 420 : 360, worldW - (compact ? 360 : 440)), h: 36},
+        positions,
+        compact,
+        machineW,
+        machineH
       };
     }
 
@@ -1467,56 +1540,86 @@ FACTORY_HTML = r"""<!doctype html>
       const slot = node.slot;
       const phase = String(slot.phase || 'S0');
       const border = slotPhaseColor(phase);
+      const compact = !!(layout && layout.compact);
       const isHover = hoverSlotId === slot.slot_id;
       const isSelected = selectedSlotId === slot.slot_id;
       const hasWarningLamp = slotHasEffect(slot.slot_id, 'warning_lamp');
       const hasMachineDark = slotHasEffect(slot.slot_id, 'machine_dark');
       const hasConveyorStop = slotHasEffect(slot.slot_id, 'conveyor_stop');
+      const r = compact ? 9 : 12;
+      const pad = compact ? 5 : 8;
+      const headerH = compact ? 18 : 32;
+      const innerX = node.x + pad;
+      const innerY = node.y + headerH;
+      const innerW = node.w - pad * 2;
+      const innerH = Math.max(12, node.h - headerH - pad);
+      const laneHalfW = Math.max(8, Math.floor(innerW * 0.5));
 
       ctx.fillStyle = 'rgba(22,27,34,0.94)';
-      roundRect(node.x, node.y, node.w, node.h, 12);
+      roundRect(node.x, node.y, node.w, node.h, r);
       ctx.fill();
 
+      if (isSelected) {
+        ctx.save();
+        ctx.strokeStyle = 'rgba(88,166,255,0.95)';
+        ctx.shadowColor = 'rgba(88,166,255,0.45)';
+        ctx.shadowBlur = 11;
+        ctx.lineWidth = 2;
+        roundRect(node.x - 3, node.y - 3, node.w + 6, node.h + 6, r + 2);
+        ctx.stroke();
+        ctx.restore();
+      }
+
       ctx.strokeStyle = border;
-      ctx.lineWidth = isSelected ? 4 : isHover ? 3 : 2;
-      roundRect(node.x, node.y, node.w, node.h, 12);
+      ctx.lineWidth = isHover ? 3 : 2;
+      roundRect(node.x, node.y, node.w, node.h, r);
       ctx.stroke();
 
       if (phase === 'S1a') {
         ctx.fillStyle = 'rgba(210,153,34,0.18)';
-        roundRect(node.x + 8, node.y + 34, 56, 56, 8);
+        roundRect(innerX, innerY, laneHalfW, innerH, compact ? 5 : 8);
         ctx.fill();
       } else if (phase === 'S1b') {
         ctx.fillStyle = 'rgba(210,153,34,0.18)';
-        roundRect(node.x + node.w - 64, node.y + 34, 56, 56, 8);
+        roundRect(innerX + innerW - laneHalfW, innerY, laneHalfW, innerH, compact ? 5 : 8);
         ctx.fill();
       } else if (phase === 'S2') {
         ctx.fillStyle = 'rgba(248,81,73,0.16)';
-        roundRect(node.x + 8, node.y + 34, node.w - 16, 56, 8);
+        roundRect(innerX, innerY, innerW, innerH, compact ? 5 : 8);
         ctx.fill();
       }
 
       if (hasMachineDark && (slot.long_only || slot.short_only)) {
         ctx.fillStyle = 'rgba(0,0,0,0.30)';
-        const innerX = node.x + 8;
-        const innerY = node.y + 34;
-        const innerW = node.w - 16;
         const darkW = Math.floor(innerW * 0.5);
         if (slot.long_only) {
-          roundRect(innerX, innerY, darkW, 56, 8);
+          roundRect(innerX, innerY, darkW, innerH, compact ? 5 : 8);
           ctx.fill();
         }
         if (slot.short_only) {
-          roundRect(innerX + innerW - darkW, innerY, darkW, 56, 8);
+          roundRect(innerX + innerW - darkW, innerY, darkW, innerH, compact ? 5 : 8);
           ctx.fill();
         }
       }
 
       ctx.fillStyle = COLORS.ink;
-      ctx.font = '700 14px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
-      ctx.fillText('#' + slot.slot_id, node.x + 10, node.y + 22);
-      ctx.font = '12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
-      ctx.fillText(phase === 'S0' ? 'S0 idle' : phase, node.x + 10, node.y + 40);
+      if (compact) {
+        ctx.font = '700 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+        ctx.fillText('#' + slot.slot_id, node.x + 7, node.y + 13);
+        const badgeText = phase === 'S0' ? 'S0' : phase;
+        const badgeW = Math.max(16, Math.ceil(ctx.measureText(badgeText).width) + 8);
+        ctx.fillStyle = 'rgba(255,255,255,0.08)';
+        roundRect(node.x + node.w - badgeW - 6, node.y + 5, badgeW, 12, 5);
+        ctx.fill();
+        ctx.fillStyle = border;
+        ctx.font = '700 9px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+        ctx.fillText(badgeText, node.x + node.w - badgeW - 2, node.y + 14);
+      } else {
+        ctx.font = '700 14px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+        ctx.fillText('#' + slot.slot_id, node.x + 10, node.y + 22);
+        ctx.font = '12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+        ctx.fillText(phase === 'S0' ? 'S0 idle' : phase, node.x + 10, node.y + 40);
+      }
 
       let lampColor = COLORS.good;
       if (slot.long_only || slot.short_only) lampColor = COLORS.warn;
@@ -1529,24 +1632,26 @@ FACTORY_HTML = r"""<!doctype html>
         lampColor = (Math.floor(nowMs / 500) % 2 === 0) ? COLORS.bad : 'rgba(248,81,73,0.35)';
       }
 
-      drawDiamond(node.x + node.w - 18, node.y + 18, 7, lampColor);
+      drawDiamond(node.x + node.w - (compact ? 10 : 18), node.y + (compact ? 12 : 18), compact ? 5 : 7, lampColor);
 
-      if (slot.long_only || slot.short_only) {
+      if (!compact && (slot.long_only || slot.short_only)) {
         ctx.fillStyle = COLORS.warn;
         ctx.font = '700 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
         const modeTag = slot.long_only ? '[LO]' : '[SO]';
         ctx.fillText(modeTag, node.x + node.w - 45, node.y + 40);
       }
 
-      const recent = Array.isArray(slot.recent_cycles) && slot.recent_cycles.length ? slot.recent_cycles[0] : null;
-      if (recent && Number.isFinite(Number(recent.net_profit))) {
-        const pnl = Number(recent.net_profit);
-        ctx.fillStyle = pnl >= 0 ? COLORS.good : COLORS.bad;
-        ctx.font = '11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
-        ctx.fillText((pnl >= 0 ? '+' : '') + '$' + fmt(pnl, 4), node.x + 10, node.y + node.h + 15);
+      if (!compact) {
+        const recent = Array.isArray(slot.recent_cycles) && slot.recent_cycles.length ? slot.recent_cycles[0] : null;
+        if (recent && Number.isFinite(Number(recent.net_profit))) {
+          const pnl = Number(recent.net_profit);
+          ctx.fillStyle = pnl >= 0 ? COLORS.good : COLORS.bad;
+          ctx.font = '11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+          ctx.fillText((pnl >= 0 ? '+' : '') + '$' + fmt(pnl, 4), node.x + 10, node.y + node.h + 15);
+        }
       }
 
-      if (s2Ratio !== null && s2Ratio > 0.75) {
+      if (!compact && s2Ratio !== null && s2Ratio > 0.75) {
         ctx.fillStyle = COLORS.bad;
         ctx.font = '10px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
         ctx.fillText('S2 ' + Math.round(s2Ratio * 100) + '%', node.x + node.w - 56, node.y + node.h + 15);
@@ -1556,7 +1661,7 @@ FACTORY_HTML = r"""<!doctype html>
         ctx.strokeStyle = COLORS.bad;
         ctx.lineWidth = 1.6;
         ctx.setLineDash([6, 4]);
-        roundRect(node.x + 8, node.y + node.h - 18, node.w - 16, 12, 6);
+        roundRect(innerX, node.y + node.h - (compact ? 11 : 18), innerW, compact ? 7 : 12, compact ? 4 : 6);
         ctx.stroke();
         ctx.setLineDash([]);
       }
@@ -1568,24 +1673,24 @@ FACTORY_HTML = r"""<!doctype html>
         gearSpeed *= 0.25;
       }
 
-      const gearX = node.x + node.w - 38;
-      const gearY = node.y + node.h * 0.5 + 10;
+      const gearX = node.x + node.w - (compact ? 18 : 38);
+      const gearY = node.y + node.h * 0.5 + (compact ? 3 : 10);
       const gearAngle = nowMs * gearSpeed;
       ctx.save();
       ctx.translate(gearX, gearY);
       ctx.rotate(gearAngle);
       ctx.globalAlpha = 0.45;
       ctx.strokeStyle = border;
-      ctx.lineWidth = 1.6;
+      ctx.lineWidth = compact ? 1.3 : 1.6;
       ctx.beginPath();
-      ctx.arc(0, 0, 8, 0, Math.PI * 2);
+      ctx.arc(0, 0, compact ? 5.5 : 8, 0, Math.PI * 2);
       ctx.stroke();
       for (let i = 0; i < 6; i += 1) {
         const a = (Math.PI * 2 * i) / 6;
-        const x1 = Math.cos(a) * 8;
-        const y1 = Math.sin(a) * 8;
-        const x2 = Math.cos(a) * 12;
-        const y2 = Math.sin(a) * 12;
+        const x1 = Math.cos(a) * (compact ? 5.5 : 8);
+        const y1 = Math.sin(a) * (compact ? 5.5 : 8);
+        const x2 = Math.cos(a) * (compact ? 8 : 12);
+        const y2 = Math.sin(a) * (compact ? 8 : 12);
         ctx.beginPath();
         ctx.moveTo(x1, y1);
         ctx.lineTo(x2, y2);
@@ -1593,22 +1698,35 @@ FACTORY_HTML = r"""<!doctype html>
       }
       ctx.restore();
 
-      if (slot.long_only || slot.short_only) {
-        const bobY = node.y - 10 + Math.sin(nowMs * 0.003) * 4;
-        const bx = node.x + node.w - 24;
+      if (hasMachineDark) {
+        const bx = node.x + node.w - (compact ? 8 : 12);
+        const by = node.y - (compact ? 5 : 7) + Math.sin(nowMs * 0.003) * 3;
+        ctx.save();
+        ctx.translate(bx, by);
         ctx.strokeStyle = COLORS.warn;
-        ctx.lineWidth = 1.8;
+        ctx.lineWidth = 1.5;
         ctx.beginPath();
-        ctx.arc(bx, bobY, 3, 0, Math.PI * 2);
+        ctx.arc(0, 0, 3.5, 0, Math.PI * 2);
+        ctx.stroke();
+        for (let i = 0; i < 6; i += 1) {
+          const a = (Math.PI * 2 * i) / 6;
+          const x1 = Math.cos(a) * 3.5;
+          const y1 = Math.sin(a) * 3.5;
+          const x2 = Math.cos(a) * 5.4;
+          const y2 = Math.sin(a) * 5.4;
+          ctx.beginPath();
+          ctx.moveTo(x1, y1);
+          ctx.lineTo(x2, y2);
+          ctx.stroke();
+        }
+        ctx.beginPath();
+        ctx.moveTo(1.8, 1.8);
+        ctx.lineTo(7.2, 7.2);
         ctx.stroke();
         ctx.beginPath();
-        ctx.moveTo(bx + 2.4, bobY + 2.4);
-        ctx.lineTo(bx + 8, bobY + 8);
+        ctx.arc(8.2, 8.2, 1.5, 0, Math.PI * 2);
         ctx.stroke();
-        ctx.beginPath();
-        ctx.moveTo(bx + 6.6, bobY + 8.2);
-        ctx.lineTo(bx + 9.2, bobY + 5.6);
-        ctx.stroke();
+        ctx.restore();
       }
 
       machineRects.push({
@@ -1622,11 +1740,12 @@ FACTORY_HTML = r"""<!doctype html>
 
     function drawConveyors(nodes, nowMs) {
       if (!nodes.length) return;
+      const compact = !!(layout && layout.compact);
       const first = nodes[0];
       const last = nodes[nodes.length - 1];
 
-      const yTop = first.y + 32;
-      const yBottom = layout.dogeChest.y + 40;
+      const yTop = first.y + (compact ? 18 : 32);
+      const yBottom = layout.dogeChest.y + (compact ? 30 : 40);
 
       ctx.lineWidth = 3;
       ctx.strokeStyle = 'rgba(88,166,255,0.45)';
@@ -1680,7 +1799,7 @@ FACTORY_HTML = r"""<!doctype html>
           const spacing = 42;
           for (let i = 0; i < 2; i += 1) {
             const x = sx + ((nowMs * speed + i * spacing) % len);
-            const y = node.y + 30;
+            const y = node.y + (compact ? 19 : 30);
             ctx.fillStyle = 'rgba(88,166,255,0.92)';
             ctx.beginPath();
             ctx.arc(x, y, 3, 0, Math.PI * 2);
@@ -1696,7 +1815,7 @@ FACTORY_HTML = r"""<!doctype html>
           const spacing = 38;
           for (let i = 0; i < 2; i += 1) {
             const x = sx + ((nowMs * speed + i * spacing) % len);
-            const y = node.y + 46;
+            const y = node.y + (compact ? 31 : 46);
             ctx.fillStyle = 'rgba(46,160,67,0.94)';
             ctx.beginPath();
             ctx.arc(x, y, 3, 0, Math.PI * 2);
@@ -1737,6 +1856,14 @@ FACTORY_HTML = r"""<!doctype html>
       const belt = layout.recycle;
       const total = Number(status.total_orphans || 0);
       const overflow = activeEffects.has('belt_overflow');
+      const slots = Array.isArray(status && status.slots) ? status.slots : [];
+      const recoveries = [];
+      for (const slot of slots) {
+        for (const rec of (Array.isArray(slot.recovery_orders) ? slot.recovery_orders : [])) {
+          recoveries.push({...rec, slot_id: slot.slot_id});
+        }
+      }
+      recoveryDotPositions = [];
 
       ctx.fillStyle = 'rgba(22,27,34,0.8)';
       roundRect(belt.x, belt.y, belt.w, belt.h, 8);
@@ -1753,20 +1880,26 @@ FACTORY_HTML = r"""<!doctype html>
       ctx.font = '11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
       ctx.fillText('RECYCLING BELT', belt.x + 10, belt.y - 8);
 
-      const dots = overflow
-        ? Math.min(72, Math.max(0, total * 2 + 6))
-        : Math.min(40, Math.max(0, total));
+      const maxDots = overflow ? 72 : 40;
+      const fallbackDots = Math.min(maxDots, Math.max(0, total));
+      const source = recoveries.length ? recoveries : new Array(fallbackDots).fill(null);
+      const dots = Math.min(maxDots, source.length);
       const innerX = belt.x + 10;
       const innerW = belt.w - 20;
       const drift = (nowMs * 0.01) % Math.max(1, innerW);
       for (let i = 0; i < dots; i += 1) {
+        const srcIdx = source.length <= dots ? i : Math.floor(i * source.length / dots);
+        const recovery = source[srcIdx] || null;
         const base = dots <= 1 ? innerW * 0.5 : i * (innerW / dots);
         const x = innerX + ((base + drift) % Math.max(1, innerW));
         const y = belt.y + belt.h * 0.5;
-        ctx.fillStyle = overflow ? COLORS.bad : (total > 12 ? COLORS.bad : COLORS.warn);
+        const ageSec = recovery ? Number(recovery.age_sec || 0) : 0;
+        const dotColor = overflow || ageSec > 900 ? COLORS.bad : (total > 12 ? COLORS.bad : COLORS.warn);
+        ctx.fillStyle = dotColor;
         ctx.beginPath();
         ctx.arc(x, y, 4, 0, Math.PI * 2);
         ctx.fill();
+        recoveryDotPositions.push({x, y, recovery});
       }
     }
 
@@ -1861,6 +1994,21 @@ FACTORY_HTML = r"""<!doctype html>
               const sy = rect.y + rect.h * 0.5;
               const tx = layout.outputChest.x + 18;
               const ty = layout.outputChest.y + 44;
+              const trail = [
+                {offset: -0.15, radius: 2, alpha: 0.20},
+                {offset: -0.10, radius: 3, alpha: 0.28},
+                {offset: -0.05, radius: 4, alpha: 0.36}
+              ];
+              for (const t of trail) {
+                const p = clamp(progress + t.offset, 0, 1);
+                if (p <= 0) continue;
+                const x = sx + (tx - sx) * p;
+                const y = sy + (ty - sy) * p;
+                ctx.fillStyle = 'rgba(46,160,67,' + (t.alpha * (1 - progress * 0.25)).toFixed(3) + ')';
+                ctx.beginPath();
+                ctx.arc(x, y, t.radius, 0, Math.PI * 2);
+                ctx.fill();
+              }
               const x = sx + (tx - sx) * progress;
               const y = sy + (ty - sy) * progress;
               ctx.fillStyle = 'rgba(46,160,67,' + (1 - progress * 0.2).toFixed(3) + ')';
@@ -1868,12 +2016,19 @@ FACTORY_HTML = r"""<!doctype html>
               ctx.arc(x, y, 5, 0, Math.PI * 2);
               ctx.fill();
             }
-          } else if (rect) {
-            const alpha = 1 - progress;
-            ctx.strokeStyle = 'rgba(88,166,255,' + alpha.toFixed(3) + ')';
-            ctx.lineWidth = 3;
-            roundRect(rect.x - 2, rect.y - 2, rect.w + 4, rect.h + 4, 12);
-            ctx.stroke();
+          } else if (rect && anim.order && anim.order.role === 'entry') {
+            const alpha = (1 - progress) * 0.58;
+            const side = String(anim.order.side || '').toLowerCase();
+            const inset = 6;
+            const innerX = rect.x + inset;
+            const innerY = rect.y + (layout && layout.compact ? 18 : 34);
+            const innerW = rect.w - inset * 2;
+            const innerH = Math.max(10, rect.h - (layout && layout.compact ? 26 : 42));
+            const flashW = innerW * 0.5;
+            const flashX = side === 'sell' ? innerX : innerX + innerW - flashW;
+            ctx.fillStyle = 'rgba(46,160,67,' + alpha.toFixed(3) + ')';
+            roundRect(flashX, innerY, flashW, innerH, 7);
+            ctx.fill();
           }
         } else if (anim.type === 'order_orphaned') {
           const rect = getMachineRect(anim.slot_id);
@@ -1893,21 +2048,29 @@ FACTORY_HTML = r"""<!doctype html>
           if (layout && layout.outputChest) {
             const cx = layout.outputChest.x + 40;
             const cy = layout.outputChest.y + 46;
-            for (let i = 0; i < 6; i += 1) {
-              const a = (Math.PI * 2 * i) / 6;
-              const r = 6 + progress * 20;
+            const net = Number(anim.cycle && anim.cycle.net_profit);
+            const highProfit = Number.isFinite(net) && net > 0.01;
+            const sparkleRgb = highProfit ? '255,215,0' : '46,160,67';
+            for (let i = 0; i < 12; i += 1) {
+              const waveStart = i < 6 ? 0 : 0.3;
+              if (progress < waveStart) continue;
+              const localP = clamp((progress - waveStart) / (1 - waveStart), 0, 1);
+              const a = (Math.PI * 2 * (i % 6)) / 6 + (i >= 6 ? 0.28 : 0);
+              const r = 7 + localP * 22 + (i % 3) * 2;
               const x = cx + Math.cos(a) * r;
               const y = cy + Math.sin(a) * r;
-              ctx.fillStyle = 'rgba(46,160,67,' + (1 - progress).toFixed(3) + ')';
+              const size = 2 + (i % 3);
+              ctx.fillStyle = 'rgba(' + sparkleRgb + ',' + (1 - localP).toFixed(3) + ')';
               ctx.beginPath();
-              ctx.arc(x, y, 2.3, 0, Math.PI * 2);
+              ctx.arc(x, y, size, 0, Math.PI * 2);
               ctx.fill();
             }
-            const net = Number(anim.cycle && anim.cycle.net_profit);
             const txt = Number.isFinite(net) ? ((net >= 0 ? '+' : '') + '$' + fmt(net, 2)) : '+$';
             ctx.fillStyle = (Number.isFinite(net) && net < 0)
               ? 'rgba(248,81,73,' + (1 - progress).toFixed(3) + ')'
-              : 'rgba(46,160,67,' + (1 - progress).toFixed(3) + ')';
+              : (highProfit
+                ? 'rgba(255,215,0,' + (1 - progress).toFixed(3) + ')'
+                : 'rgba(46,160,67,' + (1 - progress).toFixed(3) + ')');
             ctx.font = '700 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
             ctx.fillText(txt, cx + 28, cy - progress * 28);
           }
@@ -1915,18 +2078,56 @@ FACTORY_HTML = r"""<!doctype html>
           const rect = getMachineRect(anim.slot_id);
           if (rect) {
             const alpha = 1 - progress;
-            ctx.strokeStyle = 'rgba(88,166,255,' + alpha.toFixed(3) + ')';
+            const from = String(anim.from || '');
+            const to = String(anim.to || '');
+            let ring = 'rgba(210,153,34,' + alpha.toFixed(3) + ')';
+            if (from === 'S2' && to === 'S0') ring = 'rgba(46,160,67,' + alpha.toFixed(3) + ')';
+            else if ((from === 'S1a' || from === 'S1b') && to === 'S2') ring = 'rgba(248,81,73,' + alpha.toFixed(3) + ')';
             ctx.lineWidth = 3;
-            roundRect(rect.x - 3, rect.y - 3, rect.w + 6, rect.h + 6, 14);
+            ctx.strokeStyle = ring;
+            const expand = 3 + progress * 10;
+            roundRect(rect.x - expand, rect.y - expand, rect.w + expand * 2, rect.h + expand * 2, 14 + progress * 4);
             ctx.stroke();
+            if ((from === 'S1a' || from === 'S1b') && to === 'S2') {
+              const flash = alpha * (Math.floor(nowMs / 120) % 2 === 0 ? 1 : 0.35);
+              ctx.fillStyle = 'rgba(248,81,73,' + flash.toFixed(3) + ')';
+              ctx.beginPath();
+              ctx.moveTo(rect.x + rect.w + 8, rect.y + 6);
+              ctx.lineTo(rect.x + rect.w - 4, rect.y + 26);
+              ctx.lineTo(rect.x + rect.w + 20, rect.y + 26);
+              ctx.closePath();
+              ctx.fill();
+              ctx.fillStyle = 'rgba(13,17,23,' + flash.toFixed(3) + ')';
+              ctx.font = '700 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+              ctx.fillText('!', rect.x + rect.w + 5, rect.y + 22);
+            } else if (from === 'S2' && to === 'S0') {
+              ctx.strokeStyle = 'rgba(46,160,67,' + (alpha * 0.8).toFixed(3) + ')';
+              ctx.lineWidth = 2;
+              roundRect(rect.x - expand - 6, rect.y - expand - 6, rect.w + (expand + 6) * 2, rect.h + (expand + 6) * 2, 17);
+              ctx.stroke();
+            }
           }
         } else if (anim.type === 'slot_added') {
           const rect = getMachineRect(anim.slot_id);
           if (rect) {
-            const alpha = 1 - progress;
-            ctx.fillStyle = 'rgba(13,17,23,' + alpha.toFixed(3) + ')';
-            roundRect(rect.x, rect.y, rect.w, rect.h, 12);
+            const eased = easeOutBack(progress);
+            const ghostX = rect.x + (1 - eased) * 200;
+            const coverAlpha = clamp(0.95 - progress, 0, 0.95);
+            ctx.fillStyle = 'rgba(13,17,23,' + coverAlpha.toFixed(3) + ')';
+            roundRect(rect.x - 2, rect.y - 2, rect.w + 4, rect.h + 4, 12);
             ctx.fill();
+
+            const ghostAlpha = clamp(1 - progress * 0.35, 0, 1);
+            ctx.fillStyle = 'rgba(22,27,34,' + (0.8 * ghostAlpha).toFixed(3) + ')';
+            roundRect(ghostX, rect.y, rect.w, rect.h, 12);
+            ctx.fill();
+            ctx.strokeStyle = 'rgba(88,166,255,' + ghostAlpha.toFixed(3) + ')';
+            ctx.lineWidth = 2;
+            roundRect(ghostX, rect.y, rect.w, rect.h, 12);
+            ctx.stroke();
+            ctx.fillStyle = 'rgba(88,166,255,' + ghostAlpha.toFixed(3) + ')';
+            ctx.font = '700 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+            ctx.fillText('#' + anim.slot_id, ghostX + 10, rect.y + 19);
           }
         } else if (anim.type === 'slot_removed') {
           const rect = anim.anchor || getMachineRect(anim.slot_id);
@@ -1959,6 +2160,9 @@ FACTORY_HTML = r"""<!doctype html>
       const utilTxt = (util === null || util === undefined) ? '-' : fmt(util, 1) + '%';
       document.getElementById('capText').textContent =
         String(cfh.open_orders_current ?? '-') + '/' + String(cfh.open_orders_safe_cap ?? '-') + ' (' + utilTxt + ')';
+      const mode = String(status.mode || '').toUpperCase();
+      const modeDot = document.getElementById('modeDot');
+      modeDot.style.background = mode === 'HALTED' ? COLORS.bad : (mode === 'PAUSED' ? COLORS.warn : COLORS.good);
       const band = String(cfh.status_band || '-').toUpperCase();
       const bandEl = document.getElementById('bandText');
       bandEl.textContent = band;
@@ -2092,6 +2296,7 @@ FACTORY_HTML = r"""<!doctype html>
 
     function drawScene(nowMs) {
       if (!statusData || !layout) {
+        tooltipText = '';
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
         ctx.clearRect(0, 0, viewportW, viewportH);
         ctx.fillStyle = COLORS.muted;
@@ -2164,6 +2369,8 @@ FACTORY_HTML = r"""<!doctype html>
           h: rect.h
         };
       }
+
+      drawTooltip();
     }
 
     function scheduleFrame() {
@@ -2246,12 +2453,14 @@ FACTORY_HTML = r"""<!doctype html>
       const hit = hitTestMachine(world.x, world.y);
       if (hit !== null) {
         ev.preventDefault();
-        showToast('Remove slot not yet available');
+        showToast('Remove slot not yet available', 'info');
       }
     });
 
     canvas.addEventListener('mousedown', (ev) => {
       if (ev.button !== 0) return;
+      tooltipX = ev.clientX;
+      tooltipY = ev.clientY;
       const world = screenToWorld(ev.clientX, ev.clientY);
       const hit = hitTestMachine(world.x, world.y);
 
@@ -2261,17 +2470,32 @@ FACTORY_HTML = r"""<!doctype html>
       }
 
       dragging = true;
+      dragFromEmpty = true;
+      dragStartMs = performance.now();
+      dragDistance = 0;
       dragLastX = ev.clientX;
       dragLastY = ev.clientY;
       canvas.classList.add('dragging');
     });
 
     window.addEventListener('mouseup', () => {
+      const wasDragging = dragging;
+      const wasFromEmpty = dragFromEmpty;
+      const elapsed = performance.now() - dragStartMs;
+      const moved = dragDistance;
       dragging = false;
+      dragFromEmpty = false;
       canvas.classList.remove('dragging');
+      if (wasDragging && wasFromEmpty && elapsed < 200 && moved < 6 && selectedSlotId !== null) {
+        selectedSlotId = null;
+        renderDetailPanel();
+        scheduleFrame();
+      }
     });
 
     canvas.addEventListener('mousemove', (ev) => {
+      tooltipX = ev.clientX;
+      tooltipY = ev.clientY;
       const world = screenToWorld(ev.clientX, ev.clientY);
       const hit = hitTestMachine(world.x, world.y);
       if (hit !== hoverSlotId) {
@@ -2279,13 +2503,63 @@ FACTORY_HTML = r"""<!doctype html>
         scheduleFrame();
       }
 
-      if (!dragging) return;
-      const dx = ev.clientX - dragLastX;
-      const dy = ev.clientY - dragLastY;
-      dragLastX = ev.clientX;
-      dragLastY = ev.clientY;
-      camera.targetX -= dx / camera.zoom;
-      camera.targetY -= dy / camera.zoom;
+      if (dragging) {
+        tooltipText = '';
+        const dx = ev.clientX - dragLastX;
+        const dy = ev.clientY - dragLastY;
+        dragDistance += Math.sqrt(dx * dx + dy * dy);
+        dragLastX = ev.clientX;
+        dragLastY = ev.clientY;
+        camera.targetX -= dx / camera.zoom;
+        camera.targetY -= dy / camera.zoom;
+        scheduleFrame();
+        return;
+      }
+
+      if (!statusData || !layout) {
+        if (tooltipText) {
+          tooltipText = '';
+          scheduleFrame();
+        }
+        return;
+      }
+
+      let nextTooltip = '';
+      if (hit !== null) {
+        const slot = getSlotById(hit);
+        if (slot) {
+          const orders = Array.isArray(slot.open_orders) ? slot.open_orders.length : 0;
+          nextTooltip = 'Slot #' + slot.slot_id + ' | ' + String(slot.phase || 'S0')
+            + ' | $' + fmt(slot.total_profit, 4) + ' profit | ' + orders + ' orders';
+        }
+      } else {
+        const dot = hitTestRecoveryDot(world.x, world.y);
+        if (dot && dot.recovery) {
+          const rec = dot.recovery;
+          nextTooltip = 'Recovery #' + rec.recovery_id + ' | ' + String(rec.side || '-')
+            + ' | $' + fmt(rec.price, 6) + ' | ' + Math.round(Number(rec.age_sec || 0)) + 's';
+        } else if (pointInBox(world.x, world.y, layout.usdChest)) {
+          const slots = Array.isArray(statusData.slots) ? statusData.slots : [];
+          const healthy = slots.length === 0 ? true : slots.some((s) => !s.long_only);
+          nextTooltip = healthy ? 'USD side healthy' : 'USD side starved - long_only';
+        } else if (pointInBox(world.x, world.y, layout.dogeChest)) {
+          const slots = Array.isArray(statusData.slots) ? statusData.slots : [];
+          const healthy = slots.length === 0 ? true : slots.some((s) => !s.short_only);
+          nextTooltip = healthy ? 'DOGE side healthy' : 'DOGE side starved - short_only';
+        } else if (pointInBox(world.x, world.y, layout.outputChest)) {
+          nextTooltip = 'Total realized: $' + fmt(statusData.total_profit, 4);
+        }
+      }
+
+      if (nextTooltip !== tooltipText) {
+        tooltipText = nextTooltip;
+        scheduleFrame();
+      }
+    });
+
+    canvas.addEventListener('mouseleave', () => {
+      hoverSlotId = null;
+      tooltipText = '';
       scheduleFrame();
     });
 
