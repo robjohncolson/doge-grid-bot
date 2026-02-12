@@ -1,910 +1,450 @@
-# Factory Lens Specification
+# Factory Lens — Visual Factory Simulation
 
-Version: v0.2.4  
-Date: 2026-02-12  
-Status: Draft (consolidated + runtime bridge alignment)
+Version: v1.0
+Date: 2026-02-12
+Status: Implementation-ready
+Scope: 2D Canvas factory visualization of bot state machine, served at `/factory`
 
-### Changelog
+---
 
-1. **v0.2.3**: Operating-state split, schema tightening, milestone split (M1a/M1b).
-2. **v0.2.4**: Added compatibility contract for currently-implemented `status.capacity_fill_health` telemetry bridge (manual scaling diagnostics).
+## 1. Goal
 
-## 1. Purpose
+Render the bot's state machine as a living Factorio-style factory. Every visual element maps 1:1 to a runtime concept. The factory must accurately represent the state machine at all times — if something breaks, you see it break. If a slot is jammed, the machine stops. If price goes stale, the lights flicker out.
 
-Factory Lens is a separate diagnostic client for the DOGE v1 runtime. It provides:
+The factory is also bidirectional: deleting a machine removes the slot, adding a machine creates one.
 
-1. A forward production view (`runtime -> factory`).
-2. A reverse diagnosis view (`symptom -> cause -> action`).
-3. Action-oriented operator guidance, including starter prompts for Codex/Claude.
+Minimal backend additions: 3 new fields on the existing `/api/status` payload (see section 10.1). No new endpoints, no new telemetry counters. Sends existing `/api/action` commands.
 
-It is intentionally separate from core order execution logic and should not change trading behavior.
+---
 
-## 2. Scope and Non-Goals
+## 2. Concept Mapping
 
-### 2.1 In Scope
-
-1. Deterministic diagnosis from runtime payloads.
-2. A text UI (80x24-first) using a factory metaphor.
-3. `/api/diagnosis` endpoint from bot runtime.
-4. Compatibility with currently shipped `/api/status.capacity_fill_health` bridge telemetry.
-5. Prompt launcher context for engineering remediation.
-
-### 2.2 Out of Scope
-
-1. Executing trades directly from Factory Lens.
-2. AI-in-the-loop order decisions.
-3. Replacing strategy logic in `state_machine.py`.
-4. Coupling Lens lifecycle to bot process lifecycle.
-
-## 3. Core Concept Mapping (Factorio -> Runtime)
-
-| Factory Concept | Runtime Meaning | Program Mapping |
+| Visual Element | Runtime Concept | Data Source |
 |---|---|---|
-| Electricity | Price freshness + API health | `bot.py` price refresh, stale guards |
-| Inserter | Slot worker | per-slot loop execution in `bot.py` |
-| Conveyor belt | Event/action flow | `_apply_event`, `_execute_actions`, `_poll_order_status` |
-| S0 assembler | Entry production | `_ensure_slot_bootstrapped`, `sm.add_entry_order` |
-| S1a/S1b assembler | In-position cycle work | phase transitions in `state_machine.py` |
-| S2 assembler | Deadlock handling | timer-orphan logic in `state_machine.py` |
-| Input chests | Free USD / DOGE | `_safe_balance`, `_usd_balance`, `_doge_balance` |
-| Output chest | Realized cycles/PnL | `completed_cycles`, `total_profit` |
-| Circuit network | Guardrails and controls | pause/halt, invariants, budget limits |
-| Logistic bots | Self-heal layer | `_auto_repair_degraded_slot` and normalization |
+| **Power line** | Price feed from Kraken | `status.price`, `status.price_age_sec` |
+| **Power meter** | API health / capacity utilization | `capacity_fill_health.open_order_utilization_pct` |
+| **Input chest (USD)** | Buy-side health (symbolic) | Chest full when `!long_only`, empty outline when `long_only` (can't buy) |
+| **Input chest (DOGE)** | Sell-side health (symbolic) | Chest full when `!short_only`, empty outline when `short_only` (can't sell) |
+| **Machine** | Slot | `status.slots[n]` |
+| **Machine phase indicator** | S0 / S1a / S1b / S2 | `slot.phase` |
+| **Entry conveyor** (into machine) | Entry orders pending on Kraken | `slot.open_orders` where `role=entry` |
+| **Exit conveyor** (out of machine) | Exit orders pending on Kraken | `slot.open_orders` where `role=exit` |
+| **Recycling belt** | Recovery orders (orphaned exits) | `slot.recovery_orders` |
+| **Output chest** | Realized profit | `slot.total_profit` |
+| **Item on belt** | Individual order | order objects in `open_orders` / `recovery_orders` |
+| **Status band indicator** | Capacity health | `capacity_fill_health.status_band` |
+| **Circuit network wire** | Guardrails (pause/halt state) | `status.mode` |
+| **Logistic bot** (floating repair icon) | Auto-repair in progress | `slot.long_only` or `slot.short_only` (degraded) |
 
-## 4. UX Model
+---
 
-Factory Lens is a parallel client, not an in-process overlay.
+## 3. Visual States per Machine
 
-### 4.1 Keybindings
+Each machine (slot) renders differently based on its phase and health.
 
-1. `F2` toggles Factory Lens view.
-2. `Tab` switches Forward/Reverse pane focus.
-3. `Left/Right` cycles subsystem tabs.
-4. `Up/Down` changes selected slot/symptom.
-5. `Enter` opens detail drawer.
-6. `Esc` closes drawer or exits.
-7. Fallback on terminals without function keys: `Ctrl+O`.
+### 3.1 Phase Rendering
 
-### 4.2 80x24-First Layout
+| Phase | Machine Visual | Animation |
+|-------|---------------|-----------|
+| **S0** (entry) | Machine idle, doors open, waiting for input | Slow pulse glow, gears stationary |
+| **S1a** (short in position) | Machine active, A-side lit, B-side dim | Gears turning, A-side conveyor moving |
+| **S1b** (long in position) | Machine active, B-side lit, A-side dim | Gears turning, B-side conveyor moving |
+| **S2** (both exits) | Machine fully active, both sides lit, warning lamp | Fast gears, both conveyors moving |
 
-1. Header: lifecycle mode, operating state, pair, price, price age, power state.
-2. Left pane: compact factory rows (slots/assemblers/power/production).
-3. Right pane: symptom cards sorted by priority.
-4. Bottom console: interpretation, evidence, actions, prompt snippets.
+### 3.2 Health Overlays
 
-Compact slot row format:
+| Condition | Visual | Source |
+|-----------|--------|--------|
+| Normal two-sided S0 | Green status light | `!long_only && !short_only` |
+| Degraded one-sided | Yellow warning lamp + `[SO]`/`[LO]` label | `long_only \|\| short_only` |
+| S2 timeout approaching | Red blinking lamp (>75% of orphan timeout) | `slot.s2_entered_at` + `status.s2_orphan_after_sec` (see 10.1) |
+| Slot producing profit | Green sparkle on output | `recent_cycles` with positive `net_profit` |
+| Slot taking losses | Red flash on output | `recent_cycles` with negative `net_profit` |
 
-`07 S1a SO miss:B blk:budget heal:retry`
+### 3.3 Power System
 
-## 5. Diagnosis Semantics
+| State | Visual | Source |
+|-------|--------|--------|
+| Fresh price (<10s) | Bright power line, electricity particles flowing | `price_age_sec < 10` |
+| Aging price (10-60s) | Dimming power line, fewer particles | `10 < price_age_sec < 60` |
+| Stale price (>60s) | Power line dark, red warning, machines dim | `price_age_sec > 60` |
+| Bot PAUSED | All machines idle, amber overlay | `mode == "PAUSED"` |
+| Bot HALTED | All machines stopped, red overlay, alarm icon | `mode == "HALTED"` |
 
-Diagnosis uses deterministic rules. No probabilistic confidence score in v0.2.4.
+---
 
-Each symptom card includes:
+## 4. Layout
 
-1. `symptom_id`
-2. `severity` (`info`, `warn`, `crit`)
-3. `priority` (rank)
-4. `rule_id`
-5. `summary`
-6. `interpretation`
-7. `evidence` (1-8 lines)
-8. `actions`
-9. `affected_slots`
-10. `signal_code`
-11. `visual_signals`
-12. `prompts` (`codex_prompt`, `claude_prompt`) with context cap
+Top-down 2D factory floor. Auto-arranged, no manual placement needed.
 
-## 6. Symptom Taxonomy v0.2.4
+```
+┌─────────────────────────────────────────────────────────┐
+│  ⚡ POWER LINE ════════════════════════════════════════  │
+│  [PRICE: $0.0912]  [AGE: 2s]  [MODE: RUNNING]          │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│  ┌─USD─┐    ┌─────┐   ┌─────┐   ┌─────┐    ┌─PROFIT─┐│
+│  │ IN  │═►══│ #1  │   │ #2  │   │ #3  │══►═│  OUT   ││
+│  │chest│    │ S1a │   │ S0  │   │ S1b │    │ chest  ││
+│  └─────┘    └──┬──┘   └──┬──┘   └──┬──┘    └────────┘│
+│  ┌DOGE─┐       │         │         │                   │
+│  │ IN  │═►══   │         │         │                   │
+│  │chest│    ┌──┴─────────┴─────────┴──┐                │
+│  └─────┘    │    RECYCLING BELT       │                │
+│             │  ○ ○ ○  (recoveries)    │                │
+│             └─────────────────────────┘                │
+│                                                         │
+│  [Capacity: 117/168 (70%)] [Band: NORMAL] [+Add]       │
+└─────────────────────────────────────────────────────────┘
+```
 
-1. `IDLE_NORMAL`
-2. `BELT_JAM`
+### 4.1 Auto-Layout Rules
+
+1. Machines arranged in a horizontal row. If >6 machines, wrap to second row.
+2. Power line runs across the top, branching down to each machine.
+3. Input chests (USD left, DOGE left-below) feed into entry conveyors.
+4. Output chest (right) receives completed cycle items.
+5. Recycling belt runs along the bottom, collecting recovery orders from all machines.
+6. Status bar at bottom shows capacity, band, and controls.
+7. Layout reflows on slot add/remove without page reload.
+
+### 4.2 Scaling
+
+- Canvas resizes to fill viewport. Minimum 800x500.
+- Machine size and spacing scale proportionally.
+- At 20+ machines, machines shrink to icon size with tooltip on hover.
+
+---
+
+## 5. Animation
+
+### 5.1 Continuous Animations
+
+| Element | Animation | Speed |
+|---------|-----------|-------|
+| Power line particles | Small dots flowing left-to-right | Proportional to price freshness |
+| Active conveyor items | Items sliding toward machine (entry) or away (exit) | ~30px/sec |
+| Machine gears | Rotating cog icon inside machine box | Phase-dependent (S2 fastest) |
+| Output sparkle | Brief green particle burst on cycle completion | On new `recent_cycles` entry |
+| Recovery belt items | Slow drift along bottom belt | ~10px/sec |
+| Logistic bot | Small icon floating near degraded machine | Gentle bob animation |
+
+### 5.2 Event-Triggered Animations
+
+| Event | Animation |
+|-------|-----------|
+| New order placed | Item appears on entry conveyor, slides toward machine |
+| Entry fill | Item absorbed into machine, machine briefly glows |
+| Exit fill | Item emitted from machine onto exit conveyor, slides to output |
+| Cycle completed | Item reaches output chest, sparkle + profit number float-up |
+| Order orphaned | Item ejected from machine onto recycling belt |
+| Slot added | Machine slides in from right with build animation |
+| Slot removed | Machine shrinks and fades out |
+| Price goes stale | Power line dims, all machines slow down |
+| Bot paused | Amber wash over entire factory |
+| Bot halted | Red wash, alarm icon pulses |
+
+### 5.3 Animation Source of Truth
+
+Animations are driven by **diffing consecutive `/api/status` polls**. On each poll:
+
+1. Compare `slot.open_orders` arrays — new orders trigger "placed" animation, missing orders trigger "filled" or "canceled."
+2. Compare `slot.recovery_orders` — new entries trigger "orphaned" animation.
+3. Compare `slot.recent_cycles` — new entries trigger "cycle completed" animation.
+4. Compare `slot.phase` — phase change triggers machine state transition.
+5. Compare `status.mode` — mode change triggers power/overlay transition.
+
+Track previous poll state client-side. First poll renders static; subsequent polls animate deltas.
+
+---
+
+## 6. Interactivity
+
+### 6.1 Mouse
+
+| Action | Effect |
+|--------|--------|
+| Click machine | Select slot (highlights, shows detail tooltip) |
+| Hover machine | Show tooltip: slot ID, phase, profit, order count |
+| Hover belt item | Show tooltip: order side, price, volume, age |
+| Click `[+Add]` button | `POST /api/action {action: "add_slot"}` → machine appears |
+| Right-click machine | Show "Remove slot not yet available" toast (no API exists) |
+| Click recovery item | Confirm dialog → `POST /api/action {action: "soft_close", ...}` |
+| Hover input chest | Show symbolic status ("USD side healthy" or "USD side starved — long_only") |
+| Hover output chest | Show total realized PnL |
+
+### 6.2 Keyboard
+
+Full parity with the dashboard keyboard spec. Same mode FSM (NORMAL/COMMAND/HELP/CONFIRM), same `preventDefault()` behavior, same command bar with parser/validation/auto-complete/history.
+
+| Key | Action |
+|-----|--------|
+| `1`-`9` | Select machine by index |
+| `[`/`]` | Cycle machine selection |
+| `g g` | Jump to first machine (chord, 400ms timeout) |
+| `G` | Jump to last machine |
+| `+` | Add machine (slot) |
+| `-` | Soft close next recovery |
+| `p` | Toggle pause/resume (with confirm) |
+| `.` | Force refresh (rate-limited: 2s cooldown) |
+| `?` | Toggle help overlay |
+| `:` | Open command bar (same parser/commands as dashboard) |
+| `Esc` | Deselect / close overlay / return to NORMAL |
+
+Command bar, help overlay, confirm dialog, and toast system should be shared JS extracted from the dashboard implementation or duplicated identically.
+
+### 6.3 Bidirectional Requirement
+
+Visual actions MUST map to real API calls. The factory is not decorative — it's a control surface.
+
+- Adding a machine = `add_slot` API call
+- Removing a machine = future (not currently in API — show "not yet available" toast)
+- Clicking recovery item = `soft_close` API call
+- Pause/resume = same as dashboard
+
+---
+
+## 7. Detail Panel
+
+When a machine is selected (clicked or keyboard), a slide-out panel appears on the right showing:
+
+1. Slot ID, phase, mode flags (`[SO]`/`[LO]`)
+2. Market price
+3. Open orders (same table as main dashboard)
+4. Recovery orders with close buttons
+5. Recent cycles with profit coloring
+6. Cycle counters (A.N / B.N)
+7. Slot-level realized + unrealized PnL
+
+Panel closes with `Esc` or clicking elsewhere. Reuses the same data from `/api/status` — no additional API calls.
+
+---
+
+## 8. Technical Approach
+
+### 8.1 Rendering
+
+- **2D Canvas** with `requestAnimationFrame` loop.
+- Render at 30fps (sufficient for smooth belt animation, saves CPU).
+- Canvas element fills the page. Dark background matching `--bg: #0d1117`.
+- All drawing uses canvas 2D context (fillRect, strokeRect, arc, drawImage for icons).
+- No external dependencies. No Three.js, no Pixi.js.
+
+### 8.2 Architecture
+
+```
+┌──────────────────────────────────────────┐
+│  factory_view.py                         │
+│  FACTORY_HTML = """..."""                 │
+│                                          │
+│  <canvas id="factory">                   │
+│  <script>                                │
+│    1. State poller (GET /api/status)      │
+│    2. Diff engine (prev vs current)      │
+│    3. Layout engine (slot positions)     │
+│    4. Renderer (canvas draw calls)       │
+│    5. Animation queue (tweens)           │
+│    6. Input handler (mouse + keyboard)   │
+│    7. Detail panel (HTML overlay)        │
+│    8. Command bar (reused from dash)     │
+│  </script>                               │
+└──────────────────────────────────────────┘
+```
+
+### 8.3 File Organization
+
+- **New file: `factory_view.py`** — contains `FACTORY_HTML` string, same pattern as `dashboard.py`.
+- **`bot.py`** — add route: `GET /factory` serves `FACTORY_HTML`. No other backend changes.
+- The factory page polls the same `GET /api/status` and `POST /api/action` endpoints.
+
+### 8.4 Drawing Primitives
+
+Keep the visual style simple and readable:
+
+- **Machines**: Rounded rectangles with phase-colored border. Internal gear icon (drawn with arcs).
+- **Conveyors**: Horizontal lines with chevron pattern (animated via offset). Items are small colored circles.
+- **Power line**: Thick line across top with flowing dot particles.
+- **Chests**: Rectangles with fill-level indicator.
+- **Recovery belt**: Dashed line along bottom with circulating items.
+- **Text**: Canvas `fillText` for labels, slot IDs, prices. Monospace font.
+- **Colors**: Reuse dashboard CSS token values (`#2ea043` good, `#f85149` bad, `#d29922` warn, `#58a6ff` accent).
+
+---
+
+## 9. Diagnosis Engine
+
+A pure client-side JS function that reads the `/api/status` payload and outputs an array of active symptoms. The renderer maps symptoms to visual effects on the factory floor — you don't read a symptom card, you *see* the problem.
+
+### 9.1 Engine Contract
+
+```js
+// Pure function, no side effects, no network calls.
+// Input: status payload from GET /api/status
+// Output: array of symptom objects, sorted by priority (1 = highest)
+function diagnose(status) -> Symptom[]
+```
+
+Runs client-side on every poll. No backend endpoint needed.
+
+### 9.2 Symptom Taxonomy
+
+| ID | Severity | Trigger Rule | Visual Effect |
+|---|---|---|---|
+| `IDLE_NORMAL` | `info` | All slots S0, no degradation, no recoveries | Machines calm, green lights, peaceful factory |
+| `BELT_JAM` | `warn` | Any slot in S2 for >50% of orphan timeout (from `slot.s2_entered_at` + `status.s2_orphan_after_sec`, see 10.1). Falls back to "phase is S2" if fields absent. | Affected machine's output conveyor stops, items pile up, warning lamp blinks |
+| `POWER_BROWNOUT` | `crit` | `price_age_sec > 30` or `mode == "PAUSED"` | Power line flickers/dims, all machines slow, amber particles |
+| `LANE_STARVATION` | `warn` | Any slot degraded (`long_only` or `short_only`) | Affected machine's starved side goes dark, input chest for that resource flashes empty |
+| `RECOVERY_BACKLOG` | `warn` | `total_orphans > slot_count * 2` | Recycling belt overflows, items pile up at edges, belt turns yellow |
+| `CIRCUIT_TRIP_RISK` | `crit` | `capacity_fill_health.status_band == "stop"` or `partial_fill_cancel_events_1d > 0` | Circuit network wire sparks red, hazard icon near capacity meter |
+| `POWER_BLACKOUT` | `crit` | `price_age_sec > 60` or `mode == "HALTED"` | Power line dead, all machines dark, red overlay, alarm icon |
+
+### 9.3 Symptom Object
+
+```js
+{
+  symptom_id: "BELT_JAM",
+  severity: "warn",         // info | warn | crit
+  priority: 2,              // 1 = highest
+  summary: "Slot #7 stuck in S2 for 22m (73% of timeout)",
+  affected_slots: [7],
+  visual_effects: ["conveyor_stop", "warning_lamp"]
+}
+```
+
+### 9.4 Visual Mapping
+
+The renderer reads active symptoms and applies effects:
+
+| Visual Effect | What it does |
+|---|---|
+| `conveyor_stop` | Belt animation stops on affected machine, items freeze in place |
+| `warning_lamp` | Yellow/red blinking lamp icon above affected machine |
+| `power_dim` | Power line particle speed drops, brightness fades |
+| `power_dead` | Power line goes black, no particles |
+| `input_flash_empty` | Input chest for USD or DOGE blinks empty (outline only) |
+| `belt_overflow` | Recovery belt items pile up, belt color shifts to yellow/red |
+| `circuit_spark` | Small spark particles along circuit network wire |
+| `hazard_icon` | Triangle hazard icon near capacity meter |
+| `machine_dark` | One side of machine goes dark (starved lane) |
+| `alarm_pulse` | Large alarm icon in center of factory, pulsing red |
+| `amber_wash` | Semi-transparent amber overlay on entire factory |
+| `red_wash` | Semi-transparent red overlay on entire factory |
+
+### 9.5 Notification Strip
+
+A thin strip at the bottom of the canvas (above the status bar) shows the **top symptom** as text:
+
+```
+⚠ BELT_JAM: Slot #7 stuck in S2 for 22m (73% of timeout)
+```
+
+- Color-coded: `info` = blue, `warn` = yellow, `crit` = red.
+- Shows only the highest-priority symptom. Click/`Enter` to cycle through all active symptoms.
+- When `IDLE_NORMAL` is the only symptom, the strip shows `✓ Factory running normally` in green.
+
+### 9.6 Priority Rules
+
+When multiple symptoms are active, priority determines:
+1. Which symptom shows in the notification strip
+2. Which visual effects take precedence (e.g., `red_wash` overrides `amber_wash`)
+
+Priority order (1 = highest):
+1. `POWER_BLACKOUT`
+2. `CIRCUIT_TRIP_RISK`
 3. `POWER_BROWNOUT`
-4. `LANE_STARVATION`
-5. `RECOVERY_BACKLOG`
-6. `CIRCUIT_TRIP_RISK`
-
-## 7. Telemetry Isolation Contract (Hard Requirement)
-
-1. Runtime telemetry is stored in a dedicated `TelemetryAccumulator`.
-2. Trading code may write/increment telemetry but must never read telemetry for decisions.
-3. Only status/diagnosis endpoints may read telemetry.
-4. Telemetry failures must degrade to missing metrics; trading behavior must remain unchanged.
-
-## 8. Time-Window Contract
-
-Time windows are computed in runtime (not diagnosis engine) so the diagnosis engine remains pure.
-
-Required windows:
-
-1. 1 minute
-2. 5 minutes
-3. 24 hour event counters where specified
-
-Bridge note:
-
-1. Until `status.telemetry` ships, Lens may consume `capacity_fill_health.partial_fill_open_events_1d`, `capacity_fill_health.partial_fill_cancel_events_1d`, and fill-latency stats as 24h window inputs.
-
-## 9. Industrial Aesthetic Telemetry Requirements
-
-To support a true "factory diagnostics" feel:
-
-1. `grid_load` models power/utilization/brownout before hard skips.
-2. `production_stats` models throughput (cycles, fee consumption).
-3. `assembler_states` models bottleneck classes as distinct categories.
-4. Diagnosis cards include `signal_code` and `visual_signals` for compact icon-like rendering.
-
-Assembler bottleneck classification rules:
-
-1. `bottleneck_input_starved`: slot is missing a required entry leg and cannot place it due to insufficient USD or DOGE against current bootstrap minimums.
-2. `bottleneck_output_full`: slot is trapped in dual-exit pressure (`S2`) beyond timeout/deadlock thresholds.
-3. `bottleneck_low_power`: slot needed an order lifecycle action but it was skipped/blocked by API budget saturation or stale-price power gating.
-
-## 10. Prompt Context Cap
-
-Prompt payload must be concise and operator-usable:
-
-1. Top symptom card only.
-2. 1-8 evidence lines.
-3. Up to 5 compact slot rows.
-4. No full raw status payload dumps.
-5. Prompt length cap: `<= 1800` chars each.
-6. `context_evidence` may be a curated subset of symptom `evidence` for prompt brevity; it may also be identical when all lines are relevant.
-
-## 11. API Contracts
-
-### 11.1 `/api/status` Contracts
-
-The runtime now has two layers of status support for Lens:
-
-1. **Implemented bridge (`status.capacity_fill_health`)** for manual scaling diagnostics.
-2. **Future full Lens telemetry (`status.telemetry`)** using schema `factory-lens-telemetry.v1`.
-
-#### 11.1.1 Implemented Bridge: `status.capacity_fill_health`
-
-Current runtime exports:
-
-1. `open_orders_current`
-2. `open_orders_source` (`kraken` or `internal_fallback`)
-3. `open_orders_internal`
-4. `open_orders_kraken` (nullable)
-5. `open_orders_drift` (nullable)
-6. `open_order_limit_configured`
-7. `open_orders_safe_cap`
-8. `open_order_headroom`
-9. `open_order_utilization_pct`
-10. `orders_per_slot_estimate` (nullable)
-11. `estimated_slots_remaining`
-12. `partial_fill_open_events_1d`
-13. `partial_fill_cancel_events_1d`
-14. `median_fill_seconds_1d` (nullable)
-15. `p95_fill_seconds_1d` (nullable)
-16. `status_band` (`normal`, `caution`, `stop`)
-17. `blocked_risk_hint` (string array)
-
-Lens bridge interpretation guidance:
-
-1. `status_band=stop` should escalate at least `warn` severity (or `crit` when paired with `partial_fill_cancel_events_1d > 0`).
-2. `open_orders_source=internal_fallback` should generate a data-quality warning card, not a trading-action card.
-3. `partial_fill_cancel_events_1d > 0` maps to phantom-position risk and should surface a remediation prompt immediately.
-
-#### 11.1.2 Future Full Extension: `status.telemetry`
-
-Add `telemetry` object under status payload using schema `factory-lens-telemetry.v1`.
-
-### 11.2 `/api/diagnosis`
-
-Returns deterministic diagnosis report using schema `factory-lens-diagnosis.v1`.
-
-The report carries both:
-
-1. `mode`: lifecycle mode (`INIT`, `RUNNING`, `PAUSED`, `HALTED`).
-2. `operating_state`: operator-facing health (`normal`, `degraded`, `paused`, `halted`).
-
-Compatibility rules:
-
-1. Always include `schema_version` and `engine_version`.
-2. Lens clients must render unknown `symptom_id`/`signal_code` cards as raw fallback.
-3. Lens clients should show warning banner: `engine newer than client`.
-4. `warnings` is optional; clients must default missing `warnings` to an empty array.
-5. v0.2.4 assumes one diagnosis report per pair (`pair` scoped). Aggregate multi-pair diagnosis endpoints are future work.
-
-## 12. JSON Schema: `status.telemetry` (`factory-lens-telemetry.v1`)
-
-```json
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://doge-grid-bot/schemas/status.telemetry.v1.json",
-  "title": "DOGE Bot status.telemetry v1",
-  "type": "object",
-  "additionalProperties": false,
-  "required": [
-    "telemetry_version",
-    "generated_at",
-    "loop_seq",
-    "window_seconds",
-    "max_api_calls_per_loop",
-    "loop_private_calls_last",
-    "grid_load",
-    "budget_skips_1m",
-    "budget_skips_5m",
-    "place_skips_budget_1m",
-    "place_skips_budget_5m",
-    "cancel_skips_budget_1m",
-    "cancel_skips_budget_5m",
-    "query_skips_budget_1m",
-    "query_skips_budget_5m",
-    "price_refresh_failures_1m",
-    "price_refresh_failures_5m",
-    "api_errors_1m",
-    "api_errors_5m",
-    "stale_price_pause_events_5m",
-    "degraded_slots_current",
-    "degraded_slots_avg_5m",
-    "degraded_transitions_5m",
-    "auto_repair_attempts_5m",
-    "auto_repair_success_5m",
-    "auto_repair_blocked_5m",
-    "auto_repair_block_reasons_5m",
-    "recovery_orders_current",
-    "recovery_backlog_growth_5m",
-    "invariant_bypass_min_size_5m",
-    "invariant_bypass_bootstrap_pending_5m",
-    "pause_events_24h",
-    "halt_events_24h",
-    "production_stats",
-    "assembler_states",
-    "window_samples_5m"
-  ],
-  "properties": {
-    "telemetry_version": {
-      "type": "string",
-      "const": "factory-lens-telemetry.v1"
-    },
-    "generated_at": {
-      "type": "number",
-      "minimum": 0
-    },
-    "loop_seq": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "window_seconds": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["one_min", "five_min"],
-      "properties": {
-        "one_min": { "type": "integer", "const": 60 },
-        "five_min": { "type": "integer", "const": 300 }
-      }
-    },
-    "max_api_calls_per_loop": {
-      "type": "integer",
-      "minimum": 1
-    },
-    "loop_private_calls_last": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "grid_load": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "capacity_per_loop",
-        "load_avg_1m",
-        "utilization_pct_1m",
-        "saturation_state"
-      ],
-      "properties": {
-        "capacity_per_loop": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "load_avg_1m": {
-          "type": "number",
-          "minimum": 0
-        },
-        "utilization_pct_1m": {
-          "type": "number",
-          "minimum": 0
-        },
-        "saturation_state": {
-          "type": "string",
-          "enum": ["stable", "brownout", "blackout"]
-        }
-      }
-    },
-    "budget_skips_1m": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "budget_skips_5m": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "place_skips_budget_1m": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "place_skips_budget_5m": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "cancel_skips_budget_1m": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "cancel_skips_budget_5m": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "query_skips_budget_1m": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "query_skips_budget_5m": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "price_refresh_failures_1m": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "price_refresh_failures_5m": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "api_errors_1m": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "api_errors_5m": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "stale_price_pause_events_5m": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "degraded_slots_current": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "degraded_slots_avg_5m": {
-      "type": "number",
-      "minimum": 0
-    },
-    "degraded_transitions_5m": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "auto_repair_attempts_5m": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "auto_repair_success_5m": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "auto_repair_blocked_5m": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "auto_repair_block_reasons_5m": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "insufficient_usd",
-        "insufficient_doge",
-        "api_budget_exhausted",
-        "stale_price",
-        "paused_or_halted",
-        "below_exchange_minimum",
-        "placement_exception_other",
-        "no_missing_leg",
-        "other"
-      ],
-      "properties": {
-        "insufficient_usd": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "insufficient_doge": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "api_budget_exhausted": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "stale_price": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "paused_or_halted": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "below_exchange_minimum": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "placement_exception_other": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "no_missing_leg": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "other": {
-          "type": "integer",
-          "minimum": 0
-        }
-      }
-    },
-    "recovery_orders_current": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "recovery_backlog_growth_5m": {
-      "type": "integer"
-    },
-    "invariant_bypass_min_size_5m": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "invariant_bypass_bootstrap_pending_5m": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "pause_events_24h": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "halt_events_24h": {
-      "type": "integer",
-      "minimum": 0
-    },
-    "production_stats": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "cycles_completed_1m",
-        "cycles_completed_5m",
-        "fees_consumed_5m",
-        "throughput_state"
-      ],
-      "properties": {
-        "cycles_completed_1m": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "cycles_completed_5m": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "fees_consumed_5m": {
-          "type": "number",
-          "minimum": 0
-        },
-        "throughput_state": {
-          "type": "string",
-          "enum": ["idle", "low", "normal", "high"]
-        }
-      }
-    },
-    "assembler_states": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "idle_s0",
-        "working_s1",
-        "working_s2",
-        "bottleneck_input_starved",
-        "bottleneck_output_full",
-        "bottleneck_low_power"
-      ],
-      "properties": {
-        "idle_s0": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "working_s1": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "working_s2": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "bottleneck_input_starved": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "bottleneck_output_full": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "bottleneck_low_power": {
-          "type": "integer",
-          "minimum": 0
-        }
-      }
-    },
-    "window_samples_5m": {
-      "type": "integer",
-      "minimum": 0
-    }
-  }
-}
-```
-
-## 13. JSON Schema: `/api/diagnosis` (`factory-lens-diagnosis.v1`)
-
-```json
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://doge-grid-bot/schemas/api.diagnosis.v1.json",
-  "title": "Factory Lens Diagnosis API v1",
-  "type": "object",
-  "additionalProperties": false,
-  "required": [
-    "schema_version",
-    "engine_version",
-    "generated_at",
-    "pair",
-    "mode",
-    "operating_state",
-    "status_snapshot_hash",
-    "top_symptom_id",
-    "top_symptom_severity",
-    "symptoms"
-  ],
-  "properties": {
-    "schema_version": {
-      "type": "string",
-      "const": "factory-lens-diagnosis.v1"
-    },
-    "engine_version": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 64
-    },
-    "generated_at": {
-      "type": "number",
-      "minimum": 0
-    },
-    "pair": {
-      "type": "string",
-      "minLength": 3,
-      "maxLength": 32
-    },
-    "mode": {
-      "type": "string",
-      "enum": ["INIT", "RUNNING", "PAUSED", "HALTED"]
-    },
-    "operating_state": {
-      "type": "string",
-      "enum": ["normal", "degraded", "paused", "halted"]
-    },
-    "status_snapshot_hash": {
-      "type": "string",
-      "pattern": "^[a-f0-9]{8,128}$"
-    },
-    "top_symptom_id": {
-      "type": "string",
-      "pattern": "^[A-Z0-9_]{2,64}$"
-    },
-    "top_symptom_severity": {
-      "type": "string",
-      "enum": ["info", "warn", "crit"]
-    },
-    "symptoms": {
-      "type": "array",
-      "minItems": 1,
-      "maxItems": 32,
-      "items": {
-        "$ref": "#/$defs/symptom_card"
-      }
-    },
-    "warnings": {
-      "type": "array",
-      "maxItems": 16,
-      "items": {
-        "type": "string",
-        "minLength": 1,
-        "maxLength": 200
-      }
-    }
-  },
-  "$defs": {
-    "symptom_card": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "symptom_id",
-        "severity",
-        "priority",
-        "rule_id",
-        "summary",
-        "interpretation",
-        "evidence",
-        "actions",
-        "affected_slots",
-        "signal_code",
-        "visual_signals",
-        "prompts"
-      ],
-      "properties": {
-        "symptom_id": {
-          "type": "string",
-          "pattern": "^[A-Z0-9_]{2,64}$"
-        },
-        "severity": {
-          "type": "string",
-          "enum": ["info", "warn", "crit"]
-        },
-        "priority": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 999
-        },
-        "rule_id": {
-          "type": "string",
-          "pattern": "^[a-z0-9_.:-]{3,128}$"
-        },
-        "summary": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 120
-        },
-        "interpretation": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 320
-        },
-        "evidence": {
-          "type": "array",
-          "minItems": 1,
-          "maxItems": 8,
-          "items": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 160
-          }
-        },
-        "actions": {
-          "type": "array",
-          "minItems": 1,
-          "maxItems": 8,
-          "items": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 180
-          }
-        },
-        "affected_slots": {
-          "type": "array",
-          "uniqueItems": true,
-          "maxItems": 64,
-          "items": {
-            "type": "integer",
-            "minimum": 0
-          }
-        },
-        "signal_code": {
-          "type": "string",
-          "pattern": "^[A-Z0-9_]{2,64}$"
-        },
-        "visual_signals": {
-          "type": "array",
-          "maxItems": 6,
-          "items": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["icon", "color", "value"],
-            "properties": {
-              "icon": {
-                "type": "string",
-                "enum": ["electricity", "fluid", "inserter", "belt", "hazard", "factory", "chest"]
-              },
-              "color": {
-                "type": "string",
-                "enum": ["red", "yellow", "green"]
-              },
-              "value": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 40
-              }
-            }
-          }
-        },
-        "prompts": {
-          "$ref": "#/$defs/prompt_bundle"
-        }
-      }
-    },
-    "prompt_bundle": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "codex_prompt",
-        "claude_prompt",
-        "context_slot_rows",
-        "context_evidence",
-        "estimated_chars"
-      ],
-      "properties": {
-        "codex_prompt": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 1800
-        },
-        "claude_prompt": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 1800
-        },
-        "context_slot_rows": {
-          "type": "array",
-          "maxItems": 5,
-          "items": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 80
-          }
-        },
-        "context_evidence": {
-          "type": "array",
-          "minItems": 1,
-          "maxItems": 8,
-          "items": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 160
-          }
-        },
-        "estimated_chars": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 2000
-        }
-      }
-    }
-  }
-}
-```
-
-## 14. Diagnosis Engine Structure
-
-Recommended module contract:
-
-1. File: `diagnosis_engine.py`
-2. No imports from runtime modules.
-3. Pure entry point: `diagnose(status_payload: dict) -> dict`
-4. CLI mode: `python diagnosis_engine.py < status.json`
-5. Importable by `bot.py` for `/api/diagnosis`
-
-## 15. Saturation and Throughput Guidance
-
-### 15.1 `grid_load.saturation_state` Suggested Thresholds
-
-1. `stable`: utilization < 70% and no recent budget skips.
-2. `brownout`: utilization between 70% and 95%, or low nonzero skip rate.
-3. `blackout`: utilization > 95% or repeated skips impacting place/cancel/query.
-
-### 15.2 `production_stats.throughput_state` Suggested Thresholds
-
-Default 5-minute banding (engine-configurable per pair/runtime profile):
-
-1. `idle`: `0` cycles in 5m, no symptom-level faults.
-2. `low`: `1-2` cycles in 5m.
-3. `normal`: `3-9` cycles in 5m.
-4. `high`: `>=10` cycles in 5m.
-
-## 16. Milestone Plan
-
-### M0: Spec Lock
-
-1. Freeze schema fields and keybindings.
-2. Freeze symptom taxonomy and severity levels.
-3. Freeze compact row format.
-
-Acceptance:
-
-1. Canonical spec committed.
-2. Example payloads validated manually.
-
-### M1a: Telemetry Instrumentation Core (Highest Runtime Risk)
-
-1. Add `TelemetryAccumulator`.
-2. Implement rolling-window counters.
-3. Add `grid_load`, `production_stats`, `assembler_states` counters.
-4. Ensure write-only usage from trading loop.
-5. Do not expose new fields on API yet (shadow phase).
-
-Acceptance:
-
-1. No trading behavior changes from instrumentation.
-2. Unit tests enforce no telemetry-read decision branches.
-3. Runtime remains stable in shadow mode.
-
-### M1b: Telemetry Exposure and Validation
-
-1. Serialize telemetry under `/api/status` as `telemetry`.
-2. Validate payload against `factory-lens-telemetry.v1`.
-3. Add compatibility tests for missing/partial telemetry fallback.
-
-Acceptance:
-
-1. Status payload schema-valid in normal operation.
-2. Missing telemetry does not break runtime/status endpoint.
-
-### M2: Diagnosis Engine
-
-1. Implement pure rule engine in standalone module.
-2. Emit `signal_code` and `visual_signals`.
-3. Add fixture-driven tests.
-
-Acceptance:
-
-1. Deterministic outputs across fixed fixtures.
-2. Stable priority ordering.
-
-### M3: API Integration
-
-1. Add `/api/diagnosis`.
-2. Include schema and engine version fields.
-3. Add unknown-version fallback signaling.
-
-Acceptance:
-
-1. Endpoint latency acceptable.
-2. Contract-valid payloads.
-
-### M4: Factory Lens Client (Textual)
-
-1. Build two-pane UI with compact rows.
-2. Render power/load and production bars.
-3. Add slot/symptom detail drawers.
-
-Acceptance:
-
-1. Usable on 80x24 and wider terminals.
-2. Windows Terminal compatibility.
-
-### M5: Action Console + Prompt Launcher
-
-1. Add concise action cards.
-2. Add codex/claude prompt generation with size cap.
-
-Acceptance:
-
-1. Prompts are copy-pasteable and bounded.
-2. Operators can act without raw JSON inspection.
-
-### M6: Pilot and Threshold Tuning
-
-1. Run in production-adjacent mode.
-2. Tune thresholds for false-positive control.
-3. Finalize operator runbook.
-
-Acceptance:
-
-1. Operators can diagnose common incidents without log deep-dive.
-2. False-positive rate acceptable for daily operations.
-
-## 17. Framework Decision
-
-Recommended stack:
-
-1. Runtime: existing Python bot process (`bot.py`) with diagnosis endpoint.
-2. Client: separate Textual app.
-
-Rationale:
-
-1. Keeps trading runtime isolated.
-2. Supports restart/update of UI without touching bot.
-3. Provides terminal-native interactions on Windows/Linux/macOS.
+4. `BELT_JAM`
+5. `LANE_STARVATION`
+6. `RECOVERY_BACKLOG`
+7. `IDLE_NORMAL`
+
+All active symptoms' visual effects are applied simultaneously — they stack, with higher priority winning any conflicts.
+
+---
+
+## 10. Data Requirements
+
+### 10.1 Backend Additions (3 fields)
+
+Add to `status_payload()` in `bot.py`. All three values already exist on runtime objects — this is pure serialization, no new computation.
+
+| Field | Location | Type | Source |
+|-------|----------|------|--------|
+| `s2_orphan_after_sec` | top-level | `float` | `config.S2_ORPHAN_AFTER_SEC` |
+| `s2_entered_at` | per-slot | `float\|null` | `slot_state.s2_entered_at` (already on `PairState` line 109) |
+| `stale_price_max_age_sec` | top-level | `float` | `config.STALE_PRICE_MAX_AGE_SEC` |
+
+These are read-only additions. No trading behavior change. Needed for `BELT_JAM` duration calculation and S2 blink threshold.
+
+Also update `STATE_MACHINE.md` section 14 to include `GET /factory` route.
+
+### 10.2 Existing Fields Used
+
+| Visual Need | Source Field |
+|-------------|-------------|
+| Machine count + layout | `status.slots` array length |
+| Machine phase | `slot.phase` |
+| Machine health | `slot.long_only`, `slot.short_only` |
+| Orders on belts | `slot.open_orders` (side, role, price, volume) |
+| Recovery items | `slot.recovery_orders` (side, price, age_sec) |
+| Cycle completions | `slot.recent_cycles` (diff to detect new) |
+| Power state | `status.price_age_sec`, `status.mode` |
+| Capacity | `capacity_fill_health.open_order_utilization_pct` |
+| Profit output | `slot.total_profit`, `status.total_profit` |
+| Band status | `capacity_fill_health.status_band` |
+| Partial fill canary | `capacity_fill_health.partial_fill_cancel_events_1d` |
+| Total orphans | `status.total_orphans` |
+| Slot count | `status.slot_count` |
+| S2 duration | `slot.s2_entered_at` + `status.s2_orphan_after_sec` **(new, 10.1)** |
+
+### 10.3 Graceful Degradation
+
+All new fields (10.1) must be treated as optional by the client. If absent:
+- `BELT_JAM` falls back to "phase is S2" without duration percentage.
+- S2 blink threshold uses hardcoded 1800s default.
+- Stale threshold uses hardcoded 60s default.
+
+---
+
+## 11. Testing Criteria
+
+1. Factory renders all slots from `/api/status` as machines with correct phases.
+2. Adding a slot via `+` key or button causes a new machine to appear on next poll.
+3. Phase change (S0→S1a) visually transitions the machine (side lights up, gears start).
+4. Price going stale (>60s) dims the power line and all machines.
+5. Bot PAUSED shows amber overlay. Bot HALTED shows red overlay with alarm.
+6. Recovery orders appear as items on the recycling belt.
+7. Clicking a recovery item opens confirmation → soft_close API call.
+8. Selecting a machine shows the detail panel with correct slot data.
+9. Canvas resizes on window resize without breaking layout.
+10. Keyboard shortcuts (`1-9`, `[]`, `+`, `-`, `p`, `:`, `?`) work identically to main dashboard.
+11. Degraded slot (`long_only`/`short_only`) shows warning lamp + starved side goes dark.
+12. S2 slot shows belt jam visual when duration exceeds 50% of timeout.
+13. `status_band == "stop"` triggers circuit spark and hazard icon.
+14. Notification strip shows highest-priority symptom with correct color.
+15. `IDLE_NORMAL` state shows green "Factory running normally" in strip.
+
+---
+
+## 12. Milestones
+
+| Phase | Scope |
+|-------|-------|
+| F1 | Static factory: machines + power line + chests + status bar + notification strip. No animation. Route `/factory` served. |
+| F2 | Diagnosis engine: `diagnose()` function + visual effect mapping + symptom-driven rendering. |
+| F3 | Animation: belt items moving, gear rotation, power particles, phase-based machine states. |
+| F4 | Interactivity: click to select, detail panel, keyboard nav, command bar, add/remove/soft-close. |
+| F5 | Polish: diff-driven event animations (fills, orphans, cycles), sparkles, transitions, tooltips. |
+
+Each milestone is independently shippable. F1 alone is a useful static factory view. F2 makes it diagnostic.
+
+---
+
+## 13. Out of Scope
+
+- 3D rendering (Three.js)
+- Drag-and-drop machine placement
+- Custom factory layouts / saved arrangements
+- Sound effects
+- New backend telemetry counters or API endpoints
+- Multi-pair factory views
+- Prompt launchers for Codex/Claude (may layer on later)
