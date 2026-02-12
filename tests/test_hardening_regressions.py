@@ -1,3 +1,4 @@
+import io
 import unittest
 from unittest import mock
 
@@ -716,6 +717,25 @@ class BotEventLogTests(unittest.TestCase):
         self.assertEqual(cfh["open_orders_safe_cap"], 168)
         self.assertEqual(cfh["open_order_headroom"], 166)
 
+    def test_status_payload_exposes_factory_fields(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    s2_entered_at=900.0,
+                ),
+            )
+        }
+
+        payload = rt.status_payload()
+        self.assertEqual(payload["s2_orphan_after_sec"], float(config.S2_ORPHAN_AFTER_SEC))
+        self.assertEqual(payload["stale_price_max_age_sec"], float(config.STALE_PRICE_MAX_AGE_SEC))
+        self.assertEqual(payload["slots"][0]["s2_entered_at"], 900.0)
+
     def test_partial_fill_open_is_counted_once_per_txid(self):
         rt = bot.BotRuntime()
         rt.slots = {
@@ -829,6 +849,26 @@ class DashboardApiHardeningTests(unittest.TestCase):
         def _send_json(self, data, code=200):
             self.sent.append((code, data))
 
+    class _GetHandlerStub:
+        def __init__(self, path):
+            self.path = path
+            self.code = None
+            self.headers = []
+            self.sent_json = []
+            self.wfile = io.BytesIO()
+
+        def send_response(self, code):
+            self.code = code
+
+        def send_header(self, key, value):
+            self.headers.append((key, value))
+
+        def end_headers(self):
+            return None
+
+        def _send_json(self, data, code=200):
+            self.sent_json.append((code, data))
+
     def setUp(self):
         self.prev_runtime = bot._RUNTIME
 
@@ -869,6 +909,17 @@ class DashboardApiHardeningTests(unittest.TestCase):
         code, payload = handler.sent[0]
         self.assertEqual(code, 500)
         self.assertEqual(payload, {"ok": False, "message": "internal server error"})
+
+    def test_factory_route_serves_html(self):
+        handler = self._GetHandlerStub("/factory")
+
+        bot.DashboardHandler.do_GET(handler)
+
+        self.assertEqual(handler.code, 200)
+        self.assertFalse(handler.sent_json)
+        body = handler.wfile.getvalue()
+        self.assertIn(b"Factory Lens", body)
+        self.assertIn(("Content-Type", "text/html; charset=utf-8"), handler.headers)
 
 
 if __name__ == "__main__":

@@ -1473,6 +1473,7 @@ class BotRuntime:
                     "phase": phase,
                     "long_only": st.long_only,
                     "short_only": st.short_only,
+                    "s2_entered_at": st.s2_entered_at,
                     "market_price": st.market_price,
                     "cycle_a": st.cycle_a,
                     "cycle_b": st.cycle_b,
@@ -1560,6 +1561,8 @@ class BotRuntime:
                 "total_round_trips": total_round_trips,
                 "total_orphans": total_orphans,
                 "pnl_reference_price": pnl_ref_price,
+                "s2_orphan_after_sec": float(config.S2_ORPHAN_AFTER_SEC),
+                "stale_price_max_age_sec": float(config.STALE_PRICE_MAX_AGE_SEC),
                 "capacity_fill_health": {
                     "open_orders_current": open_orders_current,
                     "open_orders_source": open_orders_source,
@@ -1623,6 +1626,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
         global _RUNTIME
         if self.path == "/" or self.path.startswith("/?"):
             body = dashboard.DASHBOARD_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if self.path == "/factory" or self.path.startswith("/factory?"):
+            import factory_viz
+
+            body = factory_viz.FACTORY_HTML.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
