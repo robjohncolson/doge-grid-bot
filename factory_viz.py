@@ -378,6 +378,7 @@ FACTORY_HTML = r"""<!doctype html>
 |  [/]   prev/next   +    add slot      |
 |  gg    first slot  -    close next    |
 |  G     last slot   .    refresh       |
+|                    f    dashboard     |
 |                    :    command       |
 |                    ?    this help     |
 |                    Esc  close         |
@@ -385,7 +386,7 @@ FACTORY_HTML = r"""<!doctype html>
 |  COMMAND BAR                          |
 |  :pause  :resume  :add  :close        |
 |  :set entry N  :set profit N          |
-|  :jump N (slot #)                     |
+|  :jump N (slot #)  :q (dashboard)     |
 |  Tab=complete  up/down=history  Esc=close |
 |                                       |
 +-------------------- Esc to close -----+</pre>
@@ -859,7 +860,7 @@ FACTORY_HTML = r"""<!doctype html>
       if (verb === 'pause') return {type: 'action', action: 'pause', payload: {}};
       if (verb === 'resume') return {type: 'action', action: 'resume', payload: {}};
       if (verb === 'add') return {type: 'action', action: 'add_slot', payload: {}};
-      if (verb === 'q') return {type: 'noop'};
+      if (verb === 'q') return {type: 'navigate', href: '/'};
 
       if (verb === 'jump') {
         if (tokens.length < 2) return {error: 'usage: :jump <N>'};
@@ -1095,6 +1096,10 @@ FACTORY_HTML = r"""<!doctype html>
         return;
       }
       if (parsed.type === 'noop') return;
+      if (parsed.type === 'navigate') {
+        window.location.href = parsed.href;
+        return;
+      }
 
       pushCommandHistory(rawInput);
 
@@ -1150,17 +1155,17 @@ FACTORY_HTML = r"""<!doctype html>
           showToast('slot index #' + key + ' not found', 'error');
         }
         clearChordBuffer();
-        return;
+        return true;
       }
       if (key === '[') {
         cycleSlot(-1);
         clearChordBuffer();
-        return;
+        return true;
       }
       if (key === ']') {
         cycleSlot(1);
         clearChordBuffer();
-        return;
+        return true;
       }
       if (key === 'g') {
         if (chordKey === 'g') {
@@ -1169,42 +1174,47 @@ FACTORY_HTML = r"""<!doctype html>
         } else {
           armChord('g');
         }
-        return;
+        return true;
       }
       if (key === 'G') {
         clearChordBuffer();
         jumpLastSlot();
-        return;
+        return true;
       }
       if (key === '+') {
         clearChordBuffer();
         void dispatchAction('add_slot');
-        return;
+        return true;
       }
       if (key === '-') {
         clearChordBuffer();
         requestSoftCloseNext();
-        return;
+        return true;
       }
       if (key === 'p') {
         clearChordBuffer();
         void togglePauseResume();
-        return;
+        return true;
       }
       if (key === '.') {
         clearChordBuffer();
         forceRefreshRateLimited();
-        return;
+        return true;
       }
       if (key === '?') {
         clearChordBuffer();
         toggleHelp();
-        return;
+        return true;
       }
       if (key === ':') {
         clearChordBuffer();
         openCommandBar();
-        return;
+        return true;
+      }
+      if (key === 'f') {
+        clearChordBuffer();
+        window.location.href = '/';
+        return true;
       }
       if (key === 'Escape') {
         clearChordBuffer();
@@ -1215,9 +1225,10 @@ FACTORY_HTML = r"""<!doctype html>
         } else {
           leaveToNormal();
         }
-        return;
+        return true;
       }
       clearChordBuffer();
+      return false;
     }
 
     function onGlobalKeyDown(event) {
@@ -1255,8 +1266,9 @@ FACTORY_HTML = r"""<!doctype html>
         return;
       }
 
-      event.preventDefault();
-      handleNormalModeKey(event);
+      if (handleNormalModeKey(event)) {
+        event.preventDefault();
+      }
     }
 
     function roundRect(x, y, w, h, r) {

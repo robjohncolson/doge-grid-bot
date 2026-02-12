@@ -361,6 +361,7 @@ DASHBOARD_HTML = """<!doctype html>
 |  [/]   prev/next   +    add slot      |
 |  gg    first slot  -    close next    |
 |  G     last slot   .    refresh       |
+|                    f    factory view  |
 |                    :    command       |
 |                    ?    this help     |
 |                    Esc  close         |
@@ -368,7 +369,7 @@ DASHBOARD_HTML = """<!doctype html>
 |  COMMAND BAR                          |
 |  :pause  :resume  :add  :close        |
 |  :set entry N  :set profit N          |
-|  :jump N (slot #)                     |
+|  :jump N (slot #)  :q (factory view)  |
 |  Tab=complete  up/down=history  Esc=close |
 |                                       |
 +-------------------- Esc to close -----+</pre>
@@ -546,7 +547,7 @@ DASHBOARD_HTML = """<!doctype html>
       if (verb === 'pause') return {type: 'action', action: 'pause', payload: {}};
       if (verb === 'resume') return {type: 'action', action: 'resume', payload: {}};
       if (verb === 'add') return {type: 'action', action: 'add_slot', payload: {}};
-      if (verb === 'q') return {type: 'noop'};
+      if (verb === 'q') return {type: 'navigate', href: '/factory'};
 
       if (verb === 'jump') {
         if (tokens.length < 2) return {error: 'usage: :jump <N>'};
@@ -783,6 +784,10 @@ DASHBOARD_HTML = """<!doctype html>
         showToast('noop', 'info');
         return;
       }
+      if (parsed.type === 'navigate') {
+        window.location.href = parsed.href;
+        return;
+      }
 
       pushCommandHistory(rawInput);
 
@@ -1010,17 +1015,17 @@ DASHBOARD_HTML = """<!doctype html>
           showToast(`slot #${slotId} not found`, 'error');
         }
         clearChordBuffer();
-        return;
+        return true;
       }
       if (key === '[') {
         cycleSlot(-1);
         clearChordBuffer();
-        return;
+        return true;
       }
       if (key === ']') {
         cycleSlot(1);
         clearChordBuffer();
-        return;
+        return true;
       }
       if (key === 'g') {
         if (chordKey === 'g') {
@@ -1029,52 +1034,60 @@ DASHBOARD_HTML = """<!doctype html>
         } else {
           armChord('g');
         }
-        return;
+        return true;
       }
       if (key === 'G') {
         clearChordBuffer();
         jumpLastSlot();
-        return;
+        return true;
       }
       if (key === 'p') {
         clearChordBuffer();
         void togglePauseResume();
-        return;
+        return true;
       }
       if (key === '+') {
         clearChordBuffer();
         void dispatchAction('add_slot');
-        return;
+        return true;
       }
       if (key === '-') {
         clearChordBuffer();
         requestSoftCloseNext();
-        return;
+        return true;
       }
       if (key === '.') {
         clearChordBuffer();
         forceRefreshRateLimited();
-        return;
+        return true;
       }
       if (key === ':') {
         clearChordBuffer();
         openCommandBar();
-        return;
+        return true;
       }
       if (key === '?') {
         clearChordBuffer();
         toggleHelp();
-        return;
+        return true;
+      }
+      if (key === 'f') {
+        clearChordBuffer();
+        window.location.href = '/factory';
+        return true;
       }
       if (key === 'Escape') {
         clearChordBuffer();
         leaveToNormal();
-        return;
+        return true;
       }
       clearChordBuffer();
+      return false;
     }
 
     function onGlobalKeyDown(event) {
+      if (event.ctrlKey || event.metaKey || event.altKey) return;
+
       if (isControlInputFocused()) {
         if (event.key === 'Escape') {
           event.preventDefault();
@@ -1110,8 +1123,9 @@ DASHBOARD_HTML = """<!doctype html>
         return;
       }
 
-      event.preventDefault();
-      handleNormalModeKey(event);
+      if (handleNormalModeKey(event)) {
+        event.preventDefault();
+      }
     }
 
     function readAndValidatePctInput(inputId, label) {
