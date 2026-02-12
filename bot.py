@@ -20,7 +20,7 @@ import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from math import ceil
+from math import ceil, isfinite
 from socketserver import ThreadingMixIn
 from statistics import median
 from typing import Any
@@ -1612,9 +1612,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return {}
         raw = self.rfile.read(n)
         try:
-            return json.loads(raw.decode("utf-8"))
-        except Exception:
-            return {}
+            body = json.loads(raw.decode("utf-8"))
+        except Exception as exc:
+            raise ValueError("invalid request body") from exc
+        if not isinstance(body, dict):
+            raise ValueError("invalid request body")
+        return body
 
     def do_GET(self) -> None:  # noqa: N802
         global _RUNTIME
@@ -1638,40 +1641,69 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         global _RUNTIME
-        if not self.path.startswith("/api/action"):
-            self._send_json({"error": "not found"}, 404)
-            return
-        if _RUNTIME is None:
-            self._send_json({"error": "runtime not ready"}, 503)
-            return
+        try:
+            if not self.path.startswith("/api/action"):
+                self._send_json({"ok": False, "message": "not found"}, 404)
+                return
+            if _RUNTIME is None:
+                self._send_json({"ok": False, "message": "runtime not ready"}, 503)
+                return
 
-        body = self._read_json()
-        action = (body.get("action") or "").strip()
+            try:
+                body = self._read_json()
+            except Exception:
+                self._send_json({"ok": False, "message": "invalid request body"}, 400)
+                return
 
-        with _RUNTIME.lock:
-            ok = True
-            msg = "ok"
-            if action == "pause":
-                _RUNTIME.pause("paused from dashboard")
-                msg = "paused"
-            elif action == "resume":
-                _RUNTIME.resume()
-                msg = "running"
-            elif action == "add_slot":
-                ok, msg = _RUNTIME.add_slot()
-            elif action == "set_entry_pct":
-                ok, msg = _RUNTIME.set_entry_pct(float(body.get("value", 0)))
-            elif action == "set_profit_pct":
-                ok, msg = _RUNTIME.set_profit_pct(float(body.get("value", 0)))
+            action = (body.get("action") or "").strip()
+            parsed: dict[str, float | int] = {}
+
+            if action in ("set_entry_pct", "set_profit_pct"):
+                try:
+                    parsed["value"] = float(body.get("value", 0))
+                    if not isfinite(parsed["value"]):
+                        raise ValueError("non-finite value")
+                except (TypeError, ValueError):
+                    self._send_json({"ok": False, "message": "invalid numeric value"}, 400)
+                    return
             elif action == "soft_close":
-                ok, msg = _RUNTIME.soft_close(int(body.get("slot_id", 0)), int(body.get("recovery_id", 0)))
-            elif action == "soft_close_next":
-                ok, msg = _RUNTIME.soft_close_next()
+                try:
+                    parsed["slot_id"] = int(body.get("slot_id", 0))
+                    parsed["recovery_id"] = int(body.get("recovery_id", 0))
+                except (TypeError, ValueError):
+                    self._send_json({"ok": False, "message": "invalid slot/recovery id"}, 400)
+                    return
+            elif action in ("pause", "resume", "add_slot", "soft_close_next"):
+                pass
             else:
-                ok, msg = False, f"unknown action: {action}"
-            _RUNTIME._save_snapshot()
+                self._send_json({"ok": False, "message": f"unknown action: {action}"}, 400)
+                return
 
-        self._send_json({"ok": ok, "message": msg}, 200 if ok else 400)
+            with _RUNTIME.lock:
+                ok = True
+                msg = "ok"
+                if action == "pause":
+                    _RUNTIME.pause("paused from dashboard")
+                    msg = "paused"
+                elif action == "resume":
+                    _RUNTIME.resume()
+                    msg = "running"
+                elif action == "add_slot":
+                    ok, msg = _RUNTIME.add_slot()
+                elif action == "set_entry_pct":
+                    ok, msg = _RUNTIME.set_entry_pct(float(parsed["value"]))
+                elif action == "set_profit_pct":
+                    ok, msg = _RUNTIME.set_profit_pct(float(parsed["value"]))
+                elif action == "soft_close":
+                    ok, msg = _RUNTIME.soft_close(int(parsed["slot_id"]), int(parsed["recovery_id"]))
+                elif action == "soft_close_next":
+                    ok, msg = _RUNTIME.soft_close_next()
+                _RUNTIME._save_snapshot()
+
+            self._send_json({"ok": bool(ok), "message": str(msg)}, 200 if ok else 400)
+        except Exception:
+            logger.exception("Unhandled exception in /api/action")
+            self._send_json({"ok": False, "message": "internal server error"}, 500)
 
 
 def start_http_server() -> ThreadingHTTPServer | None:

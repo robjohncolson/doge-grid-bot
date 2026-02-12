@@ -777,5 +777,99 @@ class BotEventLogTests(unittest.TestCase):
         self.assertEqual(len(rt.slots[0].state.orders), 0)
 
 
+class DashboardApiHardeningTests(unittest.TestCase):
+    class _LockStub:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class _RuntimeStub:
+        def __init__(self):
+            self.lock = DashboardApiHardeningTests._LockStub()
+            self.raise_on_pause = False
+
+        def pause(self, _reason):
+            if self.raise_on_pause:
+                raise RuntimeError("boom")
+
+        def resume(self):
+            return None
+
+        def add_slot(self):
+            return True, "ok"
+
+        def set_entry_pct(self, _value):
+            return True, "ok"
+
+        def set_profit_pct(self, _value):
+            return True, "ok"
+
+        def soft_close(self, _slot_id, _recovery_id):
+            return True, "ok"
+
+        def soft_close_next(self):
+            return True, "ok"
+
+        def _save_snapshot(self):
+            return None
+
+    class _HandlerStub:
+        def __init__(self, body_or_exc):
+            self.path = "/api/action"
+            self._body_or_exc = body_or_exc
+            self.sent = []
+
+        def _read_json(self):
+            if isinstance(self._body_or_exc, Exception):
+                raise self._body_or_exc
+            return self._body_or_exc
+
+        def _send_json(self, data, code=200):
+            self.sent.append((code, data))
+
+    def setUp(self):
+        self.prev_runtime = bot._RUNTIME
+
+    def tearDown(self):
+        bot._RUNTIME = self.prev_runtime
+
+    def test_api_action_malformed_body_returns_json_400(self):
+        bot._RUNTIME = self._RuntimeStub()
+        handler = self._HandlerStub(ValueError("bad json"))
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 400)
+        self.assertEqual(payload, {"ok": False, "message": "invalid request body"})
+
+    def test_api_action_unknown_action_returns_json_400(self):
+        bot._RUNTIME = self._RuntimeStub()
+        handler = self._HandlerStub({"action": "wat"})
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 400)
+        self.assertEqual(payload, {"ok": False, "message": "unknown action: wat"})
+
+    def test_api_action_catch_all_returns_json_500(self):
+        runtime = self._RuntimeStub()
+        runtime.raise_on_pause = True
+        bot._RUNTIME = runtime
+        handler = self._HandlerStub({"action": "pause"})
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 500)
+        self.assertEqual(payload, {"ok": False, "message": "internal server error"})
+
+
 if __name__ == "__main__":
     unittest.main()

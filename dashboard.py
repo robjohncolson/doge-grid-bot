@@ -24,6 +24,9 @@ DASHBOARD_HTML = """<!doctype html>
       --warn: #d29922;
       --line: #30363d;
       --accent: #58a6ff;
+      --cmd-bg: #161b22;
+      --backdrop: rgba(0,0,0,0.5);
+      --toast-bg: #1c2128;
     }
     * { box-sizing: border-box; }
     body {
@@ -133,6 +136,115 @@ DASHBOARD_HTML = """<!doctype html>
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     .tiny { font-size: 11px; color: var(--muted); }
     .right { text-align: right; }
+
+    #kbMode {
+      letter-spacing: .06em;
+    }
+    #cmdBar {
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      display: none;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 14px;
+      border-top: 1px solid var(--line);
+      background: var(--cmd-bg);
+      z-index: 1200;
+    }
+    #cmdBar.open { display: flex; }
+    #cmdPrefix {
+      color: var(--accent);
+      font-size: 14px;
+    }
+    #cmdInput {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 10px;
+      background: #0f141b;
+      color: var(--ink);
+      font-size: 14px;
+      outline: none;
+    }
+    #cmdInput:focus { border-color: var(--accent); }
+    #cmdSuggestions {
+      position: fixed;
+      left: 14px;
+      right: 14px;
+      bottom: 54px;
+      display: none;
+      z-index: 1190;
+      max-width: 600px;
+    }
+    #cmdSuggestions.open { display: block; }
+    .cmd-suggestion {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 6px 8px;
+      margin-top: 6px;
+      background: var(--panel);
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .cmd-suggestion.active {
+      border-color: var(--accent);
+      color: var(--ink);
+      background: rgba(88,166,255,.12);
+    }
+    .overlay {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--backdrop);
+      z-index: 1100;
+    }
+    .overlay[hidden] { display: none; }
+    .modal {
+      width: min(720px, calc(100vw - 30px));
+      max-height: calc(100vh - 60px);
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 14px;
+      background: var(--panel);
+    }
+    #confirmDialog .modal {
+      width: min(420px, calc(100vw - 30px));
+    }
+    #confirmActions {
+      margin-top: 12px;
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+    #toasts {
+      position: fixed;
+      right: 16px;
+      bottom: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      z-index: 1250;
+    }
+    .toast {
+      min-width: 220px;
+      max-width: 360px;
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--accent);
+      border-radius: 8px;
+      padding: 8px 10px;
+      background: var(--toast-bg);
+      color: var(--ink);
+      font-size: 12px;
+      box-shadow: 0 8px 20px rgba(0,0,0,.35);
+    }
+    .toast.success { border-left-color: var(--good); }
+    .toast.error { border-left-color: var(--bad); }
+    .toast.info { border-left-color: var(--accent); }
   </style>
 </head>
 <body>
@@ -143,6 +255,7 @@ DASHBOARD_HTML = """<!doctype html>
         <span id=\"mode\" class=\"badge\">MODE</span>
         <span id=\"phase\" class=\"badge\">PHASE</span>
         <span id=\"priceAge\" class=\"badge\">PRICE</span>
+        <span id=\"kbMode\" class=\"badge\">KB NORMAL</span>
       </div>
     </div>
 
@@ -173,7 +286,6 @@ DASHBOARD_HTML = """<!doctype html>
         </div>
 
         <div style=\"height:10px\"></div>
-        <div id=\"ctlMsg\" class=\"tiny\"></div>
 
         <h3 style=\"margin-top:14px\">Summary</h3>
         <div class=\"row\"><span class=\"k\">Pair</span><span id=\"pair\" class=\"v mono\"></span></div>
@@ -234,26 +346,472 @@ DASHBOARD_HTML = """<!doctype html>
     </div>
   </div>
 
+  <div id=\"cmdSuggestions\" class=\"mono\"></div>
+  <div id=\"cmdBar\">
+    <span id=\"cmdPrefix\" class=\"mono\">:</span>
+    <input id=\"cmdInput\" class=\"mono\" type=\"text\" spellcheck=\"false\" autocomplete=\"off\" />
+  </div>
+
+  <div id=\"helpModal\" class=\"overlay\" hidden>
+    <div class=\"modal mono\">
+<pre>+- Keybindings -------------------------+
+|                                       |
+|  NAVIGATION        ACTIONS            |
+|  1-9   slot jump   p    pause/resume  |
+|  [/]   prev/next   +    add slot      |
+|  gg    first slot  -    close next    |
+|  G     last slot   .    refresh       |
+|                    :    command       |
+|                    ?    this help     |
+|                    Esc  close         |
+|                                       |
+|  COMMAND BAR                          |
+|  :pause  :resume  :add  :close        |
+|  :set entry N  :set profit N          |
+|  :jump N                              |
+|  Tab=complete  up/down=history  Esc=close |
+|                                       |
++-------------------- Esc to close -----+</pre>
+    </div>
+  </div>
+
+  <div id=\"confirmDialog\" class=\"overlay\" hidden>
+    <div class=\"modal\">
+      <div id=\"confirmText\"></div>
+      <div id=\"confirmActions\">
+        <button id=\"confirmCancelBtn\">Cancel</button>
+        <button id=\"confirmOkBtn\">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <div id=\"toasts\"></div>
+
   <script>
     let state = null;
     let selectedSlot = 0;
+    let pendingRenderState = null;
+    let kbMode = 'NORMAL';
+    let chordKey = '';
+    let chordTimer = null;
+    let pendingConfirm = null;
+    let lastForcedRefreshMs = 0;
+    let currentSuggestions = [];
+    let suggestionIndex = -1;
+    let historyIndex = 0;
+    let lastRefreshError = '';
+    const commandHistory = [];
+    const COMMAND_COMPLETIONS = ['pause', 'resume', 'add', 'close', 'set entry', 'set profit', 'jump', 'q'];
+    const CONTROL_INPUT_IDS = new Set(['entryInput', 'profitInput']);
 
     function fmt(n, d=6) {
       if (n === null || n === undefined || Number.isNaN(Number(n))) return '-';
       return Number(n).toFixed(d);
     }
 
-    async function api(path, opts={}) {
-      const res = await fetch(path, opts);
-      if (!res.ok) throw new Error(await res.text());
-      return await res.json();
+    function showToast(message, type='info') {
+      const box = document.getElementById('toasts');
+      if (!box) return;
+      while (box.children.length >= 3) {
+        box.removeChild(box.firstElementChild);
+      }
+      const item = document.createElement('div');
+      item.className = `toast ${type}`;
+      item.textContent = String(message || 'ok');
+      box.appendChild(item);
+      const timeoutMs = type === 'error' ? 8000 : 4000;
+      window.setTimeout(() => {
+        if (item.parentElement === box) box.removeChild(item);
+      }, timeoutMs);
     }
 
-    async function act(action, payload={}) {
-      const body = JSON.stringify({action, ...payload});
-      const out = await api('/api/action', {method:'POST', headers:{'Content-Type':'application/json'}, body});
-      document.getElementById('ctlMsg').textContent = out.message || 'ok';
-      await refresh();
+    function updateKbModeBadge() {
+      const badge = document.getElementById('kbMode');
+      if (!badge) return;
+      badge.textContent = `KB ${kbMode}`;
+      badge.className = 'badge';
+    }
+
+    function clearChordBuffer() {
+      chordKey = '';
+      if (chordTimer !== null) {
+        window.clearTimeout(chordTimer);
+        chordTimer = null;
+      }
+    }
+
+    function setKbMode(nextMode) {
+      if (kbMode === nextMode) return;
+      kbMode = nextMode;
+      clearChordBuffer();
+      updateKbModeBadge();
+      if (kbMode === 'NORMAL') {
+        flushPendingRender();
+      }
+    }
+
+    function closeCommandBarUi() {
+      const bar = document.getElementById('cmdBar');
+      const suggestions = document.getElementById('cmdSuggestions');
+      bar.classList.remove('open');
+      suggestions.classList.remove('open');
+      suggestions.innerHTML = '';
+      currentSuggestions = [];
+      suggestionIndex = -1;
+    }
+
+    function closeHelpUi() {
+      document.getElementById('helpModal').hidden = true;
+    }
+
+    function closeConfirmUi() {
+      pendingConfirm = null;
+      document.getElementById('confirmDialog').hidden = true;
+    }
+
+    function leaveToNormal() {
+      closeCommandBarUi();
+      closeHelpUi();
+      closeConfirmUi();
+      setKbMode('NORMAL');
+    }
+
+    function getSlots() {
+      if (!state || !Array.isArray(state.slots)) return [];
+      return state.slots;
+    }
+
+    function applySelectedSlotRender() {
+      if (!state) return;
+      renderSlots(state);
+      renderSelected(state);
+    }
+
+    function jumpToSlotIndex(indexOneBased) {
+      const slots = getSlots();
+      if (!slots.length) return false;
+      if (indexOneBased < 1 || indexOneBased > slots.length) return false;
+      selectedSlot = slots[indexOneBased - 1].slot_id;
+      applySelectedSlotRender();
+      return true;
+    }
+
+    function jumpFirstSlot() {
+      const slots = getSlots();
+      if (!slots.length) return;
+      selectedSlot = slots[0].slot_id;
+      applySelectedSlotRender();
+    }
+
+    function jumpLastSlot() {
+      const slots = getSlots();
+      if (!slots.length) return;
+      selectedSlot = slots[slots.length - 1].slot_id;
+      applySelectedSlotRender();
+    }
+
+    function cycleSlot(step) {
+      const slots = getSlots();
+      if (!slots.length) return;
+      let idx = slots.findIndex((slot) => slot.slot_id === selectedSlot);
+      if (idx < 0) idx = 0;
+      idx = (idx + step + slots.length) % slots.length;
+      selectedSlot = slots[idx].slot_id;
+      applySelectedSlotRender();
+    }
+
+    function isControlInputFocused() {
+      const active = document.activeElement;
+      return !!(active && CONTROL_INPUT_IDS.has(active.id));
+    }
+
+    function normalizeCommandInput(raw) {
+      const txt = String(raw || '').trim();
+      if (!txt) return '';
+      return txt.startsWith(':') ? txt.slice(1).trim() : txt;
+    }
+
+    function parseNonNegativeInt(raw) {
+      if (!/^[0-9]+$/.test(String(raw || ''))) return null;
+      return Number.parseInt(raw, 10);
+    }
+
+    function parseCommand(rawInput) {
+      const norm = normalizeCommandInput(rawInput);
+      if (!norm) return {type: 'noop'};
+      const tokens = norm.split(/\\s+/);
+      const verb = (tokens[0] || '').toLowerCase();
+
+      if (verb === 'pause') return {type: 'action', action: 'pause', payload: {}};
+      if (verb === 'resume') return {type: 'action', action: 'resume', payload: {}};
+      if (verb === 'add') return {type: 'action', action: 'add_slot', payload: {}};
+      if (verb === 'q') return {type: 'noop'};
+
+      if (verb === 'jump') {
+        if (tokens.length < 2) return {error: 'usage: :jump <N>'};
+        const slotIndex = parseNonNegativeInt(tokens[1]);
+        if (slotIndex === null || slotIndex <= 0) return {error: 'jump target must be a positive integer'};
+        return {type: 'jump', slotIndex};
+      }
+
+      if (verb === 'set') {
+        if (tokens.length < 3) return {error: 'usage: :set entry|profit <value>'};
+        const target = (tokens[1] || '').toLowerCase();
+        const value = Number.parseFloat(tokens[2]);
+        if (!Number.isFinite(value) || value < 0.05 || value > 50.0) {
+          return {error: 'set value must be between 0.05 and 50.0'};
+        }
+        if (target === 'entry') return {type: 'set', metric: 'entry', value};
+        if (target === 'profit') return {type: 'set', metric: 'profit', value};
+        return {error: `unknown set target: ${target}`};
+      }
+
+      if (verb === 'close') {
+        if (tokens.length === 1) return {type: 'action', action: 'soft_close_next', payload: {}};
+        if (tokens.length < 3) return {error: 'usage: :close <slot> <rid>'};
+        const slotId = parseNonNegativeInt(tokens[1]);
+        const recoveryId = parseNonNegativeInt(tokens[2]);
+        if (slotId === null || recoveryId === null) return {error: 'slot and recovery id must be non-negative integers'};
+        return {
+          type: 'action',
+          action: 'soft_close',
+          payload: {slot_id: slotId, recovery_id: recoveryId},
+        };
+      }
+
+      return {error: `unknown command: ${verb}`};
+    }
+
+    function shouldConfirmPctChange(oldValue, newValue) {
+      if (!Number.isFinite(oldValue) || oldValue === 0) return true;
+      return Math.abs(newValue - oldValue) / Math.abs(oldValue) > 0.5;
+    }
+
+    async function api(path, opts={}) {
+      const res = await fetch(path, opts);
+      const text = await res.text();
+      let data = null;
+      if (text) {
+        try {
+          data = JSON.parse(text);
+        } catch (_err) {
+          data = null;
+        }
+      }
+      if (!res.ok) {
+        const msg = data && data.message ? data.message : (text || `request failed (${res.status})`);
+        throw new Error(msg);
+      }
+      if (data !== null) return data;
+      throw new Error('invalid server response');
+    }
+
+    async function dispatchAction(action, payload={}) {
+      try {
+        const body = JSON.stringify({action, ...payload});
+        const out = await api('/api/action', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body,
+        });
+        showToast(out.message || 'ok', 'success');
+        await refresh();
+        return true;
+      } catch (err) {
+        showToast(err.message || 'request failed', 'error');
+        return false;
+      }
+    }
+
+    function openConfirmDialog(text, onConfirm) {
+      closeCommandBarUi();
+      closeHelpUi();
+      pendingConfirm = {onConfirm};
+      document.getElementById('confirmText').textContent = text;
+      document.getElementById('confirmDialog').hidden = false;
+      setKbMode('CONFIRM');
+      document.getElementById('confirmOkBtn').focus();
+    }
+
+    async function confirmAccept() {
+      if (!pendingConfirm) return;
+      const handler = pendingConfirm.onConfirm;
+      closeConfirmUi();
+      setKbMode('NORMAL');
+      if (typeof handler === 'function') {
+        await handler();
+      }
+    }
+
+    function confirmCancel() {
+      if (kbMode !== 'CONFIRM') return;
+      closeConfirmUi();
+      setKbMode('NORMAL');
+    }
+
+    function requestPause() {
+      openConfirmDialog('Pause bot? Active orders remain open.', async () => {
+        await dispatchAction('pause');
+      });
+    }
+
+    function requestSoftCloseNext() {
+      openConfirmDialog('Close oldest recovery?', async () => {
+        await dispatchAction('soft_close_next');
+      });
+    }
+
+    function requestSoftClose(slotId, recoveryId) {
+      openConfirmDialog(`Close recovery #${recoveryId} on slot #${slotId}?`, async () => {
+        await dispatchAction('soft_close', {slot_id: slotId, recovery_id: recoveryId});
+      });
+    }
+
+    function requestSetMetric(metric, value) {
+      const oldValue = Number(metric === 'entry' ? state && state.entry_pct : state && state.profit_pct);
+      const action = metric === 'entry' ? 'set_entry_pct' : 'set_profit_pct';
+      if (shouldConfirmPctChange(oldValue, value)) {
+        const oldText = Number.isFinite(oldValue) ? fmt(oldValue, 3) : '0.000';
+        const newText = fmt(value, 3);
+        openConfirmDialog(`Change ${metric} from ${oldText}% to ${newText}%?`, async () => {
+          await dispatchAction(action, {value});
+        });
+        return;
+      }
+      void dispatchAction(action, {value});
+    }
+
+    function pushCommandHistory(rawInput) {
+      const norm = normalizeCommandInput(rawInput);
+      if (!norm) return;
+      commandHistory.push(`:${norm}`);
+      if (commandHistory.length > 20) commandHistory.shift();
+      historyIndex = commandHistory.length;
+    }
+
+    function commandMatches(rawInput) {
+      const pref = normalizeCommandInput(rawInput).toLowerCase();
+      if (!pref) return COMMAND_COMPLETIONS.slice(0, 5);
+      return COMMAND_COMPLETIONS.filter((cmd) => cmd.startsWith(pref)).slice(0, 5);
+    }
+
+    function renderCommandSuggestions() {
+      const el = document.getElementById('cmdSuggestions');
+      const raw = document.getElementById('cmdInput').value;
+      currentSuggestions = commandMatches(raw);
+      if (!currentSuggestions.length) {
+        el.classList.remove('open');
+        el.innerHTML = '';
+        suggestionIndex = -1;
+        return;
+      }
+      if (suggestionIndex >= currentSuggestions.length) suggestionIndex = -1;
+      el.innerHTML = '';
+      for (let i = 0; i < currentSuggestions.length; i += 1) {
+        const row = document.createElement('div');
+        row.className = 'cmd-suggestion mono' + (i === suggestionIndex ? ' active' : '');
+        row.textContent = `:${currentSuggestions[i]}`;
+        el.appendChild(row);
+      }
+      el.classList.add('open');
+    }
+
+    function applySuggestion(index) {
+      if (!currentSuggestions.length) return;
+      const input = document.getElementById('cmdInput');
+      input.value = currentSuggestions[index];
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+    }
+
+    function recallHistory(step) {
+      if (!commandHistory.length) return;
+      historyIndex = Math.max(0, Math.min(commandHistory.length, historyIndex + step));
+      const input = document.getElementById('cmdInput');
+      if (historyIndex === commandHistory.length) {
+        input.value = '';
+      } else {
+        input.value = commandHistory[historyIndex].slice(1);
+      }
+      suggestionIndex = -1;
+      renderCommandSuggestions();
+    }
+
+    function openCommandBar() {
+      closeHelpUi();
+      closeConfirmUi();
+      const bar = document.getElementById('cmdBar');
+      const input = document.getElementById('cmdInput');
+      bar.classList.add('open');
+      input.value = '';
+      historyIndex = commandHistory.length;
+      suggestionIndex = -1;
+      renderCommandSuggestions();
+      setKbMode('COMMAND');
+      input.focus();
+    }
+
+    function closeCommandBarToNormal() {
+      closeCommandBarUi();
+      setKbMode('NORMAL');
+    }
+
+    function openHelp() {
+      closeCommandBarUi();
+      closeConfirmUi();
+      document.getElementById('helpModal').hidden = false;
+      setKbMode('HELP');
+    }
+
+    function toggleHelp() {
+      if (kbMode === 'HELP') {
+        closeHelpUi();
+        setKbMode('NORMAL');
+        return;
+      }
+      openHelp();
+    }
+
+    async function executeCommand(rawInput) {
+      const parsed = parseCommand(rawInput);
+      if (parsed.error) {
+        showToast(parsed.error, 'error');
+        return;
+      }
+      if (parsed.type === 'noop') {
+        showToast('noop', 'info');
+        return;
+      }
+
+      pushCommandHistory(rawInput);
+
+      if (parsed.type === 'jump') {
+        if (!jumpToSlotIndex(parsed.slotIndex)) {
+          showToast(`slot ${parsed.slotIndex} not found`, 'error');
+        } else {
+          showToast(`jumped to slot ${parsed.slotIndex}`, 'info');
+        }
+        return;
+      }
+
+      if (parsed.type === 'set') {
+        requestSetMetric(parsed.metric, parsed.value);
+        return;
+      }
+
+      if (parsed.action === 'pause') {
+        requestPause();
+        return;
+      }
+      if (parsed.action === 'soft_close_next') {
+        requestSoftCloseNext();
+        return;
+      }
+      if (parsed.action === 'soft_close') {
+        requestSoftClose(parsed.payload.slot_id, parsed.payload.recovery_id);
+        return;
+      }
+      await dispatchAction(parsed.action, parsed.payload);
     }
 
     function renderTop(s) {
@@ -313,16 +871,20 @@ DASHBOARD_HTML = """<!doctype html>
         const b = document.createElement('button');
         b.className = 'slot' + (slot.slot_id === selectedSlot ? ' active' : '');
         b.textContent = `#${slot.slot_id} ${slot.phase}`;
-        b.onclick = () => { selectedSlot = slot.slot_id; renderSelected(s); renderSlots(s); };
+        b.onclick = () => {
+          selectedSlot = slot.slot_id;
+          renderSelected(s);
+          renderSlots(s);
+        };
         el.appendChild(b);
       }
-      if (!s.slots.find(x => x.slot_id === selectedSlot) && s.slots.length) {
+      if (!s.slots.find((x) => x.slot_id === selectedSlot) && s.slots.length) {
         selectedSlot = s.slots[0].slot_id;
       }
     }
 
     function renderSelected(s) {
-      const slot = s.slots.find(x => x.slot_id === selectedSlot) || s.slots[0];
+      const slot = s.slots.find((x) => x.slot_id === selectedSlot) || s.slots[0];
       if (!slot) return;
 
       const sb = document.getElementById('stateBar');
@@ -362,7 +924,7 @@ DASHBOARD_HTML = """<!doctype html>
           <td>$${fmt(r.price, 6)}</td>
           <td><button data-rid=\"${r.recovery_id}\">close</button></td>
         `;
-        tr.querySelector('button').onclick = () => act('soft_close', {slot_id: slot.slot_id, recovery_id: r.recovery_id});
+        tr.querySelector('button').onclick = () => requestSoftClose(slot.slot_id, r.recovery_id);
         rb.appendChild(tr);
       }
 
@@ -375,30 +937,263 @@ DASHBOARD_HTML = """<!doctype html>
         cb.appendChild(tr);
       }
 
-      document.getElementById('entryInput').value = fmt(s.entry_pct, 3);
-      document.getElementById('profitInput').value = fmt(s.profit_pct, 3);
+      const entryInput = document.getElementById('entryInput');
+      const profitInput = document.getElementById('profitInput');
+      if (document.activeElement !== entryInput) entryInput.value = fmt(s.entry_pct, 3);
+      if (document.activeElement !== profitInput) profitInput.value = fmt(s.profit_pct, 3);
+    }
+
+    function renderAll(s) {
+      renderTop(s);
+      renderSlots(s);
+      renderSelected(s);
+    }
+
+    function flushPendingRender() {
+      if (pendingRenderState) {
+        renderAll(pendingRenderState);
+        pendingRenderState = null;
+        return;
+      }
+      if (state) renderAll(state);
     }
 
     async function refresh() {
       try {
-        state = await api('/api/status');
-        renderTop(state);
-        renderSlots(state);
-        renderSelected(state);
-      } catch (e) {
-        document.getElementById('ctlMsg').textContent = e.message;
+        const nextState = await api('/api/status');
+        state = nextState;
+        lastRefreshError = '';
+        if (kbMode === 'NORMAL') {
+          renderAll(nextState);
+          pendingRenderState = null;
+        } else {
+          pendingRenderState = nextState;
+        }
+      } catch (err) {
+        const msg = err.message || 'status refresh failed';
+        if (msg !== lastRefreshError) {
+          showToast(msg, 'error');
+          lastRefreshError = msg;
+        }
       }
     }
 
-    document.getElementById('pauseBtn').onclick = () => act('pause');
-    document.getElementById('resumeBtn').onclick = () => act('resume');
-    document.getElementById('addSlotBtn').onclick = () => act('add_slot');
-    document.getElementById('softCloseBtn').onclick = () => act('soft_close_next');
-    document.getElementById('setEntryBtn').onclick = () => act('set_entry_pct', {value: Number(document.getElementById('entryInput').value)});
-    document.getElementById('setProfitBtn').onclick = () => act('set_profit_pct', {value: Number(document.getElementById('profitInput').value)});
+    async function togglePauseResume() {
+      if (state && state.mode === 'RUNNING') {
+        requestPause();
+      } else {
+        await dispatchAction('resume');
+      }
+    }
 
-    refresh();
-    setInterval(refresh, 5000);
+    function forceRefreshRateLimited() {
+      const now = Date.now();
+      if (now - lastForcedRefreshMs < 2000) return;
+      lastForcedRefreshMs = now;
+      void refresh();
+    }
+
+    function armChord(key) {
+      clearChordBuffer();
+      chordKey = key;
+      chordTimer = window.setTimeout(() => {
+        clearChordBuffer();
+      }, 400);
+    }
+
+    function handleNormalModeKey(event) {
+      const key = event.key;
+      if (/^[1-9]$/.test(key)) {
+        jumpToSlotIndex(Number(key));
+        clearChordBuffer();
+        return;
+      }
+      if (key === '[') {
+        cycleSlot(-1);
+        clearChordBuffer();
+        return;
+      }
+      if (key === ']') {
+        cycleSlot(1);
+        clearChordBuffer();
+        return;
+      }
+      if (key === 'g') {
+        if (chordKey === 'g') {
+          clearChordBuffer();
+          jumpFirstSlot();
+        } else {
+          armChord('g');
+        }
+        return;
+      }
+      if (key === 'G') {
+        clearChordBuffer();
+        jumpLastSlot();
+        return;
+      }
+      if (key === 'p') {
+        clearChordBuffer();
+        void togglePauseResume();
+        return;
+      }
+      if (key === '+') {
+        clearChordBuffer();
+        void dispatchAction('add_slot');
+        return;
+      }
+      if (key === '-') {
+        clearChordBuffer();
+        requestSoftCloseNext();
+        return;
+      }
+      if (key === '.') {
+        clearChordBuffer();
+        forceRefreshRateLimited();
+        return;
+      }
+      if (key === ':') {
+        clearChordBuffer();
+        openCommandBar();
+        return;
+      }
+      if (key === '?') {
+        clearChordBuffer();
+        toggleHelp();
+        return;
+      }
+      if (key === 'Escape') {
+        clearChordBuffer();
+        leaveToNormal();
+        return;
+      }
+      clearChordBuffer();
+    }
+
+    function onGlobalKeyDown(event) {
+      if (isControlInputFocused()) {
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          document.activeElement.blur();
+          leaveToNormal();
+        }
+        return;
+      }
+
+      if (kbMode === 'COMMAND') {
+        if (event.target !== document.getElementById('cmdInput')) {
+          event.preventDefault();
+        }
+        return;
+      }
+
+      if (kbMode === 'HELP') {
+        event.preventDefault();
+        if (event.key === 'Escape' || event.key === '?') {
+          closeHelpUi();
+          setKbMode('NORMAL');
+        }
+        return;
+      }
+
+      if (kbMode === 'CONFIRM') {
+        event.preventDefault();
+        if (event.key === 'Enter') {
+          void confirmAccept();
+        } else if (event.key === 'Escape') {
+          confirmCancel();
+        }
+        return;
+      }
+
+      event.preventDefault();
+      handleNormalModeKey(event);
+    }
+
+    function readAndValidatePctInput(inputId, label) {
+      const value = Number(document.getElementById(inputId).value);
+      if (!Number.isFinite(value) || value < 0.05 || value > 50.0) {
+        showToast(`${label} must be between 0.05 and 50.0`, 'error');
+        return null;
+      }
+      return value;
+    }
+
+    document.getElementById('pauseBtn').onclick = () => requestPause();
+    document.getElementById('resumeBtn').onclick = () => { void dispatchAction('resume'); };
+    document.getElementById('addSlotBtn').onclick = () => { void dispatchAction('add_slot'); };
+    document.getElementById('softCloseBtn').onclick = () => requestSoftCloseNext();
+    document.getElementById('setEntryBtn').onclick = () => {
+      const value = readAndValidatePctInput('entryInput', 'entry');
+      if (value === null) return;
+      requestSetMetric('entry', value);
+    };
+    document.getElementById('setProfitBtn').onclick = () => {
+      const value = readAndValidatePctInput('profitInput', 'profit');
+      if (value === null) return;
+      requestSetMetric('profit', value);
+    };
+
+    document.getElementById('confirmOkBtn').onclick = () => { void confirmAccept(); };
+    document.getElementById('confirmCancelBtn').onclick = () => confirmCancel();
+
+    for (const id of CONTROL_INPUT_IDS) {
+      const input = document.getElementById(id);
+      input.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          event.target.blur();
+          leaveToNormal();
+        }
+      });
+      input.addEventListener('blur', () => {
+        setKbMode('NORMAL');
+      });
+    }
+
+    const cmdInput = document.getElementById('cmdInput');
+    cmdInput.addEventListener('input', () => {
+      suggestionIndex = -1;
+      renderCommandSuggestions();
+    });
+    cmdInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Tab') {
+        event.preventDefault();
+        if (!currentSuggestions.length) renderCommandSuggestions();
+        if (!currentSuggestions.length) return;
+        suggestionIndex = (suggestionIndex + 1) % currentSuggestions.length;
+        applySuggestion(suggestionIndex);
+        renderCommandSuggestions();
+        return;
+      }
+      if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        recallHistory(-1);
+        return;
+      }
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        recallHistory(1);
+        return;
+      }
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        const raw = cmdInput.value;
+        closeCommandBarToNormal();
+        void executeCommand(raw);
+        return;
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeCommandBarToNormal();
+      }
+    });
+
+    document.addEventListener('keydown', onGlobalKeyDown);
+
+    updateKbModeBadge();
+    void refresh();
+    window.setInterval(refresh, 5000);
   </script>
 </body>
 </html>
