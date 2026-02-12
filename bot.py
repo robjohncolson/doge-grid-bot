@@ -1612,6 +1612,61 @@ class BotRuntime:
             return False, "no recovery orders"
         return self.soft_close(oldest[0], oldest[1].recovery_id)
 
+    def remove_slot(self, slot_id: int) -> tuple[bool, str]:
+        """Remove a slot entirely, cancelling all its open orders on Kraken."""
+        slot = self.slots.get(slot_id)
+        if not slot:
+            return False, f"unknown slot {slot_id}"
+
+        cancelled = 0
+        failed = 0
+
+        # Cancel all active orders for this slot.
+        for o in slot.state.orders:
+            if o.txid:
+                try:
+                    self._cancel_order(o.txid)
+                    cancelled += 1
+                except Exception as e:
+                    logger.warning("remove_slot: cancel order %s failed: %s", o.txid, e)
+                    failed += 1
+
+        # Cancel all recovery orders for this slot.
+        for r in slot.state.recovery_orders:
+            if r.txid:
+                try:
+                    self._cancel_order(r.txid)
+                    cancelled += 1
+                except Exception as e:
+                    logger.warning("remove_slot: cancel recovery %s failed: %s", r.txid, e)
+                    failed += 1
+
+        if failed > 0:
+            return False, f"slot {slot_id}: {failed} cancel failures, not removed (retry)"
+
+        del self.slots[slot_id]
+        self._save_snapshot()
+
+        msg = f"slot {slot_id} removed, cancelled {cancelled} orders"
+        logger.info("remove_slot: %s", msg)
+        return True, msg
+
+    def remove_slots(self, count: int = 1) -> tuple[bool, str]:
+        """Remove N slots from the top (highest slot IDs first)."""
+        if count < 1:
+            return False, "count must be >= 1"
+        if count > len(self.slots):
+            return False, f"only {len(self.slots)} slots exist"
+
+        removed = []
+        for sid in sorted(self.slots.keys(), reverse=True)[:count]:
+            ok, msg = self.remove_slot(sid)
+            if not ok:
+                return False, f"stopped after removing {len(removed)}: {msg}"
+            removed.append(sid)
+
+        return True, f"removed {len(removed)} slots: {removed}"
+
     def cancel_stale_recoveries(self, min_distance_pct: float = 3.0) -> tuple[bool, str]:
         """Cancel recovery orders farther than min_distance_pct from current market.
 
@@ -1798,6 +1853,7 @@ class BotRuntime:
                 msg = (
                     "Commands:\n"
                     "/pause\n/resume\n/add_slot\n/status\n/help\n"
+                    "/remove_slot [slot_id]\n/remove_slots [N]\n"
                     "/soft_close [slot_id recovery_id]\n"
                     "/cancel_stale [min_distance_pct]\n"
                     "/reconcile_drift\n"
@@ -1845,6 +1901,26 @@ class BotRuntime:
                     except ValueError:
                         pass
                 ok, msg = self.cancel_stale_recoveries(dist)
+            elif head == "/remove_slot":
+                if len(parts) >= 2:
+                    try:
+                        ok, msg = self.remove_slot(int(parts[1]))
+                    except ValueError:
+                        ok, msg = False, "usage: /remove_slot [slot_id]"
+                else:
+                    # Remove highest-numbered slot by default.
+                    if not self.slots:
+                        ok, msg = False, "no slots"
+                    else:
+                        ok, msg = self.remove_slot(max(self.slots.keys()))
+            elif head == "/remove_slots":
+                count = 1
+                if len(parts) >= 2:
+                    try:
+                        count = int(parts[1])
+                    except ValueError:
+                        pass
+                ok, msg = self.remove_slots(count)
             elif head == "/reconcile_drift":
                 ok, msg = self.reconcile_drift()
             else:
@@ -2175,6 +2251,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     parsed["min_distance_pct"] = float(body.get("min_distance_pct", 3.0))
                 except (TypeError, ValueError):
                     parsed["min_distance_pct"] = 3.0
+            elif action == "remove_slot":
+                try:
+                    parsed["slot_id"] = int(body.get("slot_id", -1))
+                except (TypeError, ValueError):
+                    self._send_json({"ok": False, "message": "invalid slot_id"}, 400)
+                    return
+            elif action == "remove_slots":
+                try:
+                    parsed["count"] = int(body.get("count", 1))
+                except (TypeError, ValueError):
+                    parsed["count"] = 1
             elif action in ("pause", "resume", "add_slot", "soft_close_next", "reconcile_drift"):
                 pass
             else:
@@ -2202,6 +2289,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     ok, msg = _RUNTIME.soft_close_next()
                 elif action == "cancel_stale_recoveries":
                     ok, msg = _RUNTIME.cancel_stale_recoveries(float(parsed.get("min_distance_pct", 3.0)))
+                elif action == "remove_slot":
+                    ok, msg = _RUNTIME.remove_slot(int(parsed["slot_id"]))
+                elif action == "remove_slots":
+                    ok, msg = _RUNTIME.remove_slots(int(parsed.get("count", 1)))
                 elif action == "reconcile_drift":
                     ok, msg = _RUNTIME.reconcile_drift()
                 _RUNTIME._save_snapshot()

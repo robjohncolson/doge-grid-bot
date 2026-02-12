@@ -266,6 +266,7 @@ DASHBOARD_HTML = """<!doctype html>
           <button id=\"pauseBtn\">Pause</button>
           <button id=\"resumeBtn\">Resume</button>
           <button id=\"addSlotBtn\">Add Slot</button>
+          <button id=\"removeSlotBtn\" style=\"background:#c0392b\">Remove Slot</button>
           <button id=\"softCloseBtn\">Soft Close</button>
         </div>
 
@@ -359,7 +360,7 @@ DASHBOARD_HTML = """<!doctype html>
 |  NAVIGATION        ACTIONS            |
 |  1-9   slot #jump  p    pause/resume  |
 |  [/]   prev/next   +    add slot      |
-|  gg    first slot  -    close next    |
+|  gg    first slot  -    remove slot   |
 |  G     last slot   .    refresh       |
 |                    f    factory view  |
 |                    s    api/status   |
@@ -368,7 +369,7 @@ DASHBOARD_HTML = """<!doctype html>
 |                    Esc  close         |
 |                                       |
 |  COMMAND BAR                          |
-|  :pause  :resume  :add  :close        |
+|  :pause  :resume  :add  :remove N     |
 |  :set entry N  :set profit N          |
 |  :jump N (slot #)  :q (factory view)  |
 |  Tab=complete  up/down=history  Esc=close |
@@ -403,7 +404,7 @@ DASHBOARD_HTML = """<!doctype html>
     let historyIndex = 0;
     let lastRefreshError = '';
     const commandHistory = [];
-    const COMMAND_COMPLETIONS = ['pause', 'resume', 'add', 'close', 'set entry', 'set profit', 'jump', 'q'];
+    const COMMAND_COMPLETIONS = ['pause', 'resume', 'add', 'remove', 'close', 'set entry', 'set profit', 'jump', 'q'];
     const CONTROL_INPUT_IDS = new Set(['entryInput', 'profitInput']);
 
     function fmt(n, d=6) {
@@ -569,6 +570,13 @@ DASHBOARD_HTML = """<!doctype html>
         return {error: `unknown set target: ${target}`};
       }
 
+      if (verb === 'remove') {
+        if (tokens.length === 1) return {type: 'remove_slot', count: 1};
+        const n = parseNonNegativeInt(tokens[1]);
+        if (n === null || n < 1) return {error: 'usage: :remove [N]  (N = number of slots to remove)'};
+        return {type: 'remove_slots', count: n};
+      }
+
       if (verb === 'close') {
         if (tokens.length === 1) return {type: 'action', action: 'soft_close_next', payload: {}};
         if (tokens.length < 3) return {error: 'usage: :close <slot> <rid>'};
@@ -667,6 +675,21 @@ DASHBOARD_HTML = """<!doctype html>
     function requestSoftClose(slotId, recoveryId) {
       openConfirmDialog(`Close recovery #${recoveryId} on slot #${slotId}?`, async () => {
         await dispatchAction('soft_close', {slot_id: slotId, recovery_id: recoveryId});
+      });
+    }
+
+    function requestRemoveSlot(slotId) {
+      const slots = getSlots();
+      if (!slots.length) { showToast('no slots to remove', 'error'); return; }
+      const target = slotId != null ? slotId : slots[slots.length - 1].slot_id;
+      openConfirmDialog(`Remove slot #${target}? This cancels ALL its orders on Kraken.`, async () => {
+        await dispatchAction('remove_slot', {slot_id: target});
+      });
+    }
+
+    function requestRemoveSlots(count) {
+      openConfirmDialog(`Remove ${count} highest slot(s)? This cancels ALL their orders.`, async () => {
+        await dispatchAction('remove_slots', {count});
       });
     }
 
@@ -816,6 +839,14 @@ DASHBOARD_HTML = """<!doctype html>
       }
       if (parsed.action === 'soft_close') {
         requestSoftClose(parsed.payload.slot_id, parsed.payload.recovery_id);
+        return;
+      }
+      if (parsed.type === 'remove_slot') {
+        requestRemoveSlot();
+        return;
+      }
+      if (parsed.type === 'remove_slots') {
+        requestRemoveSlots(parsed.count);
         return;
       }
       await dispatchAction(parsed.action, parsed.payload);
@@ -1054,7 +1085,7 @@ DASHBOARD_HTML = """<!doctype html>
       }
       if (key === '-') {
         clearChordBuffer();
-        requestSoftCloseNext();
+        requestRemoveSlot();
         return true;
       }
       if (key === '.') {
@@ -1146,6 +1177,7 @@ DASHBOARD_HTML = """<!doctype html>
     document.getElementById('pauseBtn').onclick = () => requestPause();
     document.getElementById('resumeBtn').onclick = () => { void dispatchAction('resume'); };
     document.getElementById('addSlotBtn').onclick = () => { void dispatchAction('add_slot'); };
+    document.getElementById('removeSlotBtn').onclick = () => requestRemoveSlot();
     document.getElementById('softCloseBtn').onclick = () => requestSoftCloseNext();
     document.getElementById('setEntryBtn').onclick = () => {
       const value = readAndValidatePctInput('entryInput', 'entry');
