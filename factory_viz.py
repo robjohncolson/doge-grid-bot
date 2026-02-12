@@ -1,18 +1,7 @@
 """
-factory_viz.py -- Factory Lens F1 static canvas view.
+factory_viz.py -- Factory Lens interactive canvas view.
 
 Served at GET /factory.
-
-F1 scope:
-- Static factory render from GET /api/status
-- Power line, input chests, slot machines, output chest, recycling belt
-- Status bar + notification strip
-- Read-only detail panel for selected slot
-
-Out of scope for F1:
-- Diagnosis engine
-- Interactive control actions
-- Animation beyond lightweight visual pulse/blink cues
 """
 
 FACTORY_HTML = r"""<!doctype html>
@@ -32,6 +21,8 @@ FACTORY_HTML = r"""<!doctype html>
       --warn: #d29922;
       --line: #30363d;
       --accent: #58a6ff;
+      --cmd-bg: #161b22;
+      --backdrop: rgba(0,0,0,0.55);
     }
     * { box-sizing: border-box; }
     html, body {
@@ -75,6 +66,15 @@ FACTORY_HTML = r"""<!doctype html>
       padding: 3px 10px;
       color: var(--ink);
       background: rgba(255,255,255,.03);
+    }
+    #kbMode {
+      font-size: 11px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 3px 10px;
+      color: var(--muted);
+      background: rgba(255,255,255,.03);
+      letter-spacing: .06em;
     }
 
     #detailPanel {
@@ -136,6 +136,19 @@ FACTORY_HTML = r"""<!doctype html>
       font-size: 11px;
       margin-left: 6px;
     }
+    #detailPanel .miniBtn {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #1f2733;
+      color: var(--ink);
+      padding: 2px 6px;
+      cursor: pointer;
+      font-size: 11px;
+      line-height: 1.2;
+    }
+    #detailPanel .miniBtn:hover {
+      border-color: var(--accent);
+    }
 
     #notifStrip {
       position: fixed;
@@ -152,7 +165,12 @@ FACTORY_HTML = r"""<!doctype html>
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
-      pointer-events: none;
+      cursor: pointer;
+      user-select: none;
+    }
+    #notifStrip:focus {
+      outline: none;
+      border-color: var(--accent);
     }
 
     #statusBar {
@@ -193,6 +211,105 @@ FACTORY_HTML = r"""<!doctype html>
     }
     #addBtn:hover { border-color: var(--accent); }
 
+    #cmdBar {
+      position: fixed;
+      left: 14px;
+      right: 14px;
+      bottom: 62px;
+      z-index: 32;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--cmd-bg);
+      padding: 8px 10px;
+      transform: translateY(22px);
+      opacity: 0;
+      pointer-events: none;
+      transition: transform 140ms ease, opacity 140ms ease;
+    }
+    #cmdBar.open {
+      transform: translateY(0);
+      opacity: 1;
+      pointer-events: auto;
+    }
+    #cmdPrefix {
+      color: var(--accent);
+      font-size: 14px;
+    }
+    #cmdInput {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 10px;
+      background: #0f141b;
+      color: var(--ink);
+      font-size: 14px;
+      outline: none;
+    }
+    #cmdInput:focus { border-color: var(--accent); }
+    #cmdSuggestions {
+      position: fixed;
+      left: 14px;
+      right: 14px;
+      bottom: 114px;
+      z-index: 33;
+      display: none;
+      max-width: 520px;
+    }
+    #cmdSuggestions.open { display: block; }
+    .cmd-suggestion {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 6px 8px;
+      margin-top: 6px;
+      background: var(--panel);
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .cmd-suggestion.active {
+      border-color: var(--accent);
+      color: var(--ink);
+      background: rgba(88,166,255,.12);
+    }
+
+    .overlay {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--backdrop);
+      z-index: 35;
+    }
+    .overlay[hidden] { display: none; }
+    .modal {
+      width: min(760px, calc(100vw - 30px));
+      max-height: calc(100vh - 50px);
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 14px;
+      background: var(--panel);
+    }
+    #helpModal .modal pre {
+      margin: 0;
+      color: var(--ink);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    #confirmDialog { z-index: 36; }
+    #confirmDialog .modal {
+      width: min(420px, calc(100vw - 30px));
+    }
+    #confirmActions {
+      margin-top: 12px;
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+
     #toast {
       position: fixed;
       right: 16px;
@@ -213,8 +330,9 @@ FACTORY_HTML = r"""<!doctype html>
   <canvas id="factory"></canvas>
 
   <div id="hudTop">
-    <div id="title">Factory Lens F1</div>
+    <div id="title">Factory Lens F4</div>
     <div id="pairBadge">-</div>
+    <span id="kbMode">KB NORMAL</span>
   </div>
 
   <aside id="detailPanel" aria-hidden="true">
@@ -224,7 +342,7 @@ FACTORY_HTML = r"""<!doctype html>
     <div id="detailContent"></div>
   </aside>
 
-  <div id="notifStrip">Loading factory status...</div>
+  <div id="notifStrip" tabindex="0" role="button" aria-label="Cycle active symptom">Loading factory status...</div>
 
   <div id="statusBar">
     <div class="left">
@@ -233,7 +351,46 @@ FACTORY_HTML = r"""<!doctype html>
       <span>Slots <span id="slotsText" class="value">-</span></span>
       <span>Profit <span id="profitText" class="value">-</span></span>
     </div>
-    <button id="addBtn" title="F1 static view">+Add</button>
+    <button id="addBtn" title="Add slot">+Add</button>
+  </div>
+
+  <div id="cmdSuggestions" class="mono"></div>
+  <div id="cmdBar">
+    <span id="cmdPrefix" class="mono">:</span>
+    <input id="cmdInput" class="mono" type="text" spellcheck="false" autocomplete="off" />
+  </div>
+
+  <div id="helpModal" class="overlay" hidden>
+    <div class="modal mono">
+<pre>+- Keybindings -------------------------+
+|                                       |
+|  NAVIGATION        ACTIONS            |
+|  1-9   slot #jump  p    pause/resume  |
+|  [/]   prev/next   +    add slot      |
+|  gg    first slot  -    close next    |
+|  G     last slot   .    refresh       |
+|                    :    command       |
+|                    ?    this help     |
+|                    Esc  close         |
+|                                       |
+|  COMMAND BAR                          |
+|  :pause  :resume  :add  :close        |
+|  :set entry N  :set profit N          |
+|  :jump N (slot #)                     |
+|  Tab=complete  up/down=history  Esc=close |
+|                                       |
++-------------------- Esc to close -----+</pre>
+    </div>
+  </div>
+
+  <div id="confirmDialog" class="overlay" hidden>
+    <div class="modal">
+      <div id="confirmText"></div>
+      <div id="confirmActions">
+        <button id="confirmCancelBtn">Cancel</button>
+        <button id="confirmOkBtn">Confirm</button>
+      </div>
+    </div>
   </div>
 
   <div id="toast"></div>
@@ -292,6 +449,18 @@ FACTORY_HTML = r"""<!doctype html>
     let prevStatus = null;
     let animQueue = [];
     let lastMachineRectBySlot = {};
+    let notifIndex = 0;
+
+    let kbMode = 'NORMAL';
+    let chordKey = '';
+    let chordTimer = null;
+    let pendingConfirm = null;
+    let lastForcedRefreshMs = 0;
+    let currentSuggestions = [];
+    let suggestionIndex = -1;
+    let historyIndex = 0;
+    const commandHistory = [];
+    const COMMAND_COMPLETIONS = ['pause', 'resume', 'add', 'close', 'set entry', 'set profit', 'jump', 'q'];
 
     function diagnose(status) {
       const symptoms = [];
@@ -423,6 +592,7 @@ FACTORY_HTML = r"""<!doctype html>
 
     function setActiveSymptoms(symptoms) {
       activeSymptoms = Array.isArray(symptoms) ? symptoms.slice() : [];
+      if (notifIndex >= activeSymptoms.length) notifIndex = 0;
       activeEffects = new Set();
       slotEffects = {};
 
@@ -530,6 +700,544 @@ FACTORY_HTML = r"""<!doctype html>
       showToast._t = window.setTimeout(() => {
         el.style.display = 'none';
       }, 2200);
+    }
+
+    function updateKbModeBadge() {
+      const badge = document.getElementById('kbMode');
+      if (!badge) return;
+      badge.textContent = 'KB ' + kbMode;
+    }
+
+    function clearChordBuffer() {
+      chordKey = '';
+      if (chordTimer !== null) {
+        window.clearTimeout(chordTimer);
+        chordTimer = null;
+      }
+    }
+
+    function armChord(key) {
+      clearChordBuffer();
+      chordKey = key;
+      chordTimer = window.setTimeout(() => {
+        clearChordBuffer();
+      }, 400);
+    }
+
+    function setKbMode(nextMode) {
+      if (kbMode === nextMode) return;
+      kbMode = nextMode;
+      clearChordBuffer();
+      updateKbModeBadge();
+    }
+
+    function closeCommandBarUi() {
+      const bar = document.getElementById('cmdBar');
+      const suggestions = document.getElementById('cmdSuggestions');
+      bar.classList.remove('open');
+      suggestions.classList.remove('open');
+      suggestions.innerHTML = '';
+      currentSuggestions = [];
+      suggestionIndex = -1;
+    }
+
+    function closeHelpUi() {
+      document.getElementById('helpModal').hidden = true;
+    }
+
+    function closeConfirmUi() {
+      pendingConfirm = null;
+      document.getElementById('confirmDialog').hidden = true;
+    }
+
+    function leaveToNormal() {
+      closeCommandBarUi();
+      closeHelpUi();
+      closeConfirmUi();
+      setKbMode('NORMAL');
+    }
+
+    function getSlots() {
+      if (!statusData || !Array.isArray(statusData.slots)) return [];
+      return statusData.slots;
+    }
+
+    function findLayoutNodeBySlotId(slotId) {
+      if (!layout || !Array.isArray(layout.positions)) return null;
+      for (const node of layout.positions) {
+        if (node.slot && node.slot.slot_id === slotId) return node;
+      }
+      return null;
+    }
+
+    function centerCameraOnSlot(slotId) {
+      const node = findLayoutNodeBySlotId(slotId);
+      if (!node) return;
+      camera.targetX = node.x + node.w * 0.5;
+      camera.targetY = node.y + node.h * 0.5;
+      if (camera.targetZoom < 0.9) camera.targetZoom = 0.9;
+    }
+
+    function selectSlot(slotId, recenter = true) {
+      selectedSlotId = slotId;
+      if (recenter) centerCameraOnSlot(slotId);
+      renderDetailPanel();
+      scheduleFrame();
+    }
+
+    function jumpToSlotId(slotId) {
+      const slot = getSlotById(slotId);
+      if (!slot) return false;
+      selectSlot(slot.slot_id, true);
+      return true;
+    }
+
+    function jumpToSlotIndex(index) {
+      const slots = getSlots();
+      if (!slots.length) return false;
+      const idx = Number(index);
+      if (!Number.isInteger(idx) || idx < 0 || idx >= slots.length) return false;
+      selectSlot(slots[idx].slot_id, true);
+      return true;
+    }
+
+    function jumpFirstSlot() {
+      jumpToSlotIndex(0);
+    }
+
+    function jumpLastSlot() {
+      const slots = getSlots();
+      if (!slots.length) return;
+      jumpToSlotIndex(slots.length - 1);
+    }
+
+    function cycleSlot(step) {
+      const slots = getSlots();
+      if (!slots.length) return;
+      let idx = slots.findIndex((slot) => slot.slot_id === selectedSlotId);
+      if (idx < 0) idx = step > 0 ? -1 : 0;
+      idx = (idx + step + slots.length) % slots.length;
+      selectSlot(slots[idx].slot_id, true);
+    }
+
+    function normalizeCommandInput(raw) {
+      const txt = String(raw || '').trim();
+      if (!txt) return '';
+      return txt.startsWith(':') ? txt.slice(1).trim() : txt;
+    }
+
+    function parseNonNegativeInt(raw) {
+      if (!/^[0-9]+$/.test(String(raw || ''))) return null;
+      return Number.parseInt(raw, 10);
+    }
+
+    function parseCommand(rawInput) {
+      const norm = normalizeCommandInput(rawInput);
+      if (!norm) return {type: 'noop'};
+      const tokens = norm.split(/\s+/);
+      const verb = (tokens[0] || '').toLowerCase();
+
+      if (verb === 'pause') return {type: 'action', action: 'pause', payload: {}};
+      if (verb === 'resume') return {type: 'action', action: 'resume', payload: {}};
+      if (verb === 'add') return {type: 'action', action: 'add_slot', payload: {}};
+      if (verb === 'q') return {type: 'noop'};
+
+      if (verb === 'jump') {
+        if (tokens.length < 2) return {error: 'usage: :jump <N>'};
+        const slotId = parseNonNegativeInt(tokens[1]);
+        if (slotId === null) return {error: 'jump target must be a non-negative integer'};
+        return {type: 'jump', slotId};
+      }
+
+      if (verb === 'set') {
+        if (tokens.length < 3) return {error: 'usage: :set entry|profit <value>'};
+        const target = (tokens[1] || '').toLowerCase();
+        const value = Number.parseFloat(tokens[2]);
+        if (!Number.isFinite(value) || value < 0.05 || value > 50.0) {
+          return {error: 'set value must be between 0.05 and 50.0'};
+        }
+        if (target === 'entry') return {type: 'set', metric: 'entry', value};
+        if (target === 'profit') return {type: 'set', metric: 'profit', value};
+        return {error: 'unknown set target: ' + target};
+      }
+
+      if (verb === 'close') {
+        if (tokens.length === 1) return {type: 'action', action: 'soft_close_next', payload: {}};
+        if (tokens.length < 3) return {error: 'usage: :close <slot> <rid>'};
+        const slotId = parseNonNegativeInt(tokens[1]);
+        const recoveryId = parseNonNegativeInt(tokens[2]);
+        if (slotId === null || recoveryId === null) {
+          return {error: 'slot and recovery id must be non-negative integers'};
+        }
+        return {
+          type: 'action',
+          action: 'soft_close',
+          payload: {slot_id: slotId, recovery_id: recoveryId}
+        };
+      }
+
+      return {error: 'unknown command: ' + verb};
+    }
+
+    function shouldConfirmPctChange(oldValue, newValue) {
+      if (!Number.isFinite(oldValue) || oldValue === 0) return true;
+      return Math.abs(newValue - oldValue) / Math.abs(oldValue) > 0.5;
+    }
+
+    async function api(path, opts = {}) {
+      const res = await fetch(path, opts);
+      const text = await res.text();
+      let data = null;
+      if (text) {
+        try {
+          data = JSON.parse(text);
+        } catch (_err) {
+          data = null;
+        }
+      }
+      if (!res.ok) {
+        const msg = data && data.message ? data.message : (text || ('request failed (' + res.status + ')'));
+        throw new Error(msg);
+      }
+      if (data !== null) return data;
+      throw new Error('invalid server response');
+    }
+
+    async function dispatchAction(action, payload = {}) {
+      try {
+        const body = JSON.stringify({action, ...payload});
+        const out = await api('/api/action', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body
+        });
+        showToast(out.message || 'ok');
+        await refreshStatus();
+        return true;
+      } catch (err) {
+        showToast((err && err.message) ? err.message : 'request failed');
+        return false;
+      }
+    }
+
+    function openConfirmDialog(text, onConfirm) {
+      closeCommandBarUi();
+      closeHelpUi();
+      pendingConfirm = {onConfirm};
+      document.getElementById('confirmText').textContent = text;
+      document.getElementById('confirmDialog').hidden = false;
+      setKbMode('CONFIRM');
+      document.getElementById('confirmOkBtn').focus();
+    }
+
+    async function confirmAccept() {
+      if (!pendingConfirm) return;
+      const handler = pendingConfirm.onConfirm;
+      closeConfirmUi();
+      setKbMode('NORMAL');
+      if (typeof handler === 'function') {
+        await handler();
+      }
+    }
+
+    function confirmCancel() {
+      if (kbMode !== 'CONFIRM') return;
+      closeConfirmUi();
+      setKbMode('NORMAL');
+    }
+
+    function requestPause() {
+      openConfirmDialog('Pause bot? Active orders remain open.', async () => {
+        await dispatchAction('pause');
+      });
+    }
+
+    function requestSoftCloseNext() {
+      openConfirmDialog('Close oldest recovery?', async () => {
+        await dispatchAction('soft_close_next');
+      });
+    }
+
+    function requestSoftClose(slotId, recoveryId) {
+      openConfirmDialog('Close recovery #' + recoveryId + ' on slot #' + slotId + '?', async () => {
+        await dispatchAction('soft_close', {slot_id: slotId, recovery_id: recoveryId});
+      });
+    }
+
+    function requestSetMetric(metric, value) {
+      const oldValue = Number(metric === 'entry' ? statusData && statusData.entry_pct : statusData && statusData.profit_pct);
+      const action = metric === 'entry' ? 'set_entry_pct' : 'set_profit_pct';
+      if (shouldConfirmPctChange(oldValue, value)) {
+        const oldText = Number.isFinite(oldValue) ? fmt(oldValue, 3) : '0.000';
+        const newText = fmt(value, 3);
+        openConfirmDialog('Change ' + metric + ' from ' + oldText + '% to ' + newText + '%?', async () => {
+          await dispatchAction(action, {value});
+        });
+        return;
+      }
+      void dispatchAction(action, {value});
+    }
+
+    function pushCommandHistory(rawInput) {
+      const norm = normalizeCommandInput(rawInput);
+      if (!norm) return;
+      commandHistory.push(':' + norm);
+      if (commandHistory.length > 20) commandHistory.shift();
+      historyIndex = commandHistory.length;
+    }
+
+    function commandMatches(rawInput) {
+      const pref = normalizeCommandInput(rawInput).toLowerCase();
+      if (!pref) return COMMAND_COMPLETIONS.slice(0, 5);
+      return COMMAND_COMPLETIONS.filter((cmd) => cmd.startsWith(pref)).slice(0, 5);
+    }
+
+    function renderCommandSuggestions() {
+      const el = document.getElementById('cmdSuggestions');
+      const raw = document.getElementById('cmdInput').value;
+      currentSuggestions = commandMatches(raw);
+      if (!currentSuggestions.length) {
+        el.classList.remove('open');
+        el.innerHTML = '';
+        suggestionIndex = -1;
+        return;
+      }
+      if (suggestionIndex >= currentSuggestions.length) suggestionIndex = -1;
+      el.innerHTML = '';
+      for (let i = 0; i < currentSuggestions.length; i += 1) {
+        const row = document.createElement('div');
+        row.className = 'cmd-suggestion mono' + (i === suggestionIndex ? ' active' : '');
+        row.textContent = ':' + currentSuggestions[i];
+        el.appendChild(row);
+      }
+      el.classList.add('open');
+    }
+
+    function applySuggestion(index) {
+      if (!currentSuggestions.length) return;
+      const input = document.getElementById('cmdInput');
+      input.value = currentSuggestions[index];
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+    }
+
+    function recallHistory(step) {
+      if (!commandHistory.length) return;
+      historyIndex = Math.max(0, Math.min(commandHistory.length, historyIndex + step));
+      const input = document.getElementById('cmdInput');
+      if (historyIndex === commandHistory.length) {
+        input.value = '';
+      } else {
+        input.value = commandHistory[historyIndex].slice(1);
+      }
+      suggestionIndex = -1;
+      renderCommandSuggestions();
+    }
+
+    function openCommandBar() {
+      closeHelpUi();
+      closeConfirmUi();
+      const bar = document.getElementById('cmdBar');
+      const input = document.getElementById('cmdInput');
+      bar.classList.add('open');
+      input.value = '';
+      historyIndex = commandHistory.length;
+      suggestionIndex = -1;
+      renderCommandSuggestions();
+      setKbMode('COMMAND');
+      input.focus();
+    }
+
+    function closeCommandBarToNormal() {
+      closeCommandBarUi();
+      setKbMode('NORMAL');
+    }
+
+    function openHelp() {
+      closeCommandBarUi();
+      closeConfirmUi();
+      document.getElementById('helpModal').hidden = false;
+      setKbMode('HELP');
+    }
+
+    function toggleHelp() {
+      if (kbMode === 'HELP') {
+        closeHelpUi();
+        setKbMode('NORMAL');
+        return;
+      }
+      openHelp();
+    }
+
+    async function executeCommand(rawInput) {
+      const parsed = parseCommand(rawInput);
+      if (parsed.error) {
+        showToast(parsed.error);
+        return;
+      }
+      if (parsed.type === 'noop') return;
+
+      pushCommandHistory(rawInput);
+
+      if (parsed.type === 'jump') {
+        if (!jumpToSlotId(parsed.slotId)) {
+          showToast('slot #' + parsed.slotId + ' not found');
+        } else {
+          showToast('jumped to slot #' + parsed.slotId);
+        }
+        return;
+      }
+
+      if (parsed.type === 'set') {
+        requestSetMetric(parsed.metric, parsed.value);
+        return;
+      }
+
+      if (parsed.action === 'pause') {
+        requestPause();
+        return;
+      }
+      if (parsed.action === 'soft_close_next') {
+        requestSoftCloseNext();
+        return;
+      }
+      if (parsed.action === 'soft_close') {
+        requestSoftClose(parsed.payload.slot_id, parsed.payload.recovery_id);
+        return;
+      }
+      await dispatchAction(parsed.action, parsed.payload);
+    }
+
+    function forceRefreshRateLimited() {
+      const now = Date.now();
+      if (now - lastForcedRefreshMs < 2000) return;
+      lastForcedRefreshMs = now;
+      void refreshStatus();
+    }
+
+    async function togglePauseResume() {
+      if (statusData && statusData.mode === 'RUNNING') {
+        requestPause();
+      } else {
+        await dispatchAction('resume');
+      }
+    }
+
+    function handleNormalModeKey(event) {
+      const key = event.key;
+      if (/^[1-9]$/.test(key)) {
+        const idx = Number(key) - 1;
+        if (!jumpToSlotIndex(idx)) {
+          showToast('slot index #' + key + ' not found');
+        }
+        clearChordBuffer();
+        return;
+      }
+      if (key === '[') {
+        cycleSlot(-1);
+        clearChordBuffer();
+        return;
+      }
+      if (key === ']') {
+        cycleSlot(1);
+        clearChordBuffer();
+        return;
+      }
+      if (key === 'g') {
+        if (chordKey === 'g') {
+          clearChordBuffer();
+          jumpFirstSlot();
+        } else {
+          armChord('g');
+        }
+        return;
+      }
+      if (key === 'G') {
+        clearChordBuffer();
+        jumpLastSlot();
+        return;
+      }
+      if (key === '+') {
+        clearChordBuffer();
+        void dispatchAction('add_slot');
+        return;
+      }
+      if (key === '-') {
+        clearChordBuffer();
+        requestSoftCloseNext();
+        return;
+      }
+      if (key === 'p') {
+        clearChordBuffer();
+        void togglePauseResume();
+        return;
+      }
+      if (key === '.') {
+        clearChordBuffer();
+        forceRefreshRateLimited();
+        return;
+      }
+      if (key === '?') {
+        clearChordBuffer();
+        toggleHelp();
+        return;
+      }
+      if (key === ':') {
+        clearChordBuffer();
+        openCommandBar();
+        return;
+      }
+      if (key === 'Escape') {
+        clearChordBuffer();
+        if (selectedSlotId !== null) {
+          selectedSlotId = null;
+          renderDetailPanel();
+          scheduleFrame();
+        } else {
+          leaveToNormal();
+        }
+        return;
+      }
+      clearChordBuffer();
+    }
+
+    function onGlobalKeyDown(event) {
+      const cmdInput = document.getElementById('cmdInput');
+      if (event.ctrlKey || event.metaKey || event.altKey) return;
+
+      if (kbMode === 'COMMAND') {
+        if (event.target !== cmdInput) {
+          event.preventDefault();
+        }
+        return;
+      }
+
+      if (kbMode === 'HELP') {
+        event.preventDefault();
+        if (event.key === 'Escape' || event.key === '?') {
+          closeHelpUi();
+          setKbMode('NORMAL');
+        }
+        return;
+      }
+
+      if (kbMode === 'CONFIRM') {
+        event.preventDefault();
+        if (event.key === 'Enter') {
+          void confirmAccept();
+        } else if (event.key === 'Escape') {
+          confirmCancel();
+        }
+        return;
+      }
+
+      const active = document.activeElement;
+      if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable)) {
+        return;
+      }
+
+      event.preventDefault();
+      handleNormalModeKey(event);
     }
 
     function roundRect(x, y, w, h, r) {
@@ -1267,29 +1975,40 @@ FACTORY_HTML = r"""<!doctype html>
         strip.textContent = '... waiting for diagnosis';
         strip.style.borderColor = COLORS.line;
         strip.style.color = COLORS.muted;
+        strip.title = '';
         return;
       }
 
-      const top = activeSymptoms[0];
+      if (notifIndex >= activeSymptoms.length) notifIndex = 0;
+      const top = activeSymptoms[notifIndex];
       if (activeSymptoms.length === 1 && top.symptom_id === 'IDLE_NORMAL') {
         strip.textContent = 'OK Factory running normally';
         strip.style.borderColor = COLORS.good;
         strip.style.color = COLORS.good;
+        strip.title = '';
         return;
       }
 
       const icon = top.severity === 'crit' ? '!!' : (top.severity === 'warn' ? '!' : 'OK');
       const summary = String(top.summary || '');
-      strip.textContent = icon + ' ' + top.symptom_id + ': ' + summary;
+      const prefix = activeSymptoms.length > 1 ? '[' + (notifIndex + 1) + '/' + activeSymptoms.length + '] ' : '';
+      strip.textContent = prefix + icon + ' ' + top.symptom_id + ': ' + summary;
       const color = top.severity === 'crit'
         ? COLORS.bad
         : (top.severity === 'warn' ? COLORS.warn : COLORS.good);
       strip.style.borderColor = color;
       strip.style.color = color;
+      strip.title = activeSymptoms.length > 1 ? 'Click or press Enter to cycle symptoms' : '';
+    }
+
+    function cycleNotifSymptom() {
+      if (activeSymptoms.length <= 1) return;
+      notifIndex = (notifIndex + 1) % activeSymptoms.length;
+      renderNotifStrip();
     }
 
     function renderDetailPanel() {
-      if (!selectedSlotId || !statusData) {
+      if (selectedSlotId === null || !statusData) {
         PANEL.classList.remove('open');
         PANEL.setAttribute('aria-hidden', 'true');
         return;
@@ -1316,7 +2035,15 @@ FACTORY_HTML = r"""<!doctype html>
         .join('');
 
       const recRows = (Array.isArray(slot.recovery_orders) ? slot.recovery_orders : []).slice(0, 8)
-        .map((r) => '<tr><td>#' + r.recovery_id + '</td><td>' + r.side + '</td><td>' + Math.round(Number(r.age_sec || 0)) + 's</td><td>$' + fmt(r.price, 6) + '</td></tr>')
+        .map((r) => '<tr><td>#' + r.recovery_id + '</td><td>' + r.side + '</td><td>' + Math.round(Number(r.age_sec || 0)) + 's</td><td>$' + fmt(r.price, 6) + '</td><td><button class="miniBtn" data-close-rid="' + r.recovery_id + '">close</button></td></tr>')
+        .join('');
+
+      const cycleRows = (Array.isArray(slot.recent_cycles) ? slot.recent_cycles : []).slice(0, 8)
+        .map((c) => {
+          const pnl = Number(c.net_profit);
+          const color = Number.isFinite(pnl) && pnl < 0 ? COLORS.bad : COLORS.good;
+          return '<tr><td>' + c.trade_id + '.' + c.cycle + '</td><td>$' + fmt(c.entry_price, 6) + '</td><td>$' + fmt(c.exit_price, 6) + '</td><td style="color:' + color + ';">$' + fmt(c.net_profit, 4) + '</td><td>' + (c.from_recovery ? 'yes' : 'no') + '</td></tr>';
+        })
         .join('');
 
       DETAIL_CONTENT.innerHTML =
@@ -1333,13 +2060,25 @@ FACTORY_HTML = r"""<!doctype html>
           '<tr><th>Type</th><th>Trade</th><th>Price</th><th>Vol</th></tr>' +
           (openRows || '<tr><td colspan="4" class="mono">none</td></tr>') +
         '</table>' +
-        '<table><tr><th colspan="4">Recovery Orders</th></tr>' +
-          '<tr><th>ID</th><th>Side</th><th>Age</th><th>Price</th></tr>' +
-          (recRows || '<tr><td colspan="4" class="mono">none</td></tr>') +
+        '<table><tr><th colspan="5">Recovery Orders</th></tr>' +
+          '<tr><th>ID</th><th>Side</th><th>Age</th><th>Price</th><th></th></tr>' +
+          (recRows || '<tr><td colspan="5" class="mono">none</td></tr>') +
+        '</table>' +
+        '<table><tr><th colspan="5">Recent Cycles</th></tr>' +
+          '<tr><th>Trade</th><th>Entry</th><th>Exit</th><th>Net</th><th>Rec</th></tr>' +
+          (cycleRows || '<tr><td colspan="5" class="mono">none</td></tr>') +
         '</table>';
 
       PANEL.classList.add('open');
       PANEL.setAttribute('aria-hidden', 'false');
+
+      for (const btn of DETAIL_CONTENT.querySelectorAll('button[data-close-rid]')) {
+        btn.addEventListener('click', () => {
+          const recoveryId = Number.parseInt(btn.getAttribute('data-close-rid'), 10);
+          if (!Number.isFinite(recoveryId)) return;
+          requestSoftClose(slot.slot_id, recoveryId);
+        });
+      }
     }
 
     function hitTestMachine(worldX, worldY) {
@@ -1502,14 +2241,22 @@ FACTORY_HTML = r"""<!doctype html>
       }
     }
 
+    canvas.addEventListener('contextmenu', (ev) => {
+      const world = screenToWorld(ev.clientX, ev.clientY);
+      const hit = hitTestMachine(world.x, world.y);
+      if (hit !== null) {
+        ev.preventDefault();
+        showToast('Remove slot not yet available');
+      }
+    });
+
     canvas.addEventListener('mousedown', (ev) => {
+      if (ev.button !== 0) return;
       const world = screenToWorld(ev.clientX, ev.clientY);
       const hit = hitTestMachine(world.x, world.y);
 
       if (hit !== null) {
-        selectedSlotId = hit;
-        renderDetailPanel();
-        scheduleFrame();
+        selectSlot(hit, false);
         return;
       }
 
@@ -1567,8 +2314,66 @@ FACTORY_HTML = r"""<!doctype html>
     });
 
     document.getElementById('addBtn').addEventListener('click', () => {
-      showToast('F1 static view: +Add is not wired yet');
+      void dispatchAction('add_slot');
     });
+
+    const cmdInput = document.getElementById('cmdInput');
+    cmdInput.addEventListener('input', () => {
+      suggestionIndex = -1;
+      renderCommandSuggestions();
+    });
+    cmdInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Tab') {
+        event.preventDefault();
+        if (!currentSuggestions.length) renderCommandSuggestions();
+        if (!currentSuggestions.length) return;
+        suggestionIndex = (suggestionIndex + 1) % currentSuggestions.length;
+        applySuggestion(suggestionIndex);
+        renderCommandSuggestions();
+        return;
+      }
+      if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        recallHistory(-1);
+        return;
+      }
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        recallHistory(1);
+        return;
+      }
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        const raw = cmdInput.value;
+        closeCommandBarToNormal();
+        void executeCommand(raw);
+        return;
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeCommandBarToNormal();
+      }
+    });
+
+    document.getElementById('confirmOkBtn').addEventListener('click', () => {
+      void confirmAccept();
+    });
+    document.getElementById('confirmCancelBtn').addEventListener('click', () => {
+      confirmCancel();
+    });
+
+    const notifStrip = document.getElementById('notifStrip');
+    notifStrip.addEventListener('click', () => {
+      cycleNotifSymptom();
+    });
+    notifStrip.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        cycleNotifSymptom();
+      }
+    });
+
+    document.addEventListener('keydown', onGlobalKeyDown);
 
     window.addEventListener('resize', () => {
       updateCanvasSize();
@@ -1578,6 +2383,7 @@ FACTORY_HTML = r"""<!doctype html>
       scheduleFrame();
     });
 
+    updateKbModeBadge();
     updateCanvasSize();
     scheduleFrame();
     refreshStatus();
