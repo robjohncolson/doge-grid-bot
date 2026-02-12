@@ -1158,6 +1158,12 @@ class BotRuntime:
             elif action.side == "buy":
                 slot.state = replace(slot.state, short_only=True, long_only=False)
 
+        # Pre-compute order capacity for gating new entries.
+        _internal_order_count = self._internal_open_order_count()
+        _pair_limit = max(1, int(config.KRAKEN_OPEN_ORDERS_PER_PAIR_LIMIT))
+        _safe_ratio = min(1.0, max(0.1, float(config.OPEN_ORDER_SAFETY_RATIO)))
+        _order_cap = max(1, int(_pair_limit * _safe_ratio))
+
         for action in actions:
             if isinstance(action, sm.PlaceOrderAction):
                 # Pause/HALT blocks new entry placement; exits still allowed to reduce state risk.
@@ -1167,6 +1173,18 @@ class BotRuntime:
                 if self._price_age_sec() > config.STALE_PRICE_MAX_AGE_SEC:
                     self.pause("stale price data > 60s")
                     slot.state = sm.remove_order(slot.state, action.local_id)
+                    continue
+
+                # Capacity gate: block new entry orders when at open-order cap.
+                # Exit orders are always allowed (they reduce exposure).
+                if action.role == "entry" and _internal_order_count >= _order_cap:
+                    logger.warning(
+                        "slot %s entry blocked: at order capacity (%d/%d)",
+                        slot_id, _internal_order_count, _order_cap,
+                    )
+                    slot.state = sm.remove_order(slot.state, action.local_id)
+                    _mark_entry_fallback_for_insufficient_funds(action)
+                    self._normalize_slot_mode(slot_id)
                     continue
 
                 reserved_locally = self._try_reserve_loop_funds(
@@ -1211,6 +1229,7 @@ class BotRuntime:
                         continue
                     slot.state = sm.apply_order_txid(slot.state, action.local_id, txid)
                     self.ledger.commit_order(action.side, action.price, action.volume)
+                    _internal_order_count += 1
                 except Exception as e:
                     self._release_loop_reservation(
                         side=action.side,
@@ -1593,6 +1612,94 @@ class BotRuntime:
             return False, "no recovery orders"
         return self.soft_close(oldest[0], oldest[1].recovery_id)
 
+    def cancel_stale_recoveries(self, min_distance_pct: float = 3.0) -> tuple[bool, str]:
+        """Cancel recovery orders farther than min_distance_pct from current market.
+
+        Unlike soft_close, this does NOT re-place — it simply cancels and removes,
+        freeing both order slots and capital.
+        """
+        if self.last_price <= 0:
+            return False, "no market price"
+
+        cancelled = 0
+        failed = 0
+        for sid in sorted(self.slots.keys()):
+            slot = self.slots[sid]
+            keep: list[sm.RecoveryOrder] = []
+            for r in slot.state.recovery_orders:
+                distance_pct = abs(r.price - self.last_price) / self.last_price * 100.0
+                if distance_pct < min_distance_pct:
+                    keep.append(r)
+                    continue
+                # Cancel on Kraken
+                if r.txid:
+                    try:
+                        self._cancel_order(r.txid)
+                    except Exception as e:
+                        logger.warning("cancel_stale_recoveries: cancel %s failed: %s", r.txid, e)
+                        keep.append(r)
+                        failed += 1
+                        continue
+                cancelled += 1
+            slot.state = replace(slot.state, recovery_orders=tuple(keep))
+
+        if cancelled > 0:
+            self._save_snapshot()
+        msg = f"cancelled {cancelled} stale recovery orders (>{min_distance_pct:.1f}% from market)"
+        if failed:
+            msg += f", {failed} cancel failures retained"
+        return True, msg
+
+    def reconcile_drift(self) -> tuple[bool, str]:
+        """Cancel Kraken-only orders not tracked internally (drift orders).
+
+        Fetches open orders from Kraken, compares against all known txids
+        in slots (orders + recovery_orders), and cancels any pair-matching
+        orders that we don't recognize.
+        """
+        try:
+            open_orders = kraken_client.get_open_orders()
+        except Exception as e:
+            return False, f"failed to fetch open orders: {e}"
+
+        # Build set of all internally tracked txids.
+        known_txids: set[str] = set()
+        for slot in self.slots.values():
+            for o in slot.state.orders:
+                if o.txid:
+                    known_txids.add(o.txid)
+            for r in slot.state.recovery_orders:
+                if r.txid:
+                    known_txids.add(r.txid)
+
+        # Find pair-matching orders on Kraken that we don't track.
+        unknown_txids: list[str] = []
+        for txid, row in open_orders.items():
+            if not isinstance(row, dict):
+                continue
+            if not self._order_matches_runtime_pair(row):
+                continue
+            if txid not in known_txids:
+                unknown_txids.append(txid)
+
+        if not unknown_txids:
+            return True, f"no drift: {len(open_orders)} kraken orders, {len(known_txids)} tracked"
+
+        cancelled = 0
+        failed = 0
+        for txid in unknown_txids:
+            try:
+                kraken_client.cancel_order(txid)
+                cancelled += 1
+            except Exception as e:
+                logger.warning("reconcile_drift: cancel %s failed: %s", txid, e)
+                failed += 1
+
+        msg = f"cancelled {cancelled}/{len(unknown_txids)} drift orders"
+        if failed:
+            msg += f", {failed} failures"
+        return True, msg
+
     def status_text(self) -> str:
         lines = [
             f"mode: {self.mode}",
@@ -1692,6 +1799,8 @@ class BotRuntime:
                     "Commands:\n"
                     "/pause\n/resume\n/add_slot\n/status\n/help\n"
                     "/soft_close [slot_id recovery_id]\n"
+                    "/cancel_stale [min_distance_pct]\n"
+                    "/reconcile_drift\n"
                     "/set_entry_pct <value>\n"
                     "/set_profit_pct <value>"
                 )
@@ -1728,6 +1837,16 @@ class BotRuntime:
                     else:
                         notifier.send_with_buttons("Select recovery to soft-close:", rows)
                         ok, msg = True, "sent picker"
+            elif head == "/cancel_stale":
+                dist = 3.0
+                if len(parts) >= 2:
+                    try:
+                        dist = float(parts[1])
+                    except ValueError:
+                        pass
+                ok, msg = self.cancel_stale_recoveries(dist)
+            elif head == "/reconcile_drift":
+                ok, msg = self.reconcile_drift()
             else:
                 ok, msg = False, "unknown command"
 
@@ -2051,7 +2170,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 except (TypeError, ValueError):
                     self._send_json({"ok": False, "message": "invalid slot/recovery id"}, 400)
                     return
-            elif action in ("pause", "resume", "add_slot", "soft_close_next"):
+            elif action == "cancel_stale_recoveries":
+                try:
+                    parsed["min_distance_pct"] = float(body.get("min_distance_pct", 3.0))
+                except (TypeError, ValueError):
+                    parsed["min_distance_pct"] = 3.0
+            elif action in ("pause", "resume", "add_slot", "soft_close_next", "reconcile_drift"):
                 pass
             else:
                 self._send_json({"ok": False, "message": f"unknown action: {action}"}, 400)
@@ -2076,6 +2200,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     ok, msg = _RUNTIME.soft_close(int(parsed["slot_id"]), int(parsed["recovery_id"]))
                 elif action == "soft_close_next":
                     ok, msg = _RUNTIME.soft_close_next()
+                elif action == "cancel_stale_recoveries":
+                    ok, msg = _RUNTIME.cancel_stale_recoveries(float(parsed.get("min_distance_pct", 3.0)))
+                elif action == "reconcile_drift":
+                    ok, msg = _RUNTIME.reconcile_drift()
                 _RUNTIME._save_snapshot()
 
             self._send_json({"ok": bool(ok), "message": str(msg)}, 200 if ok else 400)
