@@ -2584,9 +2584,9 @@ FACTORY_HTML = r"""<!doctype html>
 
         // Subtle yellow base so slots read as portholes without becoming solid blocks
         const baseAlpha = clamp(
-          0.16 * visualState.slotAlpha * (isStarved ? 0.94 : 1),
-          0.06,
-          0.22
+          0.34 * visualState.slotAlpha * (isStarved ? 0.96 : 1),
+          0.18,
+          0.46
         );
         ctx.globalAlpha = baseAlpha;
         ctx.fillStyle = BAUHAUS_COLORS.canvas;
