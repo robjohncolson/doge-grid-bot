@@ -430,6 +430,7 @@ FACTORY_HTML = r"""<!doctype html>
 
     const BAUHAUS_COLORS = {
       void: '#FFFFFF',
+      membrane: '#FFF2CC',
       frame: '#E8881F',
       canvas: '#F4C430',
       structure: '#000000',
@@ -2392,7 +2393,7 @@ FACTORY_HTML = r"""<!doctype html>
       const hb = Math.max(1, channelHalfBot);
       const step = 12; // wobble sample every 12px
 
-      ctx.fillStyle = BAUHAUS_COLORS.void;
+      ctx.fillStyle = BAUHAUS_COLORS.membrane;
 
       // Top membrane section: wobbled perimeter path
       // Path: along top edge (left to right with wobble), down right edge with wobble,
@@ -2588,7 +2589,7 @@ FACTORY_HTML = r"""<!doctype html>
       // Layer 1: Draw the gullet (black channel with bezier funnels)
       drawBauhausGullet(layoutView, channelHalfTop, channelHalfBot, staleLevel);
 
-      // Layer 2: Draw the membrane (white, on top of gullet, with channel strip excluded)
+      // Layer 2: Draw the membrane (soft DOGE tint, on top of gullet, with channel strip excluded)
       drawBauhausMembrane(layoutView, channelHalfTop, channelHalfBot);
 
       // Layer 3: Stationary sparkles inside the gullet (clipped to gullet path)
