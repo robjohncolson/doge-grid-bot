@@ -2619,7 +2619,7 @@ FACTORY_HTML = r"""<!doctype html>
         // Phase label — crisp black monospace centered
         const fontPx = node.h >= 34 ? 12 : 10;
         ctx.fillStyle = BAUHAUS_COLORS.structure;
-        ctx.globalAlpha = clamp(visualState.slotAlpha * 0.95, 0.35, 1);
+        ctx.globalAlpha = clamp(visualState.slotAlpha * 0.95, 0.58, 1);
         ctx.font = fontPx + 'px monospace';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
