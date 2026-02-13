@@ -2145,25 +2145,32 @@ FACTORY_HTML = r"""<!doctype html>
     function drawBauhausProfitCounter(layoutView) {
       const rect = getBauhausCounterRect(layoutView);
       const shown = formatBauhausProfitText(bauhausProfitDisplayed === null ? bauhausProfitTarget : bauhausProfitDisplayed);
-      const text = 'Ð ' + shown;
       const padX = 0;
       const glyphH = rect.h - 10;
       const digitW = Math.round(glyphH * 0.62);
-      const prefixW = Math.round(glyphH * 0.68);
       const dotW = Math.max(4, Math.round(digitW * 0.35));
       const gap = 3;
 
       // No background box — digits float directly on yellow
-      let cx = rect.x + padX;
       const onColor = BAUHAUS_COLORS.structure;   // black on yellow
       const offColor = 'rgba(0,0,0,0.06)';        // ghost outlines
-      for (let i = 0; i < text.length; i += 1) {
-        const ch = text[i];
-        if (ch === ' ') {
-          cx += Math.max(4, gap);
-          continue;
-        }
-        const w = ch === 'Ð' ? prefixW : (ch === '.' ? dotW : digitW);
+      let cx = rect.x + padX;
+
+      // Leading currency marker is a plain glyph, not seven-segment.
+      ctx.save();
+      ctx.fillStyle = onColor;
+      ctx.globalAlpha = 0.95;
+      ctx.font = '700 ' + Math.round(glyphH * 0.9) + 'px "Segoe UI Symbol", "Noto Sans", sans-serif';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('Ð', cx, rect.y + rect.h * 0.5 + 0.5);
+      const dogeW = Math.max(10, Math.ceil(ctx.measureText('Ð').width));
+      ctx.restore();
+      cx += dogeW + Math.max(6, gap + 2);
+
+      for (let i = 0; i < shown.length; i += 1) {
+        const ch = shown[i];
+        const w = ch === '.' ? dotW : digitW;
         drawSevenSegGlyph(ch, cx, rect.y + 5, w, glyphH, onColor, offColor);
         cx += w + gap;
       }

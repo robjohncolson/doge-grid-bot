@@ -256,7 +256,7 @@ Orphan animations retained:
 
 Counter:
 - Top-right within membrane.
-- Seven-segment text `Ð <value>`.
+- Plain Dogecoin glyph prefix `Ð`, followed by seven-segment numeric value.
 - No background box.
 - Lit segments: black.
 - Unlit ghost segments: `rgba(0,0,0,0.06)`.
