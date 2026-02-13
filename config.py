@@ -281,6 +281,10 @@ KRAKEN_OPEN_ORDERS_PER_PAIR_LIMIT: int = _env("KRAKEN_OPEN_ORDERS_PER_PAIR_LIMIT
 OPEN_ORDER_SAFETY_RATIO: float = _env("OPEN_ORDER_SAFETY_RATIO", 0.75, float)
 # Alert when Kraken/internal open-order counts diverge for too long.
 # This is a persistence canary, not a one-sample spike alarm.
+# Auto-soft-close: when capacity utilization >= this %, soft-close farthest
+# recovery orders each cycle to prevent hitting the hard order limit.
+AUTO_SOFT_CLOSE_CAPACITY_PCT: float = _env("AUTO_SOFT_CLOSE_CAPACITY_PCT", 80.0, float)
+AUTO_SOFT_CLOSE_BATCH: int = _env("AUTO_SOFT_CLOSE_BATCH", 2, int)
 OPEN_ORDER_DRIFT_ALERT_THRESHOLD: int = _env("OPEN_ORDER_DRIFT_ALERT_THRESHOLD", 10, int)
 OPEN_ORDER_DRIFT_ALERT_PERSIST_SEC: int = _env("OPEN_ORDER_DRIFT_ALERT_PERSIST_SEC", 600, int)
 OPEN_ORDER_DRIFT_ALERT_COOLDOWN_SEC: int = _env("OPEN_ORDER_DRIFT_ALERT_COOLDOWN_SEC", 1800, int)

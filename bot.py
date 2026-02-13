@@ -1673,6 +1673,95 @@ class BotRuntime:
 
         return True, f"removed {len(removed)} slots: {removed}"
 
+    def _auto_soft_close_if_capacity_pressure(self) -> None:
+        """Soft-close farthest recovery orders when capacity utilization is high.
+
+        Triggered each main-loop cycle.  Processes a small batch (default 2)
+        per cycle to stay within rate limits while steadily draining orphans.
+        """
+        cap_threshold = float(config.AUTO_SOFT_CLOSE_CAPACITY_PCT)
+        batch_size = max(1, min(int(config.AUTO_SOFT_CLOSE_BATCH), 5))
+
+        # Use Kraken-reported count if available, else internal count.
+        if self._kraken_open_orders_current is not None:
+            current = int(self._kraken_open_orders_current)
+        else:
+            current = self._internal_open_order_count()
+
+        pair_limit = max(1, int(config.KRAKEN_OPEN_ORDERS_PER_PAIR_LIMIT))
+        utilization_pct = current / pair_limit * 100.0
+
+        if utilization_pct < cap_threshold:
+            return
+
+        # Collect all recoveries with distance from market, sorted farthest first.
+        if self.last_price <= 0:
+            return
+        candidates: list[tuple[float, int, sm.RecoveryOrder]] = []
+        for sid in self.slots:
+            for r in self.slots[sid].state.recovery_orders:
+                dist = abs(r.price - self.last_price) / self.last_price * 100.0
+                candidates.append((dist, sid, r))
+
+        if not candidates:
+            return
+
+        candidates.sort(key=lambda t: t[0], reverse=True)
+        batch = candidates[:batch_size]
+
+        repriced = 0
+        for _dist, sid, rec in batch:
+            slot = self.slots[sid]
+
+            # Cancel old order.
+            if rec.txid:
+                try:
+                    ok = self._cancel_order(rec.txid)
+                    if not ok:
+                        continue
+                except Exception:
+                    continue
+
+            # Place near market.
+            if rec.side == "sell":
+                new_price = round(self.last_price * (1 + self.entry_pct / 100.0), self.constraints["price_decimals"])
+            else:
+                new_price = round(self.last_price * (1 - self.entry_pct / 100.0), self.constraints["price_decimals"])
+
+            try:
+                txid = self._place_order(
+                    side=rec.side,
+                    volume=rec.volume,
+                    price=new_price,
+                    userref=(sid * 1_000_000 + 900_000 + rec.recovery_id),
+                )
+            except Exception:
+                txid = None
+
+            if not txid:
+                # Clear txid so poller won't silently drop on next cycle.
+                slot.state = replace(slot.state, recovery_orders=tuple(
+                    replace(x, txid="", reason="auto_close_place_failed") if x.recovery_id == rec.recovery_id else x
+                    for x in slot.state.recovery_orders
+                ))
+                continue
+
+            slot.state = replace(slot.state, recovery_orders=tuple(
+                replace(x, price=new_price, txid=txid, reason="auto_soft_close") if x.recovery_id == rec.recovery_id else x
+                for x in slot.state.recovery_orders
+            ))
+            repriced += 1
+
+        if repriced > 0:
+            logger.info(
+                "auto_soft_close: repriced %d/%d farthest recoveries (capacity %.0f%% >= %.0f%% threshold)",
+                repriced, len(batch), utilization_pct, cap_threshold,
+            )
+            notifier._send_message(
+                f"<b>Auto soft-close</b>\nCapacity {utilization_pct:.0f}% — "
+                f"repriced {repriced} farthest recoveries near market"
+            )
+
     def cancel_stale_recoveries(self, min_distance_pct: float = 3.0, max_batch: int = 8) -> tuple[bool, str]:
         """Bulk soft-close recovery orders farther than min_distance_pct from market.
 
@@ -1872,6 +1961,8 @@ class BotRuntime:
             self._poll_order_status()
             # Refresh pair open-order telemetry (Kraken source of truth) when budget allows.
             self._refresh_open_order_telemetry()
+            # Auto-soft-close farthest recoveries when nearing order capacity.
+            self._auto_soft_close_if_capacity_pressure()
 
             # Pressure notice for orphan growth.
             total_orphans = sum(len(s.state.recovery_orders) for s in self.slots.values())
