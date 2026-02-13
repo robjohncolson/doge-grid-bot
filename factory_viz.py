@@ -499,6 +499,8 @@ FACTORY_HTML = r"""<!doctype html>
     const BAUHAUS_REPRICE_EPSILON = 1e-9;
     const BAUHAUS_ORDER_SCALE_FACTOR = 25000000;
     const BAUHAUS_ORDER_MAX_OFFSET_RATIO = 0.45;
+    const BAUHAUS_ORPHAN_MORPH_MS = 820;
+    const BAUHAUS_RECOVERY_DISSOLVE_MS = 420;
 
     function loadRenderMode() {
       try {
@@ -561,6 +563,8 @@ FACTORY_HTML = r"""<!doctype html>
     let bauhausProfitFlights = [];
     let bauhausFillAnims = [];
     let bauhausOrphanRepriceAnims = new Map();
+    let bauhausOrphanMorphAnims = new Map();
+    let bauhausRecoveryDissolveAnims = [];
     let bauhausPinnedTooltip = null;
     let bauhausLastOrderPoints = [];
     let bauhausLastOrphanSprites = [];
@@ -580,6 +584,8 @@ FACTORY_HTML = r"""<!doctype html>
       bauhausLastPriceLineRect = null;
       bauhausLastCounterRect = null;
       bauhausSlotFlash = null;
+      bauhausOrphanMorphAnims.clear();
+      bauhausRecoveryDissolveAnims = [];
     }
 
     function diagnose(status) {
@@ -774,8 +780,10 @@ FACTORY_HTML = r"""<!doctype html>
           const recKey = String(slot.slot_id) + ':' + String(r && r.recovery_id);
           prevRecByKey.set(recKey, r);
         }
+        const currRecKeys = new Set();
         for (const r of (slot.recovery_orders || [])) {
           const recKey = String(slot.slot_id) + ':' + String(r && r.recovery_id);
+          currRecKeys.add(recKey);
           const prevRec = prevRecByKey.get(recKey);
           if (!prevRec) {
             events.push({type: 'order_orphaned', slot_id: slot.slot_id, recovery: r});
@@ -799,6 +807,15 @@ FACTORY_HTML = r"""<!doctype html>
               recovery: r
             });
           }
+        }
+        for (const [recKey, rec] of prevRecByKey.entries()) {
+          if (currRecKeys.has(recKey)) continue;
+          events.push({
+            type: 'recovery_gone',
+            slot_id: slot.slot_id,
+            recovery_key: recKey,
+            recovery: rec
+          });
         }
 
         const prevCycleKeys = new Set((ps.recent_cycles || []).map((c) => c.trade_id + ':' + c.cycle));
@@ -2027,6 +2044,7 @@ FACTORY_HTML = r"""<!doctype html>
           durationMs: 760,
           delta,
           applied: false,
+          fromRecovery: !!cycle.from_recovery,
           seed: hashString32(key)
         });
       }
@@ -2049,7 +2067,9 @@ FACTORY_HTML = r"""<!doctype html>
         const y = flight.fromY + (flight.toY - flight.fromY) * ease;
 
         const alpha = 1 - progress * 0.65;
-        const rgb = flight.delta >= 0 ? '0,0,0' : '80,0,0';
+        const rgb = flight.fromRecovery
+          ? '128,128,128'
+          : (flight.delta >= 0 ? '0,0,0' : '80,0,0');
         const count = 8;
         for (let i = 0; i < count; i += 1) {
           const u = seededUnit(flight.seed, i + 30);
@@ -2701,7 +2721,10 @@ FACTORY_HTML = r"""<!doctype html>
         index.set(item.key, {
           x: item.x,
           y: item.y,
-          color: item.color
+          color: item.color,
+          slot_id: item.slot_id,
+          recovery: item.recovery,
+          pctDistance: item.pctDistance
         });
       }
       return index;
@@ -2741,6 +2764,116 @@ FACTORY_HTML = r"""<!doctype html>
       }
     }
 
+    function queueBauhausOrphanMorphAnimations(events, prevStatusSnapshot, nextStatus, startMs) {
+      const list = Array.isArray(events) ? events : [];
+      if (!list.length) return;
+
+      const prevLayout = computeBauhausLayout(prevStatusSnapshot || nextStatus || {slots: []});
+      const nextLayout = computeBauhausLayout(nextStatus || {slots: []});
+      const prevPoints = computeBauhausOrderPoints(prevLayout, prevStatusSnapshot || {slots: []});
+      const nextIndex = buildBauhausOrphanIndex(nextLayout, nextStatus || {slots: []});
+      const prevExitBySlot = {};
+
+      for (const p of prevPoints) {
+        if (!p || p.role !== 'exit' || !p.node || !p.node.slot) continue;
+        const slotId = p.node.slot.slot_id;
+        if (!prevExitBySlot[slotId]) prevExitBySlot[slotId] = [];
+        prevExitBySlot[slotId].push(p);
+      }
+
+      for (const evt of list) {
+        if (evt.type !== 'order_orphaned' || !evt.recovery) continue;
+        const rec = evt.recovery;
+        const recKey = String(evt.slot_id) + ':' + String(rec.recovery_id);
+        const to = nextIndex.get(recKey);
+        if (!to) continue;
+
+        const recSide = String(rec.side || '').toLowerCase();
+        const recPrice = Number(rec.price);
+        const candidates = prevExitBySlot[evt.slot_id] || [];
+        let chosen = null;
+        let bestScore = Infinity;
+
+        for (const p of candidates) {
+          if (recSide === 'buy' || recSide === 'sell') {
+            if (String(p.side || '').toLowerCase() !== recSide) continue;
+          }
+          const orderPrice = Number(p.order && p.order.price);
+          const score = (Number.isFinite(recPrice) && Number.isFinite(orderPrice))
+            ? Math.abs(orderPrice - recPrice)
+            : 1;
+          if (score < bestScore) {
+            bestScore = score;
+            chosen = p;
+          }
+        }
+        if (!chosen && candidates.length) chosen = candidates[0];
+
+        const fallbackSide = (recSide === 'buy' || recSide === 'sell')
+          ? recSide
+          : (to.y < nextLayout.priceY ? 'sell' : 'buy');
+        const anchorNode = findBauhausNodeBySlotId(nextLayout, evt.slot_id) || (chosen ? chosen.node : null);
+        const anchorX = anchorNode ? anchorNode.x + anchorNode.w * 0.5 : to.x;
+        const anchorY = anchorNode
+          ? (fallbackSide === 'sell' ? anchorNode.y : anchorNode.y + anchorNode.h)
+          : nextLayout.priceY;
+        const fromX = chosen ? chosen.x : anchorX;
+        const fromY = chosen ? chosen.y : anchorY;
+
+        bauhausOrphanMorphAnims.set(recKey, {
+          key: recKey,
+          slot_id: evt.slot_id,
+          recovery: rec,
+          pctDistance: Number(to.pctDistance),
+          startMs,
+          durationMs: BAUHAUS_ORPHAN_MORPH_MS,
+          fromX,
+          fromY,
+          toX: to.x,
+          toY: to.y,
+          anchorX,
+          anchorY,
+          role: chosen ? chosen.role : 'exit',
+          color: to.color
+        });
+      }
+
+      while (bauhausOrphanMorphAnims.size > 260) {
+        const oldest = bauhausOrphanMorphAnims.keys().next();
+        if (oldest.done) break;
+        bauhausOrphanMorphAnims.delete(oldest.value);
+      }
+    }
+
+    function queueBauhausRecoveryDissolveAnimations(events, prevStatusSnapshot, startMs) {
+      const list = Array.isArray(events) ? events : [];
+      if (!list.length) return;
+
+      const prevLayout = computeBauhausLayout(prevStatusSnapshot || {slots: []});
+      const prevIndex = buildBauhausOrphanIndex(prevLayout, prevStatusSnapshot || {slots: []});
+
+      for (const evt of list) {
+        if (evt.type !== 'recovery_gone') continue;
+        const recKey = String(evt.recovery_key || (String(evt.slot_id) + ':' + String(evt.recovery && evt.recovery.recovery_id)));
+        const from = prevIndex.get(recKey);
+        if (!from) continue;
+        bauhausRecoveryDissolveAnims.push({
+          key: recKey,
+          slot_id: evt.slot_id,
+          recovery: evt.recovery || null,
+          x: from.x,
+          y: from.y,
+          startMs,
+          durationMs: BAUHAUS_RECOVERY_DISSOLVE_MS,
+          seed: hashString32(recKey + ':gone:' + String(startMs))
+        });
+      }
+
+      if (bauhausRecoveryDissolveAnims.length > 220) {
+        bauhausRecoveryDissolveAnims = bauhausRecoveryDissolveAnims.slice(-220);
+      }
+    }
+
     function drawOrphanPlusSprite(x, y, armColor, alpha) {
       const px = 2;
       const cx = Math.round(x);
@@ -2759,10 +2892,43 @@ FACTORY_HTML = r"""<!doctype html>
       ctx.globalAlpha = 1;
     }
 
+    function drawBauhausRecoveryDissolveAnimations(nowMs, status) {
+      if (!bauhausRecoveryDissolveAnims.length) return;
+      const keep = [];
+      const visualState = getBauhausVisualState(status);
+      const motionFactor = Math.max(0.05, visualState.motionFactor);
+
+      ctx.imageSmoothingEnabled = false;
+      for (const anim of bauhausRecoveryDissolveAnims) {
+        const progress = clamp(((nowMs - anim.startMs) * motionFactor) / anim.durationMs, 0, 1);
+        const alpha = clamp(1 - progress, 0, 1);
+        if (alpha > 0.04) {
+          drawOrphanPlusSprite(anim.x, anim.y, '#8A8A8A', alpha * 0.7);
+        }
+
+        const fragmentCount = 12;
+        for (let i = 0; i < fragmentCount; i += 1) {
+          const u = seededUnit(anim.seed, i + 41);
+          const a = (Math.PI * 2 * i) / fragmentCount + progress * 5.2;
+          const r = 1 + progress * (6 + u * 8);
+          const px = anim.x + Math.cos(a) * r;
+          const py = anim.y + Math.sin(a) * r;
+          const size = u > 0.62 ? 2 : 1;
+          ctx.fillStyle = 'rgba(128,128,128,' + (alpha * 0.9).toFixed(3) + ')';
+          ctx.fillRect(Math.round(px), Math.round(py), size, size);
+        }
+
+        if (progress < 1) keep.push(anim);
+      }
+      ctx.imageSmoothingEnabled = true;
+      bauhausRecoveryDissolveAnims = keep;
+    }
+
     function drawBauhausOrphans(layoutView, status, nowMs) {
       const items = buildBauhausOrphans(layoutView, status);
       if (!items.length) {
         bauhausOrphanRepriceAnims.clear();
+        bauhausOrphanMorphAnims.clear();
         return [];
       }
       const visualState = getBauhausVisualState(status);
@@ -2778,6 +2944,11 @@ FACTORY_HTML = r"""<!doctype html>
           bauhausOrphanRepriceAnims.delete(key);
         }
       }
+      for (const [key, anim] of bauhausOrphanMorphAnims) {
+        if (!currentKeys.has(key) || (nowMs - anim.startMs) > (anim.durationMs + 1200)) {
+          bauhausOrphanMorphAnims.delete(key);
+        }
+      }
 
       ctx.imageSmoothingEnabled = false;
       for (const item of items) {
@@ -2785,6 +2956,47 @@ FACTORY_HTML = r"""<!doctype html>
           ? 0.72
           : twinkleBase + twinkleAmp * Math.sin((nowMs * twinkleScale / item.twinklePeriodMs) * Math.PI * 2 + item.twinklePhase);
         const alpha = clamp(tw, visualState.halted ? 0.55 : 0.7, 1.0);
+
+        const morph = bauhausOrphanMorphAnims.get(item.key);
+        if (morph) {
+          const t = clamp((nowMs - morph.startMs) / morph.durationMs, 0, 1);
+          const ease = t * t * (3 - 2 * t);
+          const x = morph.fromX + (morph.toX - morph.fromX) * ease;
+          const y = morph.fromY + (morph.toY - morph.fromY) * ease;
+          const lineAlpha = clamp((0.42 - t) * 2.4, 0, 1);
+          const squareAlpha = clamp(1 - t * 2.4, 0, 1);
+          const plusAlpha = clamp((t - 0.22) / 0.58, 0, 1);
+
+          if (lineAlpha > 0.02) {
+            ctx.strokeStyle = 'rgba(153,153,153,' + (lineAlpha * alpha).toFixed(3) + ')';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(Math.round(morph.anchorX) + 0.5, Math.round(morph.anchorY) + 0.5);
+            ctx.lineTo(Math.round(x) + 0.5, Math.round(y) + 0.5);
+            ctx.stroke();
+          }
+          if (squareAlpha > 0.02) {
+            drawBauhausOrderSquare(x, y, morph.role || 'exit', alpha * squareAlpha);
+          }
+          if (plusAlpha > 0.02) {
+            drawOrphanPlusSprite(x, y, morph.color || item.color, alpha * plusAlpha);
+          }
+
+          rendered.push({
+            key: item.key,
+            slot_id: item.slot_id,
+            recovery: item.recovery,
+            pctDistance: item.pctDistance,
+            x,
+            y
+          });
+
+          if (t >= 1) {
+            bauhausOrphanMorphAnims.delete(item.key);
+          }
+          continue;
+        }
+
         const anim = bauhausOrphanRepriceAnims.get(item.key);
         if (!anim) {
           drawOrphanPlusSprite(item.x, item.y, item.color, alpha);
@@ -3863,6 +4075,7 @@ FACTORY_HTML = r"""<!doctype html>
       drawBauhausSlots(bauhausLayout, statusData, nowMs);
       bauhausLastOrderPoints = drawBauhausOrders(bauhausLayout, statusData, nowMs) || [];
       drawBauhausFillAnimations(nowMs, statusData);
+      drawBauhausRecoveryDissolveAnimations(nowMs, statusData);
       bauhausLastOrphanSprites = drawBauhausOrphans(bauhausLayout, statusData, nowMs) || [];
       drawBauhausProfitFlights(nowMs, statusData);
       bauhausLastCounterRect = drawBauhausProfitCounter(bauhausLayout);
@@ -3919,7 +4132,7 @@ FACTORY_HTML = r"""<!doctype html>
         const events = diff(statusData, next);
         const startMs = performance.now();
         for (const evt of events) {
-          if (evt.type === 'orphan_repriced') continue;
+          if (evt.type === 'orphan_repriced' || evt.type === 'recovery_gone') continue;
           const anim = {
             type: evt.type,
             slot_id: evt.slot_id,
@@ -3943,6 +4156,8 @@ FACTORY_HTML = r"""<!doctype html>
         if (isBauhausMode()) {
           queueBauhausFillAnimations(events, statusData, next, startMs);
           queueBauhausOrphanRepriceAnimations(events, statusData, next, startMs);
+          queueBauhausOrphanMorphAnimations(events, statusData, next, startMs);
+          queueBauhausRecoveryDissolveAnimations(events, statusData, startMs);
         }
 
         statusData = next;
