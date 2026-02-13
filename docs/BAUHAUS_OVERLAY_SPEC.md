@@ -170,10 +170,10 @@ Rendering (`drawBauhausSparkles(nowMs)`):
 ## 8. Slots
 
 Visual style:
-- Yellow porthole fill: opaque `#F4C430` base (inset 1px from outline).
-- Phase tint overlay on yellow:
+- Transparent slot interior (no opaque base fill).
+- Phase tint overlay:
   - S1a, S1b, S2 use alpha baseline 0.15, clamped [0.02, 0.25] (modulated by state effects).
-  - Jammed/starved multipliers apply to tint layer only; yellow base is always opaque.
+  - Jammed/starved multipliers apply to tint layer only.
 - Outline: `strokeRect`, black, 2px base.
 - Phase text centered in monospace (10-12px based on slot height).
 

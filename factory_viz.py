@@ -2582,12 +2582,7 @@ FACTORY_HTML = r"""<!doctype html>
         const isJammed = slotHasEffect(slot.slot_id, 'conveyor_stop');
         const isStarved = slotHasEffect(slot.slot_id, 'machine_dark') || !!slot.long_only || !!slot.short_only;
 
-        // Yellow base fill — slot becomes a porthole in the black gullet
-        ctx.globalAlpha = 1;
-        ctx.fillStyle = BAUHAUS_COLORS.canvas;
-        ctx.fillRect(node.x + 1, node.y + 1, node.w - 2, node.h - 2);
-
-        // Phase tint overlay on yellow (barely there, alpha 0.15)
+        // Transparent interior with faint phase tint
         if (phaseFill) {
           const tintAlpha = clamp(
             0.15
@@ -2603,7 +2598,7 @@ FACTORY_HTML = r"""<!doctype html>
           ctx.globalAlpha = 1;
         }
 
-        // Black outline — visible against yellow fill
+        // Black outline around transparent interior
         ctx.strokeStyle = BAUHAUS_COLORS.structure;
         ctx.lineWidth = isJammed ? (1.8 + pulse * 1.2) : 2;
         ctx.globalAlpha = clamp(visualState.slotAlpha * (isStarved ? 0.92 : 1), 0.35, 1);
