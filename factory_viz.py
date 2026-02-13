@@ -1929,13 +1929,14 @@ FACTORY_HTML = r"""<!doctype html>
 
     function computeBauhausLayout(status) {
       const slots = Array.isArray(status && status.slots) ? status.slots : [];
-      // Membrane inset from viewport edges
-      const membranePad = 24;
+      // Membrane inset from viewport edges — wider horizontal for visible funnel
+      const hPad = clamp(Math.round(viewportW * 0.04), 50, 80);
+      const vPad = 24;
       const membrane = {
-        x: membranePad,
-        y: membranePad,
-        w: Math.max(140, viewportW - membranePad * 2),
-        h: Math.max(100, viewportH - membranePad * 2)
+        x: hPad,
+        y: vPad,
+        w: Math.max(140, viewportW - hPad * 2),
+        h: Math.max(100, viewportH - vPad * 2)
       };
       const centerY = viewportH * 0.5;
 
@@ -2581,23 +2582,28 @@ FACTORY_HTML = r"""<!doctype html>
         const isJammed = slotHasEffect(slot.slot_id, 'conveyor_stop');
         const isStarved = slotHasEffect(slot.slot_id, 'machine_dark') || !!slot.long_only || !!slot.short_only;
 
-        // Faint phase tint (barely there, alpha 0.12)
+        // Yellow base fill — slot becomes a porthole in the black gullet
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = BAUHAUS_COLORS.canvas;
+        ctx.fillRect(node.x + 1, node.y + 1, node.w - 2, node.h - 2);
+
+        // Phase tint overlay on yellow (barely there, alpha 0.15)
         if (phaseFill) {
           const tintAlpha = clamp(
-            0.12
+            0.15
               * visualState.slotAlpha
               * (isJammed && phase === 'S2' ? (0.62 + pulse * 0.38) : 1)
               * (isStarved ? 0.88 : 1),
             0.02,
-            0.2
+            0.25
           );
           ctx.globalAlpha = tintAlpha;
           ctx.fillStyle = phaseFill;
-          ctx.fillRect(node.x, node.y, node.w, node.h);
+          ctx.fillRect(node.x + 1, node.y + 1, node.w - 2, node.h - 2);
           ctx.globalAlpha = 1;
         }
 
-        // Plain strokeRect — no roundRect, no fill, just black 2px outline
+        // Black outline — visible against yellow fill
         ctx.strokeStyle = BAUHAUS_COLORS.structure;
         ctx.lineWidth = isJammed ? (1.8 + pulse * 1.2) : 2;
         ctx.globalAlpha = clamp(visualState.slotAlpha * (isStarved ? 0.92 : 1), 0.35, 1);

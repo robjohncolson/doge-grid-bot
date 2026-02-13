@@ -1,6 +1,6 @@
 # Bauhaus Overlay -- As Implemented
 
-Version: v2.3.0-impl
+Version: v2.3.1-impl
 Date: 2026-02-13
 Status: Implemented in `factory_viz.py`
 Scope: Bauhaus rendering mode on `/factory` (toggled with `b`)
@@ -77,7 +77,7 @@ Per `renderBauhaus()` draw order:
 
 `computeBauhausLayout(status)` defines:
 
-- Membrane rectangle inset by 24px from viewport edges.
+- Membrane rectangle inset from viewport edges: horizontal `clamp(viewportW * 0.04, 50, 80)` px, vertical 24px.
 - `centerY = viewportH * 0.5`.
 - `membraneLeft = membrane.x`
 - `membraneRight = membrane.x + membrane.w`
@@ -170,10 +170,11 @@ Rendering (`drawBauhausSparkles(nowMs)`):
 ## 8. Slots
 
 Visual style:
-- Transparent windows (no opaque fill body).
+- Yellow porthole fill: opaque `#F4C430` base (inset 1px from outline).
+- Phase tint overlay on yellow:
+  - S1a, S1b, S2 use alpha baseline 0.15, clamped [0.02, 0.25] (modulated by state effects).
+  - Jammed/starved multipliers apply to tint layer only; yellow base is always opaque.
 - Outline: `strokeRect`, black, 2px base.
-- Phase tint is faint only:
-  - S1a, S1b, S2 use alpha baseline 0.12 (modulated by state effects).
 - Phase text centered in monospace (10-12px based on slot height).
 
 Degraded indicators:
