@@ -1625,8 +1625,11 @@ class BotRuntime:
         for o in slot.state.orders:
             if o.txid:
                 try:
-                    self._cancel_order(o.txid)
-                    cancelled += 1
+                    ok = self._cancel_order(o.txid)
+                    if ok:
+                        cancelled += 1
+                    else:
+                        failed += 1
                 except Exception as e:
                     logger.warning("remove_slot: cancel order %s failed: %s", o.txid, e)
                     failed += 1
@@ -1635,8 +1638,11 @@ class BotRuntime:
         for r in slot.state.recovery_orders:
             if r.txid:
                 try:
-                    self._cancel_order(r.txid)
-                    cancelled += 1
+                    ok = self._cancel_order(r.txid)
+                    if ok:
+                        cancelled += 1
+                    else:
+                        failed += 1
                 except Exception as e:
                     logger.warning("remove_slot: cancel recovery %s failed: %s", r.txid, e)
                     failed += 1
@@ -1678,6 +1684,8 @@ class BotRuntime:
         if self.last_price <= 0:
             return False, "no market price"
 
+        max_batch = max(1, min(max_batch, 20))
+
         # Collect all stale recoveries across slots.
         stale: list[tuple[int, sm.RecoveryOrder]] = []
         for sid in sorted(self.slots.keys()):
@@ -1703,9 +1711,14 @@ class BotRuntime:
                 slot = self.slots[sid]
 
                 # Cancel old order on Kraken.
+                # _cancel_order returns False on failure (not just exception).
                 if rec.txid:
                     try:
-                        self._cancel_order(rec.txid)
+                        ok = self._cancel_order(rec.txid)
+                        if not ok:
+                            logger.warning("cancel_stale: cancel %s returned False", rec.txid)
+                            failed += 1
+                            continue
                     except Exception as e:
                         logger.warning("cancel_stale: cancel %s failed: %s", rec.txid, e)
                         failed += 1
@@ -1724,11 +1737,18 @@ class BotRuntime:
                         price=new_price,
                         userref=(sid * 1_000_000 + 900_000 + rec.recovery_id),
                     )
-                    if not txid:
-                        failed += 1
-                        continue
                 except Exception as e:
-                    logger.warning("cancel_stale: place failed: %s", e)
+                    logger.warning("cancel_stale: place failed after cancel: %s", e)
+                    txid = None
+
+                if not txid:
+                    # Cancel succeeded but place failed — clear txid so the
+                    # poller doesn't see a "cancelled" order and silently drop
+                    # the recovery.  It stays in state for retry next call.
+                    slot.state = replace(slot.state, recovery_orders=tuple(
+                        replace(x, txid="", reason="place_failed") if x.recovery_id == rec.recovery_id else x
+                        for x in slot.state.recovery_orders
+                    ))
                     failed += 1
                     continue
 
@@ -1741,7 +1761,7 @@ class BotRuntime:
         finally:
             self.enforce_loop_budget = saved_enforce
 
-        if repriced > 0:
+        if repriced > 0 or failed > 0:
             self._save_snapshot()
         msg = f"repriced {repriced} stale recoveries to within {self.entry_pct:.1f}% of market"
         if failed:
