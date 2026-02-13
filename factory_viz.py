@@ -2355,7 +2355,7 @@ FACTORY_HTML = r"""<!doctype html>
       const hb = Math.max(1, channelHalfBot);
       const step = 12; // wobble sample every 12px
 
-      ctx.fillStyle = BAUHAUS_COLORS.canvas;
+      ctx.fillStyle = BAUHAUS_COLORS.void;
 
       // Top membrane section: wobbled perimeter path
       // Path: along top edge (left to right with wobble), down right edge with wobble,
@@ -2551,7 +2551,7 @@ FACTORY_HTML = r"""<!doctype html>
       // Layer 1: Draw the gullet (black channel with bezier funnels)
       drawBauhausGullet(layoutView, channelHalfTop, channelHalfBot, staleLevel);
 
-      // Layer 2: Draw the membrane (yellow, on top of gullet, with channel strip excluded)
+      // Layer 2: Draw the membrane (white, on top of gullet, with channel strip excluded)
       drawBauhausMembrane(layoutView, channelHalfTop, channelHalfBot);
 
       // Layer 3: Stationary sparkles inside the gullet (clipped to gullet path)
@@ -2582,7 +2582,18 @@ FACTORY_HTML = r"""<!doctype html>
         const isJammed = slotHasEffect(slot.slot_id, 'conveyor_stop');
         const isStarved = slotHasEffect(slot.slot_id, 'machine_dark') || !!slot.long_only || !!slot.short_only;
 
-        // Transparent interior with faint phase tint
+        // Subtle yellow base so slots read as portholes without becoming solid blocks
+        const baseAlpha = clamp(
+          0.34 * visualState.slotAlpha * (isStarved ? 0.96 : 1),
+          0.18,
+          0.46
+        );
+        ctx.globalAlpha = baseAlpha;
+        ctx.fillStyle = BAUHAUS_COLORS.canvas;
+        ctx.fillRect(node.x + 1, node.y + 1, node.w - 2, node.h - 2);
+        ctx.globalAlpha = 1;
+
+        // Phase tint overlay on yellow base
         if (phaseFill) {
           const tintAlpha = clamp(
             0.15
