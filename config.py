@@ -289,6 +289,9 @@ OPEN_ORDER_DRIFT_ALERT_THRESHOLD: int = _env("OPEN_ORDER_DRIFT_ALERT_THRESHOLD",
 OPEN_ORDER_DRIFT_ALERT_PERSIST_SEC: int = _env("OPEN_ORDER_DRIFT_ALERT_PERSIST_SEC", 600, int)
 OPEN_ORDER_DRIFT_ALERT_COOLDOWN_SEC: int = _env("OPEN_ORDER_DRIFT_ALERT_COOLDOWN_SEC", 1800, int)
 
+# Balance reconciliation: max acceptable drift between account growth and bot P&L.
+BALANCE_RECON_DRIFT_PCT: float = _env("BALANCE_RECON_DRIFT_PCT", 2.0, float)
+
 # ---------------------------------------------------------------------------
 # AI council settings
 # ---------------------------------------------------------------------------

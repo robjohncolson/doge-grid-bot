@@ -310,6 +310,15 @@ DASHBOARD_HTML = """<!doctype html>
         <div class=\"row\"><span class=\"k\">Fill Latency (1d)</span><span id=\"cfhFillLatency\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Auto Soft-Close</span><span id=\"cfhAutoClose\" class=\"v\"></span></div>
         <div id=\"cfhHints\" class=\"tiny\"></div>
+
+        <h3 style=\"margin-top:14px\">Balance Reconciliation</h3>
+        <div class=\"row\"><span class=\"k\">Status</span><span id=\"reconStatus\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Account Value</span><span id=\"reconCurrent\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Baseline</span><span id=\"reconBaseline\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Growth</span><span id=\"reconGrowth\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Bot P&amp;L</span><span id=\"reconBotPnl\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Drift</span><span id=\"reconDrift\" class=\"v\"></span></div>
+        <div id=\"reconDetails\" class=\"tiny\"></div>
       </div>
 
       <div class=\"panel\">
@@ -935,6 +944,48 @@ DASHBOARD_HTML = """<!doctype html>
 
       const hints = Array.isArray(cfh.blocked_risk_hint) ? cfh.blocked_risk_hint : [];
       document.getElementById('cfhHints').textContent = hints.length ? `Hints: ${hints.join(', ')}` : '';
+
+      // Balance Reconciliation card
+      const recon = s.balance_recon;
+      const reconStatusEl = document.getElementById('reconStatus');
+      const reconCurrentEl = document.getElementById('reconCurrent');
+      const reconBaselineEl = document.getElementById('reconBaseline');
+      const reconGrowthEl = document.getElementById('reconGrowth');
+      const reconBotPnlEl = document.getElementById('reconBotPnl');
+      const reconDriftEl = document.getElementById('reconDrift');
+      const reconDetailsEl = document.getElementById('reconDetails');
+      if (!recon) {
+        reconStatusEl.textContent = 'Baseline pending...';
+        reconStatusEl.style.color = '';
+        reconCurrentEl.textContent = '-';
+        reconBaselineEl.textContent = '-';
+        reconGrowthEl.textContent = '-';
+        reconBotPnlEl.textContent = '-';
+        reconDriftEl.textContent = '-';
+        reconDetailsEl.textContent = '';
+      } else if (recon.status === 'NO_PRICE' || recon.status === 'NO_BALANCE') {
+        reconStatusEl.textContent = recon.status;
+        reconStatusEl.style.color = '';
+        reconCurrentEl.textContent = '-';
+        reconBaselineEl.textContent = '-';
+        reconGrowthEl.textContent = '-';
+        reconBotPnlEl.textContent = '-';
+        reconDriftEl.textContent = '-';
+        reconDetailsEl.textContent = '';
+      } else {
+        const sim = recon.simulated ? ' (sim)' : '';
+        reconStatusEl.textContent = recon.status + sim;
+        reconStatusEl.style.color = recon.status === 'OK' ? 'var(--good)' : 'var(--bad)';
+        reconCurrentEl.textContent = `${fmt(recon.current_doge_eq, 1)} DOGE`;
+        reconBaselineEl.textContent = `${fmt(recon.baseline_doge_eq, 1)} DOGE`;
+        reconGrowthEl.textContent = `${fmt(recon.account_growth_doge, 2)} DOGE`;
+        reconBotPnlEl.textContent = `${fmt(recon.bot_pnl_doge, 2)} DOGE`;
+        const driftSign = recon.drift_doge >= 0 ? '+' : '';
+        reconDriftEl.textContent = `${driftSign}${fmt(recon.drift_doge, 2)} DOGE (${driftSign}${fmt(recon.drift_pct, 2)}%)`;
+        reconDriftEl.style.color = recon.status === 'OK' ? '' : 'var(--bad)';
+        const ageHrs = recon.baseline_ts ? ((Date.now() / 1000 - recon.baseline_ts) / 3600).toFixed(1) : '?';
+        reconDetailsEl.textContent = `baseline age: ${ageHrs}h | threshold: \\u00b1${fmt(recon.threshold_pct, 1)}% | price: $${fmt(recon.price, 5)}`;
+      }
     }
 
     function renderSlots(s) {

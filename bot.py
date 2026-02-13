@@ -234,6 +234,9 @@ class BotRuntime:
         self._auto_soft_close_total: int = 0
         self._auto_soft_close_last_at: float = 0.0
 
+        # Balance reconciliation baseline {usd, doge, ts}.
+        self._recon_baseline: dict | None = None
+
         # Rolling 24h fill/partial telemetry.
         self._partial_fill_open_events: deque[float] = deque()
         self._partial_fill_cancel_events: deque[float] = deque()
@@ -436,6 +439,7 @@ class BotRuntime:
             "maker_fee_pct": self.maker_fee_pct,
             "taker_fee_pct": self.taker_fee_pct,
             "slots": {str(sid): sm.to_dict(slot.state) for sid, slot in self.slots.items()},
+            "recon_baseline": self._recon_baseline,
         }
 
     def _save_snapshot(self) -> None:
@@ -457,6 +461,7 @@ class BotRuntime:
             self.constraints = snap.get("constraints", self.constraints) or self.constraints
             self.maker_fee_pct = float(snap.get("maker_fee_pct", self.maker_fee_pct))
             self.taker_fee_pct = float(snap.get("taker_fee_pct", self.taker_fee_pct))
+            self._recon_baseline = snap.get("recon_baseline", None)
 
             self.slots = {}
             for sid_text, raw_state in (snap.get("slots", {}) or {}).items():
@@ -2027,6 +2032,14 @@ class BotRuntime:
             if self._price_age_sec() > config.STALE_PRICE_MAX_AGE_SEC:
                 self.pause("stale price data > 60s")
 
+            if self._recon_baseline is None and self.last_price > 0 and self._last_balance_snapshot:
+                bal = self._last_balance_snapshot
+                self._recon_baseline = {
+                    "usd": _usd_balance(bal), "doge": _doge_balance(bal), "ts": _now(),
+                }
+                logger.info("Balance recon baseline captured: $%.2f + %.1f DOGE",
+                            self._recon_baseline["usd"], self._recon_baseline["doge"])
+
             runtime_profit = self._volatility_profit_pct()
 
             # Tick slots with latest price and timer.
@@ -2174,6 +2187,45 @@ class BotRuntime:
                 ok, msg = False, "unknown command"
 
             notifier._send_message(("OK: " if ok else "ERR: ") + msg)
+
+    # ------------------ Balance reconciliation ------------------
+
+    def _compute_balance_recon(self, total_profit: float, total_unrealized: float) -> dict | None:
+        if self._recon_baseline is None:
+            return None
+        price = self.last_price
+        if price <= 0:
+            return {"status": "NO_PRICE"}
+        bal = self._last_balance_snapshot
+        if not bal:
+            return {"status": "NO_BALANCE"}
+
+        baseline = self._recon_baseline
+        baseline_doge_eq = baseline["doge"] + baseline["usd"] / price
+        current_usd = _usd_balance(bal)
+        current_doge = _doge_balance(bal)
+        current_doge_eq = current_doge + current_usd / price
+
+        account_growth = current_doge_eq - baseline_doge_eq
+        bot_pnl_doge = (total_profit + total_unrealized) / price if price > 0 else 0.0
+        drift = account_growth - bot_pnl_doge
+        drift_pct = (drift / baseline_doge_eq * 100.0) if baseline_doge_eq > 0 else 0.0
+        threshold = float(config.BALANCE_RECON_DRIFT_PCT)
+        status = "OK" if abs(drift_pct) <= threshold else "DRIFT"
+
+        return {
+            "status": status,
+            "baseline_doge_eq": baseline_doge_eq,
+            "current_doge_eq": current_doge_eq,
+            "account_growth_doge": account_growth,
+            "bot_pnl_doge": bot_pnl_doge,
+            "drift_doge": drift,
+            "drift_pct": drift_pct,
+            "threshold_pct": threshold,
+            "baseline_ts": baseline["ts"],
+            "price": price,
+            "simulated": config.DRY_RUN,
+        }
 
     # ------------------ API status ------------------
 
@@ -2407,6 +2459,7 @@ class BotRuntime:
                     "loop_available_doge": self._loop_available_doge,
                     "ledger": self.ledger.snapshot(),
                 },
+                "balance_recon": self._compute_balance_recon(total_profit, total_unrealized_profit),
                 "slots": slots,
             }
 
