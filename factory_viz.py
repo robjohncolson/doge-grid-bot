@@ -2582,18 +2582,7 @@ FACTORY_HTML = r"""<!doctype html>
         const isJammed = slotHasEffect(slot.slot_id, 'conveyor_stop');
         const isStarved = slotHasEffect(slot.slot_id, 'machine_dark') || !!slot.long_only || !!slot.short_only;
 
-        // Subtle yellow base so slots read as portholes without becoming solid blocks
-        const baseAlpha = clamp(
-          0.34 * visualState.slotAlpha * (isStarved ? 0.96 : 1),
-          0.18,
-          0.46
-        );
-        ctx.globalAlpha = baseAlpha;
-        ctx.fillStyle = BAUHAUS_COLORS.canvas;
-        ctx.fillRect(node.x + 1, node.y + 1, node.w - 2, node.h - 2);
-        ctx.globalAlpha = 1;
-
-        // Phase tint overlay on yellow base
+        // Transparent interior with faint phase tint
         if (phaseFill) {
           const tintAlpha = clamp(
             0.15

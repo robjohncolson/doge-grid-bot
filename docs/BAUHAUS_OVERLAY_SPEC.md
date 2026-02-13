@@ -170,7 +170,7 @@ Rendering (`drawBauhausSparkles(nowMs)`):
 ## 8. Slots
 
 Visual style:
-- Slightly opaque yellow slot interior (`#F4C430`) with low alpha.
+- Transparent slot interior (no base fill).
 - Phase tint overlay:
   - S1a, S1b, S2 use alpha baseline 0.15, clamped [0.02, 0.25] (modulated by state effects).
   - Jammed/starved multipliers apply to tint layer only.
@@ -356,7 +356,7 @@ Enqueue order in refresh pipeline:
 
 - `b` toggles mode and hides/restores shell.
 - Gullet is funnel-shaped and clipped sparkles stay inside it.
-- Slots are square outlines with slightly opaque yellow interior and faint phase tint.
+- Slots are square transparent outlines with faint phase tint.
 - Order markers are 7x7; clamped lines are dashed `[3,3]`.
 - Orphans render as 3x pixel-plus sprites with ranked color/twinkle.
 - Profit counter has no box and uses ghosted seven-segment digits.
