@@ -378,6 +378,7 @@ FACTORY_HTML = r"""<!doctype html>
 |  [/]   prev/next   +    add slot      |
 |  gg    first slot  -    close next    |
 |  G     last slot   .    refresh       |
+|                    b    bauhaus view  |
 |                    f    dashboard     |
 |                    s    api/status   |
 |                    :    command       |
@@ -387,7 +388,7 @@ FACTORY_HTML = r"""<!doctype html>
 |  COMMAND BAR                          |
 |  :pause  :resume  :add  :close        |
 |  :set entry N  :set profit N          |
-|  :jump N (slot #)  :q (dashboard)     |
+|  :jump N (slot #)  :q (exit view)     |
 |  Tab=complete  up/down=history  Esc=close |
 |                                       |
 +-------------------- Esc to close -----+</pre>
@@ -427,6 +428,18 @@ FACTORY_HTML = r"""<!doctype html>
       accent: '#58a6ff'
     };
 
+    const BAUHAUS_COLORS = {
+      void: '#FFFFFF',
+      frame: '#E8881F',
+      canvas: '#F4C430',
+      structure: '#000000',
+      text: '#2B1B17',
+      alert: '#8B0000',
+      s1a: '#00CED1',
+      s1b: '#9B59B6',
+      s2: '#E74C3C'
+    };
+
     const camera = {
       x: 0,
       y: 0,
@@ -464,7 +477,6 @@ FACTORY_HTML = r"""<!doctype html>
     let activeSymptoms = [];
     let activeEffects = new Set();
     let slotEffects = {};
-    let prevStatus = null;
     let animQueue = [];
     let lastMachineRectBySlot = {};
     let notifIndex = 0;
@@ -479,6 +491,96 @@ FACTORY_HTML = r"""<!doctype html>
     let historyIndex = 0;
     const commandHistory = [];
     const COMMAND_COMPLETIONS = ['pause', 'resume', 'add', 'close', 'set entry', 'set profit', 'jump', 'q'];
+    const RENDER_MODE_STORAGE_KEY = 'factory_render_mode';
+    const RENDER_MODE_FACTORY = 'factory';
+    const RENDER_MODE_BAUHAUS = 'bauhaus';
+    const BAUHAUS_THICKNESS_WINDOW_POLLS = 60;
+    const BAUHAUS_MAX_SIDE_THICKNESS_PX = 48;
+    const BAUHAUS_REPRICE_EPSILON = 1e-9;
+    const BAUHAUS_ORDER_SCALE_FACTOR = 25000000;
+    const BAUHAUS_ORDER_MAX_OFFSET_RATIO = 0.45;
+
+    function loadRenderMode() {
+      try {
+        const raw = String(localStorage.getItem(RENDER_MODE_STORAGE_KEY) || '').toLowerCase();
+        return raw === RENDER_MODE_BAUHAUS ? RENDER_MODE_BAUHAUS : RENDER_MODE_FACTORY;
+      } catch (_err) {
+        return RENDER_MODE_FACTORY;
+      }
+    }
+
+    function saveRenderMode() {
+      try {
+        localStorage.setItem(RENDER_MODE_STORAGE_KEY, renderMode);
+      } catch (_err) {
+        // Ignore storage errors (private mode / blocked storage).
+      }
+    }
+
+    let renderMode = loadRenderMode();
+
+    function setRenderMode(nextMode) {
+      const normalized = String(nextMode || '').toLowerCase() === RENDER_MODE_BAUHAUS
+        ? RENDER_MODE_BAUHAUS
+        : RENDER_MODE_FACTORY;
+      if (renderMode === normalized) return;
+      renderMode = normalized;
+      if (renderMode === RENDER_MODE_BAUHAUS) {
+        dragging = false;
+        dragFromEmpty = false;
+        canvas.classList.remove('dragging');
+        selectedSlotId = null;
+        clearBauhausTooltipState();
+        renderDetailPanel();
+      } else {
+        bauhausFillAnims = [];
+        bauhausOrphanRepriceAnims.clear();
+        clearBauhausTooltipState();
+        clearBauhausRenderCaches();
+      }
+      saveRenderMode();
+      renderNotifStrip();
+      scheduleFrame();
+    }
+
+    function toggleRenderMode() {
+      setRenderMode(renderMode === RENDER_MODE_FACTORY ? RENDER_MODE_BAUHAUS : RENDER_MODE_FACTORY);
+      const label = renderMode === RENDER_MODE_BAUHAUS ? 'Bauhaus overlay on' : 'Factory view on';
+      showToast(label, 'info');
+    }
+
+    function isBauhausMode() {
+      return renderMode === RENDER_MODE_BAUHAUS;
+    }
+
+    let bauhausSellDogeHistory = [];
+    let bauhausBuyDogeHistory = [];
+    let bauhausLatestDogeBySide = {sell: 0, buy: 0};
+    let bauhausProfitDisplayed = null;
+    let bauhausProfitTarget = 0;
+    let bauhausProfitFlights = [];
+    let bauhausFillAnims = [];
+    let bauhausOrphanRepriceAnims = new Map();
+    let bauhausPinnedTooltip = null;
+    let bauhausLastOrderPoints = [];
+    let bauhausLastOrphanSprites = [];
+    let bauhausLastPriceLineRect = null;
+    let bauhausLastCounterRect = null;
+    let bauhausSlotFlash = null;
+
+    function clearBauhausTooltipState() {
+      bauhausPinnedTooltip = null;
+      tooltipText = '';
+      hoverSlotId = null;
+    }
+
+    function clearBauhausRenderCaches() {
+      bauhausLastOrderPoints = [];
+      bauhausLastOrphanSprites = [];
+      bauhausLastPriceLineRect = null;
+      bauhausLastCounterRect = null;
+      bauhausSlotFlash = null;
+    }
 
     function diagnose(status) {
       const symptoms = [];
@@ -667,10 +769,35 @@ FACTORY_HTML = r"""<!doctype html>
           }
         }
 
-        const prevRecIds = new Set((ps.recovery_orders || []).map((r) => r.recovery_id));
+        const prevRecByKey = new Map();
+        for (const r of (ps.recovery_orders || [])) {
+          const recKey = String(slot.slot_id) + ':' + String(r && r.recovery_id);
+          prevRecByKey.set(recKey, r);
+        }
         for (const r of (slot.recovery_orders || [])) {
-          if (!prevRecIds.has(r.recovery_id)) {
+          const recKey = String(slot.slot_id) + ':' + String(r && r.recovery_id);
+          const prevRec = prevRecByKey.get(recKey);
+          if (!prevRec) {
             events.push({type: 'order_orphaned', slot_id: slot.slot_id, recovery: r});
+            continue;
+          }
+
+          const prevPrice = Number(prevRec && prevRec.price);
+          const currPrice = Number(r && r.price);
+          if (
+            Number.isFinite(prevPrice)
+            && Number.isFinite(currPrice)
+            && Math.abs(currPrice - prevPrice) > BAUHAUS_REPRICE_EPSILON
+          ) {
+            events.push({
+              type: 'orphan_repriced',
+              slot_id: slot.slot_id,
+              recovery_id: r && r.recovery_id,
+              recovery_key: recKey,
+              old_price: prevPrice,
+              new_price: currPrice,
+              recovery: r
+            });
           }
         }
 
@@ -691,6 +818,10 @@ FACTORY_HTML = r"""<!doctype html>
       }
 
       return events;
+    }
+
+    function diff(prev, curr) {
+      return computeDiff(prev, curr);
     }
 
     function animationDurationMs(evt) {
@@ -801,7 +932,15 @@ FACTORY_HTML = r"""<!doctype html>
 
     function selectSlot(slotId, recenter = true) {
       selectedSlotId = slotId;
-      if (recenter) centerCameraOnSlot(slotId);
+      if (isBauhausMode()) {
+        bauhausSlotFlash = {
+          slotId,
+          startMs: performance.now(),
+          durationMs: 500
+        };
+      } else if (recenter) {
+        centerCameraOnSlot(slotId);
+      }
       renderDetailPanel();
       scheduleFrame();
     }
@@ -1098,6 +1237,10 @@ FACTORY_HTML = r"""<!doctype html>
       }
       if (parsed.type === 'noop') return;
       if (parsed.type === 'navigate') {
+        if (isBauhausMode()) {
+          setRenderMode(RENDER_MODE_FACTORY);
+          return;
+        }
         window.location.href = parsed.href;
         return;
       }
@@ -1217,6 +1360,11 @@ FACTORY_HTML = r"""<!doctype html>
         window.location.href = '/';
         return true;
       }
+      if (key === 'b') {
+        clearChordBuffer();
+        toggleRenderMode();
+        return true;
+      }
       if (key === 's') {
         clearChordBuffer();
         window.location.href = '/api/status';
@@ -1224,6 +1372,14 @@ FACTORY_HTML = r"""<!doctype html>
       }
       if (key === 'Escape') {
         clearChordBuffer();
+        if (isBauhausMode()) {
+          if (bauhausPinnedTooltip) {
+            clearBauhausPinnedTooltip();
+            return true;
+          }
+          setRenderMode(RENDER_MODE_FACTORY);
+          return true;
+        }
         if (selectedSlotId !== null) {
           selectedSlotId = null;
           renderDetailPanel();
@@ -1277,6 +1433,10 @@ FACTORY_HTML = r"""<!doctype html>
       }
     }
 
+    function handleKey(event) {
+      onGlobalKeyDown(event);
+    }
+
     function roundRect(x, y, w, h, r) {
       const rr = Math.min(r, w * 0.5, h * 0.5);
       ctx.beginPath();
@@ -1325,6 +1485,145 @@ FACTORY_HTML = r"""<!doctype html>
       return null;
     }
 
+    function bauhausCycleCount(status) {
+      if (!status) return 0;
+      const topLevel = Number(status.total_round_trips);
+      if (Number.isFinite(topLevel) && topLevel >= 0) return Math.round(topLevel);
+      const slots = Array.isArray(status.slots) ? status.slots : [];
+      let sumTrips = 0;
+      let foundTrips = false;
+      for (const slot of slots) {
+        const v = Number(slot && slot.total_round_trips);
+        if (Number.isFinite(v) && v >= 0) {
+          sumTrips += v;
+          foundTrips = true;
+        }
+      }
+      if (foundTrips) return Math.round(sumTrips);
+      let recent = 0;
+      for (const slot of slots) {
+        recent += Array.isArray(slot && slot.recent_cycles) ? slot.recent_cycles.length : 0;
+      }
+      return recent;
+    }
+
+    function getBauhausSlotById(slotId) {
+      if (!statusData || !Array.isArray(statusData.slots)) return null;
+      for (const slot of statusData.slots) {
+        if (slot && slot.slot_id === slotId) return slot;
+      }
+      return null;
+    }
+
+    function resolveBauhausHoverTarget(clientX, clientY) {
+      if (!isBauhausMode() || !statusData) return null;
+      const px = clientX;
+      const py = clientY;
+
+      for (let i = bauhausLastOrderPoints.length - 1; i >= 0; i -= 1) {
+        const p = bauhausLastOrderPoints[i];
+        const dx = px - p.x;
+        const dy = py - p.y;
+        if (Math.abs(dx) > 5 || Math.abs(dy) > 5) continue;
+
+        const order = p.order || {};
+        const slotId = p.node && p.node.slot ? p.node.slot.slot_id : null;
+        const market = Number(statusData.price) > 0
+          ? Number(statusData.price)
+          : Number(p.node && p.node.slot && p.node.slot.market_price);
+        const price = Number(order.price);
+        const pct = (Number.isFinite(price) && Number.isFinite(market) && market > 0)
+          ? (Math.abs(price - market) / market) * 100
+          : null;
+        const text = 'Order ' + String(order.side || p.side || '-')
+          + '/' + String(order.role || p.role || '-')
+          + ' | $' + fmt(price, 6)
+          + ' | vol ' + fmt(order.volume, 3)
+          + ' | Δ ' + (pct === null ? '-' : fmt(pct, 3) + '%');
+        return {
+          type: 'order',
+          key: 'order:' + bauhausOrderEventKey(slotId, order),
+          slot_id: slotId,
+          text
+        };
+      }
+
+      for (let i = bauhausLastOrphanSprites.length - 1; i >= 0; i -= 1) {
+        const item = bauhausLastOrphanSprites[i];
+        const dx = px - item.x;
+        const dy = py - item.y;
+        if ((dx * dx + dy * dy) > 49) continue;
+        const rec = item.recovery || {};
+        const pct = Number(item.pctDistance);
+        const text = 'Orphan #' + String(rec.recovery_id)
+          + ' | ' + String(rec.side || '-')
+          + ' | $' + fmt(rec.price, 6)
+          + ' | vol ' + fmt(rec.volume, 3)
+          + ' | age ' + Math.round(Number(rec.age_sec || 0)) + 's'
+          + ' | Δ ' + (Number.isFinite(pct) ? fmt(pct * 100, 3) + '%' : '-');
+        return {
+          type: 'orphan',
+          key: 'orphan:' + String(item.key),
+          slot_id: item.slot_id,
+          text
+        };
+      }
+
+      for (let i = machineRects.length - 1; i >= 0; i -= 1) {
+        const rect = machineRects[i];
+        if (!pointInBox(px, py, rect)) continue;
+        const slot = getBauhausSlotById(rect.slot_id);
+        if (!slot) continue;
+        const flags = [];
+        if (slot.long_only) flags.push('LO');
+        if (slot.short_only) flags.push('SO');
+        const text = 'Slot #' + slot.slot_id
+          + ' | ' + String(slot.phase || 'S0')
+          + ' | $' + fmt(slot.total_profit, 4)
+          + ' | ' + (Array.isArray(slot.open_orders) ? slot.open_orders.length : 0) + ' orders'
+          + (flags.length ? ' | ' + flags.join('/') : '');
+        return {
+          type: 'slot',
+          key: 'slot:' + String(slot.slot_id),
+          slot_id: slot.slot_id,
+          text
+        };
+      }
+
+      if (pointInBox(px, py, bauhausLastCounterRect)) {
+        const text = 'Profit $' + fmt(statusData.total_profit, 4)
+          + ' | cycles ' + String(bauhausCycleCount(statusData));
+        return {
+          type: 'profit_counter',
+          key: 'counter',
+          slot_id: null,
+          text
+        };
+      }
+
+      if (pointInBox(px, py, bauhausLastPriceLineRect)) {
+        const sides = aggregateBauhausCapitalDoge(statusData);
+        const text = 'Price $' + fmt(statusData.price, 6)
+          + ' | age ' + Math.round(Number(statusData.price_age_sec || 0)) + 's'
+          + ' | DOGE sell ' + fmt(sides.sell, 3)
+          + ' / buy ' + fmt(sides.buy, 3);
+        return {
+          type: 'price_line',
+          key: 'price-line',
+          slot_id: null,
+          text
+        };
+      }
+
+      return null;
+    }
+
+    function clearBauhausPinnedTooltip() {
+      if (!bauhausPinnedTooltip && !tooltipText && hoverSlotId === null) return;
+      clearBauhausTooltipState();
+      scheduleFrame();
+    }
+
     function drawTooltip() {
       if (!tooltipText) return;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -1341,15 +1640,16 @@ FACTORY_HTML = r"""<!doctype html>
       x = clamp(x, 8, viewportW - w - 8);
       y = clamp(y, 8, viewportH - h - 8);
 
-      ctx.fillStyle = 'rgba(13,17,23,0.95)';
+      const bauhaus = isBauhausMode();
+      ctx.fillStyle = bauhaus ? 'rgba(0,0,0,0.94)' : 'rgba(13,17,23,0.95)';
       roundRect(x, y, w, h, 7);
       ctx.fill();
-      ctx.strokeStyle = 'rgba(88,166,255,0.45)';
+      ctx.strokeStyle = bauhaus ? 'rgba(255,255,255,0.35)' : 'rgba(88,166,255,0.45)';
       ctx.lineWidth = 1;
       roundRect(x, y, w, h, 7);
       ctx.stroke();
 
-      ctx.fillStyle = COLORS.ink;
+      ctx.fillStyle = bauhaus ? '#FFFFFF' : COLORS.ink;
       ctx.fillText(tooltipText, x + padX, y + h - padY - 2);
     }
 
@@ -1433,6 +1733,1147 @@ FACTORY_HTML = r"""<!doctype html>
         machineW,
         machineH
       };
+    }
+
+    function bauhausPhaseColor(phase) {
+      if (phase === 'S1a') return BAUHAUS_COLORS.s1a;
+      if (phase === 'S1b') return BAUHAUS_COLORS.s1b;
+      if (phase === 'S2') return BAUHAUS_COLORS.s2;
+      return null;
+    }
+
+    function getBauhausVisualState(status) {
+      const mode = String(status && status.mode || '').toUpperCase();
+      const halted = mode === 'HALTED' || activeEffects.has('power_dead');
+      const paused = mode === 'PAUSED';
+      const brownout = paused || activeEffects.has('power_dim') || activeEffects.has('amber_wash');
+      const motionFactor = halted ? 0 : (paused ? 0.25 : (brownout ? 0.55 : 1));
+      const slotAlpha = halted ? 0.55 : (brownout ? 0.82 : 1);
+      const orderAlpha = halted ? 0.42 : (brownout ? 0.72 : 1);
+      return {mode, halted, paused, brownout, motionFactor, slotAlpha, orderAlpha};
+    }
+
+    function computeBauhausLayout(status) {
+      const slots = Array.isArray(status && status.slots) ? status.slots : [];
+      const pad = 18;
+      const frameStroke = clamp(Math.round(Math.min(viewportW, viewportH) * 0.012), 8, 12);
+      const outer = {
+        x: pad,
+        y: pad,
+        w: Math.max(140, viewportW - pad * 2),
+        h: Math.max(100, viewportH - pad * 2)
+      };
+      const inner = {
+        x: outer.x + frameStroke,
+        y: outer.y + frameStroke,
+        w: Math.max(100, outer.w - frameStroke * 2),
+        h: Math.max(80, outer.h - frameStroke * 2)
+      };
+      const priceY = inner.y + inner.h * 0.5;
+
+      const sidePad = Math.max(24, Math.round(inner.w * 0.04));
+      const usableW = Math.max(120, inner.w - sidePad * 2);
+      let slotW = slots.length <= 10 ? 80 : (slots.length <= 20 ? 50 : 40);
+      let slotH = slots.length <= 10 ? 40 : (slots.length <= 20 ? 28 : 24);
+      if (slots.length > 0) {
+        const maxByWidth = Math.floor((usableW - 8 * Math.max(0, slots.length - 1)) / slots.length);
+        slotW = Math.min(slotW, maxByWidth);
+      }
+      slotW = clamp(slotW, 28, 90);
+      slotH = clamp(slotH, 22, 48);
+
+      const totalSlotW = slots.length * slotW;
+      let gap = 0;
+      if (slots.length > 1) {
+        gap = Math.floor((usableW - totalSlotW) / (slots.length - 1));
+        if (!Number.isFinite(gap)) gap = 0;
+        gap = Math.max(2, gap);
+      }
+      const usedW = totalSlotW + gap * Math.max(0, slots.length - 1);
+      const startX = inner.x + sidePad + Math.max(0, Math.floor((usableW - usedW) * 0.5));
+      const slotY = priceY - slotH * 0.5;
+
+      const positions = [];
+      for (let i = 0; i < slots.length; i += 1) {
+        positions.push({
+          slot: slots[i],
+          x: startX + i * (slotW + gap),
+          y: slotY,
+          w: slotW,
+          h: slotH
+        });
+      }
+
+      return {
+        outer,
+        inner,
+        frameStroke,
+        frameRadius: 16,
+        innerRadius: 12,
+        priceY,
+        positions
+      };
+    }
+
+    function aggregateBauhausCapitalDoge(status) {
+      const slots = Array.isArray(status && status.slots) ? status.slots : [];
+      let marketPrice = Number(status && status.price);
+      if (!Number.isFinite(marketPrice) || marketPrice <= 0) marketPrice = 0;
+
+      let sellDoge = 0;
+      let buyDogeEq = 0;
+
+      for (const slot of slots) {
+        const slotMarket = Number(slot && slot.market_price);
+        const refPrice = marketPrice > 0 ? marketPrice : (Number.isFinite(slotMarket) && slotMarket > 0 ? slotMarket : 0);
+        const openOrders = Array.isArray(slot && slot.open_orders) ? slot.open_orders : [];
+        const recOrders = Array.isArray(slot && slot.recovery_orders) ? slot.recovery_orders : [];
+
+        for (const order of openOrders.concat(recOrders)) {
+          const side = String(order && order.side || '').toLowerCase();
+          const volume = Number(order && order.volume);
+          const price = Number(order && order.price);
+          if (!Number.isFinite(volume) || volume <= 0) continue;
+
+          if (side === 'sell') {
+            sellDoge += volume;
+            continue;
+          }
+
+          if (side === 'buy') {
+            if (refPrice > 0 && Number.isFinite(price) && price > 0) {
+              buyDogeEq += (volume * price) / refPrice;
+            } else {
+              // Fallback if reference price is unavailable; keeps line responsive.
+              buyDogeEq += volume;
+            }
+          }
+        }
+      }
+
+      return {
+        sell: Math.max(0, sellDoge),
+        buy: Math.max(0, buyDogeEq)
+      };
+    }
+
+    function updateBauhausThicknessWindow(status) {
+      const sides = aggregateBauhausCapitalDoge(status);
+      bauhausLatestDogeBySide = sides;
+
+      bauhausSellDogeHistory.push(sides.sell);
+      bauhausBuyDogeHistory.push(sides.buy);
+
+      if (bauhausSellDogeHistory.length > BAUHAUS_THICKNESS_WINDOW_POLLS) {
+        bauhausSellDogeHistory = bauhausSellDogeHistory.slice(-BAUHAUS_THICKNESS_WINDOW_POLLS);
+      }
+      if (bauhausBuyDogeHistory.length > BAUHAUS_THICKNESS_WINDOW_POLLS) {
+        bauhausBuyDogeHistory = bauhausBuyDogeHistory.slice(-BAUHAUS_THICKNESS_WINDOW_POLLS);
+      }
+    }
+
+    function rollingMax(values) {
+      if (!Array.isArray(values) || !values.length) return 0;
+      let maxV = 0;
+      for (const v of values) {
+        const n = Number(v);
+        if (Number.isFinite(n) && n > maxV) maxV = n;
+      }
+      return maxV;
+    }
+
+    function computeBauhausSideThicknesses() {
+      const sellMax = rollingMax(bauhausSellDogeHistory);
+      const buyMax = rollingMax(bauhausBuyDogeHistory);
+      const sellNow = Number(bauhausLatestDogeBySide.sell || 0);
+      const buyNow = Number(bauhausLatestDogeBySide.buy || 0);
+
+      const sellPx = sellMax > 0
+        ? clamp(Math.round((sellNow / sellMax) * BAUHAUS_MAX_SIDE_THICKNESS_PX), 1, BAUHAUS_MAX_SIDE_THICKNESS_PX)
+        : 1;
+      const buyPx = buyMax > 0
+        ? clamp(Math.round((buyNow / buyMax) * BAUHAUS_MAX_SIDE_THICKNESS_PX), 1, BAUHAUS_MAX_SIDE_THICKNESS_PX)
+        : 1;
+
+      return {sellPx, buyPx};
+    }
+
+    function getBauhausCounterRect(layoutView) {
+      const h = clamp(Math.round(layoutView.inner.h * 0.09), 32, 46);
+      const w = clamp(Math.round(layoutView.inner.w * 0.23), 150, 220);
+      const margin = 16;
+      return {
+        x: layoutView.inner.x + layoutView.inner.w - w - margin,
+        y: layoutView.inner.y + margin,
+        w,
+        h
+      };
+    }
+
+    function formatBauhausProfitText(value) {
+      const n = Number(value || 0);
+      const safe = Number.isFinite(n) ? n : 0;
+      const sign = safe < 0 ? '-' : '';
+      return sign + Math.abs(safe).toFixed(2);
+    }
+
+    function sevenSegActiveSegments(ch) {
+      const map = {
+        '0': 'abcedf',
+        '1': 'bc',
+        '2': 'abged',
+        '3': 'abgcd',
+        '4': 'fgbc',
+        '5': 'afgcd',
+        '6': 'afgecd',
+        '7': 'abc',
+        '8': 'abcdefg',
+        '9': 'abcfgd',
+        '-': 'g',
+        'Ð': 'abcedfg'
+      };
+      return map[ch] || '';
+    }
+
+    function drawSevenSegGlyph(ch, x, y, w, h, onColor, offColor) {
+      const t = Math.max(2, Math.round(Math.min(w, h) * 0.16));
+      const half = h * 0.5;
+      const on = sevenSegActiveSegments(ch);
+
+      function seg(name, rx, ry, rw, rh) {
+        ctx.fillStyle = on.includes(name) ? onColor : offColor;
+        ctx.fillRect(Math.round(rx), Math.round(ry), Math.max(1, Math.round(rw)), Math.max(1, Math.round(rh)));
+      }
+
+      if (ch === '.') {
+        ctx.fillStyle = onColor;
+        ctx.fillRect(Math.round(x + w - t), Math.round(y + h - t), t, t);
+        return;
+      }
+
+      seg('a', x + t, y, w - t * 2, t);
+      seg('d', x + t, y + h - t, w - t * 2, t);
+      seg('g', x + t, y + half - t * 0.5, w - t * 2, t);
+      seg('f', x, y + t, t, half - t);
+      seg('b', x + w - t, y + t, t, half - t);
+      seg('e', x, y + half, t, half - t);
+      seg('c', x + w - t, y + half, t, half - t);
+    }
+
+    function drawBauhausProfitCounter(layoutView) {
+      const rect = getBauhausCounterRect(layoutView);
+      const shown = formatBauhausProfitText(bauhausProfitDisplayed === null ? bauhausProfitTarget : bauhausProfitDisplayed);
+      const text = 'Ð ' + shown;
+      const padX = 8;
+      const glyphH = rect.h - 10;
+      const digitW = Math.round(glyphH * 0.62);
+      const prefixW = Math.round(glyphH * 0.68);
+      const dotW = Math.max(4, Math.round(digitW * 0.35));
+      const gap = 3;
+
+      ctx.fillStyle = BAUHAUS_COLORS.structure;
+      roundRect(rect.x, rect.y, rect.w, rect.h, 6);
+      ctx.fill();
+
+      let cx = rect.x + padX;
+      const onColor = '#f5f5f5';
+      const offColor = 'rgba(255,255,255,0.15)';
+      for (let i = 0; i < text.length; i += 1) {
+        const ch = text[i];
+        if (ch === ' ') {
+          cx += Math.max(4, gap);
+          continue;
+        }
+        const w = ch === 'Ð' ? prefixW : (ch === '.' ? dotW : digitW);
+        drawSevenSegGlyph(ch, cx, rect.y + 5, w, glyphH, onColor, offColor);
+        cx += w + gap;
+      }
+      return rect;
+    }
+
+    function queueBauhausProfitFlights(events, status, startMs) {
+      const list = Array.isArray(events) ? events : [];
+      if (!list.length) return;
+
+      const bauhausLayout = computeBauhausLayout(status);
+      const counter = getBauhausCounterRect(bauhausLayout);
+      const toX = counter.x + 10;
+      const toY = counter.y + counter.h * 0.5;
+
+      const nodeBySlot = {};
+      for (const node of bauhausLayout.positions) {
+        if (node && node.slot) nodeBySlot[node.slot.slot_id] = node;
+      }
+
+      for (const evt of list) {
+        if (evt.type !== 'cycle_completed') continue;
+        const cycle = evt.cycle || {};
+        const delta = Number(cycle.net_profit);
+        if (!Number.isFinite(delta)) continue;
+
+        const node = nodeBySlot[evt.slot_id];
+        const fromX = node ? node.x + node.w * 0.5 : (bauhausLayout.inner.x + bauhausLayout.inner.w * 0.5);
+        const fromY = node ? node.y + node.h * 0.5 : bauhausLayout.priceY;
+        const key = String(evt.slot_id) + ':' + String(cycle.trade_id || '') + ':' + String(cycle.cycle || '');
+
+        bauhausProfitFlights.push({
+          id: key + ':' + String(startMs),
+          slot_id: evt.slot_id,
+          fromX,
+          fromY,
+          toX,
+          toY,
+          startMs,
+          durationMs: 760,
+          delta,
+          applied: false,
+          seed: hashString32(key)
+        });
+      }
+
+      if (bauhausProfitFlights.length > 80) {
+        bauhausProfitFlights = bauhausProfitFlights.slice(-80);
+      }
+    }
+
+    function drawBauhausProfitFlights(nowMs, status) {
+      if (!bauhausProfitFlights.length) return;
+      const keep = [];
+      const visualState = getBauhausVisualState(status);
+      const motionFactor = Math.max(0.05, visualState.motionFactor);
+
+      for (const flight of bauhausProfitFlights) {
+        const progress = clamp(((nowMs - flight.startMs) * motionFactor) / flight.durationMs, 0, 1);
+        const ease = progress * progress * (3 - 2 * progress);
+        const x = flight.fromX + (flight.toX - flight.fromX) * ease;
+        const y = flight.fromY + (flight.toY - flight.fromY) * ease;
+
+        const alpha = 1 - progress * 0.65;
+        const rgb = flight.delta >= 0 ? '0,0,0' : '80,0,0';
+        const count = 8;
+        for (let i = 0; i < count; i += 1) {
+          const u = seededUnit(flight.seed, i + 30);
+          const a = (Math.PI * 2 * i) / count + progress * 6.2;
+          const r = 1 + (1 - progress) * (4 + u * 2);
+          const px = x + Math.cos(a) * r;
+          const py = y + Math.sin(a) * r;
+          ctx.fillStyle = 'rgba(' + rgb + ',' + alpha.toFixed(3) + ')';
+          ctx.fillRect(Math.round(px), Math.round(py), 2, 2);
+        }
+
+        if (progress >= 1 && !flight.applied) {
+          flight.applied = true;
+          if (bauhausProfitDisplayed === null || !Number.isFinite(bauhausProfitDisplayed)) {
+            bauhausProfitDisplayed = 0;
+          }
+          bauhausProfitDisplayed += flight.delta;
+        }
+
+        if (progress < 1) keep.push(flight);
+      }
+
+      bauhausProfitFlights = keep;
+
+      if (!bauhausProfitFlights.length && bauhausProfitDisplayed !== null) {
+        const diffToTarget = Math.abs(bauhausProfitDisplayed - bauhausProfitTarget);
+        if (diffToTarget > 1e-6) {
+          bauhausProfitDisplayed = bauhausProfitTarget;
+        }
+      }
+    }
+
+    function drawBauhausFrame(layoutView) {
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, viewportW, viewportH);
+
+      ctx.fillStyle = BAUHAUS_COLORS.void;
+      ctx.fillRect(0, 0, viewportW, viewportH);
+
+      ctx.fillStyle = BAUHAUS_COLORS.canvas;
+      roundRect(layoutView.inner.x, layoutView.inner.y, layoutView.inner.w, layoutView.inner.h, layoutView.innerRadius);
+      ctx.fill();
+
+      ctx.strokeStyle = BAUHAUS_COLORS.frame;
+      ctx.lineWidth = layoutView.frameStroke;
+      roundRect(layoutView.outer.x, layoutView.outer.y, layoutView.outer.w, layoutView.outer.h, layoutView.frameRadius);
+      ctx.stroke();
+    }
+
+    function drawBauhausPriceLine(layoutView, status, nowMs) {
+      const inner = layoutView.inner;
+      const x = inner.x + 14;
+      const w = Math.max(12, inner.w - 28);
+      const age = Number(status && status.price_age_sec || 0);
+      const visualState = getBauhausVisualState(status);
+      const mode = visualState.mode;
+      const stale = age > 60;
+      const dead = stale || mode === 'HALTED' || visualState.halted;
+
+      const t = computeBauhausSideThicknesses();
+      const yTop = Math.round(layoutView.priceY - t.sellPx);
+      const h = Math.max(2, t.sellPx + t.buyPx);
+      const rect = {
+        x: Math.round(x),
+        y: yTop,
+        w: Math.round(w),
+        h
+      };
+
+      let lineLightness = 0;
+      if (dead) lineLightness = 36;
+      else if (age > 10) lineLightness = Math.round(((Math.min(age, 60) - 10) / 50) * 24);
+      ctx.fillStyle = 'hsl(0 0% ' + lineLightness + '%)';
+      ctx.fillRect(Math.round(x), yTop, Math.round(w), h);
+
+      if (dead) return rect;
+
+      let speedPxPerMs = 0.16;
+      if (age >= 10 && age < 60) speedPxPerMs = 0.06;
+      speedPxPerMs *= visualState.motionFactor;
+      if (speedPxPerMs <= 0) return rect;
+
+      const particleCount = clamp(Math.floor(w / 26), 8, 52);
+      const lanes = Math.max(1, h);
+      const sparkleColor = age < 10 ? 'rgba(255,255,255,0.95)' : 'rgba(235,235,235,0.72)';
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(Math.round(x), yTop, Math.round(w), h);
+      ctx.clip();
+
+      ctx.fillStyle = sparkleColor;
+      for (let i = 0; i < particleCount; i += 1) {
+        const phaseOffset = i * (w / particleCount);
+        const sparkX = x + w - ((nowMs * speedPxPerMs + phaseOffset) % w);
+        const lane = (i * 3) % lanes;
+        const sparkY = yTop + lane;
+        ctx.fillRect(Math.round(sparkX), Math.round(sparkY), 1, 1);
+      }
+
+      ctx.restore();
+      return rect;
+    }
+
+    function drawBauhausSlots(layoutView, status, nowMs) {
+      const positions = Array.isArray(layoutView.positions) ? layoutView.positions : [];
+      const visualState = getBauhausVisualState(status);
+      const pulse = 0.5 + 0.5 * Math.sin(nowMs / 210);
+      machineRects = [];
+      for (const node of positions) {
+        const slot = node.slot || {};
+        const phase = String(slot.phase || 'S0');
+        const fill = bauhausPhaseColor(phase);
+        const isJammed = slotHasEffect(slot.slot_id, 'conveyor_stop');
+        const isStarved = slotHasEffect(slot.slot_id, 'machine_dark') || !!slot.long_only || !!slot.short_only;
+        const fillAlpha = clamp(
+          visualState.slotAlpha
+            * (isJammed && phase === 'S2' ? (0.62 + pulse * 0.38) : 1)
+            * (isStarved ? 0.88 : 1),
+          0.2,
+          1
+        );
+
+        if (fill) {
+          ctx.save();
+          ctx.globalAlpha = fillAlpha;
+          ctx.fillStyle = fill;
+          roundRect(node.x + 4, node.y + 4, Math.max(8, node.w - 8), Math.max(8, node.h - 8), 7);
+          ctx.fill();
+          ctx.restore();
+        }
+
+        ctx.strokeStyle = BAUHAUS_COLORS.structure;
+        ctx.lineWidth = isJammed ? (1.8 + pulse * 1.2) : 2;
+        ctx.globalAlpha = clamp(visualState.slotAlpha * (isStarved ? 0.92 : 1), 0.35, 1);
+        roundRect(node.x, node.y, node.w, node.h, 8);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+
+        const fontPx = node.h >= 34 ? 12 : 10;
+        ctx.fillStyle = BAUHAUS_COLORS.structure;
+        ctx.globalAlpha = clamp(visualState.slotAlpha * 0.95, 0.35, 1);
+        ctx.font = '700 ' + fontPx + 'px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(phase, node.x + node.w * 0.5, node.y + node.h * 0.5 + 0.5);
+        ctx.globalAlpha = 1;
+
+        if (slot.long_only || slot.short_only) {
+          const label = slot.long_only ? '[LO]' : '[SO]';
+          const triCx = node.x + node.w - 9;
+          const triCy = node.y + 9;
+          const triAlpha = clamp(0.55 + (isStarved ? pulse * 0.35 : 0), 0.45, 0.9);
+          ctx.fillStyle = 'rgba(0,0,0,' + triAlpha.toFixed(3) + ')';
+          ctx.beginPath();
+          ctx.moveTo(triCx, triCy - 5);
+          ctx.lineTo(triCx - 5, triCy + 4);
+          ctx.lineTo(triCx + 5, triCy + 4);
+          ctx.closePath();
+          ctx.fill();
+
+          ctx.fillStyle = BAUHAUS_COLORS.canvas;
+          ctx.font = '700 7px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+          ctx.fillText('!', triCx, triCy + 1);
+
+          ctx.fillStyle = BAUHAUS_COLORS.structure;
+          ctx.font = '700 8px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+          ctx.textAlign = 'right';
+          ctx.textBaseline = 'alphabetic';
+          ctx.fillText(label, node.x + node.w - 2, node.y + node.h - 2);
+        }
+
+        if (bauhausSlotFlash && bauhausSlotFlash.slotId === slot.slot_id) {
+          const t = clamp((nowMs - bauhausSlotFlash.startMs) / bauhausSlotFlash.durationMs, 0, 1);
+          const alpha = clamp(1 - t, 0, 1);
+          if (alpha > 0.01) {
+            const grow = 2 + t * 6;
+            ctx.strokeStyle = 'rgba(255,255,255,' + (0.95 * alpha).toFixed(3) + ')';
+            ctx.lineWidth = 2 + (1 - t) * 1.2;
+            roundRect(node.x - grow, node.y - grow, node.w + grow * 2, node.h + grow * 2, 10 + grow);
+            ctx.stroke();
+          }
+        }
+
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'alphabetic';
+
+        machineRects.push({
+          slot_id: slot.slot_id,
+          x: node.x,
+          y: node.y,
+          w: node.w,
+          h: node.h
+        });
+      }
+      if (bauhausSlotFlash && (nowMs - bauhausSlotFlash.startMs) >= bauhausSlotFlash.durationMs) {
+        bauhausSlotFlash = null;
+      }
+    }
+
+    function computeBauhausOrderPoints(layoutView, status) {
+      const positions = Array.isArray(layoutView.positions) ? layoutView.positions : [];
+      const points = [];
+      const defaultMarket = Number(status && status.price);
+      const maxOffset = layoutView.inner.h * 0.5 * BAUHAUS_ORDER_MAX_OFFSET_RATIO;
+      const scaleFactor = BAUHAUS_ORDER_SCALE_FACTOR; // pct^2 distance emphasis (v2.2.1 section 3.2)
+
+      for (const node of positions) {
+        const slot = node.slot || {};
+        const rawOrders = Array.isArray(slot.open_orders) ? slot.open_orders : [];
+        if (!rawOrders.length) continue;
+
+        const slotMarket = Number(slot.market_price || 0);
+        const marketPrice = (Number.isFinite(defaultMarket) && defaultMarket > 0) ? defaultMarket : slotMarket;
+        if (!Number.isFinite(marketPrice) || marketPrice <= 0) continue;
+
+        const perSide = {sell: [], buy: []};
+        for (const order of rawOrders) {
+          const side = String(order.side || '').toLowerCase();
+          if (side !== 'buy' && side !== 'sell') continue;
+
+          const orderPrice = Number(order.price);
+          if (!Number.isFinite(orderPrice) || orderPrice <= 0) continue;
+
+          const pctDistance = Math.abs(orderPrice - marketPrice) / marketPrice;
+          const rawOffset = pctDistance * pctDistance * scaleFactor;
+          const absOffset = Math.min(maxOffset, rawOffset);
+          const direction = side === 'sell' ? -1 : 1; // sell above, buy below
+
+          perSide[side].push({
+            order,
+            side,
+            role: String(order.role || '').toLowerCase(),
+            rawOffset,
+            absOffset,
+            pctDistance,
+            clamped: rawOffset > maxOffset + 1e-9,
+            direction,
+            y: layoutView.priceY + direction * absOffset
+          });
+        }
+
+        for (const sideName of ['sell', 'buy']) {
+          const items = perSide[sideName];
+          if (!items.length) continue;
+
+          items.sort((a, b) => a.absOffset - b.absOffset);
+          let prevY = null;
+          const minY = layoutView.priceY - maxOffset;
+          const maxY = layoutView.priceY + maxOffset;
+          for (const item of items) {
+            if (prevY !== null && Math.abs(item.y - prevY) < 8) {
+              item.y = prevY + item.direction * 8;
+            }
+            item.y = clamp(item.y, minY, maxY);
+            prevY = item.y;
+          }
+
+          const spacing = 10;
+          const cx = node.x + node.w * 0.5;
+          const totalW = spacing * Math.max(0, items.length - 1);
+          for (let i = 0; i < items.length; i += 1) {
+            const item = items[i];
+            item.x = cx - totalW * 0.5 + i * spacing;
+            item.node = node;
+            points.push(item);
+          }
+        }
+      }
+
+      return points;
+    }
+
+    function drawBauhausOrders(layoutView, status, nowMs) {
+      const points = computeBauhausOrderPoints(layoutView, status);
+      const visualState = getBauhausVisualState(status);
+      const jamPulse = 0.5 + 0.5 * Math.sin(nowMs / 190);
+
+      for (const p of points) {
+        const anchorX = p.node.x + p.node.w * 0.5;
+        const anchorY = p.side === 'sell' ? p.node.y : (p.node.y + p.node.h);
+        const distToSlot = Math.abs(p.y - anchorY);
+        const slotData = p.node && p.node.slot ? p.node.slot : {};
+        const starvedSell = !!slotData.long_only;
+        const starvedBuy = !!slotData.short_only;
+        if ((starvedSell && p.side === 'sell') || (starvedBuy && p.side === 'buy')) {
+          continue;
+        }
+        const slotId = p.node && p.node.slot ? p.node.slot.slot_id : null;
+        const isJammed = slotId !== null && slotHasEffect(slotId, 'conveyor_stop') && p.role === 'exit';
+        const isStarved = slotId !== null && slotHasEffect(slotId, 'machine_dark');
+        const lineAlpha = clamp(visualState.orderAlpha * (isStarved ? 0.78 : 1), 0.2, 1);
+
+        if (distToSlot >= 5) {
+          ctx.strokeStyle = isJammed ? 'rgba(120,120,120,0.95)' : '#999999';
+          ctx.lineWidth = isJammed ? (1.4 + jamPulse * 0.9) : 1;
+          ctx.globalAlpha = lineAlpha;
+          if (p.clamped) ctx.setLineDash([2, 2]);
+          else ctx.setLineDash([]);
+          ctx.beginPath();
+          ctx.moveTo(Math.round(anchorX) + 0.5, Math.round(anchorY) + 0.5);
+          ctx.lineTo(Math.round(p.x) + 0.5, Math.round(p.y) + 0.5);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.globalAlpha = 1;
+        }
+
+        const markerAlpha = clamp(visualState.orderAlpha * (isStarved ? 0.84 : 1), 0.22, 1);
+        drawBauhausOrderSquare(p.x, p.y, p.role, markerAlpha);
+      }
+      return points;
+    }
+
+    function bauhausOrderEventKey(slotId, order) {
+      const prefix = String(slotId);
+      if (order && order.txid) {
+        return prefix + ':tx:' + String(order.txid);
+      }
+      if (order && order.local_id !== null && order.local_id !== undefined) {
+        return prefix + ':lid:' + String(order.local_id);
+      }
+      const role = String(order && order.role || '');
+      const side = String(order && order.side || '');
+      const trade = String(order && order.trade_id || '');
+      const cycle = String(order && order.cycle || '');
+      const price = Number(order && order.price);
+      const volume = Number(order && order.volume);
+      const priceTxt = Number.isFinite(price) ? price.toFixed(10) : 'na';
+      const volTxt = Number.isFinite(volume) ? volume.toFixed(10) : 'na';
+      return prefix + ':fallback:' + [role, side, trade, cycle, priceTxt, volTxt].join(':');
+    }
+
+    function buildBauhausOrderPointIndex(statusSnapshot) {
+      const out = new Map();
+      if (!statusSnapshot || !Array.isArray(statusSnapshot.slots)) return out;
+
+      const layoutView = computeBauhausLayout(statusSnapshot);
+      const points = computeBauhausOrderPoints(layoutView, statusSnapshot);
+      for (const p of points) {
+        if (!p || !p.node || !p.node.slot || !p.order) continue;
+        const slotId = p.node.slot.slot_id;
+        const key = bauhausOrderEventKey(slotId, p.order);
+        out.set(key, {
+          x: p.x,
+          y: p.y,
+          side: p.side,
+          role: p.role,
+          node: {x: p.node.x, y: p.node.y, w: p.node.w, h: p.node.h}
+        });
+      }
+      return out;
+    }
+
+    function findBauhausNodeBySlotId(layoutView, slotId) {
+      const positions = Array.isArray(layoutView && layoutView.positions) ? layoutView.positions : [];
+      for (const node of positions) {
+        if (node && node.slot && node.slot.slot_id === slotId) return node;
+      }
+      return null;
+    }
+
+    function estimateBauhausOrderPoint(layoutView, status, node, order) {
+      const defaultMarket = Number(status && status.price);
+      const slotMarket = Number(node && node.slot && node.slot.market_price || 0);
+      const marketPrice = (Number.isFinite(defaultMarket) && defaultMarket > 0)
+        ? defaultMarket
+        : slotMarket;
+
+      const orderPrice = Number(order && order.price);
+      let side = String(order && order.side || '').toLowerCase();
+      if (side !== 'sell' && side !== 'buy') {
+        side = (Number.isFinite(orderPrice) && Number.isFinite(marketPrice) && orderPrice >= marketPrice) ? 'sell' : 'buy';
+      }
+      const direction = side === 'sell' ? -1 : 1;
+
+      let rawOffset = 0;
+      if (Number.isFinite(orderPrice) && orderPrice > 0 && Number.isFinite(marketPrice) && marketPrice > 0) {
+        const pctDistance = Math.abs(orderPrice - marketPrice) / marketPrice;
+        rawOffset = pctDistance * pctDistance * BAUHAUS_ORDER_SCALE_FACTOR;
+      }
+
+      const maxOffset = layoutView.inner.h * 0.5 * BAUHAUS_ORDER_MAX_OFFSET_RATIO;
+      const absOffset = Math.min(maxOffset, rawOffset);
+      const x = node ? node.x + node.w * 0.5 : (layoutView.inner.x + layoutView.inner.w * 0.5);
+      const y = layoutView.priceY + direction * absOffset;
+      return {
+        x,
+        y,
+        side,
+        role: String(order && order.role || '').toLowerCase()
+      };
+    }
+
+    function queueBauhausFillAnimations(events, prevStatusSnapshot, nextStatus, startMs) {
+      const list = Array.isArray(events) ? events : [];
+      if (!list.length) return;
+
+      const prevPointByKey = buildBauhausOrderPointIndex(prevStatusSnapshot);
+      const nextLayout = computeBauhausLayout(nextStatus || {slots: []});
+      let index = 0;
+
+      for (const evt of list) {
+        if (evt.type !== 'order_gone' || !evt.order) continue;
+
+        const key = bauhausOrderEventKey(evt.slot_id, evt.order);
+        const prevPoint = prevPointByKey.get(key) || null;
+        const nextNode = findBauhausNodeBySlotId(nextLayout, evt.slot_id);
+        const point = prevPoint || estimateBauhausOrderPoint(nextLayout, nextStatus, nextNode, evt.order);
+        const side = String(point.side || '').toLowerCase() === 'sell' ? 'sell' : 'buy';
+        const anchorNode = nextNode || (prevPoint ? prevPoint.node : null);
+        const anchorX = anchorNode ? anchorNode.x + anchorNode.w * 0.5 : point.x;
+        const anchorY = anchorNode
+          ? (side === 'sell' ? anchorNode.y : anchorNode.y + anchorNode.h)
+          : nextLayout.priceY;
+
+        const dx = point.x - anchorX;
+        const dy = point.y - anchorY;
+        const distPx = Math.hypot(dx, dy);
+        const extendMs = clamp((distPx / 100) * 1000, 160, 760);
+        const role = String(point.role || '').toLowerCase();
+        const dissolveMs = role === 'exit' ? 360 : 300;
+        const totalMs = extendMs + dissolveMs;
+        const id = key + ':' + String(startMs) + ':' + String(index);
+        index += 1;
+
+        bauhausFillAnims.push({
+          id,
+          role,
+          anchorX,
+          anchorY,
+          targetX: point.x,
+          targetY: point.y,
+          startMs,
+          extendMs,
+          dissolveMs,
+          totalMs,
+          seed: hashString32(id)
+        });
+      }
+
+      if (bauhausFillAnims.length > 180) {
+        bauhausFillAnims = bauhausFillAnims.slice(-180);
+      }
+    }
+
+    function drawBauhausOrderSquare(x, y, role, alpha) {
+      const size = 6;
+      const sx = Math.round(x - size * 0.5);
+      const sy = Math.round(y - size * 0.5);
+      const kind = String(role || '').toLowerCase();
+      const a = clamp(Number(alpha), 0, 1);
+      const prevAlpha = ctx.globalAlpha;
+      ctx.globalAlpha = Number.isFinite(a) ? a : 1;
+
+      if (kind === 'entry') {
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(sx, sy, size, size);
+        ctx.strokeStyle = BAUHAUS_COLORS.structure;
+        ctx.lineWidth = 1;
+        ctx.strokeRect(sx + 0.5, sy + 0.5, size - 1, size - 1);
+      } else if (kind === 'exit') {
+        ctx.fillStyle = BAUHAUS_COLORS.structure;
+        ctx.fillRect(sx, sy, size, size);
+      } else {
+        ctx.fillStyle = '#777777';
+        ctx.fillRect(sx, sy, size, size);
+      }
+
+      ctx.globalAlpha = prevAlpha;
+    }
+
+    function drawBauhausFillAnimations(nowMs, status) {
+      if (!bauhausFillAnims.length) return;
+      const keep = [];
+      const visualState = getBauhausVisualState(status);
+      const motionFactor = Math.max(0.05, visualState.motionFactor);
+
+      for (const anim of bauhausFillAnims) {
+        const elapsed = (nowMs - anim.startMs) * motionFactor;
+        if (elapsed < 0) {
+          keep.push(anim);
+          continue;
+        }
+        if (elapsed > anim.totalMs) continue;
+
+        const extendP = clamp(elapsed / anim.extendMs, 0, 1);
+        const dissolveP = clamp((elapsed - anim.extendMs) / anim.dissolveMs, 0, 1);
+        const lineP = elapsed < anim.extendMs ? extendP : (1 - dissolveP);
+        const lineEndX = anim.anchorX + (anim.targetX - anim.anchorX) * lineP;
+        const lineEndY = anim.anchorY + (anim.targetY - anim.anchorY) * lineP;
+
+        ctx.strokeStyle = BAUHAUS_COLORS.structure;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(Math.round(anim.anchorX) + 0.5, Math.round(anim.anchorY) + 0.5);
+        ctx.lineTo(Math.round(lineEndX) + 0.5, Math.round(lineEndY) + 0.5);
+        ctx.stroke();
+
+        if (elapsed < anim.extendMs) {
+          drawBauhausOrderSquare(anim.targetX, anim.targetY, anim.role, 1);
+        } else {
+          const shellAlpha = clamp(1 - dissolveP * 1.25, 0, 1);
+          if (shellAlpha > 0.02) {
+            drawBauhausOrderSquare(anim.targetX, anim.targetY, anim.role, shellAlpha);
+          }
+
+          const fragmentCount = anim.role === 'exit' ? 12 : 9;
+          const fragmentAlpha = clamp(1 - dissolveP, 0, 1);
+          const rgb = anim.role === 'exit'
+            ? '0,0,0'
+            : (anim.role === 'entry' ? '245,245,245' : '119,119,119');
+
+          for (let i = 0; i < fragmentCount; i += 1) {
+            const u = seededUnit(anim.seed, i + 11);
+            const a = (Math.PI * 2 * i) / fragmentCount + dissolveP * 4.4;
+            const r = 1 + dissolveP * (7 + u * 11);
+            const px = anim.targetX + Math.cos(a) * r;
+            const py = anim.targetY + Math.sin(a) * r;
+            const size = anim.role === 'exit' ? (u > 0.58 ? 2 : 1) : 1;
+            ctx.fillStyle = 'rgba(' + rgb + ',' + fragmentAlpha.toFixed(3) + ')';
+            ctx.fillRect(Math.round(px), Math.round(py), size, size);
+          }
+
+          if (anim.role === 'exit') {
+            const sparkleAlpha = clamp((1 - dissolveP) * 0.9, 0, 0.9);
+            for (let i = 0; i < 10; i += 1) {
+              const u = seededUnit(anim.seed, i + 101);
+              const v = seededUnit(anim.seed, i + 151);
+              const angle = u * Math.PI * 2 + dissolveP * 5.9;
+              const radius = 2 + dissolveP * (8 + v * 10);
+              const px = anim.targetX + Math.cos(angle) * radius;
+              const py = anim.targetY + Math.sin(angle) * radius;
+              ctx.fillStyle = 'rgba(25,25,25,' + sparkleAlpha.toFixed(3) + ')';
+              ctx.fillRect(Math.round(px), Math.round(py), 1, 1);
+            }
+          }
+        }
+
+        keep.push(anim);
+      }
+
+      bauhausFillAnims = keep;
+    }
+
+    function hashString32(input) {
+      // FNV-1a 32-bit hash for stable deterministic sprite placement.
+      let hash = 0x811c9dc5;
+      const txt = String(input || '');
+      for (let i = 0; i < txt.length; i += 1) {
+        hash ^= txt.charCodeAt(i);
+        hash = Math.imul(hash, 0x01000193);
+      }
+      return hash >>> 0;
+    }
+
+    function seededUnit(seed, index) {
+      // Stateless deterministic pseudo-random [0,1) from seed/index.
+      let x = (seed ^ Math.imul(index + 1, 0x9e3779b1)) >>> 0;
+      x ^= x >>> 16;
+      x = Math.imul(x, 0x85ebca6b);
+      x ^= x >>> 13;
+      x = Math.imul(x, 0xc2b2ae35);
+      x ^= x >>> 16;
+      return (x >>> 0) / 4294967296;
+    }
+
+    function orphanGradientColor(rankNorm, centerNorm) {
+      const r = clamp(rankNorm, 0, 1);
+      const c = clamp(centerNorm, 0, 1);
+      const backlogBoost = activeEffects.has('belt_overflow') ? 12 : 0;
+      const hue = 275 - r * 265; // violet -> blue -> green -> yellow -> red
+      const sat = clamp(40 + c * 50 + backlogBoost, 0, 100);   // center desaturated, edge vivid
+      const light = clamp(64 - c * 20 - (backlogBoost > 0 ? 4 : 0), 20, 90);
+      return 'hsl(' + hue.toFixed(1) + ' ' + sat.toFixed(1) + '% ' + light.toFixed(1) + '%)';
+    }
+
+    function buildBauhausOrphans(layoutView, status) {
+      const slots = Array.isArray(status && status.slots) ? status.slots : [];
+      const marketPrice = Number((status && status.price) || 0);
+      const margin = 12;
+      const minBand = 14;
+      const maxBand = Math.max(minBand + 1, layoutView.inner.h * 0.45);
+      const out = [];
+
+      for (const slot of slots) {
+        const recs = Array.isArray(slot && slot.recovery_orders) ? slot.recovery_orders : [];
+        const slotMarket = Number(slot && slot.market_price);
+        const refPrice = (Number.isFinite(marketPrice) && marketPrice > 0) ? marketPrice : slotMarket;
+        if (!Number.isFinite(refPrice) || refPrice <= 0) continue;
+        for (const rec of recs) {
+          const price = Number(rec && rec.price);
+          if (!Number.isFinite(price) || price <= 0) continue;
+          const side = String((rec && rec.side) || '').toLowerCase();
+          const direction = side === 'sell' ? -1 : (side === 'buy' ? 1 : (price >= refPrice ? -1 : 1));
+          const pctDistance = Math.abs(price - refPrice) / refPrice;
+          const key = String(slot.slot_id) + ':' + String(rec.recovery_id);
+          out.push({
+            key,
+            slot_id: slot.slot_id,
+            recovery: rec,
+            pctDistance,
+            direction
+          });
+        }
+      }
+
+      out.sort((a, b) => a.pctDistance - b.pctDistance);
+
+      const inner = layoutView.inner;
+      const width = Math.max(1, inner.w - margin * 2);
+      for (let i = 0; i < out.length; i += 1) {
+        const item = out[i];
+        const rankNorm = out.length <= 1 ? 0 : i / (out.length - 1);
+        const seed = hashString32(item.key);
+        const xRand = seededUnit(seed, 0);
+        const yRand = seededUnit(seed, 1);
+        const blendRand = seededUnit(seed, 2);
+        const phaseRand = seededUnit(seed, 3);
+        const periodRand = seededUnit(seed, 4);
+
+        const x = inner.x + margin + xRand * width;
+        const distNorm = Math.pow(rankNorm, 0.78);
+        const targetMag = minBand + distNorm * (maxBand - minBand);
+        const seedMag = minBand + yRand * (maxBand - minBand);
+        const mag = targetMag * 0.68 + seedMag * 0.32;
+        const y = layoutView.priceY + item.direction * mag + (blendRand - 0.5) * 14;
+        const yClamped = clamp(y, inner.y + margin, inner.y + inner.h - margin);
+
+        const centerNorm = clamp(Math.abs(yClamped - layoutView.priceY) / maxBand, 0, 1);
+        const color = orphanGradientColor(rankNorm, centerNorm);
+        const twinklePeriodMs = 2000 + periodRand * 2000;
+        const twinklePhase = phaseRand * Math.PI * 2;
+
+        item.rankNorm = rankNorm;
+        item.x = x;
+        item.y = yClamped;
+        item.color = color;
+        item.twinklePeriodMs = twinklePeriodMs;
+        item.twinklePhase = twinklePhase;
+      }
+
+      return out;
+    }
+
+    function buildBauhausOrphanIndex(layoutView, status) {
+      const index = new Map();
+      const items = buildBauhausOrphans(layoutView, status);
+      for (const item of items) {
+        index.set(item.key, {
+          x: item.x,
+          y: item.y,
+          color: item.color
+        });
+      }
+      return index;
+    }
+
+    function queueBauhausOrphanRepriceAnimations(events, prevStatusSnapshot, nextStatus, startMs) {
+      const list = Array.isArray(events) ? events : [];
+      if (!list.length) return;
+
+      const prevLayout = computeBauhausLayout(prevStatusSnapshot || nextStatus || {slots: []});
+      const nextLayout = computeBauhausLayout(nextStatus || {slots: []});
+      const prevIndex = buildBauhausOrphanIndex(prevLayout, prevStatusSnapshot || {slots: []});
+      const nextIndex = buildBauhausOrphanIndex(nextLayout, nextStatus || {slots: []});
+
+      for (const evt of list) {
+        if (evt.type !== 'orphan_repriced') continue;
+        const key = String(evt.recovery_key || (String(evt.slot_id) + ':' + String(evt.recovery_id)));
+        const to = nextIndex.get(key);
+        if (!to) continue;
+        const from = prevIndex.get(key) || to;
+
+        bauhausOrphanRepriceAnims.set(key, {
+          key,
+          startMs,
+          durationMs: 900,
+          fromX: from.x,
+          fromY: from.y,
+          toX: to.x,
+          toY: to.y
+        });
+      }
+
+      while (bauhausOrphanRepriceAnims.size > 260) {
+        const oldest = bauhausOrphanRepriceAnims.keys().next();
+        if (oldest.done) break;
+        bauhausOrphanRepriceAnims.delete(oldest.value);
+      }
+    }
+
+    function drawOrphanPlusSprite(x, y, armColor, alpha) {
+      const px = 2;
+      const cx = Math.round(x);
+      const cy = Math.round(y);
+      ctx.globalAlpha = alpha;
+
+      ctx.fillStyle = armColor;
+      ctx.fillRect(cx - px, cy, px, px);      // left
+      ctx.fillRect(cx + px, cy, px, px);      // right
+      ctx.fillRect(cx, cy - px, px, px);      // up
+      ctx.fillRect(cx, cy + px, px, px);      // down
+
+      ctx.fillStyle = BAUHAUS_COLORS.structure;
+      ctx.fillRect(cx, cy, px, px);           // center
+
+      ctx.globalAlpha = 1;
+    }
+
+    function drawBauhausOrphans(layoutView, status, nowMs) {
+      const items = buildBauhausOrphans(layoutView, status);
+      if (!items.length) {
+        bauhausOrphanRepriceAnims.clear();
+        return [];
+      }
+      const visualState = getBauhausVisualState(status);
+      const overflow = activeEffects.has('belt_overflow');
+      const twinkleBase = overflow ? 0.8 : 0.85;
+      const twinkleAmp = overflow ? 0.2 : 0.15;
+      const twinkleScale = visualState.halted ? 0 : visualState.motionFactor;
+      const rendered = [];
+
+      const currentKeys = new Set(items.map((item) => item.key));
+      for (const [key, anim] of bauhausOrphanRepriceAnims) {
+        if (!currentKeys.has(key) || (nowMs - anim.startMs) > (anim.durationMs + 1200)) {
+          bauhausOrphanRepriceAnims.delete(key);
+        }
+      }
+
+      ctx.imageSmoothingEnabled = false;
+      for (const item of items) {
+        const tw = visualState.halted
+          ? 0.72
+          : twinkleBase + twinkleAmp * Math.sin((nowMs * twinkleScale / item.twinklePeriodMs) * Math.PI * 2 + item.twinklePhase);
+        const alpha = clamp(tw, visualState.halted ? 0.55 : 0.7, 1.0);
+        const anim = bauhausOrphanRepriceAnims.get(item.key);
+        if (!anim) {
+          drawOrphanPlusSprite(item.x, item.y, item.color, alpha);
+          rendered.push({
+            key: item.key,
+            slot_id: item.slot_id,
+            recovery: item.recovery,
+            pctDistance: item.pctDistance,
+            x: item.x,
+            y: item.y
+          });
+          continue;
+        }
+
+        const t = clamp((nowMs - anim.startMs) / anim.durationMs, 0, 1);
+        const ease = t * t * (3 - 2 * t);
+        const x = anim.fromX + (anim.toX - anim.fromX) * ease;
+        const y = anim.fromY + (anim.toY - anim.fromY) * ease;
+        const baseFade = clamp(1 - t * 1.2, 0, 1);
+        const greyFade = clamp(0.25 + t * 0.75, 0, 1);
+
+        if (baseFade > 0.03) {
+          drawOrphanPlusSprite(x, y, item.color, alpha * baseFade);
+        }
+        drawOrphanPlusSprite(x, y, '#8A8A8A', alpha * greyFade);
+        rendered.push({
+          key: item.key,
+          slot_id: item.slot_id,
+          recovery: item.recovery,
+          pctDistance: item.pctDistance,
+          x,
+          y
+        });
+
+        if (t >= 1) {
+          bauhausOrphanRepriceAnims.delete(item.key);
+        }
+      }
+      ctx.imageSmoothingEnabled = true;
+      return rendered;
+    }
+
+    function drawBauhausDiagnosisOverlays(layoutView, status, nowMs) {
+      const inner = layoutView.inner;
+      const outer = layoutView.outer;
+      const visualState = getBauhausVisualState(status);
+      const hasCircuitSpark = activeEffects.has('circuit_spark');
+      const hasRedWash = activeEffects.has('red_wash') || visualState.halted;
+
+      if (visualState.brownout) {
+        ctx.save();
+        ctx.globalCompositeOperation = 'saturation';
+        ctx.fillStyle = 'rgba(128,128,128,' + (visualState.paused ? '0.82' : '0.45') + ')';
+        ctx.fillRect(inner.x, inner.y, inner.w, inner.h);
+        ctx.restore();
+
+        ctx.fillStyle = 'rgba(244,236,206,' + (visualState.paused ? '0.24' : '0.12') + ')';
+        ctx.fillRect(inner.x, inner.y, inner.w, inner.h);
+      }
+
+      if (hasRedWash) {
+        const tintAlpha = visualState.halted ? 0.2 : 0.1;
+        ctx.fillStyle = 'rgba(82,44,24,' + tintAlpha.toFixed(3) + ')';
+        ctx.fillRect(inner.x, inner.y, inner.w, inner.h);
+      }
+
+      if (visualState.halted) {
+        const cx = inner.x + inner.w * 0.5;
+        const cy = inner.y + inner.h * 0.5;
+        const grad = ctx.createRadialGradient(cx, cy, Math.min(inner.w, inner.h) * 0.12, cx, cy, Math.max(inner.w, inner.h) * 0.75);
+        grad.addColorStop(0, 'rgba(0,0,0,0.00)');
+        grad.addColorStop(1, 'rgba(0,0,0,0.60)');
+        ctx.fillStyle = grad;
+        ctx.fillRect(inner.x, inner.y, inner.w, inner.h);
+      }
+
+      if (hasCircuitSpark) {
+        const span = Math.max(1, outer.w - 18);
+        for (let i = 0; i < 16; i += 1) {
+          const phase = (nowMs * 0.12 + i * 63) % span;
+          const x = outer.x + 9 + phase;
+          const y = i % 2 === 0 ? outer.y + 2 : outer.y + outer.h - 2;
+          const alpha = 0.45 + 0.4 * Math.abs(Math.sin(nowMs * 0.01 + i * 0.9));
+          ctx.fillStyle = i % 3 === 0
+            ? 'rgba(139,0,0,' + alpha.toFixed(3) + ')'
+            : 'rgba(232,136,31,' + (alpha * 0.85).toFixed(3) + ')';
+          ctx.fillRect(Math.round(x), Math.round(y), 2, 2);
+        }
+      }
     }
 
     function slotPhaseColor(phase) {
@@ -2193,10 +3634,17 @@ FACTORY_HTML = r"""<!doctype html>
 
     function renderNotifStrip() {
       const strip = document.getElementById('notifStrip');
+      const bauhaus = isBauhausMode();
+      const sevGood = bauhaus ? '#1F5F24' : COLORS.good;
+      const sevWarn = bauhaus ? '#8C5A00' : COLORS.warn;
+      const sevCrit = bauhaus ? BAUHAUS_COLORS.alert : COLORS.bad;
+      strip.style.background = bauhaus ? 'rgba(244,196,48,0.95)' : 'rgba(22,27,34,.96)';
+      strip.style.borderColor = bauhaus ? BAUHAUS_COLORS.frame : COLORS.line;
+      strip.style.color = bauhaus ? BAUHAUS_COLORS.structure : COLORS.ink;
+
       if (!activeSymptoms.length) {
         strip.textContent = '... waiting for diagnosis';
-        strip.style.borderColor = COLORS.line;
-        strip.style.color = COLORS.muted;
+        strip.style.color = bauhaus ? BAUHAUS_COLORS.text : COLORS.muted;
         strip.title = '';
         return;
       }
@@ -2204,21 +3652,21 @@ FACTORY_HTML = r"""<!doctype html>
       if (notifIndex >= activeSymptoms.length) notifIndex = 0;
       const top = activeSymptoms[notifIndex];
       if (activeSymptoms.length === 1 && top.symptom_id === 'IDLE_NORMAL') {
-        strip.textContent = 'OK Factory running normally';
-        strip.style.borderColor = COLORS.good;
-        strip.style.color = COLORS.good;
+        strip.textContent = bauhaus ? '✓ Running' : 'OK Factory running normally';
+        strip.style.borderColor = bauhaus ? BAUHAUS_COLORS.frame : COLORS.good;
+        strip.style.color = sevGood;
         strip.title = '';
         return;
       }
 
-      const icon = top.severity === 'crit' ? '!!' : (top.severity === 'warn' ? '!' : 'OK');
+      const icon = top.severity === 'crit' ? (bauhaus ? 'CRIT' : '!!') : (top.severity === 'warn' ? (bauhaus ? 'WARN' : '!') : 'OK');
       const summary = String(top.summary || '');
       const prefix = activeSymptoms.length > 1 ? '[' + (notifIndex + 1) + '/' + activeSymptoms.length + '] ' : '';
       strip.textContent = prefix + icon + ' ' + top.symptom_id + ': ' + summary;
       const color = top.severity === 'crit'
-        ? COLORS.bad
-        : (top.severity === 'warn' ? COLORS.warn : COLORS.good);
-      strip.style.borderColor = color;
+        ? sevCrit
+        : (top.severity === 'warn' ? sevWarn : sevGood);
+      strip.style.borderColor = bauhaus ? BAUHAUS_COLORS.frame : color;
       strip.style.color = color;
       strip.title = activeSymptoms.length > 1 ? 'Click or press Enter to cycle symptoms' : '';
     }
@@ -2230,6 +3678,11 @@ FACTORY_HTML = r"""<!doctype html>
     }
 
     function renderDetailPanel() {
+      if (isBauhausMode()) {
+        PANEL.classList.remove('open');
+        PANEL.setAttribute('aria-hidden', 'true');
+        return;
+      }
       if (selectedSlotId === null || !statusData) {
         PANEL.classList.remove('open');
         PANEL.setAttribute('aria-hidden', 'true');
@@ -2312,7 +3765,7 @@ FACTORY_HTML = r"""<!doctype html>
       return null;
     }
 
-    function drawScene(nowMs) {
+    function renderFactory(nowMs) {
       if (!statusData || !layout) {
         tooltipText = '';
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -2391,6 +3844,51 @@ FACTORY_HTML = r"""<!doctype html>
       drawTooltip();
     }
 
+    function renderBauhaus(nowMs) {
+      const bauhausLayout = computeBauhausLayout(statusData || {slots: []});
+      drawBauhausFrame(bauhausLayout);
+
+      machineRects = [];
+
+      if (!statusData) {
+        clearBauhausRenderCaches();
+        ctx.fillStyle = BAUHAUS_COLORS.text;
+        ctx.font = '13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+        ctx.fillText('Loading /api/status ...', bauhausLayout.inner.x + 14, bauhausLayout.inner.y + 26);
+        drawTooltip();
+        return;
+      }
+
+      bauhausLastPriceLineRect = drawBauhausPriceLine(bauhausLayout, statusData, nowMs);
+      drawBauhausSlots(bauhausLayout, statusData, nowMs);
+      bauhausLastOrderPoints = drawBauhausOrders(bauhausLayout, statusData, nowMs) || [];
+      drawBauhausFillAnimations(nowMs, statusData);
+      bauhausLastOrphanSprites = drawBauhausOrphans(bauhausLayout, statusData, nowMs) || [];
+      drawBauhausProfitFlights(nowMs, statusData);
+      bauhausLastCounterRect = drawBauhausProfitCounter(bauhausLayout);
+      drawBauhausDiagnosisOverlays(bauhausLayout, statusData, nowMs);
+
+      // Preserve slot removal animation anchoring parity across modes.
+      lastMachineRectBySlot = {};
+      for (const rect of machineRects) {
+        lastMachineRectBySlot[rect.slot_id] = {
+          x: rect.x,
+          y: rect.y,
+          w: rect.w,
+          h: rect.h
+        };
+      }
+      drawTooltip();
+    }
+
+    function renderCurrentView(nowMs) {
+      if (renderMode === RENDER_MODE_BAUHAUS) {
+        renderBauhaus(nowMs);
+        return;
+      }
+      renderFactory(nowMs);
+    }
+
     function scheduleFrame() {
       if (rafPending) return;
       rafPending = true;
@@ -2398,7 +3896,7 @@ FACTORY_HTML = r"""<!doctype html>
         rafPending = false;
         if (ts - lastFrameMs >= 33) {
           lastFrameMs = ts;
-          drawScene(ts);
+          renderCurrentView(ts);
         }
         scheduleFrame();
       });
@@ -2418,9 +3916,10 @@ FACTORY_HTML = r"""<!doctype html>
         const res = await fetch('/api/status', {cache: 'no-store'});
         if (!res.ok) throw new Error('status request failed: ' + res.status);
         const next = await res.json();
-        const events = computeDiff(statusData, next);
+        const events = diff(statusData, next);
         const startMs = performance.now();
         for (const evt of events) {
+          if (evt.type === 'orphan_repriced') continue;
           const anim = {
             type: evt.type,
             slot_id: evt.slot_id,
@@ -2441,9 +3940,19 @@ FACTORY_HTML = r"""<!doctype html>
           animQueue = animQueue.slice(animQueue.length - 240);
         }
 
-        prevStatus = statusData;
+        if (isBauhausMode()) {
+          queueBauhausFillAnimations(events, statusData, next, startMs);
+          queueBauhausOrphanRepriceAnimations(events, statusData, next, startMs);
+        }
+
         statusData = next;
         layout = computeLayout(next);
+        updateBauhausThicknessWindow(next);
+        bauhausProfitTarget = Number(next.total_profit || 0);
+        if (bauhausProfitDisplayed === null || !Number.isFinite(bauhausProfitDisplayed)) {
+          bauhausProfitDisplayed = bauhausProfitTarget;
+        }
+        queueBauhausProfitFlights(events, next, startMs);
         setActiveSymptoms(diagnose(next));
 
         if (selectedSlotId !== null && !getSlotById(selectedSlotId)) {
@@ -2466,16 +3975,45 @@ FACTORY_HTML = r"""<!doctype html>
       }
     }
 
-    canvas.addEventListener('contextmenu', (ev) => {
+    async function poll() {
+      await refreshStatus();
+    }
+
+    function handleCanvasContextMenu(ev) {
+      if (isBauhausMode()) return;
       const world = screenToWorld(ev.clientX, ev.clientY);
       const hit = hitTestMachine(world.x, world.y);
       if (hit !== null) {
         ev.preventDefault();
         showToast('Remove slot not yet available', 'info');
       }
-    });
+    }
 
-    canvas.addEventListener('mousedown', (ev) => {
+    function handleCanvasMouseDown(ev) {
+      if (isBauhausMode()) {
+        if (ev.button !== 0) return;
+        tooltipX = ev.clientX;
+        tooltipY = ev.clientY;
+        const hit = resolveBauhausHoverTarget(ev.clientX, ev.clientY);
+        if (!hit) {
+          if (bauhausPinnedTooltip) {
+            clearBauhausPinnedTooltip();
+          }
+          return;
+        }
+        bauhausPinnedTooltip = {
+          type: hit.type,
+          key: hit.key,
+          slot_id: hit.slot_id || null,
+          text: hit.text,
+          x: ev.clientX,
+          y: ev.clientY
+        };
+        tooltipText = hit.text;
+        hoverSlotId = hit.slot_id || null;
+        scheduleFrame();
+        return;
+      }
       if (ev.button !== 0) return;
       tooltipX = ev.clientX;
       tooltipY = ev.clientY;
@@ -2494,9 +4032,10 @@ FACTORY_HTML = r"""<!doctype html>
       dragLastX = ev.clientX;
       dragLastY = ev.clientY;
       canvas.classList.add('dragging');
-    });
+    }
 
-    window.addEventListener('mouseup', () => {
+    function handleWindowMouseUp() {
+      if (isBauhausMode()) return;
       const wasDragging = dragging;
       const wasFromEmpty = dragFromEmpty;
       const elapsed = performance.now() - dragStartMs;
@@ -2509,9 +4048,37 @@ FACTORY_HTML = r"""<!doctype html>
         renderDetailPanel();
         scheduleFrame();
       }
-    });
+    }
 
-    canvas.addEventListener('mousemove', (ev) => {
+    function handleCanvasMouseMove(ev) {
+      if (isBauhausMode()) {
+        if (bauhausPinnedTooltip) {
+          const needsUpdate = tooltipText !== bauhausPinnedTooltip.text
+            || tooltipX !== bauhausPinnedTooltip.x
+            || tooltipY !== bauhausPinnedTooltip.y
+            || hoverSlotId !== (bauhausPinnedTooltip.slot_id || null);
+          if (needsUpdate) {
+            tooltipText = bauhausPinnedTooltip.text;
+            tooltipX = bauhausPinnedTooltip.x;
+            tooltipY = bauhausPinnedTooltip.y;
+            hoverSlotId = bauhausPinnedTooltip.slot_id || null;
+            scheduleFrame();
+          }
+          return;
+        }
+
+        tooltipX = ev.clientX;
+        tooltipY = ev.clientY;
+        const hit = resolveBauhausHoverTarget(ev.clientX, ev.clientY);
+        const nextTooltip = hit ? hit.text : '';
+        const nextHover = hit && hit.slot_id !== undefined ? (hit.slot_id || null) : null;
+        if (nextTooltip !== tooltipText || nextHover !== hoverSlotId) {
+          tooltipText = nextTooltip;
+          hoverSlotId = nextHover;
+          scheduleFrame();
+        }
+        return;
+      }
       tooltipX = ev.clientX;
       tooltipY = ev.clientY;
       const world = screenToWorld(ev.clientX, ev.clientY);
@@ -2573,16 +4140,25 @@ FACTORY_HTML = r"""<!doctype html>
         tooltipText = nextTooltip;
         scheduleFrame();
       }
-    });
+    }
 
-    canvas.addEventListener('mouseleave', () => {
+    function handleCanvasMouseLeave() {
+      if (isBauhausMode()) {
+        if (!bauhausPinnedTooltip) {
+          hoverSlotId = null;
+          tooltipText = '';
+          scheduleFrame();
+        }
+        return;
+      }
       hoverSlotId = null;
       tooltipText = '';
       scheduleFrame();
-    });
+    }
 
-    canvas.addEventListener('wheel', (ev) => {
+    function handleCanvasWheel(ev) {
       ev.preventDefault();
+      if (isBauhausMode()) return;
       const factor = ev.deltaY < 0 ? 1.08 : 0.92;
       const prevZoom = camera.targetZoom;
       camera.targetZoom = clamp(camera.targetZoom * factor, 0.6, 2.2);
@@ -2592,29 +4168,33 @@ FACTORY_HTML = r"""<!doctype html>
       camera.targetX = worldBefore.x - (worldBefore.x - camera.targetX) / zoomRatio;
       camera.targetY = worldBefore.y - (worldBefore.y - camera.targetY) / zoomRatio;
       scheduleFrame();
-    }, {passive: false});
+    }
 
-    canvas.addEventListener('dblclick', () => {
+    function handleCanvasDoubleClick() {
+      if (isBauhausMode()) return;
       centerCamera();
       scheduleFrame();
-    });
+    }
 
-    document.getElementById('detailClose').addEventListener('click', () => {
+    function handleDetailCloseClick() {
       selectedSlotId = null;
       renderDetailPanel();
       scheduleFrame();
-    });
+    }
 
-    document.getElementById('addBtn').addEventListener('click', () => {
+    function handleAddSlotClick() {
       void dispatchAction('add_slot');
-    });
+    }
 
     const cmdInput = document.getElementById('cmdInput');
-    cmdInput.addEventListener('input', () => {
+    const notifStrip = document.getElementById('notifStrip');
+
+    function handleCommandInput() {
       suggestionIndex = -1;
       renderCommandSuggestions();
-    });
-    cmdInput.addEventListener('keydown', (event) => {
+    }
+
+    function handleCommandKeyDown(event) {
       if (event.key === 'Tab') {
         event.preventDefault();
         if (!currentSuggestions.length) renderCommandSuggestions();
@@ -2645,41 +4225,71 @@ FACTORY_HTML = r"""<!doctype html>
         event.preventDefault();
         closeCommandBarToNormal();
       }
-    });
+    }
 
-    document.getElementById('confirmOkBtn').addEventListener('click', () => {
+    function handleConfirmOkClick() {
       void confirmAccept();
-    });
-    document.getElementById('confirmCancelBtn').addEventListener('click', () => {
-      confirmCancel();
-    });
+    }
 
-    const notifStrip = document.getElementById('notifStrip');
-    notifStrip.addEventListener('click', () => {
+    function handleConfirmCancelClick() {
+      confirmCancel();
+    }
+
+    function handleNotifStripClick() {
       cycleNotifSymptom();
-    });
-    notifStrip.addEventListener('keydown', (event) => {
+    }
+
+    function handleNotifStripKeyDown(event) {
       if (event.key === 'Enter') {
         event.preventDefault();
         cycleNotifSymptom();
       }
-    });
+    }
 
-    document.addEventListener('keydown', onGlobalKeyDown);
-
-    window.addEventListener('resize', () => {
+    function handleWindowResize() {
       updateCanvasSize();
       if (statusData) {
         layout = computeLayout(statusData);
       }
       scheduleFrame();
-    });
+    }
 
-    updateKbModeBadge();
-    updateCanvasSize();
-    scheduleFrame();
-    refreshStatus();
-    window.setInterval(refreshStatus, 5000);
+    function bindMouseHandlers() {
+      canvas.addEventListener('contextmenu', handleCanvasContextMenu);
+      canvas.addEventListener('mousedown', handleCanvasMouseDown);
+      window.addEventListener('mouseup', handleWindowMouseUp);
+      canvas.addEventListener('mousemove', handleCanvasMouseMove);
+      canvas.addEventListener('mouseleave', handleCanvasMouseLeave);
+      canvas.addEventListener('wheel', handleCanvasWheel, {passive: false});
+      canvas.addEventListener('dblclick', handleCanvasDoubleClick);
+    }
+
+    function bindUiHandlers() {
+      document.getElementById('detailClose').addEventListener('click', handleDetailCloseClick);
+      document.getElementById('addBtn').addEventListener('click', handleAddSlotClick);
+      cmdInput.addEventListener('input', handleCommandInput);
+      cmdInput.addEventListener('keydown', handleCommandKeyDown);
+      document.getElementById('confirmOkBtn').addEventListener('click', handleConfirmOkClick);
+      document.getElementById('confirmCancelBtn').addEventListener('click', handleConfirmCancelClick);
+      notifStrip.addEventListener('click', handleNotifStripClick);
+      notifStrip.addEventListener('keydown', handleNotifStripKeyDown);
+      document.addEventListener('keydown', handleKey);
+      window.addEventListener('resize', handleWindowResize);
+    }
+
+    function init() {
+      bindMouseHandlers();
+      bindUiHandlers();
+      updateKbModeBadge();
+      updateCanvasSize();
+      scheduleFrame();
+      void poll();
+      window.setInterval(() => {
+        void poll();
+      }, 5000);
+    }
+
+    init();
   </script>
 </body>
 </html>
