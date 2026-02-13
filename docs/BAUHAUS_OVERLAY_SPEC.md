@@ -124,7 +124,7 @@ Staleness color:
 
 ## 6. Membrane Rendering
 
-`drawBauhausMembrane()` draws a soft DOGE-tinted membrane (`#FFF2CC`) as two wobbled
+`drawBauhausMembrane()` draws a white membrane (`#FFFFFF`) as two wobbled
 filled paths (top and bottom), leaving the channel opening between them.
 
 Wobble:
