@@ -243,6 +243,11 @@ class BotRuntime:
         self._fill_durations_1d: deque[tuple[float, float]] = deque()
         self._partial_open_seen_txids: set[str] = set()
 
+        # Rolling 24h DOGE-equivalent equity snapshots (5-min interval).
+        self._doge_eq_snapshots: deque[tuple[float, float]] = deque()  # (ts, doge_eq)
+        self._doge_eq_snapshot_interval: float = 300.0  # 5 min
+        self._doge_eq_last_snapshot_ts: float = 0.0
+
     # ------------------ Config/State ------------------
 
     def _engine_cfg(self, slot: SlotRuntime) -> sm.EngineConfig:
@@ -313,6 +318,8 @@ class BotRuntime:
             self._partial_fill_cancel_events.popleft()
         while self._fill_durations_1d and self._fill_durations_1d[0][0] < cutoff:
             self._fill_durations_1d.popleft()
+        while self._doge_eq_snapshots and self._doge_eq_snapshots[0][0] < cutoff:
+            self._doge_eq_snapshots.popleft()
 
     def _record_partial_fill_open(self, ts: float | None = None) -> None:
         ts = ts or _now()
@@ -2188,6 +2195,168 @@ class BotRuntime:
 
             notifier._send_message(("OK: " if ok else "ERR: ") + msg)
 
+    # ------------------ DOGE bias scoreboard ------------------
+
+    def _update_doge_eq_snapshot(self, now: float) -> None:
+        if now - self._doge_eq_last_snapshot_ts < self._doge_eq_snapshot_interval:
+            return
+        bal = self._last_balance_snapshot
+        price = self.last_price
+        if not bal or price <= 0:
+            return
+        doge_eq = _doge_balance(bal) + _usd_balance(bal) / price
+        self._doge_eq_snapshots.append((now, doge_eq))
+        self._doge_eq_last_snapshot_ts = now
+
+    def _extract_b_side_gaps(self) -> list[dict]:
+        """Extract gaps between consecutive B-side cycles for opportunity PnL and re-entry lag."""
+        gaps: list[dict] = []
+        price = self.last_price
+        now = _now()
+        for slot in self.slots.values():
+            b_cycles = [c for c in slot.state.completed_cycles if c.trade_id == "B"]
+            b_cycles.sort(key=lambda c: c.cycle)
+            for i in range(len(b_cycles) - 1):
+                prev, nxt = b_cycles[i], b_cycles[i + 1]
+                if prev.exit_time <= 0 or nxt.entry_time <= 0:
+                    continue
+                lag_sec = nxt.entry_time - prev.exit_time
+                gap_start_price = prev.exit_price
+                gap_end_price = nxt.entry_price
+                if gap_start_price <= 0:
+                    continue
+                price_distance_pct = (gap_end_price - gap_start_price) / gap_start_price * 100.0
+                opportunity_usd = (gap_end_price - gap_start_price) * prev.volume
+                gaps.append({
+                    "slot_id": slot.slot_id,
+                    "lag_sec": lag_sec,
+                    "opportunity_usd": opportunity_usd,
+                    "price_distance_pct": price_distance_pct,
+                    "volume": prev.volume,
+                    "gap_start_price": gap_start_price,
+                    "gap_end_price": gap_end_price,
+                    "open": False,
+                })
+            # Detect open gap: last B-cycle exited but no new B entry yet.
+            if b_cycles and b_cycles[-1].exit_time > 0 and price > 0:
+                last = b_cycles[-1]
+                # Check if there's a pending B-side entry order already.
+                has_b_entry = any(
+                    o.trade_id == "B" and o.role == "entry" for o in slot.state.orders
+                )
+                if not has_b_entry:
+                    lag_sec = now - last.exit_time
+                    gap_start_price = last.exit_price
+                    if gap_start_price > 0:
+                        price_distance_pct = (price - gap_start_price) / gap_start_price * 100.0
+                        opportunity_usd = (price - gap_start_price) * last.volume
+                        gaps.append({
+                            "slot_id": slot.slot_id,
+                            "lag_sec": lag_sec,
+                            "opportunity_usd": opportunity_usd,
+                            "price_distance_pct": price_distance_pct,
+                            "volume": last.volume,
+                            "gap_start_price": gap_start_price,
+                            "gap_end_price": price,
+                            "open": True,
+                        })
+        return gaps
+
+    def _compute_doge_bias_scoreboard(self) -> dict | None:
+        bal = self._last_balance_snapshot
+        price = self.last_price
+        if not bal or price <= 0:
+            return None
+        now = _now()
+
+        # --- Metric 1: DOGE-Equivalent Equity ---
+        current_doge_eq = _doge_balance(bal) + _usd_balance(bal) / price
+        doge_eq_change_1h = None
+        doge_eq_change_24h = None
+        sparkline = [v for _, v in self._doge_eq_snapshots]
+
+        for target_ago, attr_name in [(3600, "1h"), (86400, "24h")]:
+            target_ts = now - target_ago
+            best_snap = None
+            best_dist = float("inf")
+            for ts, val in self._doge_eq_snapshots:
+                dist = abs(ts - target_ts)
+                if dist < best_dist and dist < 600:  # 10 min tolerance
+                    best_dist = dist
+                    best_snap = val
+            if best_snap is not None:
+                delta = current_doge_eq - best_snap
+                if attr_name == "1h":
+                    doge_eq_change_1h = delta
+                else:
+                    doge_eq_change_24h = delta
+
+        # --- Metric 2: Idle USD Above Runway ---
+        observed_usd = _usd_balance(bal)
+        usd_committed_buy_orders = 0.0
+        usd_next_entries_estimate = 0.0
+        for slot in self.slots.values():
+            usd_next_entries_estimate += self._slot_order_size_usd(slot)
+            for o in slot.state.orders:
+                if o.txid and o.side == "buy":
+                    usd_committed_buy_orders += o.volume * o.price
+            for r in slot.state.recovery_orders:
+                if r.txid and r.side == "buy":
+                    usd_committed_buy_orders += r.volume * r.price
+        usd_runway_floor = usd_committed_buy_orders + (usd_next_entries_estimate * 1.5)
+        idle_usd = max(0.0, observed_usd - usd_runway_floor)
+        idle_usd_pct = (idle_usd / observed_usd * 100.0) if observed_usd > 0 else 0.0
+
+        # --- Metrics 3 & 4: Opportunity PnL + Re-entry Lag ---
+        gaps = self._extract_b_side_gaps()
+        closed_gaps = [g for g in gaps if not g["open"]]
+        open_gaps = [g for g in gaps if g["open"]]
+
+        # Metric 3: Opportunity PnL
+        total_opportunity_pnl_usd = sum(g["opportunity_usd"] for g in closed_gaps)
+        total_opportunity_pnl_doge = total_opportunity_pnl_usd / price if price > 0 else 0.0
+        open_gap_opportunity_usd = sum(g["opportunity_usd"] for g in open_gaps) if open_gaps else None
+        gap_count = len(closed_gaps)
+        avg_opportunity_per_gap_usd = (total_opportunity_pnl_usd / gap_count) if gap_count > 0 else None
+        worst_missed_usd = max((g["opportunity_usd"] for g in closed_gaps), default=None)
+
+        # Metric 4: Re-entry Lag
+        closed_lags = [g["lag_sec"] for g in closed_gaps]
+        median_reentry_lag_sec = float(median(closed_lags)) if closed_lags else None
+        avg_reentry_lag_sec = (sum(closed_lags) / len(closed_lags)) if closed_lags else None
+        max_reentry_lag_sec = max(closed_lags, default=None)
+        current_open_lag_sec = max((g["lag_sec"] for g in open_gaps), default=None)
+        current_open_lag_price_pct = max(
+            (g["price_distance_pct"] for g in open_gaps), default=None
+        )
+        lag_count = len(closed_lags)
+        closed_price_dists = [g["price_distance_pct"] for g in closed_gaps]
+        median_price_distance_pct = float(median(closed_price_dists)) if closed_price_dists else None
+
+        return {
+            "doge_eq": current_doge_eq,
+            "doge_eq_change_1h": doge_eq_change_1h,
+            "doge_eq_change_24h": doge_eq_change_24h,
+            "doge_eq_sparkline": sparkline,
+            "idle_usd": idle_usd,
+            "idle_usd_pct": idle_usd_pct,
+            "usd_runway_floor": usd_runway_floor,
+            "observed_usd": observed_usd,
+            "total_opportunity_pnl_usd": total_opportunity_pnl_usd,
+            "total_opportunity_pnl_doge": total_opportunity_pnl_doge,
+            "open_gap_opportunity_usd": open_gap_opportunity_usd,
+            "gap_count": gap_count,
+            "avg_opportunity_per_gap_usd": avg_opportunity_per_gap_usd,
+            "worst_missed_usd": worst_missed_usd,
+            "median_reentry_lag_sec": median_reentry_lag_sec,
+            "avg_reentry_lag_sec": avg_reentry_lag_sec,
+            "max_reentry_lag_sec": max_reentry_lag_sec,
+            "current_open_lag_sec": current_open_lag_sec,
+            "current_open_lag_price_pct": current_open_lag_price_pct,
+            "lag_count": lag_count,
+            "median_price_distance_pct": median_price_distance_pct,
+        }
+
     # ------------------ Balance reconciliation ------------------
 
     def _compute_balance_recon(self, total_profit: float, total_unrealized: float) -> dict | None:
@@ -2241,6 +2410,7 @@ class BotRuntime:
         with self.lock:
             now = _now()
             self._trim_rolling_telemetry(now)
+            self._update_doge_eq_snapshot(now)
             slots = []
             total_unrealized_profit = 0.0
             total_active_orders = 0
@@ -2460,6 +2630,7 @@ class BotRuntime:
                     "ledger": self.ledger.snapshot(),
                 },
                 "balance_recon": self._compute_balance_recon(total_profit, total_unrealized_profit),
+                "doge_bias_scoreboard": self._compute_doge_bias_scoreboard(),
                 "slots": slots,
             }
 

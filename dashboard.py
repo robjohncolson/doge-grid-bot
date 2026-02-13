@@ -319,6 +319,19 @@ DASHBOARD_HTML = """<!doctype html>
         <div class=\"row\"><span class=\"k\">Bot P&amp;L</span><span id=\"reconBotPnl\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Drift</span><span id=\"reconDrift\" class=\"v\"></span></div>
         <div id=\"reconDetails\" class=\"tiny\"></div>
+
+        <h3 style=\"margin-top:14px\">DOGE Bias Scoreboard</h3>
+        <div class=\"row\"><span class=\"k\">DOGE Equity</span><span id=\"biasDogeEq\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">1h Change</span><span id=\"biasChange1h\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">24h Change</span><span id=\"biasChange24h\" class=\"v\"></span></div>
+        <div id=\"biasSparkline\" style=\"height:24px;margin:4px 0\"></div>
+        <div class=\"row\"><span class=\"k\">Idle USD</span><span id=\"biasIdleUsd\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Runway Floor</span><span id=\"biasRunway\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Opp. Cost (B-side)</span><span id=\"biasOppCost\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Open Gap</span><span id=\"biasOpenGap\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Re-entry Lag (med)</span><span id=\"biasLagMed\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Current Wait</span><span id=\"biasLagCurrent\" class=\"v\"></span></div>
+        <div id=\"biasDetails\" class=\"tiny\"></div>
       </div>
 
       <div class=\"panel\">
@@ -985,6 +998,73 @@ DASHBOARD_HTML = """<!doctype html>
         reconDriftEl.style.color = recon.status === 'OK' ? '' : 'var(--bad)';
         const ageHrs = recon.baseline_ts ? ((Date.now() / 1000 - recon.baseline_ts) / 3600).toFixed(1) : '?';
         reconDetailsEl.textContent = `baseline age: ${ageHrs}h | threshold: \\u00b1${fmt(recon.threshold_pct, 1)}% | price: $${fmt(recon.price, 5)}`;
+      }
+
+      // DOGE Bias Scoreboard card
+      const bias = s.doge_bias_scoreboard;
+      const bEq = document.getElementById('biasDogeEq');
+      const b1h = document.getElementById('biasChange1h');
+      const b24h = document.getElementById('biasChange24h');
+      const bSpark = document.getElementById('biasSparkline');
+      const bIdle = document.getElementById('biasIdleUsd');
+      const bRunway = document.getElementById('biasRunway');
+      const bOpp = document.getElementById('biasOppCost');
+      const bGap = document.getElementById('biasOpenGap');
+      const bLagM = document.getElementById('biasLagMed');
+      const bLagC = document.getElementById('biasLagCurrent');
+      const bDet = document.getElementById('biasDetails');
+      if (!bias) {
+        [bEq, b1h, b24h, bIdle, bRunway, bOpp, bGap, bLagM, bLagC].forEach(e => { e.textContent = '-'; e.style.color = ''; });
+        bSpark.innerHTML = '';
+        bDet.textContent = '';
+      } else {
+        bEq.textContent = `${fmt(bias.doge_eq, 1)} DOGE`;
+        const fmtDelta = (v, el) => {
+          if (v == null) { el.textContent = '-'; el.style.color = ''; return; }
+          const sign = v >= 0 ? '+' : '';
+          el.textContent = `${sign}${fmt(v, 1)} DOGE`;
+          el.style.color = v > 0 ? 'var(--good)' : v < 0 ? 'var(--bad)' : '';
+        };
+        fmtDelta(bias.doge_eq_change_1h, b1h);
+        fmtDelta(bias.doge_eq_change_24h, b24h);
+        // Sparkline SVG
+        const pts = bias.doge_eq_sparkline || [];
+        if (pts.length >= 2) {
+          const mn = Math.min(...pts), mx = Math.max(...pts);
+          const range = mx - mn || 1;
+          const w = 280, h = 24;
+          const coords = pts.map((v, i) => `${(i / (pts.length - 1) * w).toFixed(1)},${(h - (v - mn) / range * h).toFixed(1)}`).join(' ');
+          bSpark.innerHTML = `<svg width=\"${w}\" height=\"${h}\" viewBox=\"0 0 ${w} ${h}\"><polyline points=\"${coords}\" fill=\"none\" stroke=\"var(--accent)\" stroke-width=\"1.5\"/></svg>`;
+        } else {
+          bSpark.innerHTML = '';
+        }
+        // Idle USD
+        bIdle.textContent = `$${fmt(bias.idle_usd, 2)} (${fmt(bias.idle_usd_pct, 1)}%)`;
+        bIdle.style.color = bias.idle_usd_pct > 50 ? 'var(--warn)' : '';
+        bRunway.textContent = `$${fmt(bias.usd_runway_floor, 2)}`;
+        // Opportunity PnL
+        if (bias.gap_count === 0 && bias.open_gap_opportunity_usd == null) {
+          bOpp.textContent = '-';
+          bOpp.style.color = '';
+        } else {
+          bOpp.textContent = `$${fmt(bias.total_opportunity_pnl_usd, 2)} (${bias.gap_count} gaps)`;
+          bOpp.style.color = bias.total_opportunity_pnl_usd > 0 ? 'var(--warn)' : bias.total_opportunity_pnl_usd < 0 ? 'var(--good)' : '';
+        }
+        bGap.textContent = bias.open_gap_opportunity_usd != null ? `$${fmt(bias.open_gap_opportunity_usd, 2)}` : '-';
+        bGap.style.color = bias.open_gap_opportunity_usd != null && bias.open_gap_opportunity_usd > 0 ? 'var(--warn)' : '';
+        // Re-entry Lag
+        const fmtSec = (v) => v == null ? '-' : v >= 3600 ? `${(v / 3600).toFixed(1)}h` : v >= 60 ? `${(v / 60).toFixed(1)}m` : `${Math.round(v)}s`;
+        bLagM.textContent = fmtSec(bias.median_reentry_lag_sec);
+        bLagC.textContent = bias.current_open_lag_sec != null
+          ? `${fmtSec(bias.current_open_lag_sec)} (${fmt(bias.current_open_lag_price_pct || 0, 2)}%)`
+          : '-';
+        bLagC.style.color = bias.current_open_lag_sec != null && bias.current_open_lag_sec > 300 ? 'var(--warn)' : '';
+        // Details line
+        const parts = [];
+        if (bias.worst_missed_usd != null) parts.push(`worst miss: $${fmt(bias.worst_missed_usd, 2)}`);
+        if (bias.max_reentry_lag_sec != null) parts.push(`max lag: ${fmtSec(bias.max_reentry_lag_sec)}`);
+        if (bias.median_price_distance_pct != null) parts.push(`med dist: ${fmt(bias.median_price_distance_pct, 2)}%`);
+        bDet.textContent = parts.join(' | ');
       }
     }
 
