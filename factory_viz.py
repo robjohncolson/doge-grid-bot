@@ -534,11 +534,15 @@ FACTORY_HTML = r"""<!doctype html>
         selectedSlotId = null;
         clearBauhausTooltipState();
         renderDetailPanel();
+        enterBauhausFullscreen();
       } else {
         bauhausFillAnims = [];
         bauhausOrphanRepriceAnims.clear();
         clearBauhausTooltipState();
         clearBauhausRenderCaches();
+        bauhausGulletPath = null;
+        bauhausGulletBounds = null;
+        exitBauhausFullscreen();
       }
       saveRenderMode();
       renderNotifStrip();
@@ -571,6 +575,108 @@ FACTORY_HTML = r"""<!doctype html>
     let bauhausLastPriceLineRect = null;
     let bauhausLastCounterRect = null;
     let bauhausSlotFlash = null;
+    let bauhausGulletPath = null;
+    let bauhausGulletBounds = null;
+    let bauhausSparkles = []; // {x, y, freq, phase, opacity, fadingOut, birthMs}
+
+    const BAUHAUS_SHELL_IDS = ['hudTop', 'detailPanel', 'notifStrip', 'statusBar', 'cmdBar', 'cmdSuggestions'];
+
+    function applyBauhausOverlayStyle(el, type) {
+      if (!el) return;
+      el.dataset.bauhausStyled = '1';
+      if (type === 'cmdBar') {
+        el.style.background = BAUHAUS_COLORS.canvas;
+        el.style.borderColor = BAUHAUS_COLORS.structure;
+        el.style.color = BAUHAUS_COLORS.structure;
+        const input = el.querySelector('input');
+        if (input) {
+          input.style.background = '#FFFFFF';
+          input.style.color = BAUHAUS_COLORS.structure;
+          input.style.borderColor = BAUHAUS_COLORS.structure;
+          input.style.fontFamily = 'monospace';
+        }
+        const prefix = el.querySelector('#cmdPrefix');
+        if (prefix) prefix.style.color = BAUHAUS_COLORS.structure;
+      } else if (type === 'cmdSuggestions') {
+        el.style.background = 'none';
+        const items = el.querySelectorAll('.cmd-suggestion');
+        for (const item of items) {
+          item.style.background = BAUHAUS_COLORS.canvas;
+          item.style.borderColor = BAUHAUS_COLORS.structure;
+          item.style.color = BAUHAUS_COLORS.structure;
+        }
+      } else if (type === 'helpModal') {
+        const modal = el.querySelector('.modal');
+        if (modal) {
+          modal.style.background = BAUHAUS_COLORS.canvas;
+          modal.style.borderColor = BAUHAUS_COLORS.structure;
+          modal.style.color = BAUHAUS_COLORS.structure;
+        }
+      } else if (type === 'confirmDialog') {
+        const modal = el.querySelector('.modal');
+        if (modal) {
+          modal.style.background = BAUHAUS_COLORS.canvas;
+          modal.style.borderColor = BAUHAUS_COLORS.structure;
+          modal.style.color = BAUHAUS_COLORS.structure;
+        }
+        // Style the backdrop to be semi-transparent yellow instead of dark
+        el.style.background = 'rgba(244,196,48,0.55)';
+      }
+    }
+
+    function removeBauhausOverlayStyle(el) {
+      if (!el || !el.dataset.bauhausStyled) return;
+      delete el.dataset.bauhausStyled;
+      el.style.background = '';
+      el.style.borderColor = '';
+      el.style.color = '';
+      const input = el.querySelector('input');
+      if (input) {
+        input.style.background = '';
+        input.style.color = '';
+        input.style.borderColor = '';
+        input.style.fontFamily = '';
+      }
+      const prefix = el.querySelector('#cmdPrefix');
+      if (prefix) prefix.style.color = '';
+      const modal = el.querySelector('.modal');
+      if (modal) {
+        modal.style.background = '';
+        modal.style.borderColor = '';
+        modal.style.color = '';
+      }
+      const items = el.querySelectorAll('.cmd-suggestion');
+      for (const item of items) {
+        item.style.background = '';
+        item.style.borderColor = '';
+        item.style.color = '';
+      }
+    }
+
+    function enterBauhausFullscreen() {
+      for (const id of BAUHAUS_SHELL_IDS) {
+        const el = document.getElementById(id);
+        if (el) el.style.display = 'none';
+      }
+      const helpModal = document.getElementById('helpModal');
+      if (helpModal) helpModal.style.display = 'none';
+      const confirmDialog = document.getElementById('confirmDialog');
+      if (confirmDialog) confirmDialog.style.display = 'none';
+      canvas.style.cursor = 'default';
+    }
+
+    function exitBauhausFullscreen() {
+      for (const id of BAUHAUS_SHELL_IDS) {
+        const el = document.getElementById(id);
+        if (el) el.style.display = '';
+      }
+      // Remove Bauhaus styling from interactive overlays
+      removeBauhausOverlayStyle(document.getElementById('cmdBar'));
+      removeBauhausOverlayStyle(document.getElementById('cmdSuggestions'));
+      removeBauhausOverlayStyle(document.getElementById('helpModal'));
+      removeBauhausOverlayStyle(document.getElementById('confirmDialog'));
+      canvas.style.cursor = 'grab';
+    }
 
     function clearBauhausTooltipState() {
       bauhausPinnedTooltip = null;
@@ -586,6 +692,10 @@ FACTORY_HTML = r"""<!doctype html>
       bauhausSlotFlash = null;
       bauhausOrphanMorphAnims.clear();
       bauhausRecoveryDissolveAnims = [];
+      bauhausSparkles = [];
+      bauhausSparklesLastPollMs = 0;
+      bauhausGulletPath = null;
+      bauhausGulletBounds = null;
     }
 
     function diagnose(status) {
@@ -908,15 +1018,32 @@ FACTORY_HTML = r"""<!doctype html>
       suggestions.innerHTML = '';
       currentSuggestions = [];
       suggestionIndex = -1;
+      // Re-hide and de-style in Bauhaus mode
+      if (isBauhausMode()) {
+        bar.style.display = 'none';
+        suggestions.style.display = 'none';
+        removeBauhausOverlayStyle(bar);
+        removeBauhausOverlayStyle(suggestions);
+      }
     }
 
     function closeHelpUi() {
-      document.getElementById('helpModal').hidden = true;
+      const modal = document.getElementById('helpModal');
+      modal.hidden = true;
+      if (isBauhausMode()) {
+        modal.style.display = 'none';
+        removeBauhausOverlayStyle(modal);
+      }
     }
 
     function closeConfirmUi() {
       pendingConfirm = null;
-      document.getElementById('confirmDialog').hidden = true;
+      const dialog = document.getElementById('confirmDialog');
+      dialog.hidden = true;
+      if (isBauhausMode()) {
+        dialog.style.display = 'none';
+        removeBauhausOverlayStyle(dialog);
+      }
     }
 
     function leaveToNormal() {
@@ -1101,8 +1228,13 @@ FACTORY_HTML = r"""<!doctype html>
       closeCommandBarUi();
       closeHelpUi();
       pendingConfirm = {onConfirm};
+      const dialog = document.getElementById('confirmDialog');
       document.getElementById('confirmText').textContent = text;
-      document.getElementById('confirmDialog').hidden = false;
+      if (isBauhausMode()) {
+        dialog.style.display = '';
+        applyBauhausOverlayStyle(dialog, 'confirmDialog');
+      }
+      dialog.hidden = false;
       setKbMode('CONFIRM');
       document.getElementById('confirmOkBtn').focus();
     }
@@ -1185,6 +1317,11 @@ FACTORY_HTML = r"""<!doctype html>
         const row = document.createElement('div');
         row.className = 'cmd-suggestion mono' + (i === suggestionIndex ? ' active' : '');
         row.textContent = ':' + currentSuggestions[i];
+        if (isBauhausMode()) {
+          row.style.background = BAUHAUS_COLORS.canvas;
+          row.style.borderColor = BAUHAUS_COLORS.structure;
+          row.style.color = BAUHAUS_COLORS.structure;
+        }
         el.appendChild(row);
       }
       el.classList.add('open');
@@ -1216,6 +1353,14 @@ FACTORY_HTML = r"""<!doctype html>
       closeConfirmUi();
       const bar = document.getElementById('cmdBar');
       const input = document.getElementById('cmdInput');
+      const suggestions = document.getElementById('cmdSuggestions');
+      // Re-show and restyle in Bauhaus mode
+      if (isBauhausMode()) {
+        bar.style.display = '';
+        suggestions.style.display = '';
+        applyBauhausOverlayStyle(bar, 'cmdBar');
+        applyBauhausOverlayStyle(suggestions, 'cmdSuggestions');
+      }
       bar.classList.add('open');
       input.value = '';
       historyIndex = commandHistory.length;
@@ -1233,7 +1378,12 @@ FACTORY_HTML = r"""<!doctype html>
     function openHelp() {
       closeCommandBarUi();
       closeConfirmUi();
-      document.getElementById('helpModal').hidden = false;
+      const modal = document.getElementById('helpModal');
+      if (isBauhausMode()) {
+        modal.style.display = '';
+        applyBauhausOverlayStyle(modal, 'helpModal');
+      }
+      modal.hidden = false;
       setKbMode('HELP');
     }
 
@@ -1618,12 +1768,19 @@ FACTORY_HTML = r"""<!doctype html>
         };
       }
 
-      if (pointInBox(px, py, bauhausLastPriceLineRect)) {
+      // Hit-test the full gullet path (including funnels) for price-line hover
+      const hitGullet = bauhausGulletPath
+        ? ctx.isPointInPath(bauhausGulletPath, px * dpr, py * dpr)
+        : pointInBox(px, py, bauhausLastPriceLineRect);
+      if (hitGullet) {
         const sides = aggregateBauhausCapitalDoge(statusData);
+        const cfh = (statusData && statusData.capacity_fill_health) || {};
         const text = 'Price $' + fmt(statusData.price, 6)
           + ' | age ' + Math.round(Number(statusData.price_age_sec || 0)) + 's'
           + ' | DOGE sell ' + fmt(sides.sell, 3)
-          + ' / buy ' + fmt(sides.buy, 3);
+          + ' / buy ' + fmt(sides.buy, 3)
+          + (cfh.open_orders_current != null ? ' | cap ' + cfh.open_orders_current + '/' + (cfh.open_orders_safe_cap || '?') : '')
+          + (cfh.status_band ? ' | band ' + cfh.status_band : '');
         return {
           type: 'price_line',
           key: 'price-line',
@@ -1772,24 +1929,19 @@ FACTORY_HTML = r"""<!doctype html>
 
     function computeBauhausLayout(status) {
       const slots = Array.isArray(status && status.slots) ? status.slots : [];
-      const pad = 18;
-      const frameStroke = clamp(Math.round(Math.min(viewportW, viewportH) * 0.012), 8, 12);
-      const outer = {
-        x: pad,
-        y: pad,
-        w: Math.max(140, viewportW - pad * 2),
-        h: Math.max(100, viewportH - pad * 2)
+      // Membrane inset from viewport edges
+      const membranePad = 24;
+      const membrane = {
+        x: membranePad,
+        y: membranePad,
+        w: Math.max(140, viewportW - membranePad * 2),
+        h: Math.max(100, viewportH - membranePad * 2)
       };
-      const inner = {
-        x: outer.x + frameStroke,
-        y: outer.y + frameStroke,
-        w: Math.max(100, outer.w - frameStroke * 2),
-        h: Math.max(80, outer.h - frameStroke * 2)
-      };
-      const priceY = inner.y + inner.h * 0.5;
+      const centerY = viewportH * 0.5;
 
-      const sidePad = Math.max(24, Math.round(inner.w * 0.04));
-      const usableW = Math.max(120, inner.w - sidePad * 2);
+      // Slot sizing (unchanged logic)
+      const sidePad = Math.max(24, Math.round(membrane.w * 0.04));
+      const usableW = Math.max(120, membrane.w - sidePad * 2);
       let slotW = slots.length <= 10 ? 80 : (slots.length <= 20 ? 50 : 40);
       let slotH = slots.length <= 10 ? 40 : (slots.length <= 20 ? 28 : 24);
       if (slots.length > 0) {
@@ -1807,8 +1959,8 @@ FACTORY_HTML = r"""<!doctype html>
         gap = Math.max(2, gap);
       }
       const usedW = totalSlotW + gap * Math.max(0, slots.length - 1);
-      const startX = inner.x + sidePad + Math.max(0, Math.floor((usableW - usedW) * 0.5));
-      const slotY = priceY - slotH * 0.5;
+      const startX = membrane.x + sidePad + Math.max(0, Math.floor((usableW - usedW) * 0.5));
+      const slotY = centerY - slotH * 0.5;
 
       const positions = [];
       for (let i = 0; i < slots.length; i += 1) {
@@ -1821,14 +1973,26 @@ FACTORY_HTML = r"""<!doctype html>
         });
       }
 
+      // Funnel geometry: membrane left/right edges, and channel half-height
+      const membraneLeft = membrane.x;
+      const membraneRight = membrane.x + membrane.w;
+
       return {
-        outer,
-        inner,
-        frameStroke,
-        frameRadius: 16,
-        innerRadius: 12,
-        priceY,
-        positions
+        // Legacy aliases — downstream code references these
+        outer: membrane,
+        inner: membrane,
+        frameStroke: 0,
+        frameRadius: 0,
+        innerRadius: 0,
+        priceY: centerY,
+        positions,
+        // New fields for gullet/membrane rendering
+        membrane,
+        membraneLeft,
+        membraneRight,
+        centerY,
+        canvasW: viewportW,
+        canvasH: viewportH
       };
     }
 
@@ -1981,20 +2145,17 @@ FACTORY_HTML = r"""<!doctype html>
       const rect = getBauhausCounterRect(layoutView);
       const shown = formatBauhausProfitText(bauhausProfitDisplayed === null ? bauhausProfitTarget : bauhausProfitDisplayed);
       const text = 'Ð ' + shown;
-      const padX = 8;
+      const padX = 0;
       const glyphH = rect.h - 10;
       const digitW = Math.round(glyphH * 0.62);
       const prefixW = Math.round(glyphH * 0.68);
       const dotW = Math.max(4, Math.round(digitW * 0.35));
       const gap = 3;
 
-      ctx.fillStyle = BAUHAUS_COLORS.structure;
-      roundRect(rect.x, rect.y, rect.w, rect.h, 6);
-      ctx.fill();
-
+      // No background box — digits float directly on yellow
       let cx = rect.x + padX;
-      const onColor = '#f5f5f5';
-      const offColor = 'rgba(255,255,255,0.15)';
+      const onColor = BAUHAUS_COLORS.structure;   // black on yellow
+      const offColor = 'rgba(0,0,0,0.06)';        // ghost outlines
       for (let i = 0; i < text.length; i += 1) {
         const ch = text[i];
         if (ch === ' ') {
@@ -2069,7 +2230,7 @@ FACTORY_HTML = r"""<!doctype html>
         const alpha = 1 - progress * 0.65;
         const rgb = flight.fromRecovery
           ? '128,128,128'
-          : (flight.delta >= 0 ? '0,0,0' : '80,0,0');
+          : (flight.delta >= 0 ? '43,27,23' : '139,0,0');
         const count = 8;
         for (let i = 0; i < count; i += 1) {
           const u = seededUnit(flight.seed, i + 30);
@@ -2078,7 +2239,7 @@ FACTORY_HTML = r"""<!doctype html>
           const px = x + Math.cos(a) * r;
           const py = y + Math.sin(a) * r;
           ctx.fillStyle = 'rgba(' + rgb + ',' + alpha.toFixed(3) + ')';
-          ctx.fillRect(Math.round(px), Math.round(py), 2, 2);
+          ctx.fillRect(Math.round(px), Math.round(py), 3, 3);
         }
 
         if (progress >= 1 && !flight.applied) {
@@ -2102,75 +2263,309 @@ FACTORY_HTML = r"""<!doctype html>
       }
     }
 
+    function buildGulletPath(layoutView, channelHalfTop, channelHalfBot) {
+      const cw = layoutView.canvasW;
+      const ch = layoutView.canvasH;
+      const cy = layoutView.centerY;
+      const ml = layoutView.membraneLeft;
+      const mr = layoutView.membraneRight;
+      const ht = Math.max(1, channelHalfTop);
+      const hb = Math.max(1, channelHalfBot);
+
+      const path = new Path2D();
+
+      // TOP edge: left-to-right
+      // Start at top-left corner of canvas
+      path.moveTo(0, 0);
+      // Funnel from full canvas height down to narrow channel at left membrane edge
+      path.bezierCurveTo(
+        ml * 0.3, 0,
+        ml * 0.7, cy - ht,
+        ml, cy - ht
+      );
+      // Straight across the narrow channel top through the membrane
+      path.lineTo(mr, cy - ht);
+      // Funnel back up to full canvas height at right edge
+      path.bezierCurveTo(
+        mr + (cw - mr) * 0.3, cy - ht,
+        mr + (cw - mr) * 0.7, 0,
+        cw, 0
+      );
+
+      // Right edge down
+      path.lineTo(cw, ch);
+
+      // BOTTOM edge: right-to-left (mirror)
+      path.bezierCurveTo(
+        mr + (cw - mr) * 0.7, ch,
+        mr + (cw - mr) * 0.3, cy + hb,
+        mr, cy + hb
+      );
+      path.lineTo(ml, cy + hb);
+      path.bezierCurveTo(
+        ml * 0.7, cy + hb,
+        ml * 0.3, ch,
+        0, ch
+      );
+
+      path.closePath();
+      return path;
+    }
+
+    function drawBauhausGullet(layoutView, channelHalfTop, channelHalfBot, staleLevel) {
+      // staleLevel: 0 = fresh black, 1 = fully stale grey
+      const lightness = Math.round(staleLevel * 36);
+      const fillColor = 'hsl(0 0% ' + lightness + '%)';
+
+      const path = buildGulletPath(layoutView, channelHalfTop, channelHalfBot);
+      bauhausGulletPath = path;
+
+      // Compute bounds for sparkle rejection sampling
+      const ml = layoutView.membraneLeft;
+      const mr = layoutView.membraneRight;
+      const cy = layoutView.centerY;
+      const ht = Math.max(1, channelHalfTop);
+      const hb = Math.max(1, channelHalfBot);
+      bauhausGulletBounds = {
+        x: ml,
+        y: cy - ht,
+        w: mr - ml,
+        h: ht + hb
+      };
+
+      ctx.fillStyle = fillColor;
+      ctx.fill(path);
+
+      return path;
+    }
+
+    function membraneWobble(position, seed) {
+      // Seeded 1D noise: deterministic wobble ±3px from straight line
+      // position: 0-1 along the edge, seed: different per edge
+      const s = (position * 127.1 + seed * 311.7) % 1.0;
+      const n = Math.sin(s * 6283.185) * 43758.5453;
+      return (n - Math.floor(n) - 0.5) * 6; // ±3px
+    }
+
+    function drawBauhausMembrane(layoutView, channelHalfTop, channelHalfBot) {
+      const m = layoutView.membrane;
+      const cy = layoutView.centerY;
+      const ht = Math.max(1, channelHalfTop);
+      const hb = Math.max(1, channelHalfBot);
+      const step = 12; // wobble sample every 12px
+
+      ctx.fillStyle = BAUHAUS_COLORS.canvas;
+
+      // Top membrane section: wobbled perimeter path
+      // Path: along top edge (left to right with wobble), down right edge with wobble,
+      // across bottom at channel top (straight), up left edge with wobble
+      ctx.beginPath();
+      // Top edge: left to right, wobble outward (upward = negative y offset)
+      const topEdgeY = m.y;
+      const botChannelY = cy - ht;
+      ctx.moveTo(m.x + membraneWobble(0, 1), topEdgeY + membraneWobble(0, 2));
+      for (let px = step; px <= m.w; px += step) {
+        const t = px / m.w;
+        ctx.lineTo(m.x + px + membraneWobble(t, 1), topEdgeY + membraneWobble(t, 2));
+      }
+      // Right edge: top to channel-top, wobble outward (rightward = positive x offset)
+      const rightX = m.x + m.w;
+      const topH = Math.max(0, botChannelY - topEdgeY);
+      for (let py = 0; py <= topH; py += step) {
+        const t = py / Math.max(1, topH);
+        ctx.lineTo(rightX + membraneWobble(t, 3), topEdgeY + py);
+      }
+      // Bottom of top section: straight across at channel top (no wobble — this is the gullet edge)
+      ctx.lineTo(rightX, botChannelY);
+      ctx.lineTo(m.x, botChannelY);
+      // Left edge: channel-top back to top, wobble outward (leftward = negative x offset)
+      for (let py = topH; py >= 0; py -= step) {
+        const t = py / Math.max(1, topH);
+        ctx.lineTo(m.x + membraneWobble(t, 4), topEdgeY + py);
+      }
+      ctx.closePath();
+      ctx.fill();
+
+      // Bottom membrane section: wobbled perimeter path
+      const topChannelY = cy + hb;
+      const botEdgeY = m.y + m.h;
+      const botH = Math.max(0, botEdgeY - topChannelY);
+      ctx.beginPath();
+      // Top of bottom section: straight across at channel bottom (gullet edge)
+      ctx.moveTo(m.x, topChannelY);
+      ctx.lineTo(rightX, topChannelY);
+      // Right edge: channel-bottom to bottom, wobble outward
+      for (let py = 0; py <= botH; py += step) {
+        const t = py / Math.max(1, botH);
+        ctx.lineTo(rightX + membraneWobble(t, 5), topChannelY + py);
+      }
+      // Bottom edge: right to left, wobble outward (downward = positive y offset)
+      for (let px = m.w; px >= 0; px -= step) {
+        const t = px / m.w;
+        ctx.lineTo(m.x + px + membraneWobble(t, 6), botEdgeY + membraneWobble(t, 7));
+      }
+      // Left edge: bottom back to channel-bottom, wobble outward
+      for (let py = botH; py >= 0; py -= step) {
+        const t = py / Math.max(1, botH);
+        ctx.lineTo(m.x + membraneWobble(t, 8), topChannelY + py);
+      }
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    let bauhausSparklesLastPollMs = 0;
+
+    function rejectionSampleGullet(path, maxAttempts) {
+      // Sample a random point inside the full gullet geometry (including funnels)
+      for (let i = 0; i < maxAttempts; i++) {
+        const x = Math.random() * viewportW;
+        const y = Math.random() * viewportH;
+        if (ctx.isPointInPath(path, x * dpr, y * dpr)) {
+          return {x, y};
+        }
+      }
+      // Fallback: use center of gullet bounds
+      const gb = bauhausGulletBounds;
+      if (gb) return {x: gb.x + Math.random() * gb.w, y: gb.y + Math.random() * gb.h};
+      return {x: viewportW * 0.5, y: viewportH * 0.5};
+    }
+
+    function updateBauhausSparkles(priceAgeSec, nowMs) {
+      if (!bauhausGulletPath) {
+        bauhausSparkles = [];
+        return;
+      }
+      // Only recalculate population on poll (every ~5s), not every frame
+      if (nowMs - bauhausSparklesLastPollMs < 4000 && bauhausSparkles.length > 0) {
+        // Still remove fully faded sparkles each frame
+        bauhausSparkles = bauhausSparkles.filter(function(s) {
+          return !(s.fadingOut && nowMs - s.fadeStartMs > 1000);
+        });
+        return;
+      }
+      bauhausSparklesLastPollMs = nowMs;
+
+      // Estimate gullet area for density calculation (full path including funnels)
+      // Use canvas area × approximate coverage ratio rather than just central strip
+      const gb = bauhausGulletBounds;
+      const centralArea = gb ? gb.w * gb.h : 0;
+      // Funnel area roughly doubles the total gullet area
+      const estimatedArea = centralArea * 2.5;
+      const freshness = priceAgeSec >= 60 ? 0 : Math.max(0, 1 - priceAgeSec / 60);
+      const targetCount = Math.floor((estimatedArea / 400) * freshness);
+
+      // Mark excess sparkles for fadeout
+      let activeCount = 0;
+      for (const s of bauhausSparkles) {
+        if (!s.fadingOut) activeCount++;
+      }
+      if (activeCount > targetCount) {
+        let toRemove = activeCount - targetCount;
+        for (const s of bauhausSparkles) {
+          if (toRemove <= 0) break;
+          if (!s.fadingOut) {
+            s.fadingOut = true;
+            s.fadeStartMs = nowMs;
+            toRemove--;
+          }
+        }
+      }
+
+      // Add new sparkles via rejection sampling against full gullet path
+      let added = 0;
+      while (activeCount < targetCount && added < 40) {
+        const pt = rejectionSampleGullet(bauhausGulletPath, 20);
+        bauhausSparkles.push({
+          x: pt.x, y: pt.y,
+          freq: 1.5 + Math.random() * 2.5,
+          phase: Math.random() * Math.PI * 2,
+          opacity: 0,
+          fadingOut: false,
+          fadeStartMs: 0,
+          birthMs: nowMs
+        });
+        activeCount++;
+        added++;
+      }
+
+      // Remove fully faded sparkles
+      bauhausSparkles = bauhausSparkles.filter(function(s) {
+        return !(s.fadingOut && nowMs - s.fadeStartMs > 1000);
+      });
+    }
+
+    function drawBauhausSparkles(nowMs) {
+      if (!bauhausSparkles.length || !bauhausGulletPath) return;
+      const time = nowMs / 1000;
+
+      ctx.save();
+      ctx.clip(bauhausGulletPath);
+
+      for (const s of bauhausSparkles) {
+        // Sinusoidal twinkle
+        let alpha = 0.3 + 0.6 * (0.5 + 0.5 * Math.sin(time * s.freq * Math.PI * 2 + s.phase));
+
+        // Fade in over 500ms
+        const age = nowMs - s.birthMs;
+        if (age < 500) alpha *= age / 500;
+
+        // Fade out over 1000ms
+        if (s.fadingOut) {
+          const fadeProgress = clamp((nowMs - s.fadeStartMs) / 1000, 0, 1);
+          alpha *= 1 - fadeProgress;
+        }
+
+        if (alpha < 0.02) continue;
+        ctx.fillStyle = 'rgba(255,255,255,' + clamp(alpha, 0, 0.9).toFixed(3) + ')';
+        ctx.fillRect(Math.round(s.x), Math.round(s.y), 1, 1);
+      }
+
+      ctx.restore();
+    }
+
     function drawBauhausFrame(layoutView) {
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, viewportW, viewportH);
 
+      // Layer 0: White void
       ctx.fillStyle = BAUHAUS_COLORS.void;
       ctx.fillRect(0, 0, viewportW, viewportH);
-
-      ctx.fillStyle = BAUHAUS_COLORS.canvas;
-      roundRect(layoutView.inner.x, layoutView.inner.y, layoutView.inner.w, layoutView.inner.h, layoutView.innerRadius);
-      ctx.fill();
-
-      ctx.strokeStyle = BAUHAUS_COLORS.frame;
-      ctx.lineWidth = layoutView.frameStroke;
-      roundRect(layoutView.outer.x, layoutView.outer.y, layoutView.outer.w, layoutView.outer.h, layoutView.frameRadius);
-      ctx.stroke();
     }
 
     function drawBauhausPriceLine(layoutView, status, nowMs) {
-      const inner = layoutView.inner;
-      const x = inner.x + 14;
-      const w = Math.max(12, inner.w - 28);
       const age = Number(status && status.price_age_sec || 0);
       const visualState = getBauhausVisualState(status);
-      const mode = visualState.mode;
       const stale = age > 60;
-      const dead = stale || mode === 'HALTED' || visualState.halted;
+      const dead = stale || visualState.halted;
 
       const t = computeBauhausSideThicknesses();
-      const yTop = Math.round(layoutView.priceY - t.sellPx);
-      const h = Math.max(2, t.sellPx + t.buyPx);
-      const rect = {
-        x: Math.round(x),
-        y: yTop,
-        w: Math.round(w),
-        h
-      };
+      const channelHalfTop = Math.max(1, t.sellPx);
+      const channelHalfBot = Math.max(1, t.buyPx);
 
-      let lineLightness = 0;
-      if (dead) lineLightness = 36;
-      else if (age > 10) lineLightness = Math.round(((Math.min(age, 60) - 10) / 50) * 24);
-      ctx.fillStyle = 'hsl(0 0% ' + lineLightness + '%)';
-      ctx.fillRect(Math.round(x), yTop, Math.round(w), h);
+      // Compute stale level for gullet color (0 = fresh black, 1 = fully grey)
+      let staleLevel = 0;
+      if (dead) staleLevel = 1;
+      else if (age > 10) staleLevel = (Math.min(age, 60) - 10) / 50;
 
-      if (dead) return rect;
+      // Layer 1: Draw the gullet (black channel with bezier funnels)
+      drawBauhausGullet(layoutView, channelHalfTop, channelHalfBot, staleLevel);
 
-      let speedPxPerMs = 0.16;
-      if (age >= 10 && age < 60) speedPxPerMs = 0.06;
-      speedPxPerMs *= visualState.motionFactor;
-      if (speedPxPerMs <= 0) return rect;
+      // Layer 2: Draw the membrane (yellow, on top of gullet, with channel strip excluded)
+      drawBauhausMembrane(layoutView, channelHalfTop, channelHalfBot);
 
-      const particleCount = clamp(Math.floor(w / 26), 8, 52);
-      const lanes = Math.max(1, h);
-      const sparkleColor = age < 10 ? 'rgba(255,255,255,0.95)' : 'rgba(235,235,235,0.72)';
-
-      ctx.save();
-      ctx.beginPath();
-      ctx.rect(Math.round(x), yTop, Math.round(w), h);
-      ctx.clip();
-
-      ctx.fillStyle = sparkleColor;
-      for (let i = 0; i < particleCount; i += 1) {
-        const phaseOffset = i * (w / particleCount);
-        const sparkX = x + w - ((nowMs * speedPxPerMs + phaseOffset) % w);
-        const lane = (i * 3) % lanes;
-        const sparkY = yTop + lane;
-        ctx.fillRect(Math.round(sparkX), Math.round(sparkY), 1, 1);
+      // Layer 3: Stationary sparkles inside the gullet (clipped to gullet path)
+      if (bauhausGulletBounds && bauhausGulletPath) {
+        updateBauhausSparkles(age, nowMs);
+        drawBauhausSparkles(nowMs);
       }
 
-      ctx.restore();
+      // Return hit-test rect for the price line (the narrow channel in the membrane area)
+      const rect = {
+        x: Math.round(layoutView.membraneLeft),
+        y: Math.round(layoutView.centerY - channelHalfTop),
+        w: Math.round(layoutView.membraneRight - layoutView.membraneLeft),
+        h: Math.max(2, channelHalfTop + channelHalfBot)
+      };
       return rect;
     }
 
@@ -2182,66 +2577,68 @@ FACTORY_HTML = r"""<!doctype html>
       for (const node of positions) {
         const slot = node.slot || {};
         const phase = String(slot.phase || 'S0');
-        const fill = bauhausPhaseColor(phase);
+        const phaseFill = bauhausPhaseColor(phase);
         const isJammed = slotHasEffect(slot.slot_id, 'conveyor_stop');
         const isStarved = slotHasEffect(slot.slot_id, 'machine_dark') || !!slot.long_only || !!slot.short_only;
-        const fillAlpha = clamp(
-          visualState.slotAlpha
-            * (isJammed && phase === 'S2' ? (0.62 + pulse * 0.38) : 1)
-            * (isStarved ? 0.88 : 1),
-          0.2,
-          1
-        );
 
-        if (fill) {
-          ctx.save();
-          ctx.globalAlpha = fillAlpha;
-          ctx.fillStyle = fill;
-          roundRect(node.x + 4, node.y + 4, Math.max(8, node.w - 8), Math.max(8, node.h - 8), 7);
-          ctx.fill();
-          ctx.restore();
+        // Faint phase tint (barely there, alpha 0.12)
+        if (phaseFill) {
+          const tintAlpha = clamp(
+            0.12
+              * visualState.slotAlpha
+              * (isJammed && phase === 'S2' ? (0.62 + pulse * 0.38) : 1)
+              * (isStarved ? 0.88 : 1),
+            0.02,
+            0.2
+          );
+          ctx.globalAlpha = tintAlpha;
+          ctx.fillStyle = phaseFill;
+          ctx.fillRect(node.x, node.y, node.w, node.h);
+          ctx.globalAlpha = 1;
         }
 
+        // Plain strokeRect — no roundRect, no fill, just black 2px outline
         ctx.strokeStyle = BAUHAUS_COLORS.structure;
         ctx.lineWidth = isJammed ? (1.8 + pulse * 1.2) : 2;
         ctx.globalAlpha = clamp(visualState.slotAlpha * (isStarved ? 0.92 : 1), 0.35, 1);
-        roundRect(node.x, node.y, node.w, node.h, 8);
-        ctx.stroke();
+        ctx.strokeRect(node.x, node.y, node.w, node.h);
         ctx.globalAlpha = 1;
 
+        // Phase label — crisp black monospace centered
         const fontPx = node.h >= 34 ? 12 : 10;
         ctx.fillStyle = BAUHAUS_COLORS.structure;
         ctx.globalAlpha = clamp(visualState.slotAlpha * 0.95, 0.35, 1);
-        ctx.font = '700 ' + fontPx + 'px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+        ctx.font = fontPx + 'px monospace';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
         ctx.fillText(phase, node.x + node.w * 0.5, node.y + node.h * 0.5 + 0.5);
         ctx.globalAlpha = 1;
 
+        // Degraded state: small 6px triangle outside the slot on the starved side
         if (slot.long_only || slot.short_only) {
-          const label = slot.long_only ? '[LO]' : '[SO]';
-          const triCx = node.x + node.w - 9;
-          const triCy = node.y + 9;
-          const triAlpha = clamp(0.55 + (isStarved ? pulse * 0.35 : 0), 0.45, 0.9);
-          ctx.fillStyle = 'rgba(0,0,0,' + triAlpha.toFixed(3) + ')';
+          ctx.fillStyle = BAUHAUS_COLORS.structure;
+          ctx.globalAlpha = clamp(0.55 + (isStarved ? pulse * 0.35 : 0), 0.45, 0.9);
           ctx.beginPath();
-          ctx.moveTo(triCx, triCy - 5);
-          ctx.lineTo(triCx - 5, triCy + 4);
-          ctx.lineTo(triCx + 5, triCy + 4);
+          const triCx = node.x + node.w * 0.5;
+          if (slot.long_only) {
+            // Short side starved → ▼ below the slot
+            const triCy = node.y + node.h + 5;
+            ctx.moveTo(triCx, triCy + 6);
+            ctx.lineTo(triCx - 4, triCy);
+            ctx.lineTo(triCx + 4, triCy);
+          } else {
+            // Long side starved → ▲ above the slot
+            const triCy = node.y - 5;
+            ctx.moveTo(triCx, triCy - 6);
+            ctx.lineTo(triCx - 4, triCy);
+            ctx.lineTo(triCx + 4, triCy);
+          }
           ctx.closePath();
           ctx.fill();
-
-          ctx.fillStyle = BAUHAUS_COLORS.canvas;
-          ctx.font = '700 7px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
-          ctx.fillText('!', triCx, triCy + 1);
-
-          ctx.fillStyle = BAUHAUS_COLORS.structure;
-          ctx.font = '700 8px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
-          ctx.textAlign = 'right';
-          ctx.textBaseline = 'alphabetic';
-          ctx.fillText(label, node.x + node.w - 2, node.y + node.h - 2);
+          ctx.globalAlpha = 1;
         }
 
+        // Slot flash (selection glow)
         if (bauhausSlotFlash && bauhausSlotFlash.slotId === slot.slot_id) {
           const t = clamp((nowMs - bauhausSlotFlash.startMs) / bauhausSlotFlash.durationMs, 0, 1);
           const alpha = clamp(1 - t, 0, 1);
@@ -2249,8 +2646,7 @@ FACTORY_HTML = r"""<!doctype html>
             const grow = 2 + t * 6;
             ctx.strokeStyle = 'rgba(255,255,255,' + (0.95 * alpha).toFixed(3) + ')';
             ctx.lineWidth = 2 + (1 - t) * 1.2;
-            roundRect(node.x - grow, node.y - grow, node.w + grow * 2, node.h + grow * 2, 10 + grow);
-            ctx.stroke();
+            ctx.strokeRect(node.x - grow, node.y - grow, node.w + grow * 2, node.h + grow * 2);
           }
         }
 
@@ -2363,11 +2759,11 @@ FACTORY_HTML = r"""<!doctype html>
         const isStarved = slotId !== null && slotHasEffect(slotId, 'machine_dark');
         const lineAlpha = clamp(visualState.orderAlpha * (isStarved ? 0.78 : 1), 0.2, 1);
 
-        if (distToSlot >= 5) {
-          ctx.strokeStyle = isJammed ? 'rgba(120,120,120,0.95)' : '#999999';
+        if (distToSlot >= 6) {
+          ctx.strokeStyle = isJammed ? 'rgba(120,120,120,0.95)' : 'rgba(100,100,100,0.4)';
           ctx.lineWidth = isJammed ? (1.4 + jamPulse * 0.9) : 1;
           ctx.globalAlpha = lineAlpha;
-          if (p.clamped) ctx.setLineDash([2, 2]);
+          if (p.clamped) ctx.setLineDash([3, 3]);
           else ctx.setLineDash([]);
           ctx.beginPath();
           ctx.moveTo(Math.round(anchorX) + 0.5, Math.round(anchorY) + 0.5);
@@ -2516,9 +2912,9 @@ FACTORY_HTML = r"""<!doctype html>
     }
 
     function drawBauhausOrderSquare(x, y, role, alpha) {
-      const size = 6;
-      const sx = Math.round(x - size * 0.5);
-      const sy = Math.round(y - size * 0.5);
+      const size = 7;
+      const sx = Math.round(x - 3);
+      const sy = Math.round(y - 3);
       const kind = String(role || '').toLowerCase();
       const a = clamp(Number(alpha), 0, 1);
       const prevAlpha = ctx.globalAlpha;
@@ -2529,7 +2925,7 @@ FACTORY_HTML = r"""<!doctype html>
         ctx.fillRect(sx, sy, size, size);
         ctx.strokeStyle = BAUHAUS_COLORS.structure;
         ctx.lineWidth = 1;
-        ctx.strokeRect(sx + 0.5, sy + 0.5, size - 1, size - 1);
+        ctx.strokeRect(sx, sy, size, size);
       } else if (kind === 'exit') {
         ctx.fillStyle = BAUHAUS_COLORS.structure;
         ctx.fillRect(sx, sy, size, size);
@@ -2640,9 +3036,11 @@ FACTORY_HTML = r"""<!doctype html>
       const r = clamp(rankNorm, 0, 1);
       const c = clamp(centerNorm, 0, 1);
       const backlogBoost = activeEffects.has('belt_overflow') ? 12 : 0;
-      const hue = 275 - r * 265; // violet -> blue -> green -> yellow -> red
-      const sat = clamp(40 + c * 50 + backlogBoost, 0, 100);   // center desaturated, edge vivid
-      const light = clamp(64 - c * 20 - (backlogBoost > 0 ? 4 : 0), 20, 90);
+      const hue = 270 - r * 270; // violet (270) → cyan (180) → yellow (60) → red (0)
+      // Base saturation 70%, desaturated toward center (multiply by distance from center)
+      const centerDesat = clamp(c, 0.3, 1.0);
+      const sat = clamp(70 * centerDesat + backlogBoost, 0, 100);
+      const light = clamp(50 - (backlogBoost > 0 ? 4 : 0), 20, 90);
       return 'hsl(' + hue.toFixed(1) + ' ' + sat.toFixed(1) + '% ' + light.toFixed(1) + '%)';
     }
 
@@ -2875,19 +3273,27 @@ FACTORY_HTML = r"""<!doctype html>
     }
 
     function drawOrphanPlusSprite(x, y, armColor, alpha) {
-      const px = 2;
+      const px = 3; // 3x scale: each "pixel" is 3x3 real pixels → 15x15 total sprite
       const cx = Math.round(x);
       const cy = Math.round(y);
       ctx.globalAlpha = alpha;
 
+      // Inner ring (adjacent to center) — slightly darker
       ctx.fillStyle = armColor;
-      ctx.fillRect(cx - px, cy, px, px);      // left
-      ctx.fillRect(cx + px, cy, px, px);      // right
-      ctx.fillRect(cx, cy - px, px, px);      // up
-      ctx.fillRect(cx, cy + px, px, px);      // down
+      ctx.fillRect(cx - px, cy, px, px);      // left inner
+      ctx.fillRect(cx + px, cy, px, px);      // right inner
+      ctx.fillRect(cx, cy - px, px, px);      // top inner
+      ctx.fillRect(cx, cy + px, px, px);      // bottom inner
 
+      // Outer arms
+      ctx.fillRect(cx - px * 2, cy, px, px);  // left outer
+      ctx.fillRect(cx + px * 2, cy, px, px);  // right outer
+      ctx.fillRect(cx, cy - px * 2, px, px);  // top outer
+      ctx.fillRect(cx, cy + px * 2, px, px);  // bottom outer
+
+      // Center pixel — black
       ctx.fillStyle = BAUHAUS_COLORS.structure;
-      ctx.fillRect(cx, cy, px, px);           // center
+      ctx.fillRect(cx, cy, px, px);
 
       ctx.globalAlpha = 1;
     }
@@ -2933,8 +3339,8 @@ FACTORY_HTML = r"""<!doctype html>
       }
       const visualState = getBauhausVisualState(status);
       const overflow = activeEffects.has('belt_overflow');
-      const twinkleBase = overflow ? 0.8 : 0.85;
-      const twinkleAmp = overflow ? 0.2 : 0.15;
+      const twinkleBase = 0.5;
+      const twinkleAmp = overflow ? 0.45 : 0.4;
       const twinkleScale = visualState.halted ? 0 : visualState.motionFactor;
       const rendered = [];
 
@@ -2953,9 +3359,9 @@ FACTORY_HTML = r"""<!doctype html>
       ctx.imageSmoothingEnabled = false;
       for (const item of items) {
         const tw = visualState.halted
-          ? 0.72
+          ? 0.5
           : twinkleBase + twinkleAmp * Math.sin((nowMs * twinkleScale / item.twinklePeriodMs) * Math.PI * 2 + item.twinklePhase);
-        const alpha = clamp(tw, visualState.halted ? 0.55 : 0.7, 1.0);
+        const alpha = clamp(tw, visualState.halted ? 0.35 : 0.1, 0.9);
 
         const morph = bauhausOrphanMorphAnims.get(item.key);
         if (morph) {
@@ -3039,6 +3445,60 @@ FACTORY_HTML = r"""<!doctype html>
       return rendered;
     }
 
+    function drawBauhausCanvasNotifStrip(layoutView) {
+      const m = layoutView.membrane;
+      const stripH = 20;
+      const stripY = m.y + m.h - stripH;
+      const stripX = m.x + 10;
+      const stripW = m.w - 20;
+
+      if (!activeSymptoms.length) return;
+
+      const idx = notifIndex >= activeSymptoms.length ? 0 : notifIndex;
+      const top = activeSymptoms[idx];
+      const isIdle = activeSymptoms.length === 1 && top.symptom_id === 'IDLE_NORMAL';
+
+      // Severity dot (4px radius circle)
+      const dotR = 4;
+      const dotX = stripX + dotR;
+      const dotY = stripY + stripH * 0.5;
+      const dotColor = isIdle ? '#1F5F24'
+        : (top.severity === 'crit' ? BAUHAUS_COLORS.alert
+          : (top.severity === 'warn' ? '#B8860B' : '#1F5F24'));
+
+      ctx.beginPath();
+      ctx.arc(dotX, dotY, dotR, 0, Math.PI * 2);
+      ctx.fillStyle = dotColor;
+      ctx.fill();
+
+      // Text
+      ctx.font = '11px monospace';
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = isIdle ? '#1F5F24' : BAUHAUS_COLORS.structure;
+
+      let text;
+      if (isIdle) {
+        text = 'Running';
+      } else {
+        const prefix = activeSymptoms.length > 1 ? '[' + (idx + 1) + '/' + activeSymptoms.length + '] ' : '';
+        text = prefix + top.symptom_id + ': ' + String(top.summary || '');
+      }
+
+      // Clip text to strip width
+      const textX = dotX + dotR + 6;
+      const maxTextW = stripW - (textX - stripX);
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(textX, stripY, maxTextW, stripH);
+      ctx.clip();
+      ctx.fillText(text, textX, dotY);
+      ctx.restore();
+
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+    }
+
     function drawBauhausDiagnosisOverlays(layoutView, status, nowMs) {
       const inner = layoutView.inner;
       const outer = layoutView.outer;
@@ -3046,14 +3506,13 @@ FACTORY_HTML = r"""<!doctype html>
       const hasCircuitSpark = activeEffects.has('circuit_spark');
       const hasRedWash = activeEffects.has('red_wash') || visualState.halted;
 
-      if (visualState.brownout) {
-        ctx.save();
-        ctx.globalCompositeOperation = 'saturation';
-        ctx.fillStyle = 'rgba(128,128,128,' + (visualState.paused ? '0.82' : '0.45') + ')';
+      if (visualState.paused) {
+        // PAUSED: simple grey overlay per spec decision
+        ctx.fillStyle = 'rgba(128,128,128,0.6)';
         ctx.fillRect(inner.x, inner.y, inner.w, inner.h);
-        ctx.restore();
-
-        ctx.fillStyle = 'rgba(244,236,206,' + (visualState.paused ? '0.24' : '0.12') + ')';
+      } else if (visualState.brownout) {
+        // Brownout: lighter desaturation
+        ctx.fillStyle = 'rgba(128,128,128,0.35)';
         ctx.fillRect(inner.x, inner.y, inner.w, inner.h);
       }
 
@@ -3074,11 +3533,37 @@ FACTORY_HTML = r"""<!doctype html>
       }
 
       if (hasCircuitSpark) {
-        const span = Math.max(1, outer.w - 18);
+        // Sparks travel along the wobbled membrane edge
+        const m = layoutView.membrane || outer;
+        const perim = (m.w + m.h) * 2;
+        const span = Math.max(1, perim);
         for (let i = 0; i < 16; i += 1) {
-          const phase = (nowMs * 0.12 + i * 63) % span;
-          const x = outer.x + 9 + phase;
-          const y = i % 2 === 0 ? outer.y + 2 : outer.y + outer.h - 2;
+          const phase = (nowMs * 0.18 + i * (perim / 16)) % span;
+          let x, y;
+          if (phase < m.w) {
+            // Top edge: left to right
+            const t = phase / m.w;
+            x = m.x + phase + membraneWobble(t, 1);
+            y = m.y + membraneWobble(t, 2);
+          } else if (phase < m.w + m.h) {
+            // Right edge: top to bottom
+            const py = phase - m.w;
+            const t = py / m.h;
+            x = m.x + m.w + membraneWobble(t, 3);
+            y = m.y + py;
+          } else if (phase < m.w * 2 + m.h) {
+            // Bottom edge: right to left
+            const px = phase - m.w - m.h;
+            const t = px / m.w;
+            x = m.x + m.w - px + membraneWobble(t, 6);
+            y = m.y + m.h + membraneWobble(t, 7);
+          } else {
+            // Left edge: bottom to top
+            const py = phase - m.w * 2 - m.h;
+            const t = py / m.h;
+            x = m.x + membraneWobble(t, 8);
+            y = m.y + m.h - py;
+          }
           const alpha = 0.45 + 0.4 * Math.abs(Math.sin(nowMs * 0.01 + i * 0.9));
           ctx.fillStyle = i % 3 === 0
             ? 'rgba(139,0,0,' + alpha.toFixed(3) + ')'
@@ -4079,7 +4564,10 @@ FACTORY_HTML = r"""<!doctype html>
       bauhausLastOrphanSprites = drawBauhausOrphans(bauhausLayout, statusData, nowMs) || [];
       drawBauhausProfitFlights(nowMs, statusData);
       bauhausLastCounterRect = drawBauhausProfitCounter(bauhausLayout);
-      drawBauhausDiagnosisOverlays(bauhausLayout, statusData, nowMs);
+      drawBauhausCanvasNotifStrip(bauhausLayout);                     // layer 9
+      drawTooltip();                                                   // layer 10
+      drawBauhausDiagnosisOverlays(bauhausLayout, statusData, nowMs); // layer 11
+      // layer 12: command bar / help / confirm (HTML overlays, rendered by browser on top)
 
       // Preserve slot removal animation anchoring parity across modes.
       lastMachineRectBySlot = {};
@@ -4091,7 +4579,6 @@ FACTORY_HTML = r"""<!doctype html>
           h: rect.h
         };
       }
-      drawTooltip();
     }
 
     function renderCurrentView(nowMs) {
@@ -4497,6 +4984,7 @@ FACTORY_HTML = r"""<!doctype html>
       bindUiHandlers();
       updateKbModeBadge();
       updateCanvasSize();
+      if (isBauhausMode()) enterBauhausFullscreen();
       scheduleFrame();
       void poll();
       window.setInterval(() => {
