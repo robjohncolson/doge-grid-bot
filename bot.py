@@ -1909,6 +1909,88 @@ class BotRuntime:
             msg += f", {failed} failures"
         return True, msg
 
+    def _pnl_audit_summary(self, tolerance: float = 1e-8) -> dict[str, Any]:
+        """Recompute realized P&L from completed cycles."""
+        total_profit_state = 0.0
+        total_profit_cycles = 0.0
+        total_loss_state = 0.0
+        total_loss_cycles = 0.0
+        total_trips_state = 0
+        total_trips_cycles = 0
+        bad_slots: list[str] = []
+
+        for sid in sorted(self.slots.keys()):
+            st = self.slots[sid].state
+            cycle_profit = sum(c.net_profit for c in st.completed_cycles)
+            cycle_loss = sum(-c.net_profit for c in st.completed_cycles if c.net_profit < 0)
+            cycle_trips = len(st.completed_cycles)
+
+            profit_drift = st.total_profit - cycle_profit
+            loss_drift = st.today_realized_loss - cycle_loss
+            trips_drift = st.total_round_trips - cycle_trips
+            if abs(profit_drift) > tolerance or abs(loss_drift) > tolerance or trips_drift != 0:
+                bad_slots.append(f"{sid}(pnl={profit_drift:+.6f},loss={loss_drift:+.6f},trips={trips_drift:+d})")
+
+            total_profit_state += st.total_profit
+            total_profit_cycles += cycle_profit
+            total_loss_state += st.today_realized_loss
+            total_loss_cycles += cycle_loss
+            total_trips_state += st.total_round_trips
+            total_trips_cycles += cycle_trips
+
+        profit_drift = total_profit_state - total_profit_cycles
+        loss_drift = total_loss_state - total_loss_cycles
+        trips_drift = total_trips_state - total_trips_cycles
+        ok = abs(profit_drift) <= tolerance and abs(loss_drift) <= tolerance and trips_drift == 0 and not bad_slots
+        preview = bad_slots[:6]
+        more = max(0, len(bad_slots) - len(preview))
+
+        return {
+            "ok": ok,
+            "tolerance": tolerance,
+            "slot_count": len(self.slots),
+            "slot_mismatch_count": len(bad_slots),
+            "slot_mismatches_preview": preview,
+            "slot_mismatches_more": more,
+            "profit_drift": profit_drift,
+            "loss_drift": loss_drift,
+            "trips_drift": trips_drift,
+            "total_round_trips_state": total_trips_state,
+            "total_round_trips_cycles": total_trips_cycles,
+            "total_profit_state": total_profit_state,
+            "total_profit_cycles": total_profit_cycles,
+            "total_loss_state": total_loss_state,
+            "total_loss_cycles": total_loss_cycles,
+        }
+
+    def _format_pnl_audit_message(self, summary: dict[str, Any]) -> str:
+        if bool(summary.get("ok")):
+            return (
+                "pnl audit OK: "
+                f"slots={int(summary.get('slot_count', 0))} "
+                f"trips={int(summary.get('total_round_trips_state', 0))} "
+                f"profit_drift={float(summary.get('profit_drift', 0.0)):+.8f} "
+                f"loss_drift={float(summary.get('loss_drift', 0.0)):+.8f}"
+            )
+
+        preview = list(summary.get("slot_mismatches_preview", []))
+        details = ", ".join(str(x) for x in preview)
+        more = int(summary.get("slot_mismatches_more", 0))
+        if more > 0:
+            details += f", +{more} more"
+        return (
+            "pnl audit mismatch: "
+            f"profit_drift={float(summary.get('profit_drift', 0.0)):+.8f} "
+            f"loss_drift={float(summary.get('loss_drift', 0.0)):+.8f} "
+            f"trips_drift={int(summary.get('trips_drift', 0)):+d}; "
+            f"slots={details or 'none'}"
+        )
+
+    def audit_pnl(self, tolerance: float = 1e-8) -> tuple[bool, str]:
+        """Recompute realized P&L from completed cycles and report drift."""
+        summary = self._pnl_audit_summary(tolerance=tolerance)
+        return bool(summary.get("ok")), self._format_pnl_audit_message(summary)
+
     def status_text(self) -> str:
         lines = [
             f"mode: {self.mode}",
@@ -2013,6 +2095,7 @@ class BotRuntime:
                     "/soft_close [slot_id recovery_id]\n"
                     "/cancel_stale [min_distance_pct]\n"
                     "/reconcile_drift\n"
+                    "/audit_pnl\n"
                     "/set_entry_pct <value>\n"
                     "/set_profit_pct <value>"
                 )
@@ -2079,6 +2162,8 @@ class BotRuntime:
                 ok, msg = self.remove_slots(count)
             elif head == "/reconcile_drift":
                 ok, msg = self.reconcile_drift()
+            elif head == "/audit_pnl":
+                ok, msg = self.audit_pnl()
             else:
                 ok, msg = False, "unknown command"
 
@@ -2247,6 +2332,7 @@ class BotRuntime:
             pnl_ref_price = self.last_price if self.last_price > 0 else (slots[0]["market_price"] if slots else 0.0)
             total_profit_doge = total_profit / pnl_ref_price if pnl_ref_price > 0 else 0.0
             total_unrealized_doge = total_unrealized_profit / pnl_ref_price if pnl_ref_price > 0 else 0.0
+            pnl_audit = self._pnl_audit_summary()
 
             return {
                 "mode": self.mode,
@@ -2265,6 +2351,17 @@ class BotRuntime:
                 "today_realized_loss": total_loss,
                 "total_round_trips": total_round_trips,
                 "total_orphans": total_orphans,
+                "pnl_audit": {
+                    "ok": bool(pnl_audit.get("ok")),
+                    "message": self._format_pnl_audit_message(pnl_audit),
+                    "tolerance": float(pnl_audit.get("tolerance", 0.0)),
+                    "profit_drift": float(pnl_audit.get("profit_drift", 0.0)),
+                    "loss_drift": float(pnl_audit.get("loss_drift", 0.0)),
+                    "trips_drift": int(pnl_audit.get("trips_drift", 0)),
+                    "slot_mismatch_count": int(pnl_audit.get("slot_mismatch_count", 0)),
+                    "slot_mismatches_preview": list(pnl_audit.get("slot_mismatches_preview", [])),
+                    "slot_mismatches_more": int(pnl_audit.get("slot_mismatches_more", 0)),
+                },
                 "pnl_reference_price": pnl_ref_price,
                 "s2_orphan_after_sec": float(config.S2_ORPHAN_AFTER_SEC),
                 "stale_price_max_age_sec": float(config.STALE_PRICE_MAX_AGE_SEC),
@@ -2320,6 +2417,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         payload = json.dumps(data).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -2422,7 +2522,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     parsed["count"] = int(body.get("count", 1))
                 except (TypeError, ValueError):
                     parsed["count"] = 1
-            elif action in ("pause", "resume", "add_slot", "soft_close_next", "reconcile_drift"):
+            elif action in ("pause", "resume", "add_slot", "soft_close_next", "reconcile_drift", "audit_pnl"):
                 pass
             else:
                 self._send_json({"ok": False, "message": f"unknown action: {action}"}, 400)
@@ -2458,6 +2558,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     ok, msg = _RUNTIME.remove_slots(int(parsed.get("count", 1)))
                 elif action == "reconcile_drift":
                     ok, msg = _RUNTIME.reconcile_drift()
+                elif action == "audit_pnl":
+                    ok, msg = _RUNTIME.audit_pnl()
                 _RUNTIME._save_snapshot()
 
             self._send_json({"ok": bool(ok), "message": str(msg)}, 200 if ok else 400)

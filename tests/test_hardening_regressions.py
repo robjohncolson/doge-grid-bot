@@ -735,6 +735,78 @@ class BotEventLogTests(unittest.TestCase):
         self.assertEqual(payload["s2_orphan_after_sec"], float(config.S2_ORPHAN_AFTER_SEC))
         self.assertEqual(payload["stale_price_max_age_sec"], float(config.STALE_PRICE_MAX_AGE_SEC))
         self.assertEqual(payload["slots"][0]["s2_entered_at"], 900.0)
+        self.assertIn("pnl_audit", payload)
+        self.assertTrue(payload["pnl_audit"]["ok"])
+        self.assertAlmostEqual(payload["pnl_audit"]["profit_drift"], 0.0)
+        self.assertAlmostEqual(payload["pnl_audit"]["loss_drift"], 0.0)
+        self.assertEqual(payload["pnl_audit"]["trips_drift"], 0)
+
+    def test_audit_pnl_ok_when_cycle_totals_match(self):
+        rt = bot.BotRuntime()
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    completed_cycles=(
+                        sm.CycleRecord(
+                            trade_id="A",
+                            cycle=1,
+                            entry_price=0.101,
+                            exit_price=0.099,
+                            volume=13.0,
+                            gross_profit=0.026,
+                            fees=0.001,
+                            net_profit=0.025,
+                            entry_time=900.0,
+                            exit_time=950.0,
+                        ),
+                    ),
+                    total_profit=0.025,
+                    today_realized_loss=0.0,
+                    total_round_trips=1,
+                ),
+            )
+        }
+
+        ok, msg = rt.audit_pnl()
+        self.assertTrue(ok)
+        self.assertIn("pnl audit OK", msg)
+
+    def test_audit_pnl_flags_drift(self):
+        rt = bot.BotRuntime()
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    completed_cycles=(
+                        sm.CycleRecord(
+                            trade_id="B",
+                            cycle=2,
+                            entry_price=0.099,
+                            exit_price=0.101,
+                            volume=13.0,
+                            gross_profit=0.026,
+                            fees=0.001,
+                            net_profit=0.025,
+                            entry_time=900.0,
+                            exit_time=950.0,
+                        ),
+                    ),
+                    total_profit=0.05,
+                    today_realized_loss=0.01,
+                    total_round_trips=2,
+                ),
+            )
+        }
+
+        ok, msg = rt.audit_pnl()
+        self.assertFalse(ok)
+        self.assertIn("pnl audit mismatch", msg)
+        self.assertIn("slots=0(", msg)
 
     def test_partial_fill_open_is_counted_once_per_txid(self):
         rt = bot.BotRuntime()
@@ -832,6 +904,9 @@ class DashboardApiHardeningTests(unittest.TestCase):
         def soft_close_next(self):
             return True, "ok"
 
+        def audit_pnl(self):
+            return True, "audit ok"
+
         def _save_snapshot(self):
             return None
 
@@ -909,6 +984,26 @@ class DashboardApiHardeningTests(unittest.TestCase):
         code, payload = handler.sent[0]
         self.assertEqual(code, 500)
         self.assertEqual(payload, {"ok": False, "message": "internal server error"})
+
+    def test_api_action_audit_pnl_routes_ok(self):
+        bot._RUNTIME = self._RuntimeStub()
+        handler = self._HandlerStub({"action": "audit_pnl"})
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 200)
+        self.assertEqual(payload, {"ok": True, "message": "audit ok"})
+
+    def test_send_json_sets_no_cache_headers(self):
+        handler = self._GetHandlerStub("/api/status")
+        bot.DashboardHandler._send_json(handler, {"ok": True}, 200)
+
+        self.assertEqual(handler.code, 200)
+        self.assertIn(("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0"), handler.headers)
+        self.assertIn(("Pragma", "no-cache"), handler.headers)
+        self.assertIn(("Expires", "0"), handler.headers)
 
     def test_factory_route_serves_html(self):
         handler = self._GetHandlerStub("/factory")

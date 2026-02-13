@@ -296,6 +296,8 @@ DASHBOARD_HTML = """<!doctype html>
         <div class=\"row\"><span class=\"k\">Realized PnL (DOGE eq)</span><span id=\"totalPnlDoge\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Unrealized PnL</span><span id=\"totalUnrealized\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Today Loss</span><span id=\"todayLoss\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">P&amp;L Audit</span><span id=\"pnlAudit\" class=\"v\"></span></div>
+        <div id=\"pnlAuditDetails\" class=\"tiny\"></div>
         <div class=\"row\"><span class=\"k\">Orphans</span><span id=\"orphans\" class=\"v\"></span></div>
 
         <h3 style=\"margin-top:14px\">Capacity &amp; Fill Health</h3>
@@ -370,6 +372,7 @@ DASHBOARD_HTML = """<!doctype html>
 |                                       |
 |  COMMAND BAR                          |
 |  :pause  :resume  :add  :remove N     |
+|  :audit                              |
 |  :set entry N  :set profit N          |
 |  :jump N (slot #)  :q (factory view)  |
 |  Tab=complete  up/down=history  Esc=close |
@@ -404,7 +407,7 @@ DASHBOARD_HTML = """<!doctype html>
     let historyIndex = 0;
     let lastRefreshError = '';
     const commandHistory = [];
-    const COMMAND_COMPLETIONS = ['pause', 'resume', 'add', 'remove', 'close', 'set entry', 'set profit', 'jump', 'q'];
+    const COMMAND_COMPLETIONS = ['pause', 'resume', 'add', 'remove', 'close', 'audit', 'set entry', 'set profit', 'jump', 'q'];
     const CONTROL_INPUT_IDS = new Set(['entryInput', 'profitInput']);
 
     function fmt(n, d=6) {
@@ -549,6 +552,7 @@ DASHBOARD_HTML = """<!doctype html>
       if (verb === 'pause') return {type: 'action', action: 'pause', payload: {}};
       if (verb === 'resume') return {type: 'action', action: 'resume', payload: {}};
       if (verb === 'add') return {type: 'action', action: 'add_slot', payload: {}};
+      if (verb === 'audit') return {type: 'action', action: 'audit_pnl', payload: {}};
       if (verb === 'q') return {type: 'navigate', href: '/factory'};
 
       if (verb === 'jump') {
@@ -873,6 +877,23 @@ DASHBOARD_HTML = """<!doctype html>
       document.getElementById('totalUnrealized').textContent =
         `$${fmt(s.total_unrealized_profit, 6)} (${fmt(s.total_unrealized_doge, 3)} DOGE)`;
       document.getElementById('todayLoss').textContent = `$${fmt(s.today_realized_loss, 4)}`;
+      const pnlAudit = s.pnl_audit || null;
+      const pnlAuditEl = document.getElementById('pnlAudit');
+      const pnlAuditDetailsEl = document.getElementById('pnlAuditDetails');
+      if (pnlAudit && typeof pnlAudit.ok === 'boolean') {
+        pnlAuditEl.textContent = pnlAudit.ok ? 'OK' : 'MISMATCH';
+        pnlAuditEl.style.color = pnlAudit.ok ? 'var(--good)' : 'var(--bad)';
+        const mismatchCount = Number(pnlAudit.slot_mismatch_count || 0);
+        pnlAuditDetailsEl.textContent =
+          `drift pnl=${fmt(pnlAudit.profit_drift, 8)} loss=${fmt(pnlAudit.loss_drift, 8)} trips=${pnlAudit.trips_drift || 0}`
+          + (mismatchCount > 0 ? ` mismatched_slots=${mismatchCount}` : '');
+        pnlAuditDetailsEl.title = String(pnlAudit.message || '');
+      } else {
+        pnlAuditEl.textContent = '-';
+        pnlAuditEl.style.color = '';
+        pnlAuditDetailsEl.textContent = '';
+        pnlAuditDetailsEl.title = '';
+      }
       document.getElementById('orphans').textContent = s.total_orphans;
 
       const cfh = s.capacity_fill_health || {};
