@@ -2237,29 +2237,26 @@ class BotRuntime:
                     "gap_end_price": gap_end_price,
                     "open": False,
                 })
-            # Detect open gap: last B-cycle exited but no new B entry yet.
+            # Detect open gap: last B-cycle exited but no subsequent B entry has filled.
+            # A resting (unfilled) B-entry still leaves capital in USD, so we measure
+            # the gap from the last exit fill to now regardless of pending orders.
             if b_cycles and b_cycles[-1].exit_time > 0 and price > 0:
                 last = b_cycles[-1]
-                # Check if there's a pending B-side entry order already.
-                has_b_entry = any(
-                    o.trade_id == "B" and o.role == "entry" for o in slot.state.orders
-                )
-                if not has_b_entry:
-                    lag_sec = now - last.exit_time
-                    gap_start_price = last.exit_price
-                    if gap_start_price > 0:
-                        price_distance_pct = (price - gap_start_price) / gap_start_price * 100.0
-                        opportunity_usd = (price - gap_start_price) * last.volume
-                        gaps.append({
-                            "slot_id": slot.slot_id,
-                            "lag_sec": lag_sec,
-                            "opportunity_usd": opportunity_usd,
-                            "price_distance_pct": price_distance_pct,
-                            "volume": last.volume,
-                            "gap_start_price": gap_start_price,
-                            "gap_end_price": price,
-                            "open": True,
-                        })
+                lag_sec = now - last.exit_time
+                gap_start_price = last.exit_price
+                if gap_start_price > 0:
+                    price_distance_pct = (price - gap_start_price) / gap_start_price * 100.0
+                    opportunity_usd = (price - gap_start_price) * last.volume
+                    gaps.append({
+                        "slot_id": slot.slot_id,
+                        "lag_sec": lag_sec,
+                        "opportunity_usd": opportunity_usd,
+                        "price_distance_pct": price_distance_pct,
+                        "volume": last.volume,
+                        "gap_start_price": gap_start_price,
+                        "gap_end_price": price,
+                        "open": True,
+                    })
         return gaps
 
     def _compute_doge_bias_scoreboard(self) -> dict | None:
