@@ -1758,7 +1758,8 @@ FACTORY_HTML = r"""<!doctype html>
       }
 
       if (pointInBox(px, py, bauhausLastCounterRect)) {
-        const text = 'Profit $' + fmt(statusData.total_profit, 4)
+        const text = 'Profit Ð' + fmt(statusData.total_profit_doge, 3)
+          + ' ($' + fmt(statusData.total_profit, 4) + ')'
           + ' | cycles ' + String(bauhausCycleCount(statusData));
         return {
           type: 'profit_counter',
@@ -2096,7 +2097,7 @@ FACTORY_HTML = r"""<!doctype html>
       const n = Number(value || 0);
       const safe = Number.isFinite(n) ? n : 0;
       const sign = safe < 0 ? '-' : '';
-      return sign + Math.abs(safe).toFixed(2);
+      return sign + Math.abs(safe).toFixed(3);
     }
 
     function sevenSegActiveSegments(ch) {
@@ -2151,8 +2152,8 @@ FACTORY_HTML = r"""<!doctype html>
       const dotW = Math.max(4, Math.round(digitW * 0.35));
       const gap = 3;
 
-      // No background box — digits float directly on yellow
-      const onColor = BAUHAUS_COLORS.structure;   // black on yellow
+      // No background box — digits float directly on the membrane
+      const onColor = BAUHAUS_COLORS.structure;   // black on light membrane
       const offColor = 'rgba(0,0,0,0.06)';        // ghost outlines
       let cx = rect.x + padX;
 
@@ -2177,6 +2178,64 @@ FACTORY_HTML = r"""<!doctype html>
       return rect;
     }
 
+    function bauhausOrderCurrencySymbol(side) {
+      const s = String(side || '').toLowerCase();
+      if (s === 'sell') return 'Ð';
+      if (s === 'buy') return '$';
+      return '?';
+    }
+
+    function drawBauhausPixelCurrencyGlyph(symbol, x, y, px, color, alpha) {
+      const rows = symbol === 'Ð'
+        ? [
+            '11110',
+            '10001',
+            '10001',
+            '11110',
+            '10001',
+            '10001',
+            '11110'
+          ]
+        : [
+            '01110',
+            '10100',
+            '01110',
+            '00101',
+            '01110',
+            '00101',
+            '11110'
+          ];
+
+      const prevAlpha = ctx.globalAlpha;
+      ctx.globalAlpha = prevAlpha * clamp(Number(alpha), 0, 1);
+      ctx.fillStyle = color;
+
+      for (let row = 0; row < rows.length; row += 1) {
+        const bits = rows[row];
+        for (let col = 0; col < bits.length; col += 1) {
+          if (bits[col] !== '1') continue;
+          ctx.fillRect(
+            Math.round(x + col * px),
+            Math.round(y + row * px),
+            Math.max(1, Math.round(px)),
+            Math.max(1, Math.round(px))
+          );
+        }
+      }
+
+      // Crossbar to read as Dogecoin D-with-stroke instead of plain D.
+      if (symbol === 'Ð') {
+        ctx.fillRect(
+          Math.round(x + px),
+          Math.round(y + px * 3),
+          Math.max(1, Math.round(px * 3)),
+          Math.max(1, Math.round(px))
+        );
+      }
+
+      ctx.globalAlpha = prevAlpha;
+    }
+
     function queueBauhausProfitFlights(events, status, startMs) {
       const list = Array.isArray(events) ? events : [];
       if (!list.length) return;
@@ -2194,8 +2253,13 @@ FACTORY_HTML = r"""<!doctype html>
       for (const evt of list) {
         if (evt.type !== 'cycle_completed') continue;
         const cycle = evt.cycle || {};
-        const delta = Number(cycle.net_profit);
-        if (!Number.isFinite(delta)) continue;
+        const refPriceRaw = Number(status && (status.pnl_reference_price != null
+          ? status.pnl_reference_price
+          : status.price));
+        const refPrice = Number.isFinite(refPriceRaw) && refPriceRaw > 0 ? refPriceRaw : 0;
+        const deltaUsd = Number(cycle.net_profit);
+        const delta = (Number.isFinite(deltaUsd) && refPrice > 0) ? (deltaUsd / refPrice) : 0;
+        if (!Number.isFinite(delta) || Math.abs(delta) < 1e-12) continue;
 
         const node = nodeBySlot[evt.slot_id];
         const fromX = node ? node.x + node.w * 0.5 : (bauhausLayout.inner.x + bauhausLayout.inner.w * 0.5);
@@ -2793,7 +2857,7 @@ FACTORY_HTML = r"""<!doctype html>
         }
 
         const markerAlpha = clamp(visualState.orderAlpha * (isStarved ? 0.84 : 1), 0.22, 1);
-        drawBauhausOrderSquare(p.x, p.y, p.role, markerAlpha);
+        drawBauhausOrderSquare(p.x, p.y, p.role, p.side, markerAlpha);
       }
       return points;
     }
@@ -2913,6 +2977,7 @@ FACTORY_HTML = r"""<!doctype html>
         bauhausFillAnims.push({
           id,
           role,
+          side,
           anchorX,
           anchorY,
           targetX: point.x,
@@ -2930,11 +2995,12 @@ FACTORY_HTML = r"""<!doctype html>
       }
     }
 
-    function drawBauhausOrderSquare(x, y, role, alpha) {
-      const size = 7;
-      const sx = Math.round(x - 3);
-      const sy = Math.round(y - 3);
+    function drawBauhausOrderSquare(x, y, role, side, alpha) {
+      const size = 9;
+      const sx = Math.round(x - size * 0.5);
+      const sy = Math.round(y - size * 0.5);
       const kind = String(role || '').toLowerCase();
+      const symbol = bauhausOrderCurrencySymbol(side);
       const a = clamp(Number(alpha), 0, 1);
       const prevAlpha = ctx.globalAlpha;
       ctx.globalAlpha = Number.isFinite(a) ? a : 1;
@@ -2945,12 +3011,21 @@ FACTORY_HTML = r"""<!doctype html>
         ctx.strokeStyle = BAUHAUS_COLORS.structure;
         ctx.lineWidth = 1;
         ctx.strokeRect(sx, sy, size, size);
+        drawBauhausPixelCurrencyGlyph(symbol, sx + 2, sy + 1, 1, BAUHAUS_COLORS.structure, 1);
       } else if (kind === 'exit') {
         ctx.fillStyle = BAUHAUS_COLORS.structure;
         ctx.fillRect(sx, sy, size, size);
+        ctx.strokeStyle = 'rgba(255,255,255,0.22)';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(sx, sy, size, size);
+        drawBauhausPixelCurrencyGlyph(symbol, sx + 2, sy + 1, 1, '#FFFFFF', 1);
       } else {
         ctx.fillStyle = '#777777';
         ctx.fillRect(sx, sy, size, size);
+        ctx.strokeStyle = BAUHAUS_COLORS.structure;
+        ctx.lineWidth = 1;
+        ctx.strokeRect(sx, sy, size, size);
+        drawBauhausPixelCurrencyGlyph(symbol, sx + 2, sy + 1, 1, BAUHAUS_COLORS.structure, 0.9);
       }
 
       ctx.globalAlpha = prevAlpha;
@@ -2984,11 +3059,11 @@ FACTORY_HTML = r"""<!doctype html>
         ctx.stroke();
 
         if (elapsed < anim.extendMs) {
-          drawBauhausOrderSquare(anim.targetX, anim.targetY, anim.role, 1);
+          drawBauhausOrderSquare(anim.targetX, anim.targetY, anim.role, anim.side, 1);
         } else {
           const shellAlpha = clamp(1 - dissolveP * 1.25, 0, 1);
           if (shellAlpha > 0.02) {
-            drawBauhausOrderSquare(anim.targetX, anim.targetY, anim.role, shellAlpha);
+            drawBauhausOrderSquare(anim.targetX, anim.targetY, anim.role, anim.side, shellAlpha);
           }
 
           const fragmentCount = anim.role === 'exit' ? 12 : 9;
@@ -3251,6 +3326,7 @@ FACTORY_HTML = r"""<!doctype html>
           anchorX,
           anchorY,
           role: chosen ? chosen.role : 'exit',
+          side: chosen ? chosen.side : fallbackSide,
           color: to.color
         });
       }
@@ -3401,7 +3477,13 @@ FACTORY_HTML = r"""<!doctype html>
             ctx.stroke();
           }
           if (squareAlpha > 0.02) {
-            drawBauhausOrderSquare(x, y, morph.role || 'exit', alpha * squareAlpha);
+            drawBauhausOrderSquare(
+              x,
+              y,
+              morph.role || 'exit',
+              morph.side || String(morph.recovery && morph.recovery.side || '').toLowerCase(),
+              alpha * squareAlpha
+            );
           }
           if (plusAlpha > 0.02) {
             drawOrphanPlusSprite(x, y, morph.color || item.color, alpha * plusAlpha);
@@ -4669,7 +4751,7 @@ FACTORY_HTML = r"""<!doctype html>
         statusData = next;
         layout = computeLayout(next);
         updateBauhausThicknessWindow(next);
-        bauhausProfitTarget = Number(next.total_profit || 0);
+        bauhausProfitTarget = Number(next.total_profit_doge || 0);
         if (bauhausProfitDisplayed === null || !Number.isFinite(bauhausProfitDisplayed)) {
           bauhausProfitDisplayed = bauhausProfitTarget;
         }

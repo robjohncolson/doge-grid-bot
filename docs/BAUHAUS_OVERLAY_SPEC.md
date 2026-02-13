@@ -195,10 +195,13 @@ Y positioning:
 - Clamp at `45%` of half membrane height (`BAUHAUS_ORDER_MAX_OFFSET_RATIO=0.45`).
 
 Markers (`drawBauhausOrderSquare`):
-- Size: 7x7.
-- Entry: white fill + black 1px stroke.
-- Exit: solid black.
-- Other: gray.
+- Size: 9x9 badge.
+- Pixel currency glyph by order side:
+  - `sell` -> `Ð`
+  - `buy` -> `$`
+- Entry: white badge + black glyph.
+- Exit: black badge + white glyph (with faint white keyline).
+- Other: gray badge + dark glyph.
 
 Hairlines:
 - Base: `rgba(100,100,100,0.4)`, 1px.
@@ -257,6 +260,7 @@ Orphan animations retained:
 Counter:
 - Top-right within membrane.
 - Plain Dogecoin glyph prefix `Ð`, followed by seven-segment numeric value.
+- Numeric value is DOGE-equivalent realized profit (`total_profit_doge`), shown with 3 decimals.
 - No background box.
 - Lit segments: black.
 - Unlit ghost segments: `rgba(0,0,0,0.06)`.
@@ -357,9 +361,9 @@ Enqueue order in refresh pipeline:
 - `b` toggles mode and hides/restores shell.
 - Gullet is funnel-shaped and clipped sparkles stay inside it.
 - Slots are square outlines with slightly opaque yellow interior and faint phase tint.
-- Order markers are 7x7; clamped lines are dashed `[3,3]`.
+- Order markers are 9x9 currency badges (`Ð`/`$`); clamped lines are dashed `[3,3]`.
 - Orphans render as 3x pixel-plus sprites with ranked color/twinkle.
-- Profit counter has no box and uses ghosted seven-segment digits.
+- Profit counter has no box and uses ghosted seven-segment DOGE-equivalent digits.
 - Canvas notification strip shows severity dot + text.
 - Gullet hover tooltip includes capacity and band.
 - Circuit sparks run along membrane edge.
