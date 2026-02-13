@@ -230,6 +230,10 @@ class BotRuntime:
         self._open_order_drift_alert_active = False
         self._open_order_drift_alert_active_since: float | None = None
 
+        # Auto-soft-close telemetry.
+        self._auto_soft_close_total: int = 0
+        self._auto_soft_close_last_at: float = 0.0
+
         # Rolling 24h fill/partial telemetry.
         self._partial_fill_open_events: deque[float] = deque()
         self._partial_fill_cancel_events: deque[float] = deque()
@@ -1753,9 +1757,11 @@ class BotRuntime:
             repriced += 1
 
         if repriced > 0:
+            self._auto_soft_close_total += repriced
+            self._auto_soft_close_last_at = _now()
             logger.info(
-                "auto_soft_close: repriced %d/%d farthest recoveries (capacity %.0f%% >= %.0f%% threshold)",
-                repriced, len(batch), utilization_pct, cap_threshold,
+                "auto_soft_close: repriced %d/%d farthest recoveries (capacity %.0f%% >= %.0f%% threshold, lifetime %d)",
+                repriced, len(batch), utilization_pct, cap_threshold, self._auto_soft_close_total,
             )
             notifier._send_message(
                 f"<b>Auto soft-close</b>\nCapacity {utilization_pct:.0f}% — "
@@ -2387,6 +2393,9 @@ class BotRuntime:
                     "p95_fill_seconds_1d": p95_fill_seconds_1d,
                     "status_band": status_band,
                     "blocked_risk_hint": blocked_risk_hint,
+                    "auto_soft_close_total": self._auto_soft_close_total,
+                    "auto_soft_close_last_at": self._auto_soft_close_last_at or None,
+                    "auto_soft_close_threshold_pct": float(config.AUTO_SOFT_CLOSE_CAPACITY_PCT),
                 },
                 "balance_health": {
                     "usd_observed": observed_usd_balance,

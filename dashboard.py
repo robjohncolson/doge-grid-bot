@@ -308,6 +308,7 @@ DASHBOARD_HTML = """<!doctype html>
         <div class=\"row\"><span class=\"k\">Partial Open (1d)</span><span id=\"cfhPartialOpen\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Partial Cancel (1d)</span><span id=\"cfhPartialCancel\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Fill Latency (1d)</span><span id=\"cfhFillLatency\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Auto Soft-Close</span><span id=\"cfhAutoClose\" class=\"v\"></span></div>
         <div id=\"cfhHints\" class=\"tiny\"></div>
       </div>
 
@@ -918,6 +919,19 @@ DASHBOARD_HTML = """<!doctype html>
         (med === null || med === undefined || p95 === null || p95 === undefined)
           ? '-'
           : `${Math.round(Number(med))}s / ${Math.round(Number(p95))}s`;
+
+      const autoCloseTotal = cfh.auto_soft_close_total || 0;
+      const autoCloseLastAt = cfh.auto_soft_close_last_at;
+      const autoCloseEl = document.getElementById('cfhAutoClose');
+      if (autoCloseTotal === 0) {
+        autoCloseEl.textContent = 'idle';
+        autoCloseEl.style.color = '';
+      } else {
+        const ago = autoCloseLastAt ? Math.round((Date.now() / 1000) - autoCloseLastAt) : null;
+        const agoText = ago !== null && ago < 300 ? ` (${ago}s ago)` : '';
+        autoCloseEl.textContent = `${autoCloseTotal} repriced${agoText}`;
+        autoCloseEl.style.color = ago !== null && ago < 120 ? 'var(--warn)' : '';
+      }
 
       const hints = Array.isArray(cfh.blocked_risk_hint) ? cfh.blocked_risk_hint : [];
       document.getElementById('cfhHints').textContent = hints.length ? `Hints: ${hints.join(', ')}` : '';
