@@ -2185,55 +2185,21 @@ FACTORY_HTML = r"""<!doctype html>
       return '?';
     }
 
-    function drawBauhausPixelCurrencyGlyph(symbol, x, y, px, color, alpha) {
-      const rows = symbol === 'Ð'
-        ? [
-            '11110',
-            '10001',
-            '10001',
-            '11110',
-            '10001',
-            '10001',
-            '11110'
-          ]
-        : [
-            '01110',
-            '10100',
-            '01110',
-            '00101',
-            '01110',
-            '00101',
-            '11110'
-          ];
-
-      const prevAlpha = ctx.globalAlpha;
-      ctx.globalAlpha = prevAlpha * clamp(Number(alpha), 0, 1);
-      ctx.fillStyle = color;
-
-      for (let row = 0; row < rows.length; row += 1) {
-        const bits = rows[row];
-        for (let col = 0; col < bits.length; col += 1) {
-          if (bits[col] !== '1') continue;
-          ctx.fillRect(
-            Math.round(x + col * px),
-            Math.round(y + row * px),
-            Math.max(1, Math.round(px)),
-            Math.max(1, Math.round(px))
-          );
-        }
-      }
-
-      // Crossbar to read as Dogecoin D-with-stroke instead of plain D.
-      if (symbol === 'Ð') {
-        ctx.fillRect(
-          Math.round(x + px),
-          Math.round(y + px * 3),
-          Math.max(1, Math.round(px * 3)),
-          Math.max(1, Math.round(px))
-        );
-      }
-
-      ctx.globalAlpha = prevAlpha;
+    function drawBauhausCurrencySymbol(symbol, x, y, fillColor, strokeColor, alpha) {
+      const a = clamp(Number(alpha), 0, 1);
+      ctx.save();
+      ctx.globalAlpha = Number.isFinite(a) ? a : 1;
+      ctx.font = '700 12px "Segoe UI Symbol", "Noto Sans Symbols 2", "Noto Sans", sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.strokeStyle = strokeColor;
+      ctx.lineWidth = 2;
+      ctx.lineJoin = 'round';
+      ctx.miterLimit = 2;
+      ctx.strokeText(symbol, x, y + 0.5);
+      ctx.fillStyle = fillColor;
+      ctx.fillText(symbol, x, y + 0.5);
+      ctx.restore();
     }
 
     function queueBauhausProfitFlights(events, status, startMs) {
@@ -2996,39 +2962,16 @@ FACTORY_HTML = r"""<!doctype html>
     }
 
     function drawBauhausOrderSquare(x, y, role, side, alpha) {
-      const size = 9;
-      const sx = Math.round(x - size * 0.5);
-      const sy = Math.round(y - size * 0.5);
       const kind = String(role || '').toLowerCase();
       const symbol = bauhausOrderCurrencySymbol(side);
       const a = clamp(Number(alpha), 0, 1);
-      const prevAlpha = ctx.globalAlpha;
-      ctx.globalAlpha = Number.isFinite(a) ? a : 1;
-
       if (kind === 'entry') {
-        ctx.fillStyle = '#FFFFFF';
-        ctx.fillRect(sx, sy, size, size);
-        ctx.strokeStyle = BAUHAUS_COLORS.structure;
-        ctx.lineWidth = 1;
-        ctx.strokeRect(sx, sy, size, size);
-        drawBauhausPixelCurrencyGlyph(symbol, sx + 2, sy + 1, 1, BAUHAUS_COLORS.structure, 1);
+        drawBauhausCurrencySymbol(symbol, x, y, '#FFFFFF', 'rgba(0,0,0,0.90)', a);
       } else if (kind === 'exit') {
-        ctx.fillStyle = BAUHAUS_COLORS.structure;
-        ctx.fillRect(sx, sy, size, size);
-        ctx.strokeStyle = 'rgba(255,255,255,0.22)';
-        ctx.lineWidth = 1;
-        ctx.strokeRect(sx, sy, size, size);
-        drawBauhausPixelCurrencyGlyph(symbol, sx + 2, sy + 1, 1, '#FFFFFF', 1);
+        drawBauhausCurrencySymbol(symbol, x, y, BAUHAUS_COLORS.structure, 'rgba(255,255,255,0.85)', a);
       } else {
-        ctx.fillStyle = '#777777';
-        ctx.fillRect(sx, sy, size, size);
-        ctx.strokeStyle = BAUHAUS_COLORS.structure;
-        ctx.lineWidth = 1;
-        ctx.strokeRect(sx, sy, size, size);
-        drawBauhausPixelCurrencyGlyph(symbol, sx + 2, sy + 1, 1, BAUHAUS_COLORS.structure, 0.9);
+        drawBauhausCurrencySymbol(symbol, x, y, '#777777', 'rgba(0,0,0,0.75)', a * 0.95);
       }
-
-      ctx.globalAlpha = prevAlpha;
     }
 
     function drawBauhausFillAnimations(nowMs, status) {

@@ -195,13 +195,12 @@ Y positioning:
 - Clamp at `45%` of half membrane height (`BAUHAUS_ORDER_MAX_OFFSET_RATIO=0.45`).
 
 Markers (`drawBauhausOrderSquare`):
-- Size: 9x9 badge.
-- Pixel currency glyph by order side:
+- Unboxed currency symbol marker by order side:
   - `sell` -> `Ð`
   - `buy` -> `$`
-- Entry: white badge + black glyph.
-- Exit: black badge + white glyph (with faint white keyline).
-- Other: gray badge + dark glyph.
+- Entry: white symbol with dark halo.
+- Exit: black symbol with light halo.
+- Other: gray symbol with dark halo.
 
 Hairlines:
 - Base: `rgba(100,100,100,0.4)`, 1px.
@@ -361,7 +360,7 @@ Enqueue order in refresh pipeline:
 - `b` toggles mode and hides/restores shell.
 - Gullet is funnel-shaped and clipped sparkles stay inside it.
 - Slots are square outlines with slightly opaque yellow interior and faint phase tint.
-- Order markers are 9x9 currency badges (`Ð`/`$`); clamped lines are dashed `[3,3]`.
+- Order markers are unboxed currency symbols (`Ð`/`$`); clamped lines are dashed `[3,3]`.
 - Orphans render as 3x pixel-plus sprites with ranked color/twinkle.
 - Profit counter has no box and uses ghosted seven-segment DOGE-equivalent digits.
 - Canvas notification strip shows severity dot + text.
