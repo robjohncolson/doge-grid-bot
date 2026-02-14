@@ -276,6 +276,8 @@ DASHBOARD_HTML = """<!doctype html>
           <button id=\"addSlotBtn\">Add Slot</button>
           <button id=\"removeSlotBtn\" style=\"background:#c0392b\">Remove Slot</button>
           <button id=\"softCloseBtn\">Soft Close</button>
+          <button id=\"reconcileBtn\">Reconcile Drift</button>
+          <button id=\"cancelStaleBtn\">Refresh Recoveries</button>
         </div>
 
         <div style=\"height:10px\"></div>
@@ -429,7 +431,7 @@ DASHBOARD_HTML = """<!doctype html>
 |                                       |
 |  COMMAND BAR                          |
 |  :pause  :resume  :add  :remove N     |
-|  :audit                              |
+|  :audit  :drift  :stale [d] [n]      |
 |  :set entry N  :set profit N          |
 |  :layer add [auto|doge|usd]           |
 |  :layer remove                        |
@@ -467,7 +469,7 @@ DASHBOARD_HTML = """<!doctype html>
     let lastRefreshError = '';
     const commandHistory = [];
     const COMMAND_COMPLETIONS = [
-      'pause', 'resume', 'add', 'remove', 'close', 'audit',
+      'pause', 'resume', 'add', 'remove', 'close', 'audit', 'drift', 'stale',
       'set entry', 'set profit', 'jump', 'layer add', 'layer remove', 'q',
     ];
     const CONTROL_INPUT_IDS = new Set(['entryInput', 'profitInput', 'layerSourceSelect']);
@@ -615,6 +617,26 @@ DASHBOARD_HTML = """<!doctype html>
       if (verb === 'resume') return {type: 'action', action: 'resume', payload: {}};
       if (verb === 'add') return {type: 'action', action: 'add_slot', payload: {}};
       if (verb === 'audit') return {type: 'action', action: 'audit_pnl', payload: {}};
+      if (verb === 'drift') return {type: 'action', action: 'reconcile_drift', payload: {}};
+      if (verb === 'stale') {
+        let minDistancePct = 3.0;
+        let maxBatch = 8;
+        if (tokens.length >= 2) {
+          const dist = Number.parseFloat(tokens[1]);
+          if (!Number.isFinite(dist) || dist <= 0) return {error: 'usage: :stale [min_distance_pct] [max_batch]'};
+          minDistancePct = dist;
+        }
+        if (tokens.length >= 3) {
+          const batch = Number.parseInt(tokens[2], 10);
+          if (!Number.isFinite(batch) || batch < 1 || batch > 20) return {error: 'stale max_batch must be 1..20'};
+          maxBatch = batch;
+        }
+        return {
+          type: 'action',
+          action: 'cancel_stale_recoveries',
+          payload: {min_distance_pct: minDistancePct, max_batch: maxBatch},
+        };
+      }
       if (verb === 'q') return {type: 'navigate', href: '/factory'};
 
       if (verb === 'jump') {
@@ -748,6 +770,24 @@ DASHBOARD_HTML = """<!doctype html>
       openConfirmDialog('Close oldest recovery?', async () => {
         await dispatchAction('soft_close_next');
       });
+    }
+
+    function requestReconcileDrift() {
+      openConfirmDialog('Reconcile drift now? This cancels Kraken-only unknown orders for the active pair.', async () => {
+        await dispatchAction('reconcile_drift');
+      });
+    }
+
+    function requestCancelStaleRecoveries(minDistancePct = 3.0, maxBatch = 8) {
+      openConfirmDialog(
+        `Refresh stale recoveries now? min_distance=${minDistancePct}%, max_batch=${maxBatch}.`,
+        async () => {
+          await dispatchAction('cancel_stale_recoveries', {
+            min_distance_pct: minDistancePct,
+            max_batch: maxBatch,
+          });
+        },
+      );
     }
 
     function requestSoftClose(slotId, recoveryId) {
@@ -1493,6 +1533,8 @@ DASHBOARD_HTML = """<!doctype html>
     document.getElementById('addSlotBtn').onclick = () => { void dispatchAction('add_slot'); };
     document.getElementById('removeSlotBtn').onclick = () => requestRemoveSlot();
     document.getElementById('softCloseBtn').onclick = () => requestSoftCloseNext();
+    document.getElementById('reconcileBtn').onclick = () => requestReconcileDrift();
+    document.getElementById('cancelStaleBtn').onclick = () => requestCancelStaleRecoveries();
     document.getElementById('addLayerBtn').onclick = () => {
       const source = document.getElementById('layerSourceSelect').value || 'AUTO';
       requestAddLayer(source);
