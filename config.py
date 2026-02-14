@@ -290,7 +290,7 @@ STALE_PRICE_MAX_AGE_SEC: int = _env("STALE_PRICE_MAX_AGE_SEC", 60, int)
 
 # Simplified exit lifecycle:
 # - S1 stale exit: orphan after this age when market has moved away.
-S1_ORPHAN_AFTER_SEC: int = _env("S1_ORPHAN_AFTER_SEC", 600, int)   # 10 min
+S1_ORPHAN_AFTER_SEC: int = _env("S1_ORPHAN_AFTER_SEC", 1350, int)  # 22.5 min
 # - S2 deadlock: orphan worse exit after this age.
 S2_ORPHAN_AFTER_SEC: int = _env("S2_ORPHAN_AFTER_SEC", 1800, int)  # 30 min
 
@@ -324,6 +324,13 @@ OPEN_ORDER_SAFETY_RATIO: float = _env("OPEN_ORDER_SAFETY_RATIO", 0.75, float)
 # recovery orders each cycle to prevent hitting the hard order limit.
 AUTO_SOFT_CLOSE_CAPACITY_PCT: float = _env("AUTO_SOFT_CLOSE_CAPACITY_PCT", 95.0, float)
 AUTO_SOFT_CLOSE_BATCH: int = _env("AUTO_SOFT_CLOSE_BATCH", 2, int)
+
+# Auto recovery drain: force-close a small number of recoveries each loop
+# to reduce backlog when above per-slot cap or under capacity pressure.
+AUTO_RECOVERY_DRAIN_ENABLED: bool = _env("AUTO_RECOVERY_DRAIN_ENABLED", True, bool)
+AUTO_RECOVERY_DRAIN_MAX_PER_LOOP: int = _env("AUTO_RECOVERY_DRAIN_MAX_PER_LOOP", 1, int)
+AUTO_RECOVERY_DRAIN_CAPACITY_PCT: float = _env("AUTO_RECOVERY_DRAIN_CAPACITY_PCT", 80.0, float)
+
 OPEN_ORDER_DRIFT_ALERT_THRESHOLD: int = _env("OPEN_ORDER_DRIFT_ALERT_THRESHOLD", 10, int)
 OPEN_ORDER_DRIFT_ALERT_PERSIST_SEC: int = _env("OPEN_ORDER_DRIFT_ALERT_PERSIST_SEC", 600, int)
 OPEN_ORDER_DRIFT_ALERT_COOLDOWN_SEC: int = _env("OPEN_ORDER_DRIFT_ALERT_COOLDOWN_SEC", 1800, int)

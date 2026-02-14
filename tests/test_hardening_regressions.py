@@ -26,6 +26,7 @@ class DogeV1StateMachineTests(unittest.TestCase):
             loss_backoff_start=3,
             loss_cooldown_start=5,
             loss_cooldown_sec=900,
+            max_recovery_slots=2,
         )
 
     def test_s0_invariants_hold(self):
@@ -183,6 +184,91 @@ class DogeV1StateMachineTests(unittest.TestCase):
         st2, actions = sm.transition(st, sm.TimerTick(timestamp=1000.0), cfg, order_size_usd=2.0)
         self.assertEqual(len(st2.recovery_orders), 1)
         self.assertTrue(any(isinstance(x, sm.OrphanOrderAction) for x in actions))
+
+    def test_s1_orphan_enforces_recovery_cap_furthest_then_oldest(self):
+        st = sm.PairState(
+            market_price=101.0,
+            now=1000.0,
+            orders=(
+                sm.OrderState(
+                    local_id=1,
+                    side="buy",
+                    role="exit",
+                    price=100.0,
+                    volume=13.0,
+                    trade_id="A",
+                    cycle=7,
+                    txid="TX-A-EXIT",
+                    entry_price=101.5,
+                    entry_fee=0.02,
+                    entry_filled_at=300.0,
+                ),
+                sm.OrderState(
+                    local_id=2,
+                    side="buy",
+                    role="entry",
+                    price=99.5,
+                    volume=13.0,
+                    trade_id="B",
+                    cycle=4,
+                    txid="TX-B-ENTRY",
+                    placed_at=900.0,
+                ),
+            ),
+            recovery_orders=(
+                sm.RecoveryOrder(
+                    recovery_id=1,
+                    side="sell",
+                    price=101.0,
+                    volume=13.0,
+                    trade_id="B",
+                    cycle=1,
+                    entry_price=105.0,
+                    entry_fee=0.03,
+                    entry_filled_at=60.0,
+                    orphaned_at=100.0,
+                    txid="TX-OLD-1",
+                    reason="s1_timeout",
+                ),
+                sm.RecoveryOrder(
+                    recovery_id=2,
+                    side="sell",
+                    price=102.0,
+                    volume=13.0,
+                    trade_id="B",
+                    cycle=2,
+                    entry_price=106.0,
+                    entry_fee=0.02,
+                    entry_filled_at=120.0,
+                    orphaned_at=200.0,
+                    txid="TX-OLD-2",
+                    reason="s1_timeout",
+                ),
+            ),
+            cycle_a=7,
+            cycle_b=4,
+            next_order_id=3,
+            next_recovery_id=3,
+        )
+        cfg = self._cfg()
+
+        st2, actions = sm.transition(st, sm.TimerTick(timestamp=1000.0), cfg, order_size_usd=2.0)
+
+        self.assertEqual(len(st2.recovery_orders), 2)
+        remaining_ids = {r.recovery_id for r in st2.recovery_orders}
+        self.assertNotIn(2, remaining_ids)
+        self.assertIn(1, remaining_ids)
+        self.assertIn(3, remaining_ids)
+        cancels = [a for a in actions if isinstance(a, sm.CancelOrderAction)]
+        self.assertEqual(len(cancels), 1)
+        self.assertEqual(cancels[0].txid, "TX-OLD-2")
+        self.assertEqual(cancels[0].reason, "recovery_cap_evict_priority")
+        books = [a for a in actions if isinstance(a, sm.BookCycleAction)]
+        self.assertEqual(len(books), 1)
+        self.assertTrue(books[0].from_recovery)
+        self.assertLess(books[0].net_profit, 0.0)
+        self.assertEqual(st2.total_round_trips, 1)
+        self.assertEqual(len(st2.completed_cycles), 1)
 
     def test_s2_timeout_orphans_worse_leg(self):
         st = sm.PairState(
@@ -881,12 +967,16 @@ class BotEventLogTests(unittest.TestCase):
             )
         }
         payload = rt.status_payload()
-        es = payload["capacity_fill_health"]["entry_scheduler"]
+        cfh = payload["capacity_fill_health"]
+        es = cfh["entry_scheduler"]
         self.assertEqual(es["cap_per_loop"], 2)
         self.assertEqual(es["used_this_loop"], 1)
         self.assertEqual(es["pending_entries"], 1)
         self.assertEqual(es["deferred_total"], 5)
         self.assertEqual(es["drained_total"], 3)
+        self.assertIn("auto_recovery_drain_total", cfh)
+        self.assertIn("auto_recovery_drain_last_at", cfh)
+        self.assertIn("auto_recovery_drain_threshold_pct", cfh)
 
     def test_status_payload_exposes_factory_fields(self):
         rt = bot.BotRuntime()
@@ -913,6 +1003,197 @@ class BotEventLogTests(unittest.TestCase):
         self.assertAlmostEqual(payload["pnl_audit"]["loss_drift"], 0.0)
         self.assertEqual(payload["pnl_audit"]["trips_drift"], 0)
 
+    def test_daily_loss_lock_pauses_on_aggregate_utc_threshold(self):
+        rt = bot.BotRuntime()
+        rt.mode = "RUNNING"
+        day_ts = 1704068400.0  # 2024-01-01 00:20:00 UTC
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=day_ts,
+                    completed_cycles=(
+                        sm.CycleRecord(
+                            trade_id="A",
+                            cycle=1,
+                            entry_price=0.1,
+                            exit_price=0.099,
+                            volume=13.0,
+                            gross_profit=-1.6,
+                            fees=0.1,
+                            net_profit=-1.7,
+                            entry_time=day_ts - 1200.0,
+                            exit_time=day_ts - 600.0,
+                        ),
+                    ),
+                ),
+            ),
+            1: bot.SlotRuntime(
+                slot_id=1,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=day_ts,
+                    completed_cycles=(
+                        sm.CycleRecord(
+                            trade_id="B",
+                            cycle=1,
+                            entry_price=0.1,
+                            exit_price=0.101,
+                            volume=13.0,
+                            gross_profit=-1.3,
+                            fees=0.1,
+                            net_profit=-1.4,
+                            entry_time=day_ts - 1100.0,
+                            exit_time=day_ts - 500.0,
+                        ),
+                    ),
+                ),
+            ),
+        }
+
+        with mock.patch.object(config, "DAILY_LOSS_LIMIT", 3.0):
+            daily_loss = rt._update_daily_loss_lock(day_ts)
+
+        self.assertAlmostEqual(daily_loss, 3.1, places=8)
+        self.assertTrue(rt._daily_loss_lock_active)
+        self.assertEqual(rt._daily_loss_lock_utc_day, "2024-01-01")
+        self.assertEqual(rt.mode, "PAUSED")
+        self.assertIn("daily loss limit hit", rt.pause_reason)
+
+    def test_daily_loss_lock_counts_eviction_booked_loss(self):
+        rt = bot.BotRuntime()
+        rt.mode = "RUNNING"
+        now_ts = 1704068400.0  # 2024-01-01 UTC
+        st = sm.PairState(
+            market_price=101.0,
+            now=now_ts,
+            orders=(
+                sm.OrderState(
+                    local_id=1,
+                    side="buy",
+                    role="exit",
+                    price=100.0,
+                    volume=13.0,
+                    trade_id="A",
+                    cycle=9,
+                    txid="TX-A-EXIT",
+                    entry_price=101.5,
+                    entry_fee=0.02,
+                    entry_filled_at=now_ts - 3600.0,
+                ),
+                sm.OrderState(
+                    local_id=2,
+                    side="buy",
+                    role="entry",
+                    price=99.5,
+                    volume=13.0,
+                    trade_id="B",
+                    cycle=5,
+                    txid="TX-B-ENTRY",
+                    placed_at=now_ts - 1800.0,
+                ),
+            ),
+            recovery_orders=(
+                sm.RecoveryOrder(
+                    recovery_id=1,
+                    side="sell",
+                    price=101.0,
+                    volume=13.0,
+                    trade_id="B",
+                    cycle=1,
+                    entry_price=105.0,
+                    entry_fee=0.03,
+                    entry_filled_at=now_ts - 7200.0,
+                    orphaned_at=now_ts - 7000.0,
+                    txid="TX-OLD-1",
+                    reason="s1_timeout",
+                ),
+                sm.RecoveryOrder(
+                    recovery_id=2,
+                    side="sell",
+                    price=102.0,
+                    volume=13.0,
+                    trade_id="B",
+                    cycle=2,
+                    entry_price=106.0,
+                    entry_fee=0.02,
+                    entry_filled_at=now_ts - 6800.0,
+                    orphaned_at=now_ts - 6500.0,
+                    txid="TX-OLD-2",
+                    reason="s1_timeout",
+                ),
+            ),
+            cycle_a=9,
+            cycle_b=5,
+            next_order_id=3,
+            next_recovery_id=3,
+        )
+        rt.slots = {0: bot.SlotRuntime(slot_id=0, state=st)}
+        with mock.patch.object(rt, "_cancel_order"):
+            with mock.patch.object(rt, "_place_order", return_value="TX-NEW"):
+                rt._apply_event(0, sm.TimerTick(timestamp=now_ts), "timer_tick", {})
+
+        self.assertGreater(rt.slots[0].state.today_realized_loss, 0.0)
+        with mock.patch.object(config, "DAILY_LOSS_LIMIT", 0.5):
+            daily_loss = rt._update_daily_loss_lock(now_ts)
+        self.assertGreaterEqual(daily_loss, 0.5)
+        self.assertTrue(rt._daily_loss_lock_active)
+
+    def test_resume_is_blocked_while_daily_loss_lock_active(self):
+        rt = bot.BotRuntime()
+        rt.mode = "PAUSED"
+        rt.pause_reason = "daily loss limit hit: $3.1000 >= $3.0000 (UTC 2024-01-01)"
+        rt._daily_loss_lock_active = True
+        rt._daily_loss_lock_utc_day = "2024-01-01"
+
+        with mock.patch.object(config, "DAILY_LOSS_LIMIT", 3.0):
+            with mock.patch("bot._now", return_value=1704072000.0):  # 2024-01-01 UTC
+                ok, msg = rt.resume()
+
+        self.assertFalse(ok)
+        self.assertIn("daily loss lock active", msg)
+        self.assertEqual(rt.mode, "PAUSED")
+
+    def test_daily_loss_lock_clears_on_utc_rollover_then_manual_resume_works(self):
+        rt = bot.BotRuntime()
+        rt.mode = "PAUSED"
+        rt.pause_reason = "daily loss limit hit: $3.1000 >= $3.0000 (UTC 2024-01-01)"
+        rt._daily_loss_lock_active = True
+        rt._daily_loss_lock_utc_day = "2024-01-01"
+        rt.slots = {}
+
+        with mock.patch.object(config, "DAILY_LOSS_LIMIT", 3.0):
+            rt._update_daily_loss_lock(1704153900.0)  # 2024-01-02 00:05:00 UTC
+            self.assertFalse(rt._daily_loss_lock_active)
+            self.assertIn("cleared at UTC rollover", rt.pause_reason)
+
+            with mock.patch("bot._now", return_value=1704153900.0):
+                ok, msg = rt.resume()
+
+        self.assertTrue(ok)
+        self.assertEqual(msg, "running")
+        self.assertEqual(rt.mode, "RUNNING")
+
+    def test_status_payload_exposes_daily_loss_lock_fields(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        rt._daily_loss_lock_active = True
+        rt._daily_loss_lock_utc_day = "2024-01-01"
+        rt._daily_realized_loss_utc = 3.2
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(market_price=0.1, now=1000.0),
+            )
+        }
+
+        payload = rt.status_payload()
+        self.assertIn("daily_loss_limit", payload)
+        self.assertIn("daily_realized_loss_utc", payload)
+        self.assertIn("daily_loss_lock_active", payload)
+        self.assertIn("daily_loss_lock_utc_day", payload)
+
     def test_status_payload_exposes_capital_layers_and_slot_alias(self):
         rt = bot.BotRuntime()
         rt.last_price = 0.1
@@ -931,6 +1212,97 @@ class BotEventLogTests(unittest.TestCase):
         self.assertIn("target_layers", layers)
         self.assertIn("effective_layers", layers)
         self.assertIn("layer_step_doge_eq", layers)
+
+    def test_auto_drain_recovery_backlog_prefers_furthest_then_oldest(self):
+        rt = bot.BotRuntime()
+        rt.mode = "RUNNING"
+        rt.last_price = 100.0
+        rt._kraken_open_orders_current = 0
+        rt.constraints = {
+            "price_decimals": 6,
+            "volume_decimals": 0,
+            "min_volume": 13.0,
+            "min_cost_usd": 0.0,
+        }
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=100.0,
+                    now=1000.0,
+                    orders=(
+                        sm.OrderState(
+                            local_id=1,
+                            side="sell",
+                            role="entry",
+                            price=100.2,
+                            volume=13.0,
+                            trade_id="A",
+                            cycle=1,
+                            txid="TX-A-ENTRY",
+                            placed_at=999.0,
+                        ),
+                        sm.OrderState(
+                            local_id=2,
+                            side="buy",
+                            role="entry",
+                            price=99.8,
+                            volume=13.0,
+                            trade_id="B",
+                            cycle=1,
+                            txid="TX-B-ENTRY",
+                            placed_at=999.0,
+                        ),
+                    ),
+                    recovery_orders=(
+                        sm.RecoveryOrder(
+                            recovery_id=1,
+                            side="sell",
+                            price=103.0,
+                            volume=13.0,
+                            trade_id="B",
+                            cycle=11,
+                            entry_price=106.0,
+                            entry_fee=0.02,
+                            entry_filled_at=600.0,
+                            orphaned_at=500.0,
+                            txid="TX-REC-1",
+                            reason="s1_timeout",
+                        ),
+                        sm.RecoveryOrder(
+                            recovery_id=2,
+                            side="sell",
+                            price=110.0,
+                            volume=13.0,
+                            trade_id="B",
+                            cycle=12,
+                            entry_price=107.0,
+                            entry_fee=0.03,
+                            entry_filled_at=700.0,
+                            orphaned_at=700.0,
+                            txid="TX-REC-2",
+                            reason="s1_timeout",
+                        ),
+                    ),
+                ),
+            )
+        }
+
+        with mock.patch.object(config, "AUTO_RECOVERY_DRAIN_ENABLED", True):
+            with mock.patch.object(config, "AUTO_RECOVERY_DRAIN_MAX_PER_LOOP", 1):
+                with mock.patch.object(config, "AUTO_RECOVERY_DRAIN_CAPACITY_PCT", 95.0):
+                    with mock.patch.object(config, "MAX_RECOVERY_SLOTS", 1):
+                        with mock.patch.object(rt, "_cancel_order", return_value=True) as cancel_mock:
+                            rt._auto_drain_recovery_backlog()
+
+        cancel_mock.assert_called_once_with("TX-REC-2")
+        remaining = {r.recovery_id for r in rt.slots[0].state.recovery_orders}
+        self.assertIn(1, remaining)
+        self.assertNotIn(2, remaining)
+        self.assertEqual(rt._auto_recovery_drain_total, 1)
+        self.assertEqual(len(rt.slots[0].state.completed_cycles), 1)
+        self.assertTrue(rt.slots[0].state.completed_cycles[0].from_recovery)
+        self.assertGreater(rt.slots[0].state.today_realized_loss, 0.0)
 
     def test_add_layer_auto_accepts_mixed_doge_and_usd(self):
         rt = bot.BotRuntime()
@@ -1112,13 +1484,14 @@ class DashboardApiHardeningTests(unittest.TestCase):
         def __init__(self):
             self.lock = DashboardApiHardeningTests._LockStub()
             self.raise_on_pause = False
+            self.resume_result = (True, "running")
 
         def pause(self, _reason):
             if self.raise_on_pause:
                 raise RuntimeError("boom")
 
         def resume(self):
-            return None
+            return self.resume_result
 
         def add_slot(self):
             return True, "ok"
@@ -1254,6 +1627,19 @@ class DashboardApiHardeningTests(unittest.TestCase):
         code, payload = handler.sent[0]
         self.assertEqual(code, 200)
         self.assertEqual(payload, {"ok": True, "message": "layer ok"})
+
+    def test_api_action_resume_failure_returns_json_400(self):
+        runtime = self._RuntimeStub()
+        runtime.resume_result = (False, "daily loss lock active")
+        bot._RUNTIME = runtime
+        handler = self._HandlerStub({"action": "resume"})
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 400)
+        self.assertEqual(payload, {"ok": False, "message": "daily loss lock active"})
 
     def test_api_action_remove_layer_routes_ok(self):
         bot._RUNTIME = self._RuntimeStub()

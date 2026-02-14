@@ -35,7 +35,7 @@ class EngineConfig:
     min_cost_usd: float = 0.0
     maker_fee_pct: float = 0.25
     stale_price_max_age_sec: float = 60.0
-    s1_orphan_after_sec: float = 600.0
+    s1_orphan_after_sec: float = 1350.0
     s2_orphan_after_sec: float = 1800.0
     loss_backoff_start: int = 3
     loss_cooldown_start: int = 5
@@ -45,6 +45,7 @@ class EngineConfig:
     backoff_max_multiplier: float = 5.0
     max_consecutive_refreshes: int = 3
     refresh_cooldown_sec: float = 300.0
+    max_recovery_slots: int = 2
 
 
 @dataclass(frozen=True)
@@ -73,6 +74,8 @@ class RecoveryOrder:
     cycle: int
     entry_price: float
     orphaned_at: float
+    entry_fee: float = 0.0
+    entry_filled_at: float = 0.0
     txid: str = ""
     reason: str = "stale"
 
@@ -662,6 +665,66 @@ def _orphan_exit(
     actions: list[Action] = []
     st = state
 
+    # Enforce per-slot recovery cap using deterministic priority eviction.
+    # If the cap would be exceeded by this new recovery, cancel/remove first by:
+    # 1) furthest distance from market, 2) oldest orphaned_at, 3) recovery_id.
+    max_recovery_slots = max(1, int(cfg.max_recovery_slots))
+    overflow = max(0, (len(st.recovery_orders) + 1) - max_recovery_slots)
+    if overflow > 0 and st.recovery_orders:
+        market = float(st.market_price)
+
+        def _evict_rank(rec: RecoveryOrder) -> tuple[float, float, int]:
+            if market > 0:
+                dist = abs(float(rec.price) - market) / market
+            else:
+                dist = 0.0
+            return (-dist, float(rec.orphaned_at), int(rec.recovery_id))
+
+        ordered = sorted(st.recovery_orders, key=_evict_rank)
+        evict_ids = {int(r.recovery_id) for r in ordered[:overflow]}
+        kept: list[RecoveryOrder] = []
+        for rec in st.recovery_orders:
+            if int(rec.recovery_id) in evict_ids:
+                if rec.txid:
+                    actions.append(
+                        CancelOrderAction(
+                            local_id=-int(rec.recovery_id),
+                            txid=rec.txid,
+                            reason="recovery_cap_evict_priority",
+                        )
+                    )
+                # Book eviction as a realized recovery cycle so P&L and daily-loss
+                # safety rails stay consistent with what was forcibly closed.
+                fill_price = float(st.market_price if st.market_price > 0 else rec.price)
+                if fill_price <= 0:
+                    fill_price = float(rec.entry_price if rec.entry_price > 0 else 0.0)
+                fill_fee = max(0.0, fill_price * float(rec.volume) * (float(cfg.maker_fee_pct) / 100.0))
+                pseudo_order = OrderState(
+                    local_id=-1,
+                    side=rec.side,
+                    role="exit",
+                    price=rec.price,
+                    volume=rec.volume,
+                    trade_id=rec.trade_id,
+                    cycle=rec.cycle,
+                    entry_price=rec.entry_price,
+                    entry_fee=float(rec.entry_fee),
+                    entry_filled_at=float(rec.entry_filled_at if rec.entry_filled_at > 0 else rec.orphaned_at),
+                )
+                st, cycle_record, book_action = _book_cycle(
+                    st,
+                    pseudo_order,
+                    fill_price,
+                    fill_fee,
+                    st.now,
+                    from_recovery=True,
+                )
+                st = _update_loss_counters(st, rec.trade_id, cycle_record.net_profit, cfg)
+                actions.append(book_action)
+                continue
+            kept.append(rec)
+        st = replace(st, recovery_orders=tuple(kept))
+
     recovery_id = st.next_recovery_id
     recovery = RecoveryOrder(
         recovery_id=recovery_id,
@@ -671,6 +734,8 @@ def _orphan_exit(
         trade_id=order.trade_id,
         cycle=order.cycle,
         entry_price=order.entry_price,
+        entry_fee=order.entry_fee,
+        entry_filled_at=order.entry_filled_at,
         orphaned_at=st.now,
         txid=order.txid,
         reason=reason,
@@ -949,8 +1014,8 @@ def transition(
             trade_id=rec.trade_id,
             cycle=rec.cycle,
             entry_price=rec.entry_price,
-            entry_fee=0.0,
-            entry_filled_at=rec.orphaned_at,
+            entry_fee=rec.entry_fee,
+            entry_filled_at=rec.entry_filled_at if rec.entry_filled_at > 0 else rec.orphaned_at,
         )
         st, cycle_record, book_action = _book_cycle(st, pseudo_order, event.price, event.fee, event.timestamp, from_recovery=True)
         st = _update_loss_counters(st, rec.trade_id, cycle_record.net_profit, cfg)

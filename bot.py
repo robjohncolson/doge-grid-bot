@@ -249,6 +249,8 @@ class BotRuntime:
         # Auto-soft-close telemetry.
         self._auto_soft_close_total: int = 0
         self._auto_soft_close_last_at: float = 0.0
+        self._auto_recovery_drain_total: int = 0
+        self._auto_recovery_drain_last_at: float = 0.0
 
         # Balance reconciliation baseline {usd, doge, ts}.
         self._recon_baseline: dict | None = None
@@ -275,6 +277,11 @@ class BotRuntime:
         self._rebalancer_damped_until: float = 0.0
         self._rebalancer_last_capacity_band: str = "normal"
 
+        # Daily loss lock (aggregate bot-level, UTC day).
+        self._daily_loss_lock_active: bool = False
+        self._daily_loss_lock_utc_day: str = ""
+        self._daily_realized_loss_utc: float = 0.0
+
     # ------------------ Config/State ------------------
 
     def _engine_cfg(self, slot: SlotRuntime) -> sm.EngineConfig:
@@ -297,6 +304,7 @@ class BotRuntime:
             reentry_base_cooldown_sec=float(config.REENTRY_BASE_COOLDOWN_SEC),
             backoff_factor=float(config.ENTRY_BACKOFF_FACTOR),
             backoff_max_multiplier=float(config.ENTRY_BACKOFF_MAX_MULTIPLIER),
+            max_recovery_slots=max(1, int(config.MAX_RECOVERY_SLOTS)),
         )
 
     def _allocate_slot_alias(self, used_aliases: set[str] | None = None) -> str:
@@ -910,6 +918,9 @@ class BotRuntime:
             "entry_adds_drained_total": self._entry_adds_drained_total,
             "entry_adds_last_deferred_at": self._entry_adds_last_deferred_at,
             "entry_adds_last_drained_at": self._entry_adds_last_drained_at,
+            "daily_loss_lock_active": bool(self._daily_loss_lock_active),
+            "daily_loss_lock_utc_day": str(self._daily_loss_lock_utc_day or ""),
+            "daily_realized_loss_utc": float(self._daily_realized_loss_utc),
         }
 
     def _save_local_runtime_snapshot(self, snapshot: dict) -> None:
@@ -996,6 +1007,9 @@ class BotRuntime:
             self._entry_adds_last_drained_at = float(
                 snap.get("entry_adds_last_drained_at", self._entry_adds_last_drained_at)
             )
+            self._daily_loss_lock_active = bool(snap.get("daily_loss_lock_active", self._daily_loss_lock_active))
+            self._daily_loss_lock_utc_day = str(snap.get("daily_loss_lock_utc_day", self._daily_loss_lock_utc_day) or "")
+            self._daily_realized_loss_utc = float(snap.get("daily_realized_loss_utc", self._daily_realized_loss_utc))
             hist = snap.get("rebalancer_sign_flip_history", [])
             cleaned_hist: list[float] = []
             if isinstance(hist, list):
@@ -1228,11 +1242,22 @@ class BotRuntime:
             self.pause_reason = reason
             notifier.notify_risk_event("pause", reason, self.pair_display)
 
-    def resume(self) -> None:
+    def resume(self) -> tuple[bool, str]:
+        self._update_daily_loss_lock(_now())
+        if self._daily_loss_lock_active:
+            msg = (
+                "daily loss lock active "
+                f"(UTC {self._daily_loss_lock_utc_day or self._utc_day_key()}); manual resume available after rollover"
+            )
+            self.pause_reason = msg
+            return False, msg
+        if self.mode == "HALTED":
+            return False, "bot halted"
         self.mode = "RUNNING"
         self.pause_reason = ""
         self.consecutive_api_errors = 0
         notifier.notify_risk_event("resume", "Resumed by operator", self.pair_display)
+        return True, "running"
 
     def halt(self, reason: str) -> None:
         self.mode = "HALTED"
@@ -1288,6 +1313,56 @@ class BotRuntime:
         fee_floor = self.maker_fee_pct * 2.0 + 0.1
         target = max(target, fee_floor)
         return round(target, 4)
+
+    def _utc_day_key(self, ts: float | None = None) -> str:
+        dt = datetime.fromtimestamp(ts if ts is not None else _now(), timezone.utc)
+        return dt.strftime("%Y-%m-%d")
+
+    def _compute_daily_realized_loss_utc(self, now_ts: float | None = None) -> float:
+        now_ts = float(now_ts if now_ts is not None else _now())
+        now_dt = datetime.fromtimestamp(now_ts, timezone.utc)
+        day_start_dt = datetime(now_dt.year, now_dt.month, now_dt.day, tzinfo=timezone.utc)
+        day_start = day_start_dt.timestamp()
+        day_end = day_start + 86400.0
+
+        loss_total = 0.0
+        for slot in self.slots.values():
+            for cycle in slot.state.completed_cycles:
+                exit_ts = float(getattr(cycle, "exit_time", 0.0) or 0.0)
+                if exit_ts <= 0.0 or exit_ts < day_start or exit_ts >= day_end:
+                    continue
+                net = float(getattr(cycle, "net_profit", 0.0) or 0.0)
+                if net < 0.0:
+                    loss_total += -net
+        return loss_total
+
+    def _update_daily_loss_lock(self, now_ts: float | None = None) -> float:
+        now_ts = float(now_ts if now_ts is not None else _now())
+        utc_day = self._utc_day_key(now_ts)
+
+        # Auto-clear at UTC rollover, but require manual operator resume.
+        if self._daily_loss_lock_active and self._daily_loss_lock_utc_day and self._daily_loss_lock_utc_day != utc_day:
+            self._daily_loss_lock_active = False
+            self._daily_loss_lock_utc_day = ""
+            if self.mode == "PAUSED" and str(self.pause_reason).startswith("daily loss limit hit"):
+                self.pause_reason = "daily loss lock cleared at UTC rollover; manual resume required"
+
+        daily_loss = self._compute_daily_realized_loss_utc(now_ts)
+        self._daily_realized_loss_utc = float(daily_loss)
+
+        limit = max(0.0, float(config.DAILY_LOSS_LIMIT))
+        if limit <= 0.0:
+            return daily_loss
+
+        if daily_loss + 1e-12 < limit:
+            return daily_loss
+
+        if not self._daily_loss_lock_active or self._daily_loss_lock_utc_day != utc_day:
+            self._daily_loss_lock_active = True
+            self._daily_loss_lock_utc_day = utc_day
+            reason = f"daily loss limit hit: ${daily_loss:.4f} >= ${limit:.4f} (UTC {utc_day})"
+            self.pause(reason)
+        return daily_loss
 
     # ------------------ Startup/Reconcile ------------------
 
@@ -2414,6 +2489,116 @@ class BotRuntime:
                 f"repriced {repriced} farthest recoveries near market"
             )
 
+    def _auto_drain_recovery_backlog(self) -> None:
+        """Force-close a small number of recoveries to reduce persistent backlog.
+
+        Priority is deterministic: furthest-from-market first, then oldest.
+        """
+        if not bool(config.AUTO_RECOVERY_DRAIN_ENABLED):
+            return
+        if self.last_price <= 0:
+            return
+
+        max_per_loop = max(1, min(int(config.AUTO_RECOVERY_DRAIN_MAX_PER_LOOP), 5))
+        if max_per_loop <= 0:
+            return
+
+        total_recoveries = sum(len(slot.state.recovery_orders) for slot in self.slots.values())
+        if total_recoveries <= 0:
+            return
+
+        slot_count = max(1, len(self.slots))
+        target_total = max(0, int(config.MAX_RECOVERY_SLOTS)) * slot_count
+        excess = max(0, total_recoveries - target_total)
+
+        if self._kraken_open_orders_current is not None:
+            open_current = int(self._kraken_open_orders_current)
+        else:
+            open_current = self._internal_open_order_count()
+        pair_limit = max(1, int(config.KRAKEN_OPEN_ORDERS_PER_PAIR_LIMIT))
+        utilization_pct = open_current / pair_limit * 100.0
+        pressure_threshold = float(config.AUTO_RECOVERY_DRAIN_CAPACITY_PCT)
+        pressure = utilization_pct >= pressure_threshold
+
+        if excess <= 0 and not pressure:
+            return
+
+        drain_target = min(max_per_loop, excess if excess > 0 else total_recoveries)
+        if drain_target <= 0:
+            return
+
+        candidates: list[tuple[float, float, int, int, sm.RecoveryOrder]] = []
+        for sid in sorted(self.slots.keys()):
+            st = self.slots[sid].state
+            for rec in st.recovery_orders:
+                dist = abs(float(rec.price) - float(self.last_price)) / float(self.last_price)
+                candidates.append((-dist, float(rec.orphaned_at), int(rec.recovery_id), sid, rec))
+        if not candidates:
+            return
+        candidates.sort()
+
+        drained = 0
+        now_ts = _now()
+        for _neg_dist, _orphaned_at, _rid, sid, rec in candidates:
+            if drained >= drain_target:
+                break
+            slot = self.slots.get(sid)
+            if not slot:
+                continue
+            live = next((r for r in slot.state.recovery_orders if r.recovery_id == rec.recovery_id), None)
+            if not live:
+                continue
+
+            if live.txid:
+                try:
+                    ok = self._cancel_order(live.txid)
+                    if not ok:
+                        continue
+                except Exception as e:
+                    logger.warning("auto_drain: cancel recovery %s failed: %s", live.txid, e)
+                    continue
+
+            fill_price = float(slot.state.market_price if slot.state.market_price > 0 else self.last_price)
+            if fill_price <= 0:
+                fill_price = float(live.price if live.price > 0 else live.entry_price)
+            if fill_price <= 0:
+                continue
+            fill_fee = max(0.0, fill_price * float(live.volume) * (float(self.maker_fee_pct) / 100.0))
+            ev = sm.RecoveryFillEvent(
+                recovery_id=int(live.recovery_id),
+                txid=str(live.txid or ""),
+                side=live.side,
+                price=fill_price,
+                volume=float(live.volume),
+                fee=fill_fee,
+                timestamp=now_ts,
+            )
+            self._apply_event(
+                sid,
+                ev,
+                "recovery_auto_drain",
+                {
+                    "recovery_id": int(live.recovery_id),
+                    "fill_price": fill_price,
+                    "fill_fee": fill_fee,
+                    "reason": "auto_recovery_drain",
+                },
+            )
+            drained += 1
+
+        if drained > 0:
+            self._auto_recovery_drain_total += drained
+            self._auto_recovery_drain_last_at = now_ts
+            logger.info(
+                "auto_recovery_drain: drained %d recoveries (excess=%d pressure=%s util=%.1f%% target_total=%d lifetime=%d)",
+                drained,
+                excess,
+                pressure,
+                utilization_pct,
+                target_total,
+                self._auto_recovery_drain_total,
+            )
+
     def cancel_stale_recoveries(self, min_distance_pct: float = 3.0, max_batch: int = 8) -> tuple[bool, str]:
         """Bulk soft-close recovery orders farther than min_distance_pct from market.
 
@@ -2672,6 +2857,7 @@ class BotRuntime:
             self._refresh_price(strict=False)
             if self._price_age_sec() > config.STALE_PRICE_MAX_AGE_SEC:
                 self.pause("stale price data > 60s")
+            self._update_daily_loss_lock(_now())
             self._update_rebalancer(_now())
             # Prioritize older deferred entries each loop, while avoiding stale placements
             # that the upcoming price tick is likely to refresh anyway.
@@ -2708,8 +2894,11 @@ class BotRuntime:
             self._drain_pending_entry_orders("entry_scheduler_post_tick", skip_stale=False)
 
             self._poll_order_status()
+            self._update_daily_loss_lock(_now())
             # Refresh pair open-order telemetry (Kraken source of truth) when budget allows.
             self._refresh_open_order_telemetry()
+            # Force-drain a small number of recoveries when backlog/pressure is high.
+            self._auto_drain_recovery_backlog()
             # Auto-soft-close farthest recoveries when nearing order capacity.
             self._auto_soft_close_if_capacity_pressure()
 
@@ -2748,8 +2937,7 @@ class BotRuntime:
                 self.pause("paused by operator")
                 msg = "paused"
             elif head == "/resume":
-                self.resume()
-                msg = "running"
+                ok, msg = self.resume()
             elif head == "/add_slot":
                 ok, msg = self.add_slot()
             elif head == "/status":
@@ -3232,6 +3420,10 @@ class BotRuntime:
             total_loss = sum(s.state.today_realized_loss for s in self.slots.values())
             total_round_trips = sum(s.state.total_round_trips for s in self.slots.values())
             total_orphans = sum(len(s.state.recovery_orders) for s in self.slots.values())
+            daily_realized_loss_utc = self._compute_daily_realized_loss_utc(now)
+            self._daily_realized_loss_utc = float(daily_realized_loss_utc)
+            daily_loss_lock_active = bool(self._daily_loss_lock_active)
+            daily_loss_lock_day = str(self._daily_loss_lock_utc_day or "")
             capacity = self._compute_capacity_health(now)
             pending_entries = len(self._pending_entry_orders())
             try:
@@ -3298,6 +3490,10 @@ class BotRuntime:
                 "total_unrealized_profit": total_unrealized_profit,
                 "total_unrealized_doge": total_unrealized_doge,
                 "today_realized_loss": total_loss,
+                "daily_loss_limit": float(config.DAILY_LOSS_LIMIT),
+                "daily_realized_loss_utc": float(daily_realized_loss_utc),
+                "daily_loss_lock_active": daily_loss_lock_active,
+                "daily_loss_lock_utc_day": daily_loss_lock_day,
                 "total_round_trips": total_round_trips,
                 "total_orphans": total_orphans,
                 "pnl_audit": {
@@ -3336,6 +3532,9 @@ class BotRuntime:
                     "auto_soft_close_total": self._auto_soft_close_total,
                     "auto_soft_close_last_at": self._auto_soft_close_last_at or None,
                     "auto_soft_close_threshold_pct": float(config.AUTO_SOFT_CLOSE_CAPACITY_PCT),
+                    "auto_recovery_drain_total": self._auto_recovery_drain_total,
+                    "auto_recovery_drain_last_at": self._auto_recovery_drain_last_at or None,
+                    "auto_recovery_drain_threshold_pct": float(config.AUTO_RECOVERY_DRAIN_CAPACITY_PCT),
                     "private_api_metronome": {
                         "enabled": bool(private_api.get("enabled", False)),
                         "wave_calls": int(private_api.get("wave_calls", 0) or 0),
@@ -3569,8 +3768,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     _RUNTIME.pause("paused from dashboard")
                     msg = "paused"
                 elif action == "resume":
-                    _RUNTIME.resume()
-                    msg = "running"
+                    ok, msg = _RUNTIME.resume()
                 elif action == "add_slot":
                     ok, msg = _RUNTIME.add_slot()
                 elif action == "add_layer":
