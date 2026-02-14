@@ -331,6 +331,8 @@ DASHBOARD_HTML = """<!doctype html>
         <div class=\"row\"><span class=\"k\">Open Gap</span><span id=\"biasOpenGap\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Re-entry Lag (med)</span><span id=\"biasLagMed\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Current Wait</span><span id=\"biasLagCurrent\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Governor</span><span id=\"rebalGov\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Size Skew</span><span id=\"rebalSizes\" class=\"v\"></span></div>
         <div id=\"biasDetails\" class=\"tiny\"></div>
       </div>
 
@@ -1013,10 +1015,16 @@ DASHBOARD_HTML = """<!doctype html>
       const bLagM = document.getElementById('biasLagMed');
       const bLagC = document.getElementById('biasLagCurrent');
       const bDet = document.getElementById('biasDetails');
+      const govEl = document.getElementById('rebalGov');
+      const sizesEl = document.getElementById('rebalSizes');
       if (!bias) {
         [bEq, b1h, b24h, bIdle, bRunway, bOpp, bGap, bLagM, bLagC].forEach(e => { e.textContent = '-'; e.style.color = ''; });
         bSpark.innerHTML = '';
         bDet.textContent = '';
+        govEl.textContent = '-';
+        govEl.style.color = '';
+        sizesEl.textContent = '-';
+        sizesEl.style.color = '';
       } else {
         bEq.textContent = `${fmt(bias.doge_eq, 1)} DOGE`;
         const fmtDelta = (v, el) => {
@@ -1065,6 +1073,32 @@ DASHBOARD_HTML = """<!doctype html>
         if (bias.max_reentry_lag_sec != null) parts.push(`max lag: ${fmtSec(bias.max_reentry_lag_sec)}`);
         if (bias.median_price_distance_pct != null) parts.push(`med dist: ${fmt(bias.median_price_distance_pct, 2)}%`);
         bDet.textContent = parts.join(' | ');
+
+        const rebal = s.rebalancer || null;
+        if (!rebal || !rebal.enabled) {
+          govEl.textContent = 'Off';
+          govEl.style.color = '';
+          sizesEl.textContent = 'A ×1.00 | B ×1.00';
+          sizesEl.style.color = '';
+        } else {
+          const dir = String(rebal.skew_direction || 'neutral');
+          const damped = Boolean(rebal.damped);
+          const skewPct = Number(rebal.skew || 0) * 100;
+          if (dir === 'buy_doge') {
+            govEl.textContent = `▶ Buy DOGE (${skewPct >= 0 ? '+' : ''}${fmt(skewPct, 1)}%)`;
+            govEl.style.color = damped ? 'var(--warn)' : 'var(--good)';
+          } else if (dir === 'sell_doge') {
+            govEl.textContent = `▶ Sell DOGE (${skewPct >= 0 ? '+' : ''}${fmt(skewPct, 1)}%)`;
+            govEl.style.color = damped ? 'var(--warn)' : 'var(--bad)';
+          } else {
+            govEl.textContent = damped ? 'Neutral (damped)' : 'Neutral';
+            govEl.style.color = damped ? 'var(--warn)' : '';
+          }
+          const aMult = Number(rebal.size_mult_a || 1);
+          const bMult = Number(rebal.size_mult_b || 1);
+          sizesEl.textContent = `A ×${fmt(aMult, 2)} | B ×${fmt(bMult, 2)}`;
+          sizesEl.style.color = damped ? 'var(--warn)' : '';
+        }
       }
     }
 

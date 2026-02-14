@@ -354,6 +354,33 @@ EXIT_DRIFT_MAX_PCT: float = _env("EXIT_DRIFT_MAX_PCT", 2.5, float)
 REBALANCE_ON_S1: bool = _env("REBALANCE_ON_S1", True, bool)
 
 # ---------------------------------------------------------------------------
+# Inventory rebalancer (size-skew governor)
+# ---------------------------------------------------------------------------
+
+# Master switch for inventory rebalancer.
+REBALANCE_ENABLED: bool = _env("REBALANCE_ENABLED", True, bool)
+
+# Target idle USD ratio (0.40 = keep ~40% USD idle runway).
+REBALANCE_TARGET_IDLE_PCT: float = _env("REBALANCE_TARGET_IDLE_PCT", 0.40, float)
+
+# PD gains for skew controller.
+REBALANCE_KP: float = _env("REBALANCE_KP", 2.0, float)
+REBALANCE_KD: float = _env("REBALANCE_KD", 0.5, float)
+
+# Controller output and slew limits.
+REBALANCE_MAX_SKEW: float = _env("REBALANCE_MAX_SKEW", 0.30, float)
+REBALANCE_MAX_SKEW_STEP: float = _env("REBALANCE_MAX_SKEW_STEP", 0.05, float)
+REBALANCE_NEUTRAL_BAND: float = _env("REBALANCE_NEUTRAL_BAND", 0.05, float)
+
+# EMA smoothing and update cadence.
+REBALANCE_EMA_HALFLIFE: float = _env("REBALANCE_EMA_HALFLIFE", 1800.0, float)
+REBALANCE_INTERVAL_SEC: float = _env("REBALANCE_INTERVAL_SEC", 300.0, float)
+
+# Mapping from skew signal -> size multiplier.
+REBALANCE_SIZE_SENSITIVITY: float = _env("REBALANCE_SIZE_SENSITIVITY", 1.0, float)
+REBALANCE_MAX_SIZE_MULT: float = _env("REBALANCE_MAX_SIZE_MULT", 1.5, float)
+
+# ---------------------------------------------------------------------------
 # Entry backoff after consecutive losses
 # ---------------------------------------------------------------------------
 

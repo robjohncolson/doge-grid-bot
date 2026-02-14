@@ -652,6 +652,7 @@ def _orphan_exit(
     order: OrderState,
     reason: str,
     order_size_usd: float,
+    order_sizes: dict[str, float] | None = None,
 ) -> tuple[PairState, list[Action]]:
     actions: list[Action] = []
     st = state
@@ -680,15 +681,34 @@ def _orphan_exit(
     # Advance orphaned trade cycle and re-place entry for that side.
     if order.trade_id == "A":
         st = replace(st, cycle_a=st.cycle_a + 1)
-        st, entry_actions = _place_followup_entry_after_cycle(st, cfg, trade_id="A", order_size_usd=order_size_usd, reason="orphan_A")
+        effective_size = order_sizes.get("A", order_size_usd) if order_sizes else order_size_usd
+        st, entry_actions = _place_followup_entry_after_cycle(
+            st,
+            cfg,
+            trade_id="A",
+            order_size_usd=effective_size,
+            reason="orphan_A",
+        )
     else:
         st = replace(st, cycle_b=st.cycle_b + 1)
-        st, entry_actions = _place_followup_entry_after_cycle(st, cfg, trade_id="B", order_size_usd=order_size_usd, reason="orphan_B")
+        effective_size = order_sizes.get("B", order_size_usd) if order_sizes else order_size_usd
+        st, entry_actions = _place_followup_entry_after_cycle(
+            st,
+            cfg,
+            trade_id="B",
+            order_size_usd=effective_size,
+            reason="orphan_B",
+        )
     actions.extend(entry_actions)
     return st, actions
 
 
-def _refresh_stale_entries(state: PairState, cfg: EngineConfig, order_size_usd: float) -> tuple[PairState, list[Action]]:
+def _refresh_stale_entries(
+    state: PairState,
+    cfg: EngineConfig,
+    order_size_usd: float,
+    order_sizes: dict[str, float] | None = None,
+) -> tuple[PairState, list[Action]]:
     actions: list[Action] = []
     st = state
     # Refresh one entry per tick max for stability.
@@ -742,13 +762,14 @@ def _refresh_stale_entries(state: PairState, cfg: EngineConfig, order_size_usd: 
         # Replace stale entry.
         st = replace(st, orders=_remove_order(st, o.local_id))
         actions.append(CancelOrderAction(local_id=o.local_id, txid=o.txid, reason="stale_entry"))
+        effective_size = order_sizes.get(o.trade_id, order_size_usd) if order_sizes else order_size_usd
         st, new_entry, place_action = _new_entry_order(
             st,
             cfg,
             side=o.side,
             trade_id=o.trade_id,
             cycle=o.cycle,
-            order_size_usd=order_size_usd,
+            order_size_usd=effective_size,
             reason="refresh_entry",
         )
         if new_entry and place_action:
@@ -763,7 +784,13 @@ def _refresh_stale_entries(state: PairState, cfg: EngineConfig, order_size_usd: 
     return st, actions
 
 
-def transition(state: PairState, event: Event, cfg: EngineConfig, order_size_usd: float) -> tuple[PairState, list[Action]]:
+def transition(
+    state: PairState,
+    event: Event,
+    cfg: EngineConfig,
+    order_size_usd: float,
+    order_sizes: dict[str, float] | None = None,
+) -> tuple[PairState, list[Action]]:
     """
     Pure reducer for one event.
     """
@@ -772,7 +799,7 @@ def transition(state: PairState, event: Event, cfg: EngineConfig, order_size_usd
 
     if isinstance(event, PriceTick):
         st = replace(st, now=event.timestamp, market_price=event.price, last_price_update_at=event.timestamp)
-        st, a = _refresh_stale_entries(st, cfg, order_size_usd=order_size_usd)
+        st, a = _refresh_stale_entries(st, cfg, order_size_usd=order_size_usd, order_sizes=order_sizes)
         actions.extend(a)
         return st, actions
 
@@ -792,7 +819,14 @@ def transition(state: PairState, event: Event, cfg: EngineConfig, order_size_usd
                     ex.side == "buy" and st.market_price > ex.price
                 )
                 if age >= cfg.s1_orphan_after_sec and moved_away:
-                    st, a = _orphan_exit(st, cfg, ex, reason="s1_timeout", order_size_usd=order_size_usd)
+                    st, a = _orphan_exit(
+                        st,
+                        cfg,
+                        ex,
+                        reason="s1_timeout",
+                        order_size_usd=order_size_usd,
+                        order_sizes=order_sizes,
+                    )
                     actions.extend(a)
                     return st, actions
 
@@ -809,7 +843,14 @@ def transition(state: PairState, event: Event, cfg: EngineConfig, order_size_usd
                     a_dist = abs(buy_exit.price - st.market_price) / st.market_price
                     b_dist = abs(sell_exit.price - st.market_price) / st.market_price
                     worse = buy_exit if a_dist > b_dist else sell_exit
-                    st, a = _orphan_exit(st, cfg, worse, reason="s2_timeout", order_size_usd=order_size_usd)
+                    st, a = _orphan_exit(
+                        st,
+                        cfg,
+                        worse,
+                        reason="s2_timeout",
+                        order_size_usd=order_size_usd,
+                        order_sizes=order_sizes,
+                    )
                     st = replace(st, s2_entered_at=None)
                     actions.extend(a)
                     return st, actions
@@ -871,8 +912,13 @@ def transition(state: PairState, event: Event, cfg: EngineConfig, order_size_usd
             st = replace(st, cycle_a=max(st.cycle_a, order.cycle + 1))
         else:
             st = replace(st, cycle_b=max(st.cycle_b, order.cycle + 1))
+        effective_size = order_sizes.get(order.trade_id, order_size_usd) if order_sizes else order_size_usd
         st, follow_actions = _place_followup_entry_after_cycle(
-            st, cfg, trade_id=order.trade_id, order_size_usd=order_size_usd, reason="cycle_complete"
+            st,
+            cfg,
+            trade_id=order.trade_id,
+            order_size_usd=effective_size,
+            reason="cycle_complete",
         )
         actions.extend(follow_actions)
         st = _clear_s2_flag_if_not_s2(st)

@@ -14,13 +14,14 @@ from __future__ import annotations
 from collections import deque
 import json
 import logging
+import os
 import signal
 import threading
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from math import ceil, isfinite
+from math import ceil, exp, isfinite
 from socketserver import ThreadingMixIn
 from statistics import median
 from typing import Any
@@ -34,6 +35,7 @@ import supabase_store
 
 
 logger = logging.getLogger(__name__)
+_BOT_RUNTIME_STATE_FILE = os.path.join(config.LOG_DIR, "bot_runtime.json")
 
 
 def setup_logging() -> None:
@@ -248,6 +250,17 @@ class BotRuntime:
         self._doge_eq_snapshot_interval: float = 300.0  # 5 min
         self._doge_eq_last_snapshot_ts: float = 0.0
 
+        # Inventory rebalancer state.
+        self._rebalancer_idle_ratio: float = 0.0
+        self._rebalancer_smoothed_error: float = 0.0
+        self._rebalancer_smoothed_velocity: float = 0.0
+        self._rebalancer_current_skew: float = 0.0
+        self._rebalancer_last_update_ts: float = 0.0
+        self._rebalancer_last_raw_error: float = 0.0
+        self._rebalancer_sign_flip_history: deque[float] = deque()
+        self._rebalancer_damped_until: float = 0.0
+        self._rebalancer_last_capacity_band: str = "normal"
+
     # ------------------ Config/State ------------------
 
     def _engine_cfg(self, slot: SlotRuntime) -> sm.EngineConfig:
@@ -271,9 +284,49 @@ class BotRuntime:
             backoff_max_multiplier=float(config.ENTRY_BACKOFF_MAX_MULTIPLIER),
         )
 
-    def _slot_order_size_usd(self, slot: SlotRuntime) -> float:
+    def _slot_order_size_usd(self, slot: SlotRuntime, trade_id: str | None = None) -> float:
         # Independent compounding per slot.
-        return max(float(config.ORDER_SIZE_USD), float(config.ORDER_SIZE_USD) + slot.state.total_profit)
+        base = max(float(config.ORDER_SIZE_USD), float(config.ORDER_SIZE_USD) + slot.state.total_profit)
+        if trade_id is None or not bool(config.REBALANCE_ENABLED):
+            return base
+
+        skew = float(self._rebalancer_current_skew)
+        if abs(skew) <= 1e-12:
+            return base
+
+        favored = (skew > 0 and trade_id == "B") or (skew < 0 and trade_id == "A")
+        if not favored:
+            return base
+
+        sensitivity = max(0.0, float(config.REBALANCE_SIZE_SENSITIVITY))
+        max_mult = max(1.0, float(config.REBALANCE_MAX_SIZE_MULT))
+        mult = min(max_mult, 1.0 + abs(skew) * sensitivity)
+        effective = base * mult
+
+        # Fund guard: scaling should not make an already-viable side non-viable.
+        if skew > 0 and trade_id == "B":
+            available_usd: float | None = None
+            if self._loop_available_usd is not None:
+                available_usd = float(self._loop_available_usd)
+            elif self.ledger._synced:
+                available_usd = float(self.ledger.available_usd)
+            if available_usd is not None:
+                max_safe = max(base, available_usd - base)
+                effective = min(effective, max_safe)
+        elif skew < 0 and trade_id == "A":
+            price = float(slot.state.market_price or self.last_price)
+            if price > 0:
+                available_doge: float | None = None
+                if self._loop_available_doge is not None:
+                    available_doge = float(self._loop_available_doge)
+                elif self.ledger._synced:
+                    available_doge = float(self.ledger.available_doge)
+                if available_doge is not None:
+                    base_doge = base / price
+                    max_safe_doge = max(base_doge, available_doge - base_doge)
+                    effective = min(effective, max_safe_doge * price)
+
+        return max(base, effective)
 
     def _minimum_bootstrap_requirements(self, market_price: float) -> tuple[float, float]:
         min_vol = float(self.constraints.get("min_volume", 13.0))
@@ -308,6 +361,65 @@ class BotRuntime:
             if not isinstance(row, dict) or self._order_matches_runtime_pair(row):
                 count += 1
         return count
+
+    def _compute_capacity_health(self, now: float | None = None) -> dict:
+        now = now or _now()
+        self._trim_rolling_telemetry(now)
+
+        internal_open_orders_current = self._internal_open_order_count()
+        kraken_open_orders_current = self._kraken_open_orders_current
+        if kraken_open_orders_current is None:
+            open_orders_current = internal_open_orders_current
+            open_orders_source = "internal_fallback"
+        else:
+            open_orders_current = int(kraken_open_orders_current)
+            open_orders_source = "kraken"
+
+        pair_open_order_limit = max(1, int(config.KRAKEN_OPEN_ORDERS_PER_PAIR_LIMIT))
+        safety_ratio = min(1.0, max(0.1, float(config.OPEN_ORDER_SAFETY_RATIO)))
+        open_orders_safe_cap = max(1, int(pair_open_order_limit * safety_ratio))
+        open_order_headroom = open_orders_safe_cap - open_orders_current
+        open_order_utilization_pct = (
+            open_orders_current / open_orders_safe_cap * 100.0 if open_orders_safe_cap > 0 else 0.0
+        )
+        orders_per_slot_estimate = (open_orders_current / len(self.slots)) if self.slots else None
+        estimated_slots_remaining = 0
+        if orders_per_slot_estimate and orders_per_slot_estimate > 0 and open_order_headroom > 0:
+            estimated_slots_remaining = int(open_order_headroom // orders_per_slot_estimate)
+
+        partial_fill_open_events_1d = len(self._partial_fill_open_events)
+        partial_fill_cancel_events_1d = len(self._partial_fill_cancel_events)
+        median_fill_seconds_1d, p95_fill_seconds_1d = self._fill_duration_stats_1d()
+
+        if partial_fill_cancel_events_1d > 0 or open_order_headroom < 10:
+            status_band = "stop"
+        elif open_order_headroom < 20:
+            status_band = "caution"
+        else:
+            status_band = "normal"
+
+        return {
+            "open_orders_current": open_orders_current,
+            "open_orders_source": open_orders_source,
+            "open_orders_internal": internal_open_orders_current,
+            "open_orders_kraken": kraken_open_orders_current,
+            "open_orders_drift": (
+                None
+                if kraken_open_orders_current is None
+                else int(kraken_open_orders_current) - internal_open_orders_current
+            ),
+            "open_order_limit_configured": pair_open_order_limit,
+            "open_orders_safe_cap": open_orders_safe_cap,
+            "open_order_headroom": open_order_headroom,
+            "open_order_utilization_pct": open_order_utilization_pct,
+            "orders_per_slot_estimate": orders_per_slot_estimate,
+            "estimated_slots_remaining": estimated_slots_remaining,
+            "partial_fill_open_events_1d": partial_fill_open_events_1d,
+            "partial_fill_cancel_events_1d": partial_fill_cancel_events_1d,
+            "median_fill_seconds_1d": median_fill_seconds_1d,
+            "p95_fill_seconds_1d": p95_fill_seconds_1d,
+            "status_band": status_band,
+        }
 
     def _trim_rolling_telemetry(self, now: float | None = None) -> None:
         now = now or _now()
@@ -447,13 +559,47 @@ class BotRuntime:
             "taker_fee_pct": self.taker_fee_pct,
             "slots": {str(sid): sm.to_dict(slot.state) for sid, slot in self.slots.items()},
             "recon_baseline": self._recon_baseline,
+            "rebalancer_idle_ratio": self._rebalancer_idle_ratio,
+            "rebalancer_smoothed_error": self._rebalancer_smoothed_error,
+            "rebalancer_smoothed_velocity": self._rebalancer_smoothed_velocity,
+            "rebalancer_current_skew": self._rebalancer_current_skew,
+            "rebalancer_last_update_ts": self._rebalancer_last_update_ts,
+            "rebalancer_last_raw_error": self._rebalancer_last_raw_error,
+            "rebalancer_sign_flip_history": list(self._rebalancer_sign_flip_history)[-20:],
+            "rebalancer_damped_until": self._rebalancer_damped_until,
         }
 
+    def _save_local_runtime_snapshot(self, snapshot: dict) -> None:
+        try:
+            os.makedirs(config.LOG_DIR, exist_ok=True)
+            tmp_path = _BOT_RUNTIME_STATE_FILE + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, ensure_ascii=True, separators=(",", ":"))
+            os.replace(tmp_path, _BOT_RUNTIME_STATE_FILE)
+        except Exception as e:
+            logger.warning("Local runtime snapshot write failed: %s", e)
+
+    def _load_local_runtime_snapshot(self) -> dict:
+        try:
+            with open(_BOT_RUNTIME_STATE_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            return raw if isinstance(raw, dict) else {}
+        except Exception:
+            return {}
+
     def _save_snapshot(self) -> None:
-        supabase_store.save_state(self._global_snapshot(), pair="__v1__")
+        snap = self._global_snapshot()
+        supabase_store.save_state(snap, pair="__v1__")
+        self._save_local_runtime_snapshot(snap)
 
     def _load_snapshot(self) -> None:
-        snap = supabase_store.load_state(pair="__v1__") or {}
+        try:
+            snap = supabase_store.load_state(pair="__v1__") or {}
+        except Exception as e:
+            logger.warning("Supabase snapshot load failed: %s", e)
+            snap = {}
+        if not snap:
+            snap = self._load_local_runtime_snapshot()
         if snap:
             self.mode = snap.get("mode", "INIT")
             self.pause_reason = snap.get("pause_reason", "")
@@ -469,6 +615,30 @@ class BotRuntime:
             self.maker_fee_pct = float(snap.get("maker_fee_pct", self.maker_fee_pct))
             self.taker_fee_pct = float(snap.get("taker_fee_pct", self.taker_fee_pct))
             self._recon_baseline = snap.get("recon_baseline", None)
+            self._rebalancer_idle_ratio = float(snap.get("rebalancer_idle_ratio", self._rebalancer_idle_ratio))
+            self._rebalancer_smoothed_error = float(
+                snap.get("rebalancer_smoothed_error", self._rebalancer_smoothed_error)
+            )
+            self._rebalancer_smoothed_velocity = float(
+                snap.get("rebalancer_smoothed_velocity", self._rebalancer_smoothed_velocity)
+            )
+            self._rebalancer_current_skew = float(snap.get("rebalancer_current_skew", self._rebalancer_current_skew))
+            self._rebalancer_last_update_ts = float(
+                snap.get("rebalancer_last_update_ts", self._rebalancer_last_update_ts)
+            )
+            self._rebalancer_last_raw_error = float(
+                snap.get("rebalancer_last_raw_error", self._rebalancer_last_raw_error)
+            )
+            self._rebalancer_damped_until = float(snap.get("rebalancer_damped_until", self._rebalancer_damped_until))
+            hist = snap.get("rebalancer_sign_flip_history", [])
+            cleaned_hist: list[float] = []
+            if isinstance(hist, list):
+                for row in hist:
+                    try:
+                        cleaned_hist.append(float(row))
+                    except Exception:
+                        continue
+            self._rebalancer_sign_flip_history = deque(sorted(cleaned_hist)[-20:])
 
             self.slots = {}
             for sid_text, raw_state in (snap.get("slots", {}) or {}).items():
@@ -1140,9 +1310,19 @@ class BotRuntime:
         slot = self.slots[slot_id]
         cfg = self._engine_cfg(slot)
         old_phase = sm.derive_phase(slot.state)
+        order_sizes = {
+            "A": self._slot_order_size_usd(slot, trade_id="A"),
+            "B": self._slot_order_size_usd(slot, trade_id="B"),
+        }
         order_size = self._slot_order_size_usd(slot)
 
-        new_state, actions = sm.transition(slot.state, event, cfg, order_size_usd=order_size)
+        new_state, actions = sm.transition(
+            slot.state,
+            event,
+            cfg,
+            order_size_usd=order_size,
+            order_sizes=order_sizes,
+        )
         self.slots[slot_id].state = new_state
         new_phase = sm.derive_phase(new_state)
 
@@ -1244,6 +1424,15 @@ class BotRuntime:
                         self._normalize_slot_mode(slot_id)
                         continue
                     slot.state = sm.apply_order_txid(slot.state, action.local_id, txid)
+                    state_order = sm.find_order(slot.state, action.local_id)
+                    if state_order and abs(float(state_order.volume) - float(action.volume)) > 1e-8:
+                        logger.error(
+                            "[REBAL] VOLUME DRIFT slot=%s local_id=%s state_vol=%.10f action_vol=%.10f",
+                            slot_id,
+                            action.local_id,
+                            state_order.volume,
+                            action.volume,
+                        )
                     self.ledger.commit_order(action.side, action.price, action.volume)
                     _internal_order_count += 1
                 except Exception as e:
@@ -2038,6 +2227,7 @@ class BotRuntime:
             self._refresh_price(strict=False)
             if self._price_age_sec() > config.STALE_PRICE_MAX_AGE_SEC:
                 self.pause("stale price data > 60s")
+            self._update_rebalancer(_now())
 
             if self._recon_baseline is None and self.last_price > 0 and self._last_balance_snapshot:
                 bal = self._last_balance_snapshot
@@ -2354,6 +2544,97 @@ class BotRuntime:
             "median_price_distance_pct": median_price_distance_pct,
         }
 
+    def _update_rebalancer(self, now: float) -> None:
+        if not bool(config.REBALANCE_ENABLED):
+            self._rebalancer_current_skew = 0.0
+            return
+
+        interval_sec = max(1.0, float(config.REBALANCE_INTERVAL_SEC))
+        last_ts = float(self._rebalancer_last_update_ts)
+        if last_ts > 0 and (now - last_ts) < interval_sec:
+            return
+
+        capacity = self._compute_capacity_health(now)
+        band = str(capacity.get("status_band") or "normal")
+        self._rebalancer_last_capacity_band = band
+        if band in ("caution", "stop"):
+            self._rebalancer_current_skew = 0.0
+            self._rebalancer_last_update_ts = now
+            logger.info("[REBAL] paused: capacity band=%s", band)
+            return
+
+        scoreboard = self._compute_doge_bias_scoreboard()
+        if not scoreboard:
+            self._rebalancer_current_skew = 0.0
+            self._rebalancer_last_update_ts = now
+            return
+
+        idle_ratio = max(0.0, min(1.0, float(scoreboard.get("idle_usd_pct", 0.0)) / 100.0))
+        target = max(0.0, min(1.0, float(config.REBALANCE_TARGET_IDLE_PCT)))
+        raw_error = idle_ratio - target
+
+        dt = max(1.0, (now - last_ts) if last_ts > 0 else interval_sec)
+        halflife = max(1.0, float(config.REBALANCE_EMA_HALFLIFE))
+        alpha = 1.0 - exp(-dt / halflife)
+
+        prev_error = float(self._rebalancer_smoothed_error)
+        smoothed_error = alpha * raw_error + (1.0 - alpha) * prev_error
+        raw_velocity = (smoothed_error - prev_error) / dt
+        prev_velocity = float(self._rebalancer_smoothed_velocity)
+        smoothed_velocity = alpha * raw_velocity + (1.0 - alpha) * prev_velocity
+
+        max_skew = max(0.0, float(config.REBALANCE_MAX_SKEW))
+        if now < float(self._rebalancer_damped_until):
+            max_skew *= 0.5
+
+        neutral_band = max(0.0, float(config.REBALANCE_NEUTRAL_BAND))
+        if abs(smoothed_error) < neutral_band:
+            raw_skew = 0.0
+        else:
+            raw_skew = float(config.REBALANCE_KP) * smoothed_error + float(config.REBALANCE_KD) * smoothed_velocity
+            raw_skew = max(-max_skew, min(max_skew, raw_skew))
+
+        current_skew = float(self._rebalancer_current_skew)
+        max_step = max(0.0, float(config.REBALANCE_MAX_SKEW_STEP))
+        delta = raw_skew - current_skew
+        if abs(delta) > max_step:
+            new_skew = current_skew + (max_step if delta > 0 else -max_step)
+        else:
+            new_skew = raw_skew
+        new_skew = max(-max_skew, min(max_skew, new_skew))
+
+        # 1h sign-flip tracking for oscillation damping.
+        if abs(current_skew) > 1e-12 and abs(new_skew) > 1e-12 and current_skew * new_skew < 0:
+            self._rebalancer_sign_flip_history.append(now)
+        cutoff = now - 3600.0
+        while self._rebalancer_sign_flip_history and self._rebalancer_sign_flip_history[0] < cutoff:
+            self._rebalancer_sign_flip_history.popleft()
+        sign_flips_1h = len(self._rebalancer_sign_flip_history)
+        if sign_flips_1h >= 3 and now >= float(self._rebalancer_damped_until):
+            self._rebalancer_damped_until = now + 3600.0
+            logger.warning(
+                "[REBAL] WARNING: oscillation detected (%d flips/hr), auto-damping active",
+                sign_flips_1h,
+            )
+
+        self._rebalancer_idle_ratio = idle_ratio
+        self._rebalancer_last_raw_error = raw_error
+        self._rebalancer_smoothed_error = smoothed_error
+        self._rebalancer_smoothed_velocity = smoothed_velocity
+        self._rebalancer_current_skew = new_skew
+        self._rebalancer_last_update_ts = now
+
+        logger.info(
+            "[REBAL] idle=%.3f target=%.3f err=%+.4f vel=%+.6f skew=%+.4f band=%s flips1h=%d",
+            idle_ratio,
+            target,
+            smoothed_error,
+            smoothed_velocity,
+            new_skew,
+            band,
+            sign_flips_1h,
+        )
+
     # ------------------ Balance reconciliation ------------------
 
     def _compute_balance_recon(self, total_profit: float, total_unrealized: float) -> dict | None:
@@ -2498,40 +2779,19 @@ class BotRuntime:
             total_loss = sum(s.state.today_realized_loss for s in self.slots.values())
             total_round_trips = sum(s.state.total_round_trips for s in self.slots.values())
             total_orphans = sum(len(s.state.recovery_orders) for s in self.slots.values())
-            internal_open_orders_current = total_active_orders + total_orphans
+            capacity = self._compute_capacity_health(now)
+            internal_open_orders_current = int(capacity.get("open_orders_internal") or 0)
             last_balance = dict(self._last_balance_snapshot) if self._last_balance_snapshot else {}
             observed_usd_balance = _usd_balance(last_balance) if last_balance else None
             observed_doge_balance = _doge_balance(last_balance) if last_balance else None
             balance_age_sec = (now - self._last_balance_ts) if last_balance else None
-            kraken_open_orders_current = self._kraken_open_orders_current
-            if kraken_open_orders_current is None:
-                open_orders_current = internal_open_orders_current
-                open_orders_source = "internal_fallback"
-            else:
-                open_orders_current = int(kraken_open_orders_current)
-                open_orders_source = "kraken"
-
-            pair_open_order_limit = max(1, int(config.KRAKEN_OPEN_ORDERS_PER_PAIR_LIMIT))
-            safety_ratio = float(config.OPEN_ORDER_SAFETY_RATIO)
-            safety_ratio = min(1.0, max(0.1, safety_ratio))
-            open_orders_safe_cap = max(1, int(pair_open_order_limit * safety_ratio))
-            open_order_headroom = open_orders_safe_cap - open_orders_current
-            open_order_utilization_pct = (open_orders_current / open_orders_safe_cap * 100.0) if open_orders_safe_cap > 0 else 0.0
-            orders_per_slot_estimate = (open_orders_current / len(self.slots)) if self.slots else None
-            estimated_slots_remaining = 0
-            if orders_per_slot_estimate and orders_per_slot_estimate > 0 and open_order_headroom > 0:
-                estimated_slots_remaining = int(open_order_headroom // orders_per_slot_estimate)
-
-            partial_fill_open_events_1d = len(self._partial_fill_open_events)
-            partial_fill_cancel_events_1d = len(self._partial_fill_cancel_events)
-            median_fill_seconds_1d, p95_fill_seconds_1d = self._fill_duration_stats_1d()
-
-            if partial_fill_cancel_events_1d > 0 or open_order_headroom < 10:
-                status_band = "stop"
-            elif open_order_headroom < 20:
-                status_band = "caution"
-            else:
-                status_band = "normal"
+            kraken_open_orders_current = capacity.get("open_orders_kraken")
+            open_orders_current = int(capacity.get("open_orders_current") or 0)
+            open_orders_source = str(capacity.get("open_orders_source") or "internal_fallback")
+            open_order_headroom = int(capacity.get("open_order_headroom") or 0)
+            partial_fill_open_events_1d = int(capacity.get("partial_fill_open_events_1d") or 0)
+            partial_fill_cancel_events_1d = int(capacity.get("partial_fill_cancel_events_1d") or 0)
+            status_band = str(capacity.get("status_band") or "normal")
 
             drift_persistent = self._open_order_drift_is_persistent(
                 now=now,
@@ -2552,6 +2812,10 @@ class BotRuntime:
                 blocked_risk_hint.append("partial_fill_open_pressure")
             if partial_fill_cancel_events_1d > 0:
                 blocked_risk_hint.append("partial_fill_cancel_detected")
+
+            cutoff_flips = now - 3600.0
+            while self._rebalancer_sign_flip_history and self._rebalancer_sign_flip_history[0] < cutoff_flips:
+                self._rebalancer_sign_flip_history.popleft()
 
             top_phase = slots[0]["phase"] if slots else "S0"
             pnl_ref_price = self.last_price if self.last_price > 0 else (slots[0]["market_price"] if slots else 0.0)
@@ -2593,23 +2857,19 @@ class BotRuntime:
                 "capacity_fill_health": {
                     "open_orders_current": open_orders_current,
                     "open_orders_source": open_orders_source,
-                    "open_orders_internal": internal_open_orders_current,
+                    "open_orders_internal": int(capacity.get("open_orders_internal") or internal_open_orders_current),
                     "open_orders_kraken": kraken_open_orders_current,
-                    "open_orders_drift": (
-                        None
-                        if kraken_open_orders_current is None
-                        else int(kraken_open_orders_current) - internal_open_orders_current
-                    ),
-                    "open_order_limit_configured": pair_open_order_limit,
-                    "open_orders_safe_cap": open_orders_safe_cap,
+                    "open_orders_drift": capacity.get("open_orders_drift"),
+                    "open_order_limit_configured": int(capacity.get("open_order_limit_configured") or 0),
+                    "open_orders_safe_cap": int(capacity.get("open_orders_safe_cap") or 0),
                     "open_order_headroom": open_order_headroom,
-                    "open_order_utilization_pct": open_order_utilization_pct,
-                    "orders_per_slot_estimate": orders_per_slot_estimate,
-                    "estimated_slots_remaining": estimated_slots_remaining,
+                    "open_order_utilization_pct": float(capacity.get("open_order_utilization_pct") or 0.0),
+                    "orders_per_slot_estimate": capacity.get("orders_per_slot_estimate"),
+                    "estimated_slots_remaining": int(capacity.get("estimated_slots_remaining") or 0),
                     "partial_fill_open_events_1d": partial_fill_open_events_1d,
                     "partial_fill_cancel_events_1d": partial_fill_cancel_events_1d,
-                    "median_fill_seconds_1d": median_fill_seconds_1d,
-                    "p95_fill_seconds_1d": p95_fill_seconds_1d,
+                    "median_fill_seconds_1d": capacity.get("median_fill_seconds_1d"),
+                    "p95_fill_seconds_1d": capacity.get("p95_fill_seconds_1d"),
                     "status_band": status_band,
                     "blocked_risk_hint": blocked_risk_hint,
                     "auto_soft_close_total": self._auto_soft_close_total,
@@ -2628,6 +2888,41 @@ class BotRuntime:
                 },
                 "balance_recon": self._compute_balance_recon(total_profit, total_unrealized_profit),
                 "doge_bias_scoreboard": self._compute_doge_bias_scoreboard(),
+                "rebalancer": {
+                    "enabled": bool(config.REBALANCE_ENABLED),
+                    "idle_ratio": float(self._rebalancer_idle_ratio),
+                    "target": float(config.REBALANCE_TARGET_IDLE_PCT),
+                    "error": float(self._rebalancer_last_raw_error),
+                    "smoothed_error": float(self._rebalancer_smoothed_error),
+                    "velocity": float(self._rebalancer_smoothed_velocity),
+                    "skew": float(self._rebalancer_current_skew),
+                    "skew_direction": (
+                        "buy_doge"
+                        if self._rebalancer_current_skew > 1e-12
+                        else "sell_doge"
+                        if self._rebalancer_current_skew < -1e-12
+                        else "neutral"
+                    ),
+                    "size_mult_a": (
+                        min(
+                            float(config.REBALANCE_MAX_SIZE_MULT),
+                            1.0 + abs(float(self._rebalancer_current_skew)) * float(config.REBALANCE_SIZE_SENSITIVITY),
+                        )
+                        if self._rebalancer_current_skew < 0
+                        else 1.0
+                    ),
+                    "size_mult_b": (
+                        min(
+                            float(config.REBALANCE_MAX_SIZE_MULT),
+                            1.0 + abs(float(self._rebalancer_current_skew)) * float(config.REBALANCE_SIZE_SENSITIVITY),
+                        )
+                        if self._rebalancer_current_skew > 0
+                        else 1.0
+                    ),
+                    "damped": bool(now < float(self._rebalancer_damped_until)),
+                    "sign_flips_1h": len(self._rebalancer_sign_flip_history),
+                    "capacity_band": self._rebalancer_last_capacity_band,
+                },
                 "slots": slots,
             }
 
