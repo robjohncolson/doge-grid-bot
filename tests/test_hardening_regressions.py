@@ -1416,14 +1416,78 @@ class BotEventLogTests(unittest.TestCase):
         rt.pause_reason = "daily loss limit hit: $3.1000 >= $3.0000 (UTC 2024-01-01)"
         rt._daily_loss_lock_active = True
         rt._daily_loss_lock_utc_day = "2024-01-01"
+        day_ts = 1704072000.0  # 2024-01-01 UTC
+        # Need actual losses exceeding the limit so the lock stays active.
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1, now=day_ts,
+                    completed_cycles=(
+                        sm.CycleRecord(
+                            trade_id="A", cycle=1,
+                            entry_price=0.1, exit_price=0.099, volume=13.0,
+                            gross_profit=-1.6, fees=0.1, net_profit=-1.7,
+                            entry_time=day_ts - 1200.0, exit_time=day_ts - 600.0,
+                        ),
+                        sm.CycleRecord(
+                            trade_id="B", cycle=1,
+                            entry_price=0.1, exit_price=0.101, volume=13.0,
+                            gross_profit=-1.3, fees=0.1, net_profit=-1.4,
+                            entry_time=day_ts - 1100.0, exit_time=day_ts - 500.0,
+                        ),
+                    ),
+                ),
+            ),
+        }
 
         with mock.patch.object(config, "DAILY_LOSS_LIMIT", 3.0):
-            with mock.patch("bot._now", return_value=1704072000.0):  # 2024-01-01 UTC
+            with mock.patch("bot._now", return_value=day_ts):
                 ok, msg = rt.resume()
 
         self.assertFalse(ok)
         self.assertIn("daily loss lock active", msg)
         self.assertEqual(rt.mode, "PAUSED")
+
+    def test_daily_loss_lock_clears_when_limit_raised_above_loss(self):
+        """Lock clears on same UTC day when DAILY_LOSS_LIMIT is raised above current loss."""
+        rt = bot.BotRuntime()
+        rt.mode = "PAUSED"
+        rt.pause_reason = "daily loss limit hit: $3.1000 >= $3.0000 (UTC 2024-01-01)"
+        rt._daily_loss_lock_active = True
+        rt._daily_loss_lock_utc_day = "2024-01-01"
+        day_ts = 1704072000.0  # 2024-01-01 UTC
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1, now=day_ts,
+                    completed_cycles=(
+                        sm.CycleRecord(
+                            trade_id="A", cycle=1,
+                            entry_price=0.1, exit_price=0.099, volume=13.0,
+                            gross_profit=-1.6, fees=0.1, net_profit=-1.7,
+                            entry_time=day_ts - 1200.0, exit_time=day_ts - 600.0,
+                        ),
+                        sm.CycleRecord(
+                            trade_id="B", cycle=1,
+                            entry_price=0.1, exit_price=0.101, volume=13.0,
+                            gross_profit=-1.3, fees=0.1, net_profit=-1.4,
+                            entry_time=day_ts - 1100.0, exit_time=day_ts - 500.0,
+                        ),
+                    ),
+                ),
+            ),
+        }
+
+        # Loss is 3.1, raise limit to 25 — lock should clear, resume should work.
+        with mock.patch.object(config, "DAILY_LOSS_LIMIT", 25.0):
+            with mock.patch("bot._now", return_value=day_ts):
+                ok, msg = rt.resume()
+
+        self.assertTrue(ok)
+        self.assertFalse(rt._daily_loss_lock_active)
+        self.assertEqual(rt.mode, "RUNNING")
 
     def test_daily_loss_lock_clears_on_utc_rollover_then_manual_resume_works(self):
         rt = bot.BotRuntime()

@@ -1375,6 +1375,17 @@ class BotRuntime:
         self._daily_realized_loss_utc = float(daily_loss)
 
         limit = max(0.0, float(config.DAILY_LOSS_LIMIT))
+
+        # If limit is disabled (0) or raised above current loss, clear any
+        # existing lock on the same day so resume() is not blocked.
+        if self._daily_loss_lock_active and (limit <= 0.0 or daily_loss + 1e-12 < limit):
+            logger.info(
+                "daily loss lock cleared: loss $%.4f < limit $%.4f (or limit disabled)",
+                daily_loss, limit,
+            )
+            self._daily_loss_lock_active = False
+            self._daily_loss_lock_utc_day = ""
+
         if limit <= 0.0:
             return daily_loss
 
@@ -1565,10 +1576,17 @@ class BotRuntime:
             if actions:
                 self._execute_actions(slot_id, actions, "bootstrap")
             else:
+                target_usd = self._slot_order_size_usd(slot)
+                min_vol = float(self.constraints.get("min_volume", 13.0))
+                min_cost = float(self.constraints.get("min_cost_usd", 0.0))
+                required_usd = max(min_cost, min_vol * market)
                 logger.info(
-                    "slot %s bootstrap waiting: target order size $%.4f below Kraken minimum constraints",
-                    slot_id,
-                    self._slot_order_size_usd(slot),
+                    "slot %s bootstrap waiting: target $%.4f < required $%.4f "
+                    "(ORDER_SIZE_USD=$%.4f, total_profit=$%.4f, min_vol=%.1f, "
+                    "min_cost=$%.4f, market=$%.6f)",
+                    slot_id, target_usd, required_usd,
+                    float(config.ORDER_SIZE_USD), slot.state.total_profit,
+                    min_vol, min_cost, market,
                 )
             return
 
