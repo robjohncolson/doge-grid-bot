@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from math import ceil, exp, isfinite
+from math import ceil, exp, floor, isfinite
 from socketserver import ThreadingMixIn
 from statistics import median
 from typing import Any
@@ -92,6 +92,7 @@ def _doge_balance(balance: dict) -> float:
 class SlotRuntime:
     slot_id: int
     state: sm.PairState
+    alias: str = ""
 
 
 class CapitalLedger:
@@ -207,6 +208,13 @@ class BotRuntime:
         self.slots: dict[int, SlotRuntime] = {}
         self.ledger = CapitalLedger()
         self.next_slot_id = 1
+        self.slot_alias_pool: tuple[str, ...] = tuple(config.SLOT_ALIAS_POOL)
+        self.slot_alias_recycle_queue: deque[str] = deque()
+        self.slot_alias_fallback_counter = 1
+
+        self.target_layers = 0
+        self.effective_layers = 0
+        self.layer_last_add_event: dict | None = None
 
         self.next_event_id = 1
         self.seen_fill_txids: set[str] = set()
@@ -291,24 +299,245 @@ class BotRuntime:
             backoff_max_multiplier=float(config.ENTRY_BACKOFF_MAX_MULTIPLIER),
         )
 
+    def _allocate_slot_alias(self, used_aliases: set[str] | None = None) -> str:
+        used = set(used_aliases or set())
+        if used_aliases is None:
+            for slot in self.slots.values():
+                alias = str(slot.alias or "").strip().lower()
+                if alias:
+                    used.add(alias)
+
+        pool = [str(a).strip().lower() for a in self.slot_alias_pool if str(a).strip()]
+        if not pool:
+            pool = ["wow"]
+
+        recycled_set = {str(a).strip().lower() for a in self.slot_alias_recycle_queue if str(a).strip()}
+        for alias in pool:
+            if alias not in used and alias not in recycled_set:
+                return alias
+
+        while self.slot_alias_recycle_queue:
+            alias = str(self.slot_alias_recycle_queue.popleft()).strip().lower()
+            if not alias or alias in used:
+                continue
+            return alias
+
+        while True:
+            alias = f"doge-{self.slot_alias_fallback_counter:02d}"
+            self.slot_alias_fallback_counter += 1
+            if alias not in used:
+                return alias
+
+    def _release_slot_alias(self, alias: str) -> None:
+        norm = str(alias or "").strip().lower()
+        if not norm:
+            return
+        if norm not in self.slot_alias_pool:
+            return
+        if norm in self.slot_alias_recycle_queue:
+            return
+        self.slot_alias_recycle_queue.append(norm)
+
+    def _slot_label(self, slot: SlotRuntime) -> str:
+        alias = str(slot.alias or "").strip().lower()
+        if alias:
+            return alias
+        return f"slot-{slot.slot_id}"
+
+    def _sanitize_slot_alias_state(self) -> None:
+        pool = [str(a).strip().lower() for a in self.slot_alias_pool if str(a).strip()]
+        if not pool:
+            pool = ["wow"]
+        self.slot_alias_pool = tuple(pool)
+
+        cleaned_queue: deque[str] = deque()
+        seen_queue: set[str] = set()
+        for raw in list(self.slot_alias_recycle_queue):
+            alias = str(raw).strip().lower()
+            if not alias or alias not in self.slot_alias_pool or alias in seen_queue:
+                continue
+            cleaned_queue.append(alias)
+            seen_queue.add(alias)
+        self.slot_alias_recycle_queue = cleaned_queue
+
+        used: set[str] = set()
+        for sid in sorted(self.slots.keys()):
+            slot = self.slots[sid]
+            alias = str(slot.alias or "").strip().lower()
+            if alias and alias not in used:
+                slot.alias = alias
+                used.add(alias)
+                continue
+            slot.alias = self._allocate_slot_alias(used_aliases=used)
+            used.add(slot.alias)
+
+        self.slot_alias_recycle_queue = deque(a for a in self.slot_alias_recycle_queue if a not in used)
+
+    def _capital_layer_step_doge_eq(self) -> float:
+        return max(0.0, float(config.CAPITAL_LAYER_DOGE_PER_ORDER)) * max(1, int(config.CAPITAL_LAYER_ORDER_BUDGET))
+
+    def _layer_mark_price(self, slot: SlotRuntime | None = None) -> float:
+        if slot is not None:
+            px = float(slot.state.market_price or 0.0)
+            if px > 0:
+                return px
+        if self.last_price > 0:
+            return float(self.last_price)
+        return 0.0
+
+    def _available_free_balances(self, *, prefer_fresh: bool = False) -> tuple[float, float]:
+        if prefer_fresh:
+            bal = self._safe_balance()
+            if bal is not None:
+                return max(0.0, _usd_balance(bal)), max(0.0, _doge_balance(bal))
+
+        if self._loop_available_usd is not None and self._loop_available_doge is not None:
+            return max(0.0, float(self._loop_available_usd)), max(0.0, float(self._loop_available_doge))
+
+        if self.ledger._synced:
+            return max(0.0, float(self.ledger.available_usd)), max(0.0, float(self.ledger.available_doge))
+
+        if self._last_balance_snapshot:
+            return (
+                max(0.0, _usd_balance(self._last_balance_snapshot)),
+                max(0.0, _doge_balance(self._last_balance_snapshot)),
+            )
+        return 0.0, 0.0
+
+    def _active_order_side_counts(self) -> tuple[int, int, int]:
+        sells = 0
+        buys = 0
+        total = 0
+        for slot in self.slots.values():
+            for o in slot.state.orders:
+                if not o.txid:
+                    continue
+                total += 1
+                if o.side == "sell":
+                    sells += 1
+                elif o.side == "buy":
+                    buys += 1
+            for r in slot.state.recovery_orders:
+                if not r.txid:
+                    continue
+                total += 1
+                if r.side == "sell":
+                    sells += 1
+                elif r.side == "buy":
+                    buys += 1
+        return sells, buys, total
+
+    def _recompute_effective_layers(self, mark_price: float | None = None) -> dict[str, float | int | None]:
+        doge_per_order = max(0.0, float(config.CAPITAL_LAYER_DOGE_PER_ORDER))
+        layer_order_budget = max(1, int(config.CAPITAL_LAYER_ORDER_BUDGET))
+        layer_step_doge_eq = doge_per_order * float(layer_order_budget)
+
+        price = float(mark_price or 0.0)
+        if price <= 0:
+            price = self._layer_mark_price()
+
+        free_usd, free_doge = self._available_free_balances(prefer_fresh=False)
+        active_sell_orders, active_buy_orders, open_orders_total = self._active_order_side_counts()
+        sell_den = max(1, active_sell_orders)
+        buy_den = max(1, active_buy_orders)
+        buffer = max(1.0, float(config.CAPITAL_LAYER_BALANCE_BUFFER))
+
+        if doge_per_order <= 0:
+            max_layers_from_doge = 0
+            max_layers_from_usd = 0
+        else:
+            max_layers_from_doge = int(floor(free_doge / (sell_den * doge_per_order * buffer)))
+            if price > 0:
+                max_layers_from_usd = int(floor(free_usd / (buy_den * doge_per_order * price * buffer)))
+            else:
+                max_layers_from_usd = 0
+
+        target_layers = max(0, int(self.target_layers))
+        effective_layers = max(0, min(target_layers, max_layers_from_doge, max_layers_from_usd))
+        self.effective_layers = int(effective_layers)
+
+        gap_layers = max(0, target_layers - effective_layers)
+        gap_doge_now = max(0.0, (target_layers - max_layers_from_doge) * sell_den * doge_per_order)
+        gap_usd_now = max(0.0, (target_layers - max_layers_from_usd) * buy_den * doge_per_order * max(price, 0.0))
+
+        return {
+            "target_layers": target_layers,
+            "effective_layers": effective_layers,
+            "doge_per_order_per_layer": doge_per_order,
+            "layer_order_budget": layer_order_budget,
+            "layer_step_doge_eq": layer_step_doge_eq,
+            "mark_price": price if price > 0 else None,
+            "add_layer_usd_equiv_now": (layer_step_doge_eq * price) if price > 0 else None,
+            "active_sell_orders": active_sell_orders,
+            "active_buy_orders": active_buy_orders,
+            "open_orders_total": open_orders_total,
+            "max_layers_from_doge": max_layers_from_doge,
+            "max_layers_from_usd": max_layers_from_usd,
+            "gap_layers": gap_layers,
+            "gap_doge_now": gap_doge_now,
+            "gap_usd_now": gap_usd_now,
+            "free_usd": free_usd,
+            "free_doge": free_doge,
+        }
+
+    def _count_orders_at_funded_size(self) -> int:
+        matched = 0
+        for slot in self.slots.values():
+            cfg = self._engine_cfg(slot)
+            vol_decimals = int(cfg.volume_decimals)
+            if vol_decimals <= 0:
+                tol = 0.5
+            else:
+                tol = 0.5 * (10 ** (-vol_decimals))
+
+            for o in slot.state.orders:
+                if not o.txid:
+                    continue
+                trade = o.trade_id if o.trade_id in ("A", "B") else None
+                target_usd = self._slot_order_size_usd(slot, trade_id=trade)
+                expected_vol = sm.compute_order_volume(float(o.price), cfg, float(target_usd))
+                if expected_vol is None:
+                    continue
+                if abs(float(o.volume) - float(expected_vol)) <= tol + 1e-12:
+                    matched += 1
+
+            for r in slot.state.recovery_orders:
+                if not r.txid:
+                    continue
+                trade = r.trade_id if r.trade_id in ("A", "B") else None
+                target_usd = self._slot_order_size_usd(slot, trade_id=trade)
+                expected_vol = sm.compute_order_volume(float(r.price), cfg, float(target_usd))
+                if expected_vol is None:
+                    continue
+                if abs(float(r.volume) - float(expected_vol)) <= tol + 1e-12:
+                    matched += 1
+        return matched
+
     def _slot_order_size_usd(self, slot: SlotRuntime, trade_id: str | None = None) -> float:
         # Independent compounding per slot.
         base = max(float(config.ORDER_SIZE_USD), float(config.ORDER_SIZE_USD) + slot.state.total_profit)
+        layer_metrics = self._recompute_effective_layers(mark_price=self._layer_mark_price(slot))
+        effective_layers = int(layer_metrics.get("effective_layers", 0))
+        layer_usd = 0.0
+        layer_price = self._layer_mark_price(slot)
+        if layer_price > 0:
+            layer_usd = effective_layers * max(0.0, float(config.CAPITAL_LAYER_DOGE_PER_ORDER)) * layer_price
+        base_with_layers = max(base, base + layer_usd)
         if trade_id is None or not bool(config.REBALANCE_ENABLED):
-            return base
+            return base_with_layers
 
         skew = float(self._rebalancer_current_skew)
         if abs(skew) <= 1e-12:
-            return base
+            return base_with_layers
 
         favored = (skew > 0 and trade_id == "B") or (skew < 0 and trade_id == "A")
         if not favored:
-            return base
+            return base_with_layers
 
         sensitivity = max(0.0, float(config.REBALANCE_SIZE_SENSITIVITY))
         max_mult = max(1.0, float(config.REBALANCE_MAX_SIZE_MULT))
         mult = min(max_mult, 1.0 + abs(skew) * sensitivity)
-        effective = base * mult
+        effective = base_with_layers * mult
 
         # Fund guard: scaling should not make an already-viable side non-viable.
         if skew > 0 and trade_id == "B":
@@ -318,7 +547,7 @@ class BotRuntime:
             elif self.ledger._synced:
                 available_usd = float(self.ledger.available_usd)
             if available_usd is not None:
-                max_safe = max(base, available_usd - base)
+                max_safe = max(base_with_layers, available_usd - base_with_layers)
                 effective = min(effective, max_safe)
         elif skew < 0 and trade_id == "A":
             price = float(slot.state.market_price or self.last_price)
@@ -329,11 +558,11 @@ class BotRuntime:
                 elif self.ledger._synced:
                     available_doge = float(self.ledger.available_doge)
                 if available_doge is not None:
-                    base_doge = base / price
+                    base_doge = base_with_layers / price
                     max_safe_doge = max(base_doge, available_doge - base_doge)
                     effective = min(effective, max_safe_doge * price)
 
-        return max(base, effective)
+        return max(base_with_layers, effective)
 
     def _minimum_bootstrap_requirements(self, market_price: float) -> tuple[float, float]:
         min_vol = float(self.constraints.get("min_volume", 13.0))
@@ -661,7 +890,13 @@ class BotRuntime:
             "constraints": self.constraints,
             "maker_fee_pct": self.maker_fee_pct,
             "taker_fee_pct": self.taker_fee_pct,
+            "target_layers": int(self.target_layers),
+            "effective_layers": int(self.effective_layers),
+            "layer_last_add_event": self.layer_last_add_event,
+            "slot_alias_recycle_queue": list(self.slot_alias_recycle_queue),
+            "slot_alias_fallback_counter": int(self.slot_alias_fallback_counter),
             "slots": {str(sid): sm.to_dict(slot.state) for sid, slot in self.slots.items()},
+            "slot_aliases": {str(sid): str(slot.alias or "").strip().lower() for sid, slot in self.slots.items()},
             "recon_baseline": self._recon_baseline,
             "rebalancer_idle_ratio": self._rebalancer_idle_ratio,
             "rebalancer_smoothed_error": self._rebalancer_smoothed_error,
@@ -722,6 +957,21 @@ class BotRuntime:
             self.constraints = snap.get("constraints", self.constraints) or self.constraints
             self.maker_fee_pct = float(snap.get("maker_fee_pct", self.maker_fee_pct))
             self.taker_fee_pct = float(snap.get("taker_fee_pct", self.taker_fee_pct))
+            self.target_layers = max(0, int(snap.get("target_layers", self.target_layers)))
+            self.effective_layers = max(0, int(snap.get("effective_layers", self.effective_layers)))
+            raw_last_add = snap.get("layer_last_add_event", self.layer_last_add_event)
+            self.layer_last_add_event = raw_last_add if isinstance(raw_last_add, dict) else None
+            self.slot_alias_fallback_counter = max(
+                1,
+                int(snap.get("slot_alias_fallback_counter", self.slot_alias_fallback_counter)),
+            )
+            raw_alias_queue = snap.get("slot_alias_recycle_queue", list(self.slot_alias_recycle_queue))
+            self.slot_alias_recycle_queue = deque()
+            if isinstance(raw_alias_queue, list):
+                for alias in raw_alias_queue:
+                    norm = str(alias).strip().lower()
+                    if norm:
+                        self.slot_alias_recycle_queue.append(norm)
             self._recon_baseline = snap.get("recon_baseline", None)
             self._rebalancer_idle_ratio = float(snap.get("rebalancer_idle_ratio", self._rebalancer_idle_ratio))
             self._rebalancer_smoothed_error = float(
@@ -757,9 +1007,15 @@ class BotRuntime:
             self._rebalancer_sign_flip_history = deque(sorted(cleaned_hist)[-20:])
 
             self.slots = {}
+            slot_aliases = snap.get("slot_aliases", {})
+            slot_aliases = slot_aliases if isinstance(slot_aliases, dict) else {}
             for sid_text, raw_state in (snap.get("slots", {}) or {}).items():
                 sid = int(sid_text)
-                self.slots[sid] = SlotRuntime(slot_id=sid, state=sm.from_dict(raw_state))
+                alias = str(slot_aliases.get(str(sid)) or slot_aliases.get(sid) or "").strip().lower()
+                self.slots[sid] = SlotRuntime(slot_id=sid, state=sm.from_dict(raw_state), alias=alias)
+
+            self._sanitize_slot_alias_state()
+            self._recompute_effective_layers()
 
         # Startup rebase: if snapshot lagged behind queued event writes before a
         # restart, avoid duplicate-key collisions on bot_events(event_id).
@@ -905,6 +1161,7 @@ class BotRuntime:
 
         # Restore runtime snapshot.
         self._load_snapshot()
+        self._sanitize_slot_alias_state()
 
         # Ensure at least slot 0 exists.
         if not self.slots:
@@ -916,6 +1173,7 @@ class BotRuntime:
                     now=ts,
                     profit_pct_runtime=self.profit_pct,
                 ),
+                alias=self._allocate_slot_alias(),
             )
             self.next_slot_id = 1
 
@@ -939,6 +1197,8 @@ class BotRuntime:
         # Ensure each slot has active entries/exits after reconciliation/replay.
         for sid in sorted(self.slots.keys()):
             self._ensure_slot_bootstrapped(sid)
+
+        self._recompute_effective_layers()
 
         if self.mode not in ("PAUSED", "HALTED"):
             self.mode = "RUNNING"
@@ -1863,15 +2123,74 @@ class BotRuntime:
             return False, "bot halted"
         sid = self.next_slot_id
         self.next_slot_id += 1
+        alias = self._allocate_slot_alias()
         st = sm.PairState(
             market_price=self.last_price,
             now=_now(),
             profit_pct_runtime=self.profit_pct,
         )
-        self.slots[sid] = SlotRuntime(slot_id=sid, state=st)
+        self.slots[sid] = SlotRuntime(slot_id=sid, state=st, alias=alias)
         self._ensure_slot_bootstrapped(sid)
         self._save_snapshot()
-        return True, f"slot {sid} added"
+        return True, f"slot {sid} ({alias}) added"
+
+    def add_layer(self, source: str | None = None) -> tuple[bool, str]:
+        src = str(source or config.CAPITAL_LAYER_DEFAULT_SOURCE).strip().upper()
+        if src not in {"AUTO", "DOGE", "USD"}:
+            return False, f"invalid layer funding source: {src}"
+
+        step_doge_eq = self._capital_layer_step_doge_eq()
+        if step_doge_eq <= 0:
+            return False, "layer add rejected: invalid layer step"
+
+        price = self._layer_mark_price()
+        if price <= 0:
+            return False, "layer add rejected: market price unavailable"
+
+        free_usd, free_doge = self._available_free_balances(prefer_fresh=True)
+        required_usd = step_doge_eq * price
+        available_doge_eq = free_doge + (free_usd / price)
+
+        ok = False
+        if src == "DOGE":
+            ok = free_doge + 1e-12 >= step_doge_eq
+        elif src == "USD":
+            ok = free_usd + 1e-12 >= required_usd
+        else:
+            ok = available_doge_eq + 1e-12 >= step_doge_eq
+
+        if not ok:
+            if src == "DOGE":
+                return False, f"layer add rejected: need {step_doge_eq:.0f} DOGE, available {free_doge:.4f} DOGE"
+            if src == "USD":
+                return False, f"layer add rejected: need ${required_usd:.4f}, available ${free_usd:.4f}"
+            return (
+                False,
+                f"layer add rejected: need {step_doge_eq:.0f} DOGE-eq, available {available_doge_eq:.4f} DOGE-eq",
+            )
+
+        self.target_layers = max(0, int(self.target_layers)) + 1
+        self.layer_last_add_event = {
+            "timestamp": _now(),
+            "source": src,
+            "price_at_commit": float(price),
+            "usd_equiv_at_commit": float(required_usd),
+        }
+        self._recompute_effective_layers(mark_price=price)
+        self._save_snapshot()
+        return (
+            True,
+            f"layer added: target={self.target_layers} (+{config.CAPITAL_LAYER_DOGE_PER_ORDER:.0f} DOGE/order), "
+            f"commit step {step_doge_eq:.0f} DOGE-eq @ ${price:.4f}",
+        )
+
+    def remove_layer(self) -> tuple[bool, str]:
+        if int(self.target_layers) <= 0:
+            return False, "layer remove rejected: target already zero"
+        self.target_layers = int(self.target_layers) - 1
+        self._recompute_effective_layers()
+        self._save_snapshot()
+        return True, f"layer removed: target={self.target_layers} (+{self.target_layers:.0f} DOGE/order)"
 
     def set_entry_pct(self, value: float) -> tuple[bool, str]:
         if value < 0.05:
@@ -1980,6 +2299,7 @@ class BotRuntime:
         if failed > 0:
             return False, f"slot {slot_id}: {failed} cancel failures, not removed (retry)"
 
+        self._release_slot_alias(slot.alias)
         del self.slots[slot_id]
         self._save_snapshot()
 
@@ -2885,6 +3205,8 @@ class BotRuntime:
                 slot_unrealized_doge = slot_unrealized_profit / st.market_price if st.market_price > 0 else 0.0
                 slots.append({
                     "slot_id": sid,
+                    "slot_alias": self._slot_label(self.slots[sid]),
+                    "slot_label": self._slot_label(self.slots[sid]),
                     "phase": phase,
                     "long_only": st.long_only,
                     "short_only": st.short_only,
@@ -2958,6 +3280,8 @@ class BotRuntime:
             total_profit_doge = total_profit / pnl_ref_price if pnl_ref_price > 0 else 0.0
             total_unrealized_doge = total_unrealized_profit / pnl_ref_price if pnl_ref_price > 0 else 0.0
             pnl_audit = self._pnl_audit_summary()
+            layer_metrics = self._recompute_effective_layers(mark_price=pnl_ref_price)
+            orders_at_funded_size = self._count_orders_at_funded_size()
 
             return {
                 "mode": self.mode,
@@ -3083,6 +3407,23 @@ class BotRuntime:
                     "sign_flips_1h": len(self._rebalancer_sign_flip_history),
                     "capacity_band": self._rebalancer_last_capacity_band,
                 },
+                "capital_layers": {
+                    "target_layers": int(layer_metrics.get("target_layers", 0) or 0),
+                    "effective_layers": int(layer_metrics.get("effective_layers", 0) or 0),
+                    "doge_per_order_per_layer": float(layer_metrics.get("doge_per_order_per_layer", 0.0) or 0.0),
+                    "layer_order_budget": int(layer_metrics.get("layer_order_budget", 0) or 0),
+                    "layer_step_doge_eq": float(layer_metrics.get("layer_step_doge_eq", 0.0) or 0.0),
+                    "add_layer_usd_equiv_now": layer_metrics.get("add_layer_usd_equiv_now"),
+                    "funding_source_default": str(config.CAPITAL_LAYER_DEFAULT_SOURCE),
+                    "active_sell_orders": int(layer_metrics.get("active_sell_orders", 0) or 0),
+                    "active_buy_orders": int(layer_metrics.get("active_buy_orders", 0) or 0),
+                    "orders_at_funded_size": int(orders_at_funded_size),
+                    "open_orders_total": int(layer_metrics.get("open_orders_total", 0) or 0),
+                    "gap_layers": int(layer_metrics.get("gap_layers", 0) or 0),
+                    "gap_doge_now": float(layer_metrics.get("gap_doge_now", 0.0) or 0.0),
+                    "gap_usd_now": float(layer_metrics.get("gap_usd_now", 0.0) or 0.0),
+                    "last_add_layer_event": self.layer_last_add_event,
+                },
                 "slots": slots,
             }
 
@@ -3170,7 +3511,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
 
             action = (body.get("action") or "").strip()
-            parsed: dict[str, float | int] = {}
+            parsed: dict[str, float | int | str] = {}
 
             if action in ("set_entry_pct", "set_profit_pct"):
                 try:
@@ -3207,6 +3548,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     parsed["count"] = int(body.get("count", 1))
                 except (TypeError, ValueError):
                     parsed["count"] = 1
+            elif action == "add_layer":
+                source = str(body.get("source", config.CAPITAL_LAYER_DEFAULT_SOURCE)).strip().upper()
+                if source not in {"AUTO", "DOGE", "USD"}:
+                    self._send_json({"ok": False, "message": "invalid layer source"}, 400)
+                    return
+                parsed["source"] = source
+            elif action == "remove_layer":
+                pass
             elif action in ("pause", "resume", "add_slot", "soft_close_next", "reconcile_drift", "audit_pnl"):
                 pass
             else:
@@ -3224,6 +3573,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     msg = "running"
                 elif action == "add_slot":
                     ok, msg = _RUNTIME.add_slot()
+                elif action == "add_layer":
+                    ok, msg = _RUNTIME.add_layer(str(parsed.get("source", config.CAPITAL_LAYER_DEFAULT_SOURCE)))
+                elif action == "remove_layer":
+                    ok, msg = _RUNTIME.remove_layer()
                 elif action == "set_entry_pct":
                     ok, msg = _RUNTIME.set_entry_pct(float(parsed["value"]))
                 elif action == "set_profit_pct":

@@ -117,6 +117,34 @@ CAPITAL_BUDGET_MODE: str = _env("CAPITAL_BUDGET_MODE", "off", str)
 # pair's minimum cost.  Profits fund additional slots instead of compounding.
 ORDER_SIZE_USD: float = _env("ORDER_SIZE_USD", 2.00, float)
 
+# Capital layers (manual vertical sizing).
+# Each layer adds this much DOGE to every new order's target size.
+CAPITAL_LAYER_DOGE_PER_ORDER: float = _env("CAPITAL_LAYER_DOGE_PER_ORDER", 1.0, float)
+
+# Commitment unit denominator for layer preview/validation.
+# 225 matches configured per-pair maximum open orders.
+CAPITAL_LAYER_ORDER_BUDGET: int = _env("CAPITAL_LAYER_ORDER_BUDGET", 225, int)
+
+# Safety haircut for layer affordability checks.
+CAPITAL_LAYER_BALANCE_BUFFER: float = _env("CAPITAL_LAYER_BALANCE_BUFFER", 1.03, float)
+
+# Default funding source for add-layer action.
+_CAPITAL_LAYER_DEFAULT_SOURCE_RAW: str = _env("CAPITAL_LAYER_DEFAULT_SOURCE", "AUTO", str)
+CAPITAL_LAYER_DEFAULT_SOURCE: str = str(_CAPITAL_LAYER_DEFAULT_SOURCE_RAW).strip().upper()
+if CAPITAL_LAYER_DEFAULT_SOURCE not in {"AUTO", "DOGE", "USD"}:
+    CAPITAL_LAYER_DEFAULT_SOURCE = "AUTO"
+
+# Doge-themed slot aliases shown in dashboard/log display.
+_SLOT_ALIAS_POOL_DEFAULT = [
+    "wow", "such", "much", "very", "many", "so", "amaze", "plz",
+    "coin", "moon", "hodl", "treat", "shibe", "bork", "snoot", "floof",
+    "smol", "boop", "wag", "zoom", "paws", "mlem", "blep", "sniff",
+]
+_SLOT_ALIAS_POOL_RAW: str = _env("SLOT_ALIAS_POOL", ",".join(_SLOT_ALIAS_POOL_DEFAULT), str)
+SLOT_ALIAS_POOL: list[str] = [s.strip().lower() for s in _SLOT_ALIAS_POOL_RAW.split(",") if s.strip()]
+if not SLOT_ALIAS_POOL:
+    SLOT_ALIAS_POOL = list(_SLOT_ALIAS_POOL_DEFAULT)
+
 # ---------------------------------------------------------------------------
 # Grid geometry
 # ---------------------------------------------------------------------------

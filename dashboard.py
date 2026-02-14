@@ -86,6 +86,14 @@ DASHBOARD_HTML = """<!doctype html>
       color: var(--ink);
       padding: 8px;
     }
+    select {
+      width: 100%;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: #0f141b;
+      color: var(--ink);
+      padding: 8px;
+    }
     button {
       border: 1px solid var(--line);
       background: #1f2733;
@@ -288,6 +296,30 @@ DASHBOARD_HTML = """<!doctype html>
 
         <div style=\"height:10px\"></div>
 
+        <h3 style=\"margin-top:14px\">Capital Layers</h3>
+        <div class=\"k\">Funding Source</div>
+        <div style=\"display:flex;gap:8px\">
+          <select id=\"layerSourceSelect\">
+            <option value=\"AUTO\">AUTO</option>
+            <option value=\"DOGE\">DOGE</option>
+            <option value=\"USD\">USD</option>
+          </select>
+          <button id=\"addLayerBtn\">Add Layer</button>
+        </div>
+        <div style=\"height:8px\"></div>
+        <div style=\"display:flex;gap:8px\">
+          <button id=\"removeLayerBtn\" class=\"wide\">Remove Layer</button>
+        </div>
+        <div class=\"row\"><span class=\"k\">Target Size</span><span id=\"layerTarget\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Funded Now</span><span id=\"layerFunded\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Step Size</span><span id=\"layerStep\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">USD Equiv Now</span><span id=\"layerUsdNow\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Propagation</span><span id=\"layerPropagation\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Funding Gap</span><span id=\"layerGap\" class=\"v\"></span></div>
+        <div id=\"layerHint\" class=\"tiny\"></div>
+
+        <div style=\"height:10px\"></div>
+
         <h3 style=\"margin-top:14px\">Summary</h3>
         <div class=\"row\"><span class=\"k\">Pair</span><span id=\"pair\" class=\"v mono\"></span></div>
         <div class=\"row\"><span class=\"k\">Slots</span><span id=\"slotCount\" class=\"v\"></span></div>
@@ -399,6 +431,8 @@ DASHBOARD_HTML = """<!doctype html>
 |  :pause  :resume  :add  :remove N     |
 |  :audit                              |
 |  :set entry N  :set profit N          |
+|  :layer add [auto|doge|usd]           |
+|  :layer remove                        |
 |  :jump N (slot #)  :q (factory view)  |
 |  Tab=complete  up/down=history  Esc=close |
 |                                       |
@@ -432,8 +466,11 @@ DASHBOARD_HTML = """<!doctype html>
     let historyIndex = 0;
     let lastRefreshError = '';
     const commandHistory = [];
-    const COMMAND_COMPLETIONS = ['pause', 'resume', 'add', 'remove', 'close', 'audit', 'set entry', 'set profit', 'jump', 'q'];
-    const CONTROL_INPUT_IDS = new Set(['entryInput', 'profitInput']);
+    const COMMAND_COMPLETIONS = [
+      'pause', 'resume', 'add', 'remove', 'close', 'audit',
+      'set entry', 'set profit', 'jump', 'layer add', 'layer remove', 'q',
+    ];
+    const CONTROL_INPUT_IDS = new Set(['entryInput', 'profitInput', 'layerSourceSelect']);
 
     function fmt(n, d=6) {
       if (n === null || n === undefined || Number.isNaN(Number(n))) return '-';
@@ -587,6 +624,18 @@ DASHBOARD_HTML = """<!doctype html>
         return {type: 'jump', slotId};
       }
 
+      if (verb === 'layer') {
+        if (tokens.length < 2) return {error: 'usage: :layer add [auto|doge|usd] | :layer remove'};
+        const op = (tokens[1] || '').toLowerCase();
+        if (op === 'remove') return {type: 'layer_remove'};
+        if (op !== 'add') return {error: 'usage: :layer add [auto|doge|usd] | :layer remove'};
+        const source = (tokens[2] || 'auto').toUpperCase();
+        if (!['AUTO', 'DOGE', 'USD'].includes(source)) {
+          return {error: 'layer source must be auto, doge, or usd'};
+        }
+        return {type: 'layer_add', source};
+      }
+
       if (verb === 'set') {
         if (tokens.length < 3) return {error: 'usage: :set entry|profit <value>'};
         const target = (tokens[1] || '').toLowerCase();
@@ -719,6 +768,28 @@ DASHBOARD_HTML = """<!doctype html>
     function requestRemoveSlots(count) {
       openConfirmDialog(`Remove ${count} highest slot(s)? This cancels ALL their orders.`, async () => {
         await dispatchAction('remove_slots', {count});
+      });
+    }
+
+    function requestAddLayer(source) {
+      const src = String(source || 'AUTO').toUpperCase();
+      const layer = state && state.capital_layers ? state.capital_layers : {};
+      const usdNowRaw = layer.add_layer_usd_equiv_now;
+      const usdNow = usdNowRaw === null || usdNowRaw === undefined ? Number.NaN : Number(usdNowRaw);
+      const usdText = Number.isFinite(usdNow) ? `$${fmt(usdNow, 4)}` : 'price unavailable';
+      const text = [
+        `Commit one layer = +1 DOGE/order across up to 225 orders.`,
+        `This commit step is 225 DOGE-equivalent at current price (${usdText}).`,
+        `Funding source: ${src}.`,
+      ].join(' ');
+      openConfirmDialog(text, async () => {
+        await dispatchAction('add_layer', {source: src});
+      });
+    }
+
+    function requestRemoveLayer() {
+      openConfirmDialog('Remove one layer (-1 DOGE/order) for newly placed orders?', async () => {
+        await dispatchAction('remove_layer');
       });
     }
 
@@ -858,6 +929,15 @@ DASHBOARD_HTML = """<!doctype html>
         return;
       }
 
+      if (parsed.type === 'layer_add') {
+        requestAddLayer(parsed.source);
+        return;
+      }
+      if (parsed.type === 'layer_remove') {
+        requestRemoveLayer();
+        return;
+      }
+
       if (parsed.action === 'pause') {
         requestPause();
         return;
@@ -959,6 +1039,36 @@ DASHBOARD_HTML = """<!doctype html>
 
       const hints = Array.isArray(cfh.blocked_risk_hint) ? cfh.blocked_risk_hint : [];
       document.getElementById('cfhHints').textContent = hints.length ? `Hints: ${hints.join(', ')}` : '';
+
+      const layers = s.capital_layers || {};
+      const targetLayers = Number(layers.target_layers || 0);
+      const effectiveLayers = Number(layers.effective_layers || 0);
+      const dogePerLayer = Number(layers.doge_per_order_per_layer || 0);
+      const layerStep = Number(layers.layer_step_doge_eq || 0);
+      const usdNowRaw = layers.add_layer_usd_equiv_now;
+      const usdNow = usdNowRaw === null || usdNowRaw === undefined ? Number.NaN : Number(usdNowRaw);
+      const ordersFunded = Number(layers.orders_at_funded_size || 0);
+      const ordersTotal = Number(layers.open_orders_total || 0);
+      const gapLayers = Number(layers.gap_layers || 0);
+      const gapDoge = Number(layers.gap_doge_now || 0);
+      const gapUsd = Number(layers.gap_usd_now || 0);
+      const sourceDefault = String(layers.funding_source_default || 'AUTO').toUpperCase();
+
+      document.getElementById('layerTarget').textContent = `+${fmt(targetLayers * dogePerLayer, 3)} DOGE/order`;
+      document.getElementById('layerFunded').textContent = `+${fmt(effectiveLayers * dogePerLayer, 3)} DOGE/order`;
+      document.getElementById('layerStep').textContent = `${fmt(layerStep, 3)} DOGE-eq`;
+      document.getElementById('layerUsdNow').textContent = Number.isFinite(usdNow) ? `$${fmt(usdNow, 4)}` : '-';
+      document.getElementById('layerPropagation').textContent = `${ordersFunded}/${ordersTotal}`;
+      document.getElementById('layerGap').textContent = `short ${fmt(gapDoge, 3)} DOGE and $${fmt(gapUsd, 4)}`;
+      document.getElementById('layerHint').textContent =
+        gapLayers > 0
+          ? 'Orders resize gradually as they recycle. No mass cancel/replace.'
+          : 'Orders resize gradually as they recycle.';
+
+      const layerSourceSelect = document.getElementById('layerSourceSelect');
+      if (layerSourceSelect && document.activeElement !== layerSourceSelect) {
+        layerSourceSelect.value = sourceDefault;
+      }
 
       // Balance Reconciliation card
       const recon = s.balance_recon;
@@ -1108,7 +1218,9 @@ DASHBOARD_HTML = """<!doctype html>
       for (const slot of s.slots) {
         const b = document.createElement('button');
         b.className = 'slot' + (slot.slot_id === selectedSlot ? ' active' : '');
-        b.textContent = `#${slot.slot_id} ${slot.phase}`;
+        const alias = slot.slot_alias || slot.slot_label || `slot-${slot.slot_id}`;
+        b.textContent = `${alias} ${slot.phase}`;
+        b.title = `slot #${slot.slot_id}`;
         b.onclick = () => {
           selectedSlot = slot.slot_id;
           renderSelected(s);
@@ -1126,8 +1238,10 @@ DASHBOARD_HTML = """<!doctype html>
       if (!slot) return;
 
       const sb = document.getElementById('stateBar');
+      const alias = slot.slot_alias || slot.slot_label || `slot-${slot.slot_id}`;
       sb.innerHTML = `
         <span class=\"statepill ${slot.phase}\">${slot.phase}</span>
+        <span class=\"tiny\">${alias} (#${slot.slot_id})</span>
         <span class=\"tiny\">price $${fmt(slot.market_price, 6)}</span>
         <span class=\"tiny\">A.${slot.cycle_a} / B.${slot.cycle_b}</span>
         <span class=\"tiny\">open ${slot.open_orders.length}</span>
@@ -1379,6 +1493,11 @@ DASHBOARD_HTML = """<!doctype html>
     document.getElementById('addSlotBtn').onclick = () => { void dispatchAction('add_slot'); };
     document.getElementById('removeSlotBtn').onclick = () => requestRemoveSlot();
     document.getElementById('softCloseBtn').onclick = () => requestSoftCloseNext();
+    document.getElementById('addLayerBtn').onclick = () => {
+      const source = document.getElementById('layerSourceSelect').value || 'AUTO';
+      requestAddLayer(source);
+    };
+    document.getElementById('removeLayerBtn').onclick = () => requestRemoveLayer();
     document.getElementById('setEntryBtn').onclick = () => {
       const value = readAndValidatePctInput('entryInput', 'entry');
       if (value === null) return;

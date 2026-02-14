@@ -913,6 +913,65 @@ class BotEventLogTests(unittest.TestCase):
         self.assertAlmostEqual(payload["pnl_audit"]["loss_drift"], 0.0)
         self.assertEqual(payload["pnl_audit"]["trips_drift"], 0)
 
+    def test_status_payload_exposes_capital_layers_and_slot_alias(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                alias="wow",
+                state=sm.PairState(market_price=0.1, now=1000.0),
+            )
+        }
+
+        payload = rt.status_payload()
+        self.assertEqual(payload["slots"][0]["slot_alias"], "wow")
+        self.assertEqual(payload["slots"][0]["slot_label"], "wow")
+        layers = payload["capital_layers"]
+        self.assertIn("target_layers", layers)
+        self.assertIn("effective_layers", layers)
+        self.assertIn("layer_step_doge_eq", layers)
+
+    def test_add_layer_auto_accepts_mixed_doge_and_usd(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        rt._last_balance_snapshot = {"USD": 10.0, "DOGE": 200.0}
+        rt._last_balance_ts = 1000.0
+
+        ok, msg = rt.add_layer("AUTO")
+        self.assertTrue(ok)
+        self.assertIn("layer added", msg)
+        self.assertEqual(rt.target_layers, 1)
+        self.assertEqual(rt.layer_last_add_event["source"], "AUTO")
+
+    def test_remove_layer_rejects_zero_target(self):
+        rt = bot.BotRuntime()
+        ok, msg = rt.remove_layer()
+        self.assertFalse(ok)
+        self.assertIn("target already zero", msg)
+
+    def test_recycled_alias_not_reused_until_unused_pool_exhausted(self):
+        rt = bot.BotRuntime()
+        rt.slot_alias_pool = ("wow", "such", "much")
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                alias="wow",
+                state=sm.PairState(market_price=0.1, now=1000.0),
+            )
+        }
+        rt.next_slot_id = 1
+
+        with mock.patch.object(rt, "_save_snapshot"):
+            ok, _msg = rt.remove_slot(0)
+            self.assertTrue(ok)
+            with mock.patch.object(rt, "_ensure_slot_bootstrapped"):
+                ok2, _msg2 = rt.add_slot()
+                self.assertTrue(ok2)
+
+        # "such" is still unused, so it must be picked before recycled "wow".
+        self.assertEqual(rt.slots[1].alias, "such")
+
     def test_audit_pnl_ok_when_cycle_totals_match(self):
         rt = bot.BotRuntime()
         rt.slots = {
@@ -1064,6 +1123,12 @@ class DashboardApiHardeningTests(unittest.TestCase):
         def add_slot(self):
             return True, "ok"
 
+        def add_layer(self, _source):
+            return True, "layer ok"
+
+        def remove_layer(self):
+            return True, "layer removed"
+
         def set_entry_pct(self, _value):
             return True, "ok"
 
@@ -1144,6 +1209,17 @@ class DashboardApiHardeningTests(unittest.TestCase):
         self.assertEqual(code, 400)
         self.assertEqual(payload, {"ok": False, "message": "unknown action: wat"})
 
+    def test_api_action_add_layer_invalid_source_returns_json_400(self):
+        bot._RUNTIME = self._RuntimeStub()
+        handler = self._HandlerStub({"action": "add_layer", "source": "bad"})
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 400)
+        self.assertEqual(payload, {"ok": False, "message": "invalid layer source"})
+
     def test_api_action_catch_all_returns_json_500(self):
         runtime = self._RuntimeStub()
         runtime.raise_on_pause = True
@@ -1167,6 +1243,28 @@ class DashboardApiHardeningTests(unittest.TestCase):
         code, payload = handler.sent[0]
         self.assertEqual(code, 200)
         self.assertEqual(payload, {"ok": True, "message": "audit ok"})
+
+    def test_api_action_add_layer_routes_ok(self):
+        bot._RUNTIME = self._RuntimeStub()
+        handler = self._HandlerStub({"action": "add_layer", "source": "AUTO"})
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 200)
+        self.assertEqual(payload, {"ok": True, "message": "layer ok"})
+
+    def test_api_action_remove_layer_routes_ok(self):
+        bot._RUNTIME = self._RuntimeStub()
+        handler = self._HandlerStub({"action": "remove_layer"})
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 200)
+        self.assertEqual(payload, {"ok": True, "message": "layer removed"})
 
     def test_send_json_sets_no_cache_headers(self):
         handler = self._GetHandlerStub("/api/status")
