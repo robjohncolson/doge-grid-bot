@@ -276,6 +276,14 @@ class BotRuntime:
         self._rebalancer_sign_flip_history: deque[float] = deque()
         self._rebalancer_damped_until: float = 0.0
         self._rebalancer_last_capacity_band: str = "normal"
+        base_target = max(0.0, min(1.0, float(config.REBALANCE_TARGET_IDLE_PCT)))
+        self._trend_fast_ema: float = 0.0
+        self._trend_slow_ema: float = 0.0
+        self._trend_score: float = 0.0
+        self._trend_dynamic_target: float = base_target
+        self._trend_smoothed_target: float = base_target
+        self._trend_target_locked_until: float = 0.0
+        self._trend_last_update_ts: float = 0.0
 
         # Daily loss lock (aggregate bot-level, UTC day).
         self._daily_loss_lock_active: bool = False
@@ -914,6 +922,13 @@ class BotRuntime:
             "rebalancer_last_raw_error": self._rebalancer_last_raw_error,
             "rebalancer_sign_flip_history": list(self._rebalancer_sign_flip_history)[-20:],
             "rebalancer_damped_until": self._rebalancer_damped_until,
+            "trend_fast_ema": self._trend_fast_ema,
+            "trend_slow_ema": self._trend_slow_ema,
+            "trend_score": self._trend_score,
+            "trend_dynamic_target": self._trend_dynamic_target,
+            "trend_smoothed_target": self._trend_smoothed_target,
+            "trend_target_locked_until": self._trend_target_locked_until,
+            "trend_last_update_ts": self._trend_last_update_ts,
             "entry_adds_deferred_total": self._entry_adds_deferred_total,
             "entry_adds_drained_total": self._entry_adds_drained_total,
             "entry_adds_last_deferred_at": self._entry_adds_last_deferred_at,
@@ -999,6 +1014,15 @@ class BotRuntime:
                 snap.get("rebalancer_last_raw_error", self._rebalancer_last_raw_error)
             )
             self._rebalancer_damped_until = float(snap.get("rebalancer_damped_until", self._rebalancer_damped_until))
+            self._trend_fast_ema = float(snap.get("trend_fast_ema", self._trend_fast_ema))
+            self._trend_slow_ema = float(snap.get("trend_slow_ema", self._trend_slow_ema))
+            self._trend_score = float(snap.get("trend_score", self._trend_score))
+            self._trend_dynamic_target = float(snap.get("trend_dynamic_target", self._trend_dynamic_target))
+            self._trend_smoothed_target = float(snap.get("trend_smoothed_target", self._trend_smoothed_target))
+            self._trend_target_locked_until = float(
+                snap.get("trend_target_locked_until", self._trend_target_locked_until)
+            )
+            self._trend_last_update_ts = float(snap.get("trend_last_update_ts", self._trend_last_update_ts))
             self._entry_adds_deferred_total = int(snap.get("entry_adds_deferred_total", self._entry_adds_deferred_total))
             self._entry_adds_drained_total = int(snap.get("entry_adds_drained_total", self._entry_adds_drained_total))
             self._entry_adds_last_deferred_at = float(
@@ -3183,6 +3207,96 @@ class BotRuntime:
             "median_price_distance_pct": median_price_distance_pct,
         }
 
+    def _compute_dynamic_idle_target(self, now: float) -> float:
+        base_target = max(0.0, min(1.0, float(config.REBALANCE_TARGET_IDLE_PCT)))
+        floor_target = max(0.0, min(1.0, float(config.TREND_IDLE_FLOOR)))
+        ceil_target = max(0.0, min(1.0, float(config.TREND_IDLE_CEILING)))
+        if floor_target > ceil_target:
+            floor_target, ceil_target = ceil_target, floor_target
+        sensitivity = max(0.0, float(config.TREND_IDLE_SENSITIVITY))
+        dead_zone = max(0.0, float(config.TREND_DEAD_ZONE))
+        hold_sec = max(0.0, float(config.TREND_HYSTERESIS_SEC))
+        min_samples = max(1, int(config.TREND_MIN_SAMPLES))
+        fast_halflife = max(1.0, float(config.TREND_FAST_HALFLIFE))
+        slow_halflife = max(fast_halflife, float(config.TREND_SLOW_HALFLIFE))
+        smooth_halflife = max(1.0, float(config.TREND_HYSTERESIS_SMOOTH_HALFLIFE))
+        price = float(self.last_price)
+        if price <= 0:
+            self._trend_score = 0.0
+            self._trend_dynamic_target = base_target
+            self._trend_smoothed_target = base_target
+            self._trend_target_locked_until = 0.0
+            return base_target
+
+        last_update_ts = float(self._trend_last_update_ts)
+        interval_sec = max(1.0, float(config.REBALANCE_INTERVAL_SEC))
+        dt = max(1.0, (now - last_update_ts) if last_update_ts > 0 else interval_sec)
+
+        # Long update gaps can leave stale EMA state; restart from current price.
+        if last_update_ts > 0 and (now - last_update_ts) > (slow_halflife * 2.0):
+            self._trend_fast_ema = price
+            self._trend_slow_ema = price
+
+        has_persisted_ema = self._trend_fast_ema > 0 and self._trend_slow_ema > 0
+        if not has_persisted_ema:
+            if len(self.price_history) < min_samples:
+                self._trend_fast_ema = price
+                self._trend_slow_ema = price
+                self._trend_score = 0.0
+                self._trend_dynamic_target = base_target
+                self._trend_smoothed_target = base_target
+                self._trend_target_locked_until = 0.0
+                self._trend_last_update_ts = now
+                return base_target
+            self._trend_fast_ema = price
+            self._trend_slow_ema = price
+
+        fast_alpha = 1.0 - exp(-dt / fast_halflife)
+        slow_alpha = 1.0 - exp(-dt / slow_halflife)
+        self._trend_fast_ema = fast_alpha * price + (1.0 - fast_alpha) * float(self._trend_fast_ema)
+        self._trend_slow_ema = slow_alpha * price + (1.0 - slow_alpha) * float(self._trend_slow_ema)
+
+        slow = float(self._trend_slow_ema)
+        if slow <= 0:
+            self._trend_score = 0.0
+        else:
+            self._trend_score = (float(self._trend_fast_ema) - slow) / slow
+
+        # Dead zone first: collapse to base target and skip hold/smoothing stages.
+        if abs(float(self._trend_score)) < dead_zone:
+            self._trend_dynamic_target = base_target
+            self._trend_smoothed_target = base_target
+            self._trend_target_locked_until = 0.0
+            self._trend_last_update_ts = now
+            return base_target
+
+        raw_target = base_target - sensitivity * float(self._trend_score)
+        clamped_target = max(floor_target, min(ceil_target, raw_target))
+
+        # Hold second: freeze output and smoothing state.
+        if now < float(self._trend_target_locked_until):
+            self._trend_last_update_ts = now
+            return max(0.0, min(1.0, float(self._trend_dynamic_target)))
+
+        # Smooth third: only when hold is not active.
+        prev_output = max(0.0, min(1.0, float(self._trend_dynamic_target)))
+        prev_smoothed = float(self._trend_smoothed_target)
+        if not isfinite(prev_smoothed):
+            prev_smoothed = prev_output
+        target_alpha = 1.0 - exp(-dt / smooth_halflife)
+        smoothed_target = target_alpha * clamped_target + (1.0 - target_alpha) * prev_smoothed
+        smoothed_target = max(floor_target, min(ceil_target, smoothed_target))
+        self._trend_smoothed_target = smoothed_target
+        self._trend_dynamic_target = smoothed_target
+
+        if abs(smoothed_target - prev_output) > 0.02 + 1e-12:
+            self._trend_target_locked_until = now + hold_sec
+        else:
+            self._trend_target_locked_until = 0.0
+
+        self._trend_last_update_ts = now
+        return max(0.0, min(1.0, smoothed_target))
+
     def _update_rebalancer(self, now: float) -> None:
         if not bool(config.REBALANCE_ENABLED):
             self._rebalancer_current_skew = 0.0
@@ -3192,6 +3306,8 @@ class BotRuntime:
         last_ts = float(self._rebalancer_last_update_ts)
         if last_ts > 0 and (now - last_ts) < interval_sec:
             return
+
+        target = self._compute_dynamic_idle_target(now)
 
         capacity = self._compute_capacity_health(now)
         band = str(capacity.get("status_band") or "normal")
@@ -3209,7 +3325,6 @@ class BotRuntime:
             return
 
         idle_ratio = max(0.0, min(1.0, float(scoreboard.get("idle_usd_pct", 0.0)) / 100.0))
-        target = max(0.0, min(1.0, float(config.REBALANCE_TARGET_IDLE_PCT)))
         raw_error = idle_ratio - target
 
         dt = max(1.0, (now - last_ts) if last_ts > 0 else interval_sec)
@@ -3574,7 +3689,8 @@ class BotRuntime:
                 "rebalancer": {
                     "enabled": bool(config.REBALANCE_ENABLED),
                     "idle_ratio": float(self._rebalancer_idle_ratio),
-                    "target": float(config.REBALANCE_TARGET_IDLE_PCT),
+                    "target": float(max(0.0, min(1.0, self._trend_dynamic_target))),
+                    "base_target": float(max(0.0, min(1.0, float(config.REBALANCE_TARGET_IDLE_PCT)))),
                     "error": float(self._rebalancer_last_raw_error),
                     "smoothed_error": float(self._rebalancer_smoothed_error),
                     "velocity": float(self._rebalancer_smoothed_velocity),
@@ -3605,6 +3721,21 @@ class BotRuntime:
                     "damped": bool(now < float(self._rebalancer_damped_until)),
                     "sign_flips_1h": len(self._rebalancer_sign_flip_history),
                     "capacity_band": self._rebalancer_last_capacity_band,
+                },
+                "trend": {
+                    "score": float(self._trend_score),
+                    "score_display": (
+                        f"+{(float(self._trend_score) * 100.0):.2f}%"
+                        if float(self._trend_score) > 0
+                        else f"{(float(self._trend_score) * 100.0):.2f}%"
+                    ),
+                    "fast_ema": float(self._trend_fast_ema),
+                    "slow_ema": float(self._trend_slow_ema),
+                    "dynamic_idle_target": float(max(0.0, min(1.0, self._trend_dynamic_target))),
+                    "hysteresis_active": bool(now < float(self._trend_target_locked_until)),
+                    "hysteresis_expires_in_sec": int(
+                        max(0.0, float(self._trend_target_locked_until) - now)
+                    ),
                 },
                 "capital_layers": {
                     "target_layers": int(layer_metrics.get("target_layers", 0) or 0),

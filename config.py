@@ -409,6 +409,17 @@ REBALANCE_ENABLED: bool = _env("REBALANCE_ENABLED", True, bool)
 # Target idle USD ratio (0.40 = keep ~40% USD idle runway).
 REBALANCE_TARGET_IDLE_PCT: float = _env("REBALANCE_TARGET_IDLE_PCT", 0.40, float)
 
+# Dynamic idle target (trend-aware target adjustment for rebalancer input only).
+TREND_FAST_HALFLIFE: float = _env("TREND_FAST_HALFLIFE", 1800.0, float)
+TREND_SLOW_HALFLIFE: float = _env("TREND_SLOW_HALFLIFE", 14400.0, float)
+TREND_IDLE_SENSITIVITY: float = _env("TREND_IDLE_SENSITIVITY", 5.0, float)
+TREND_IDLE_FLOOR: float = _env("TREND_IDLE_FLOOR", 0.15, float)
+TREND_IDLE_CEILING: float = _env("TREND_IDLE_CEILING", 0.60, float)
+TREND_MIN_SAMPLES: int = _env("TREND_MIN_SAMPLES", 24, int)
+TREND_HYSTERESIS_SEC: float = _env("TREND_HYSTERESIS_SEC", 600.0, float)
+TREND_HYSTERESIS_SMOOTH_HALFLIFE: float = _env("TREND_HYSTERESIS_SMOOTH_HALFLIFE", 900.0, float)
+TREND_DEAD_ZONE: float = _env("TREND_DEAD_ZONE", 0.001, float)
+
 # PD gains for skew controller.
 REBALANCE_KP: float = _env("REBALANCE_KP", 2.0, float)
 REBALANCE_KD: float = _env("REBALANCE_KD", 0.5, float)

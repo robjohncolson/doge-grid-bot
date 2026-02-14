@@ -1003,6 +1003,276 @@ class BotEventLogTests(unittest.TestCase):
         self.assertAlmostEqual(payload["pnl_audit"]["loss_drift"], 0.0)
         self.assertEqual(payload["pnl_audit"]["trips_drift"], 0)
 
+    def test_dynamic_idle_target_cold_start_uses_base_target(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        rt.price_history = [(float(i), 0.1) for i in range(5)]
+        now = 2000.0
+
+        with mock.patch.object(config, "REBALANCE_TARGET_IDLE_PCT", 0.40):
+            with mock.patch.object(config, "TREND_MIN_SAMPLES", 24):
+                target = rt._compute_dynamic_idle_target(now)
+
+        self.assertAlmostEqual(target, 0.40)
+        self.assertAlmostEqual(rt._trend_score, 0.0)
+        self.assertAlmostEqual(rt._trend_dynamic_target, 0.40)
+
+    def test_dynamic_idle_target_restart_uses_persisted_emas(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.102
+        rt.price_history = []
+        rt._trend_fast_ema = 0.102
+        rt._trend_slow_ema = 0.100
+        rt._trend_last_update_ts = 1000.0
+        rt._trend_dynamic_target = 0.40
+        rt._trend_smoothed_target = 0.40
+        now = 1300.0
+
+        with mock.patch.object(config, "REBALANCE_TARGET_IDLE_PCT", 0.40):
+            target = rt._compute_dynamic_idle_target(now)
+
+        self.assertGreater(rt._trend_score, 0.0)
+        self.assertLess(target, 0.40)
+        self.assertLess(rt._trend_slow_ema, rt.last_price)
+
+    def test_dynamic_idle_target_resets_after_long_data_gap(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.12
+        rt.price_history = [(float(i), 0.12) for i in range(50)]
+        rt._trend_fast_ema = 0.20
+        rt._trend_slow_ema = 0.10
+        rt._trend_last_update_ts = 1000.0
+        now = 1300.0
+
+        with mock.patch.object(config, "REBALANCE_TARGET_IDLE_PCT", 0.40):
+            with mock.patch.object(config, "TREND_FAST_HALFLIFE", 100.0):
+                with mock.patch.object(config, "TREND_SLOW_HALFLIFE", 100.0):
+                    target = rt._compute_dynamic_idle_target(now)
+
+        self.assertAlmostEqual(target, 0.40)
+        self.assertAlmostEqual(rt._trend_fast_ema, 0.12)
+        self.assertAlmostEqual(rt._trend_slow_ema, 0.12)
+        self.assertAlmostEqual(rt._trend_score, 0.0)
+
+    def test_dynamic_idle_target_positive_trend_hits_floor_bound(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.20
+        rt.price_history = [(float(i), 0.20) for i in range(50)]
+        rt._trend_fast_ema = 0.20
+        rt._trend_slow_ema = 0.10
+        rt._trend_last_update_ts = 1000.0
+        rt._trend_dynamic_target = 0.40
+        rt._trend_smoothed_target = 0.40
+        now = 1300.0
+
+        with mock.patch.object(config, "REBALANCE_TARGET_IDLE_PCT", 0.40):
+            with mock.patch.object(config, "TREND_IDLE_SENSITIVITY", 5.0):
+                with mock.patch.object(config, "TREND_IDLE_FLOOR", 0.15):
+                    with mock.patch.object(config, "TREND_IDLE_CEILING", 0.60):
+                        with mock.patch.object(config, "TREND_HYSTERESIS_SMOOTH_HALFLIFE", 1.0):
+                            target = rt._compute_dynamic_idle_target(now)
+
+        self.assertGreater(rt._trend_score, 0.0)
+        self.assertAlmostEqual(target, 0.15, places=4)
+        self.assertAlmostEqual(rt._trend_dynamic_target, 0.15, places=4)
+
+    def test_dynamic_idle_target_negative_trend_hits_ceiling_bound(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.10
+        rt.price_history = [(float(i), 0.10) for i in range(50)]
+        rt._trend_fast_ema = 0.10
+        rt._trend_slow_ema = 0.20
+        rt._trend_last_update_ts = 1000.0
+        rt._trend_dynamic_target = 0.40
+        rt._trend_smoothed_target = 0.40
+        now = 1300.0
+
+        with mock.patch.object(config, "REBALANCE_TARGET_IDLE_PCT", 0.40):
+            with mock.patch.object(config, "TREND_IDLE_SENSITIVITY", 5.0):
+                with mock.patch.object(config, "TREND_IDLE_FLOOR", 0.15):
+                    with mock.patch.object(config, "TREND_IDLE_CEILING", 0.60):
+                        with mock.patch.object(config, "TREND_HYSTERESIS_SMOOTH_HALFLIFE", 1.0):
+                            target = rt._compute_dynamic_idle_target(now)
+
+        self.assertLess(rt._trend_score, 0.0)
+        self.assertAlmostEqual(target, 0.60, places=4)
+        self.assertAlmostEqual(rt._trend_dynamic_target, 0.60, places=4)
+
+    def test_dynamic_idle_target_dead_zone_returns_base_target(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.10005
+        rt.price_history = [(float(i), 0.10005) for i in range(50)]
+        rt._trend_fast_ema = 0.10005
+        rt._trend_slow_ema = 0.10000
+        rt._trend_last_update_ts = 1000.0
+        rt._trend_dynamic_target = 0.37
+        rt._trend_smoothed_target = 0.37
+        rt._trend_target_locked_until = 9999.0
+        now = 1300.0
+
+        with mock.patch.object(config, "REBALANCE_TARGET_IDLE_PCT", 0.40):
+            with mock.patch.object(config, "TREND_DEAD_ZONE", 0.001):
+                target = rt._compute_dynamic_idle_target(now)
+
+        self.assertAlmostEqual(target, 0.40, places=6)
+        self.assertAlmostEqual(rt._trend_dynamic_target, 0.40, places=6)
+        self.assertAlmostEqual(rt._trend_smoothed_target, 0.40, places=6)
+        self.assertEqual(rt._trend_target_locked_until, 0.0)
+
+    def test_dynamic_idle_target_hysteresis_hold_freezes_output_and_smoothing(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.20
+        rt.price_history = [(float(i), 0.20) for i in range(50)]
+        rt._trend_fast_ema = 0.20
+        rt._trend_slow_ema = 0.10
+        rt._trend_last_update_ts = 1000.0
+        rt._trend_dynamic_target = 0.33
+        rt._trend_smoothed_target = 0.33
+        rt._trend_target_locked_until = 2000.0
+        now = 1500.0
+
+        with mock.patch.object(config, "REBALANCE_TARGET_IDLE_PCT", 0.40):
+            with mock.patch.object(config, "TREND_HYSTERESIS_SMOOTH_HALFLIFE", 1.0):
+                target = rt._compute_dynamic_idle_target(now)
+
+        self.assertAlmostEqual(target, 0.33, places=6)
+        self.assertAlmostEqual(rt._trend_dynamic_target, 0.33, places=6)
+        self.assertAlmostEqual(rt._trend_smoothed_target, 0.33, places=6)
+        self.assertAlmostEqual(rt._trend_target_locked_until, 2000.0, places=6)
+
+    def test_dynamic_idle_target_hysteresis_hold_triggers_on_large_jump(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.20
+        rt.price_history = [(float(i), 0.20) for i in range(50)]
+        rt._trend_fast_ema = 0.20
+        rt._trend_slow_ema = 0.10
+        rt._trend_last_update_ts = 1000.0
+        rt._trend_dynamic_target = 0.40
+        rt._trend_smoothed_target = 0.40
+        now = 1300.0
+
+        with mock.patch.object(config, "REBALANCE_TARGET_IDLE_PCT", 0.40):
+            with mock.patch.object(config, "TREND_HYSTERESIS_SEC", 600.0):
+                with mock.patch.object(config, "TREND_HYSTERESIS_SMOOTH_HALFLIFE", 1.0):
+                    target = rt._compute_dynamic_idle_target(now)
+
+        self.assertLess(target, 0.38)
+        self.assertAlmostEqual(rt._trend_target_locked_until, 1900.0, places=6)
+
+    def test_dynamic_idle_target_fast_ema_tracks_price_more_closely_than_slow(self):
+        rt = bot.BotRuntime()
+        rt._trend_fast_ema = 1.0
+        rt._trend_slow_ema = 1.0
+        rt._trend_last_update_ts = 0.0
+        rt._trend_dynamic_target = 0.40
+        rt._trend_smoothed_target = 0.40
+        rt.price_history = [(float(i), 1.0) for i in range(50)]
+        now = 1000.0
+
+        with mock.patch.object(config, "TREND_FAST_HALFLIFE", 30.0):
+            with mock.patch.object(config, "TREND_SLOW_HALFLIFE", 300.0):
+                with mock.patch.object(config, "TREND_DEAD_ZONE", 0.0):
+                    for px in [1.00, 1.05, 1.10, 1.20, 1.30]:
+                        rt.last_price = px
+                        now += 60.0
+                        rt._compute_dynamic_idle_target(now)
+
+        current = 1.30
+        self.assertLess(abs(rt._trend_fast_ema - current), abs(rt._trend_slow_ema - current))
+
+    def test_status_payload_exposes_dynamic_rebalancer_target_and_trend_block(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        rt._trend_score = 0.0123
+        rt._trend_fast_ema = 0.10541
+        rt._trend_slow_ema = 0.10412
+        rt._trend_dynamic_target = 0.32
+        rt._trend_target_locked_until = 1050.0
+        rt._rebalancer_current_skew = 0.10
+
+        with mock.patch("bot._now", return_value=1000.0):
+            with mock.patch.object(config, "REBALANCE_TARGET_IDLE_PCT", 0.40):
+                payload = rt.status_payload()
+
+        self.assertAlmostEqual(payload["rebalancer"]["target"], 0.32)
+        self.assertAlmostEqual(payload["rebalancer"]["base_target"], 0.40)
+        trend = payload["trend"]
+        self.assertAlmostEqual(trend["score"], 0.0123)
+        self.assertEqual(trend["score_display"], "+1.23%")
+        self.assertAlmostEqual(trend["dynamic_idle_target"], 0.32)
+        self.assertTrue(trend["hysteresis_active"])
+        self.assertEqual(trend["hysteresis_expires_in_sec"], 50)
+
+    def test_global_snapshot_persists_trend_fields(self):
+        rt = bot.BotRuntime()
+        rt._trend_fast_ema = 0.101
+        rt._trend_slow_ema = 0.100
+        rt._trend_score = 0.01
+        rt._trend_dynamic_target = 0.35
+        rt._trend_smoothed_target = 0.34
+        rt._trend_target_locked_until = 2222.0
+        rt._trend_last_update_ts = 1234.0
+
+        snap = rt._global_snapshot()
+
+        self.assertAlmostEqual(snap["trend_fast_ema"], 0.101)
+        self.assertAlmostEqual(snap["trend_slow_ema"], 0.100)
+        self.assertAlmostEqual(snap["trend_score"], 0.01)
+        self.assertAlmostEqual(snap["trend_dynamic_target"], 0.35)
+        self.assertAlmostEqual(snap["trend_smoothed_target"], 0.34)
+        self.assertAlmostEqual(snap["trend_target_locked_until"], 2222.0)
+        self.assertAlmostEqual(snap["trend_last_update_ts"], 1234.0)
+
+    def test_load_snapshot_backward_compatible_without_trend_fields(self):
+        rt = bot.BotRuntime()
+        old_snap = rt._global_snapshot()
+        old_snap.pop("trend_fast_ema", None)
+        old_snap.pop("trend_slow_ema", None)
+        old_snap.pop("trend_score", None)
+        old_snap.pop("trend_dynamic_target", None)
+        old_snap.pop("trend_smoothed_target", None)
+        old_snap.pop("trend_target_locked_until", None)
+        old_snap.pop("trend_last_update_ts", None)
+
+        rt._trend_fast_ema = 0.0
+        rt._trend_slow_ema = 0.0
+        rt._trend_score = 0.0
+        rt._trend_dynamic_target = 0.40
+        rt._trend_smoothed_target = 0.40
+        rt._trend_target_locked_until = 0.0
+        rt._trend_last_update_ts = 0.0
+
+        with mock.patch("supabase_store.load_state", return_value=old_snap):
+            with mock.patch("supabase_store.load_max_event_id", return_value=0):
+                rt._load_snapshot()
+
+        self.assertAlmostEqual(rt._trend_dynamic_target, 0.40)
+        self.assertAlmostEqual(rt._trend_smoothed_target, 0.40)
+        self.assertAlmostEqual(rt._trend_score, 0.0)
+
+    def test_load_snapshot_restores_trend_fields(self):
+        rt = bot.BotRuntime()
+        snap = rt._global_snapshot()
+        snap["trend_fast_ema"] = 0.106
+        snap["trend_slow_ema"] = 0.104
+        snap["trend_score"] = 0.0192307692
+        snap["trend_dynamic_target"] = 0.31
+        snap["trend_smoothed_target"] = 0.315
+        snap["trend_target_locked_until"] = 9999.0
+        snap["trend_last_update_ts"] = 7777.0
+
+        with mock.patch("supabase_store.load_state", return_value=snap):
+            with mock.patch("supabase_store.load_max_event_id", return_value=0):
+                rt._load_snapshot()
+
+        self.assertAlmostEqual(rt._trend_fast_ema, 0.106)
+        self.assertAlmostEqual(rt._trend_slow_ema, 0.104)
+        self.assertAlmostEqual(rt._trend_score, 0.0192307692)
+        self.assertAlmostEqual(rt._trend_dynamic_target, 0.31)
+        self.assertAlmostEqual(rt._trend_smoothed_target, 0.315)
+        self.assertAlmostEqual(rt._trend_target_locked_until, 9999.0)
+        self.assertAlmostEqual(rt._trend_last_update_ts, 7777.0)
+
     def test_daily_loss_lock_pauses_on_aggregate_utc_threshold(self):
         rt = bot.BotRuntime()
         rt.mode = "RUNNING"

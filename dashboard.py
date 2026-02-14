@@ -365,6 +365,8 @@ DASHBOARD_HTML = """<!doctype html>
         <div class=\"row\"><span class=\"k\">Open Gap</span><span id=\"biasOpenGap\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Re-entry Lag (med)</span><span id=\"biasLagMed\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Current Wait</span><span id=\"biasLagCurrent\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Trend Score</span><span id=\"trendScore\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Idle Target</span><span id=\"trendIdleTarget\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Governor</span><span id=\"rebalGov\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Size Skew</span><span id=\"rebalSizes\" class=\"v\"></span></div>
         <div id=\"biasDetails\" class=\"tiny\"></div>
@@ -1165,8 +1167,11 @@ DASHBOARD_HTML = """<!doctype html>
       const bLagM = document.getElementById('biasLagMed');
       const bLagC = document.getElementById('biasLagCurrent');
       const bDet = document.getElementById('biasDetails');
+      const trendScoreEl = document.getElementById('trendScore');
+      const trendIdleEl = document.getElementById('trendIdleTarget');
       const govEl = document.getElementById('rebalGov');
       const sizesEl = document.getElementById('rebalSizes');
+      const trend = s.trend || null;
       if (!bias) {
         [bEq, b1h, b24h, bIdle, bRunway, bOpp, bGap, bLagM, bLagC].forEach(e => { e.textContent = '-'; e.style.color = ''; });
         bSpark.innerHTML = '';
@@ -1249,6 +1254,26 @@ DASHBOARD_HTML = """<!doctype html>
           sizesEl.textContent = `A ×${fmt(aMult, 2)} | B ×${fmt(bMult, 2)}`;
           sizesEl.style.color = damped ? 'var(--warn)' : '';
         }
+      }
+      if (!trend) {
+        trendScoreEl.textContent = '-';
+        trendScoreEl.style.color = '';
+        trendIdleEl.textContent = '-';
+        trendIdleEl.style.color = '';
+      } else {
+        const score = Number(trend.score || 0);
+        const scorePct = score * 100;
+        const scoreSign = scorePct >= 0 ? '+' : '';
+        trendScoreEl.textContent = `${scoreSign}${fmt(scorePct, 2)}%`;
+        if (score > 0.005) trendScoreEl.style.color = 'var(--good)';
+        else if (score < -0.005) trendScoreEl.style.color = 'var(--bad)';
+        else trendScoreEl.style.color = '';
+
+        const rebal = s.rebalancer || {};
+        const dynamicTarget = Number(rebal.target != null ? rebal.target : trend.dynamic_idle_target || 0);
+        const baseTarget = Number(rebal.base_target != null ? rebal.base_target : 0);
+        trendIdleEl.textContent = `${fmt(dynamicTarget * 100, 1)}% (base ${fmt(baseTarget * 100, 1)}%)`;
+        trendIdleEl.style.color = dynamicTarget < baseTarget ? 'var(--good)' : dynamicTarget > baseTarget ? 'var(--warn)' : '';
       }
     }
 
