@@ -272,9 +272,20 @@ S2_ORPHAN_AFTER_SEC: int = _env("S2_ORPHAN_AFTER_SEC", 1800, int)  # 30 min
 LOSS_BACKOFF_START: int = _env("LOSS_BACKOFF_START", 3, int)
 LOSS_COOLDOWN_START: int = _env("LOSS_COOLDOWN_START", 5, int)
 LOSS_COOLDOWN_SEC: int = _env("LOSS_COOLDOWN_SEC", 900, int)       # 15 min
+# Base re-entry cooldown after cycle close/orphan (seconds), regardless of PnL.
+# This slows immediate re-entries and reduces order-velocity bursts across slots.
+REENTRY_BASE_COOLDOWN_SEC: float = _env("REENTRY_BASE_COOLDOWN_SEC", 60.0, float)
 
 # Soft operational limits.
 MAX_API_CALLS_PER_LOOP: int = _env("MAX_API_CALLS_PER_LOOP", 10, int)
+# Max new entry placements per main loop across all slots.
+# Exits/cancels are not capped here; this only throttles fresh entry Adds.
+MAX_ENTRY_ADDS_PER_LOOP: int = _env("MAX_ENTRY_ADDS_PER_LOOP", 2, int)
+# Private API metronome: smooths bursts into paced call waves.
+# Example default = 2 calls per 1.5s (~1.33 calls/sec sustained).
+PRIVATE_API_METRONOME_ENABLED: bool = _env("PRIVATE_API_METRONOME_ENABLED", True, bool)
+PRIVATE_API_METRONOME_WAVE_CALLS: int = _env("PRIVATE_API_METRONOME_WAVE_CALLS", 2, int)
+PRIVATE_API_METRONOME_WAVE_SECONDS: float = _env("PRIVATE_API_METRONOME_WAVE_SECONDS", 1.5, float)
 ORPHAN_PRESSURE_WARN_AT: int = _env("ORPHAN_PRESSURE_WARN_AT", 100, int)
 # Capacity telemetry controls for manual scaling.
 KRAKEN_OPEN_ORDERS_PER_PAIR_LIMIT: int = _env("KRAKEN_OPEN_ORDERS_PER_PAIR_LIMIT", 225, int)
@@ -685,6 +696,14 @@ def print_banner():
         f"  Stop floor:      ${STOP_FLOOR:.2f}",
         f"  Daily loss limit: ${DAILY_LOSS_LIMIT:.2f}",
         f"  Poll interval:   {POLL_INTERVAL_SECONDS}s",
+        f"  Re-entry delay:  {max(0.0, float(REENTRY_BASE_COOLDOWN_SEC)):.0f}s base",
+        f"  Entry add cap:   {max(1, int(MAX_ENTRY_ADDS_PER_LOOP))} per loop",
+        (
+            "  API metronome:  "
+            f"{'on' if PRIVATE_API_METRONOME_ENABLED else 'off'} "
+            f"({max(1, int(PRIVATE_API_METRONOME_WAVE_CALLS))} calls/"
+            f"{max(0.05, float(PRIVATE_API_METRONOME_WAVE_SECONDS)):.2f}s)"
+        ),
         f"  AI council:      manual (/check or dashboard)",
         f"  Health port:     {HEALTH_PORT}",
         f"  Log level:       {LOG_LEVEL}",

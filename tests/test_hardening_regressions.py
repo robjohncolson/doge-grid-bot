@@ -1,9 +1,11 @@
 import io
+import time
 import unittest
 from unittest import mock
 
 import bot
 import config
+import kraken_client
 import state_machine as sm
 
 
@@ -57,6 +59,89 @@ class DogeV1StateMachineTests(unittest.TestCase):
         exit_order = [o for o in st2.orders if o.role == "exit"][0]
         self.assertEqual(exit_order.volume, 27.0)
         self.assertTrue(any(isinstance(x, sm.PlaceOrderAction) and x.role == "exit" for x in actions))
+
+    def test_exit_fill_applies_base_reentry_cooldown(self):
+        st = sm.PairState(
+            market_price=0.1,
+            now=1000.0,
+            orders=(
+                sm.OrderState(
+                    local_id=1,
+                    side="sell",
+                    role="exit",
+                    price=0.1008,
+                    volume=13.0,
+                    trade_id="A",
+                    cycle=1,
+                    txid="TX-A-EXIT",
+                    placed_at=999.0,
+                    entry_price=0.1,
+                    entry_fee=0.0,
+                    entry_filled_at=950.0,
+                ),
+                sm.OrderState(
+                    local_id=2,
+                    side="buy",
+                    role="entry",
+                    price=0.0998,
+                    volume=13.0,
+                    trade_id="B",
+                    cycle=1,
+                    txid="TX-B-ENTRY",
+                    placed_at=999.0,
+                ),
+            ),
+        )
+        cfg = sm.EngineConfig(
+            entry_pct=0.2,
+            profit_pct=1.0,
+            refresh_pct=1.0,
+            order_size_usd=2.0,
+            price_decimals=6,
+            volume_decimals=0,
+            min_volume=13.0,
+            min_cost_usd=0.0,
+            maker_fee_pct=0.25,
+            s1_orphan_after_sec=600,
+            s2_orphan_after_sec=1800,
+            loss_backoff_start=3,
+            loss_cooldown_start=5,
+            loss_cooldown_sec=900,
+            reentry_base_cooldown_sec=60.0,
+        )
+        fill = sm.FillEvent(
+            order_local_id=1,
+            txid="TX-A-EXIT",
+            side="sell",
+            price=0.1008,
+            volume=13.0,
+            fee=0.01,
+            timestamp=1100.0,
+        )
+        st2, actions = sm.transition(st, fill, cfg, order_size_usd=2.0)
+        self.assertAlmostEqual(st2.cooldown_until_a, 1160.0)
+        self.assertFalse(
+            any(isinstance(x, sm.PlaceOrderAction) and x.role == "entry" and x.trade_id == "A" for x in actions)
+        )
+
+    def test_add_entry_order_respects_trade_cooldown(self):
+        st = sm.PairState(
+            market_price=0.1,
+            now=1000.0,
+            cooldown_until_a=1060.0,
+        )
+        cfg = self._cfg()
+        st2, action = sm.add_entry_order(
+            st,
+            cfg,
+            side="sell",
+            trade_id="A",
+            cycle=1,
+            order_size_usd=2.0,
+            reason="cooldown_guard",
+        )
+        self.assertIsNone(action)
+        self.assertEqual(st2.orders, ())
 
     def test_s1_timeout_orphans_stale_exit(self):
         st = sm.PairState(
@@ -232,6 +317,52 @@ class BotEventLogTests(unittest.TestCase):
                 bounded = q.call_args.kwargs["txids"] if "txids" in q.call_args.kwargs else q.call_args.args[0]
                 self.assertEqual(len(bounded), 50)
             rt.end_loop()
+
+    def test_entry_scheduler_defers_and_drains_pending_entries(self):
+        rt = bot.BotRuntime()
+        rt.mode = "RUNNING"
+        now = bot._now()
+        rt.last_price = 0.1
+        rt.last_price_ts = now
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=now,
+                ),
+            )
+        }
+        cfg = rt._engine_cfg(rt.slots[0])
+        st = rt.slots[0].state
+        st, a1 = sm.add_entry_order(st, cfg, side="sell", trade_id="A", cycle=st.cycle_a, order_size_usd=2.0, reason="t1")
+        st, a2 = sm.add_entry_order(st, cfg, side="buy", trade_id="B", cycle=st.cycle_b, order_size_usd=2.0, reason="t2")
+        rt.slots[0].state = st
+        self.assertIsNotNone(a1)
+        self.assertIsNotNone(a2)
+
+        rt.entry_adds_per_loop_cap = 1
+        rt.entry_adds_per_loop_used = 0
+        rt._loop_available_usd = 100.0
+        rt._loop_available_doge = 1000.0
+
+        with mock.patch.object(rt, "_place_order", side_effect=["TX-A", "TX-B"]):
+            rt._execute_actions(0, [a1, a2], "unit_test")
+            o1 = sm.find_order(rt.slots[0].state, a1.local_id)
+            o2 = sm.find_order(rt.slots[0].state, a2.local_id)
+            self.assertIsNotNone(o1)
+            self.assertIsNotNone(o2)
+            self.assertTrue(bool(o1.txid) ^ bool(o2.txid))
+            self.assertEqual(rt._entry_adds_deferred_total, 1)
+
+            rt.entry_adds_per_loop_used = 0
+            rt._drain_pending_entry_orders("unit_test_drain", skip_stale=False)
+
+        o1 = sm.find_order(rt.slots[0].state, a1.local_id)
+        o2 = sm.find_order(rt.slots[0].state, a2.local_id)
+        self.assertTrue(bool(o1 and o1.txid))
+        self.assertTrue(bool(o2 and o2.txid))
+        self.assertEqual(rt._entry_adds_drained_total, 1)
 
     @mock.patch("supabase_store.save_fill")
     def test_replay_missed_fills_aggregates_and_applies_once(self, _save_fill):
@@ -716,6 +847,46 @@ class BotEventLogTests(unittest.TestCase):
         self.assertEqual(cfh["open_orders_current"], 2)
         self.assertEqual(cfh["open_orders_safe_cap"], 168)
         self.assertEqual(cfh["open_order_headroom"], 166)
+        self.assertIn("entry_scheduler", cfh)
+
+    def test_status_payload_exposes_entry_scheduler_fields(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        rt.entry_adds_per_loop_cap = 2
+        rt.entry_adds_per_loop_used = 1
+        rt._entry_adds_deferred_total = 5
+        rt._entry_adds_drained_total = 3
+        rt._entry_adds_last_deferred_at = 1000.0
+        rt._entry_adds_last_drained_at = 1005.0
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    orders=(
+                        sm.OrderState(
+                            local_id=1,
+                            side="buy",
+                            role="entry",
+                            price=0.0998,
+                            volume=13.0,
+                            trade_id="B",
+                            cycle=1,
+                            txid="",
+                            placed_at=999.0,
+                        ),
+                    ),
+                ),
+            )
+        }
+        payload = rt.status_payload()
+        es = payload["capacity_fill_health"]["entry_scheduler"]
+        self.assertEqual(es["cap_per_loop"], 2)
+        self.assertEqual(es["used_this_loop"], 1)
+        self.assertEqual(es["pending_entries"], 1)
+        self.assertEqual(es["deferred_total"], 5)
+        self.assertEqual(es["drained_total"], 3)
 
     def test_status_payload_exposes_factory_fields(self):
         rt = bot.BotRuntime()
@@ -734,6 +905,7 @@ class BotEventLogTests(unittest.TestCase):
         payload = rt.status_payload()
         self.assertEqual(payload["s2_orphan_after_sec"], float(config.S2_ORPHAN_AFTER_SEC))
         self.assertEqual(payload["stale_price_max_age_sec"], float(config.STALE_PRICE_MAX_AGE_SEC))
+        self.assertEqual(payload["reentry_base_cooldown_sec"], float(config.REENTRY_BASE_COOLDOWN_SEC))
         self.assertEqual(payload["slots"][0]["s2_entered_at"], 900.0)
         self.assertIn("pnl_audit", payload)
         self.assertTrue(payload["pnl_audit"]["ok"])
@@ -1112,6 +1284,53 @@ class OpenOrderDriftAlertTests(unittest.TestCase):
                         self.assertIn("Open-order drift recovered", send_mock.call_args_list[1].args[0])
                         self.assertFalse(rt._open_order_drift_alert_active)
                         self.assertIsNone(rt._open_order_drift_over_threshold_since)
+
+
+class PrivateApiMetronomeTests(unittest.TestCase):
+    def test_rate_limiter_metronome_waits_between_waves(self):
+        limiter = kraken_client._RateLimiter(max_budget=100, decay_rate=100.0)
+        with mock.patch.object(config, "PRIVATE_API_METRONOME_ENABLED", True):
+            with mock.patch.object(config, "PRIVATE_API_METRONOME_WAVE_CALLS", 1):
+                with mock.patch.object(config, "PRIVATE_API_METRONOME_WAVE_SECONDS", 0.08):
+                    start = time.time()
+                    limiter.consume(1)
+                    limiter.consume(1)
+                    elapsed = time.time() - start
+                    self.assertGreaterEqual(elapsed, 0.06)
+                    telemetry = limiter.telemetry()
+                    self.assertGreaterEqual(telemetry["wait_events"], 1)
+                    self.assertTrue(telemetry["enabled"])
+
+    def test_status_payload_exposes_private_api_metronome(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(market_price=0.1, now=1000.0),
+            )
+        }
+        fake = {
+            "enabled": True,
+            "wave_calls": 2,
+            "wave_seconds": 1.5,
+            "wave_calls_used": 1,
+            "wave_window_remaining_sec": 0.6,
+            "wait_events": 3,
+            "wait_total_sec": 1.2,
+            "last_wait_sec": 0.5,
+            "calls_last_60s": 40,
+            "effective_calls_per_sec": 0.6667,
+            "budget_available": 9.5,
+            "consecutive_rate_errors": 0,
+        }
+        with mock.patch("kraken_client.rate_limit_telemetry", return_value=fake):
+            payload = rt.status_payload()
+        meta = payload["capacity_fill_health"]["private_api_metronome"]
+        self.assertTrue(meta["enabled"])
+        self.assertEqual(meta["wave_calls"], 2)
+        self.assertEqual(meta["wait_events"], 3)
+        self.assertAlmostEqual(meta["wait_total_sec"], 1.2)
 
 
 if __name__ == "__main__":

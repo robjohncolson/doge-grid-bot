@@ -22,6 +22,7 @@ import base64
 import json
 import logging
 import threading
+from collections import deque
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -70,6 +71,30 @@ class _RateLimiter:
         self._last_decay = time.time()
         self._consecutive_errors = 0
         self._circuit_open_until = 0.0  # timestamp; 0 = closed
+        self._wave_started_at = 0.0
+        self._wave_calls_used = 0
+        self._metronome_wait_events = 0
+        self._metronome_wait_total_sec = 0.0
+        self._metronome_last_wait_sec = 0.0
+        self._recent_private_call_ts: deque[float] = deque()
+
+    @staticmethod
+    def _metronome_config() -> tuple[bool, int, float]:
+        enabled = bool(getattr(config, "PRIVATE_API_METRONOME_ENABLED", False))
+        try:
+            wave_calls = max(1, int(getattr(config, "PRIVATE_API_METRONOME_WAVE_CALLS", 2)))
+        except (TypeError, ValueError):
+            wave_calls = 2
+        try:
+            wave_seconds = max(0.05, float(getattr(config, "PRIVATE_API_METRONOME_WAVE_SECONDS", 1.5)))
+        except (TypeError, ValueError):
+            wave_seconds = 1.5
+        return enabled, wave_calls, wave_seconds
+
+    def _trim_recent_calls_locked(self, now: float):
+        cutoff = now - 60.0
+        while self._recent_private_call_ts and self._recent_private_call_ts[0] < cutoff:
+            self._recent_private_call_ts.popleft()
 
     def _decay(self):
         """Replenish budget based on elapsed time. Must hold _lock."""
@@ -84,6 +109,7 @@ class _RateLimiter:
         """Consume rate-limit units. Allows overdraft down to -2 (like the
         old code) so startup bursts aren't blocked for minutes.  Only truly
         blocks when the circuit breaker is open or budget is deeply negative."""
+        units = max(1, int(units))
         with self._cond:
             # Circuit breaker: hard block until it clears
             now = time.time()
@@ -95,6 +121,31 @@ class _RateLimiter:
 
             self._decay()
 
+            # Metronome pacing: spread private calls into fixed-size waves.
+            metronome_enabled, wave_calls, wave_seconds = self._metronome_config()
+            if metronome_enabled:
+                remaining = units
+                while remaining > 0:
+                    now = time.time()
+                    if self._wave_started_at <= 0 or (now - self._wave_started_at) >= wave_seconds:
+                        self._wave_started_at = now
+                        self._wave_calls_used = 0
+                    wave_room = wave_calls - self._wave_calls_used
+                    if wave_room <= 0:
+                        wait = max(0.01, self._wave_started_at + wave_seconds - now)
+                        self._metronome_wait_events += 1
+                        self._metronome_wait_total_sec += wait
+                        self._metronome_last_wait_sec = wait
+                        self._cond.wait(timeout=wait)
+                        self._decay()
+                        continue
+                    take = min(wave_room, remaining)
+                    self._wave_calls_used += take
+                    remaining -= take
+            else:
+                self._wave_started_at = 0.0
+                self._wave_calls_used = 0
+
             # Soft throttle: if budget is very low, wait briefly (like old 2s pause)
             if self._budget <= 1:
                 logger.warning("Rate limit nearly exhausted (%.1f/%d), waiting 2s",
@@ -104,6 +155,9 @@ class _RateLimiter:
 
             # Always deduct (can go negative -- floor at -2 to bound overdraft)
             self._budget = max(-2.0, self._budget - units)
+            now = time.time()
+            self._recent_private_call_ts.append(now)
+            self._trim_recent_calls_locked(now)
 
     def report_rate_error(self):
         """Called after a Kraken rate-limit or lockout error."""
@@ -129,6 +183,31 @@ class _RateLimiter:
             self._decay()
             return self._budget
 
+    def telemetry(self) -> dict:
+        with self._lock:
+            self._decay()
+            now = time.time()
+            self._trim_recent_calls_locked(now)
+            metronome_enabled, wave_calls, wave_seconds = self._metronome_config()
+            window_remaining = 0.0
+            if self._wave_started_at > 0:
+                window_remaining = max(0.0, (self._wave_started_at + wave_seconds) - now)
+            calls_last_60s = len(self._recent_private_call_ts)
+            return {
+                "enabled": metronome_enabled,
+                "wave_calls": wave_calls,
+                "wave_seconds": wave_seconds,
+                "wave_calls_used": int(self._wave_calls_used if metronome_enabled else 0),
+                "wave_window_remaining_sec": window_remaining if metronome_enabled else 0.0,
+                "wait_events": int(self._metronome_wait_events),
+                "wait_total_sec": float(self._metronome_wait_total_sec),
+                "last_wait_sec": float(self._metronome_last_wait_sec),
+                "calls_last_60s": int(calls_last_60s),
+                "effective_calls_per_sec": float(calls_last_60s / 60.0),
+                "budget_available": float(self._budget),
+                "consecutive_rate_errors": int(self._consecutive_errors),
+            }
+
 
 _rate_limiter = _RateLimiter()
 
@@ -141,6 +220,11 @@ def _consume_call():
 def budget_available() -> float:
     """Return the current available rate-limit budget (non-blocking)."""
     return _rate_limiter.budget_available()
+
+
+def rate_limit_telemetry() -> dict:
+    """Return private-API limiter/metronome telemetry for dashboards."""
+    return _rate_limiter.telemetry()
 
 
 # ---------------------------------------------------------------------------

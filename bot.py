@@ -218,6 +218,12 @@ class BotRuntime:
         self.consecutive_api_errors = 0
         self.enforce_loop_budget = False
         self.loop_private_calls = 0
+        self.entry_adds_per_loop_cap = max(1, int(config.MAX_ENTRY_ADDS_PER_LOOP))
+        self.entry_adds_per_loop_used = 0
+        self._entry_adds_deferred_total = 0
+        self._entry_adds_drained_total = 0
+        self._entry_adds_last_deferred_at = 0.0
+        self._entry_adds_last_drained_at = 0.0
         self._loop_balance_cache: dict | None = None
         self._loop_available_usd: float | None = None
         self._loop_available_doge: float | None = None
@@ -280,6 +286,7 @@ class BotRuntime:
             loss_backoff_start=int(config.LOSS_BACKOFF_START),
             loss_cooldown_start=int(config.LOSS_COOLDOWN_START),
             loss_cooldown_sec=float(config.LOSS_COOLDOWN_SEC),
+            reentry_base_cooldown_sec=float(config.REENTRY_BASE_COOLDOWN_SEC),
             backoff_factor=float(config.ENTRY_BACKOFF_FACTOR),
             backoff_max_multiplier=float(config.ENTRY_BACKOFF_MAX_MULTIPLIER),
         )
@@ -420,6 +427,103 @@ class BotRuntime:
             "p95_fill_seconds_1d": p95_fill_seconds_1d,
             "status_band": status_band,
         }
+
+    def _pending_entry_orders(self) -> list[tuple[int, sm.OrderState]]:
+        pending: list[tuple[int, sm.OrderState]] = []
+        for sid in sorted(self.slots.keys()):
+            st = self.slots[sid].state
+            for o in st.orders:
+                if o.role == "entry" and not o.txid:
+                    pending.append((sid, o))
+        pending.sort(key=lambda row: (float(row[1].placed_at or 0.0), int(row[0]), int(row[1].local_id)))
+        return pending
+
+    def _compute_entry_adds_loop_cap(self) -> int:
+        base_cap = max(1, int(config.MAX_ENTRY_ADDS_PER_LOOP))
+        try:
+            capacity = self._compute_capacity_health()
+            headroom = int(capacity.get("open_order_headroom") or 0)
+        except Exception:
+            return base_cap
+
+        # Tighten entry velocity as we approach order-cap pressure.
+        if headroom <= 5:
+            return 1
+        if headroom <= 10:
+            return min(base_cap, 2)
+        if headroom <= 20:
+            return min(base_cap, 3)
+        return base_cap
+
+    def _defer_entry_due_scheduler(self, slot_id: int, action: sm.PlaceOrderAction, source: str) -> None:
+        self._entry_adds_deferred_total += 1
+        self._entry_adds_last_deferred_at = _now()
+        logger.info(
+            "entry_scheduler: deferred %s %s [%s.%s] slot=%s local=%s (cap %d/loop reached via %s)",
+            action.role,
+            action.side,
+            action.trade_id,
+            action.cycle,
+            slot_id,
+            action.local_id,
+            self.entry_adds_per_loop_cap,
+            source,
+        )
+
+    def _drain_pending_entry_orders(self, source: str, *, skip_stale: bool = False) -> None:
+        if self.mode in ("PAUSED", "HALTED"):
+            return
+        if self.entry_adds_per_loop_used >= self.entry_adds_per_loop_cap:
+            return
+        if self._price_age_sec() > config.STALE_PRICE_MAX_AGE_SEC:
+            return
+
+        max_drift_pct = max(0.05, float(config.PAIR_REFRESH_PCT))
+        pending = self._pending_entry_orders()
+        if not pending:
+            return
+
+        drained = 0
+        for sid, order in pending:
+            if self.entry_adds_per_loop_used >= self.entry_adds_per_loop_cap:
+                break
+            slot = self.slots.get(sid)
+            if slot is None:
+                continue
+            current = sm.find_order(slot.state, order.local_id)
+            if current is None or current.role != "entry" or current.txid:
+                continue
+
+            if skip_stale and self.last_price > 0:
+                drift = abs(current.price - self.last_price) / self.last_price * 100.0
+                if drift > max_drift_pct:
+                    continue
+
+            action = sm.PlaceOrderAction(
+                local_id=current.local_id,
+                side=current.side,
+                role="entry",
+                price=current.price,
+                volume=current.volume,
+                trade_id=current.trade_id,
+                cycle=current.cycle,
+                reason="entry_scheduler_drain",
+            )
+            before = self.entry_adds_per_loop_used
+            self._execute_actions(sid, [action], source)
+            if self.entry_adds_per_loop_used > before:
+                drained += 1
+
+        if drained > 0:
+            self._entry_adds_drained_total += drained
+            self._entry_adds_last_drained_at = _now()
+            logger.info(
+                "entry_scheduler: drained %d pending entries via %s (used %d/%d this loop)",
+                drained,
+                source,
+                self.entry_adds_per_loop_used,
+                self.entry_adds_per_loop_cap,
+            )
 
     def _trim_rolling_telemetry(self, now: float | None = None) -> None:
         now = now or _now()
@@ -567,6 +671,10 @@ class BotRuntime:
             "rebalancer_last_raw_error": self._rebalancer_last_raw_error,
             "rebalancer_sign_flip_history": list(self._rebalancer_sign_flip_history)[-20:],
             "rebalancer_damped_until": self._rebalancer_damped_until,
+            "entry_adds_deferred_total": self._entry_adds_deferred_total,
+            "entry_adds_drained_total": self._entry_adds_drained_total,
+            "entry_adds_last_deferred_at": self._entry_adds_last_deferred_at,
+            "entry_adds_last_drained_at": self._entry_adds_last_drained_at,
         }
 
     def _save_local_runtime_snapshot(self, snapshot: dict) -> None:
@@ -630,6 +738,14 @@ class BotRuntime:
                 snap.get("rebalancer_last_raw_error", self._rebalancer_last_raw_error)
             )
             self._rebalancer_damped_until = float(snap.get("rebalancer_damped_until", self._rebalancer_damped_until))
+            self._entry_adds_deferred_total = int(snap.get("entry_adds_deferred_total", self._entry_adds_deferred_total))
+            self._entry_adds_drained_total = int(snap.get("entry_adds_drained_total", self._entry_adds_drained_total))
+            self._entry_adds_last_deferred_at = float(
+                snap.get("entry_adds_last_deferred_at", self._entry_adds_last_deferred_at)
+            )
+            self._entry_adds_last_drained_at = float(
+                snap.get("entry_adds_last_drained_at", self._entry_adds_last_drained_at)
+            )
             hist = snap.get("rebalancer_sign_flip_history", [])
             cleaned_hist: list[float] = []
             if isinstance(hist, list):
@@ -680,6 +796,8 @@ class BotRuntime:
     def begin_loop(self) -> None:
         self.enforce_loop_budget = True
         self.loop_private_calls = 0
+        self.entry_adds_per_loop_used = 0
+        self.entry_adds_per_loop_cap = self._compute_entry_adds_loop_cap()
         self._loop_balance_cache = None
         self._loop_available_usd = None
         self._loop_available_doge = None
@@ -692,6 +810,7 @@ class BotRuntime:
 
     def end_loop(self) -> None:
         self.enforce_loop_budget = False
+        self.entry_adds_per_loop_used = 0
         self._loop_balance_cache = None
         self._loop_available_usd = None
         self._loop_available_doge = None
@@ -1383,6 +1502,10 @@ class BotRuntime:
                     self._normalize_slot_mode(slot_id)
                     continue
 
+                if action.role == "entry" and self.entry_adds_per_loop_used >= self.entry_adds_per_loop_cap:
+                    self._defer_entry_due_scheduler(slot_id, action, source)
+                    continue
+
                 reserved_locally = self._try_reserve_loop_funds(
                     side=action.side,
                     volume=action.volume,
@@ -1434,6 +1557,8 @@ class BotRuntime:
                             action.volume,
                         )
                     self.ledger.commit_order(action.side, action.price, action.volume)
+                    if action.role == "entry":
+                        self.entry_adds_per_loop_used += 1
                     _internal_order_count += 1
                 except Exception as e:
                     self._release_loop_reservation(
@@ -2228,6 +2353,9 @@ class BotRuntime:
             if self._price_age_sec() > config.STALE_PRICE_MAX_AGE_SEC:
                 self.pause("stale price data > 60s")
             self._update_rebalancer(_now())
+            # Prioritize older deferred entries each loop, while avoiding stale placements
+            # that the upcoming price tick is likely to refresh anyway.
+            self._drain_pending_entry_orders("entry_scheduler_pre_tick", skip_stale=True)
 
             if self._recon_baseline is None and self.last_price > 0 and self._last_balance_snapshot:
                 bal = self._last_balance_snapshot
@@ -2255,6 +2383,9 @@ class BotRuntime:
                 # When a slot is in one-sided fallback, try to restore normal mode
                 # as soon as balances and API budget allow.
                 self._auto_repair_degraded_slot(sid)
+
+            # After all slot transitions/actions, use remaining entry quota.
+            self._drain_pending_entry_orders("entry_scheduler_post_tick", skip_stale=False)
 
             self._poll_order_status()
             # Refresh pair open-order telemetry (Kraken source of truth) when budget allows.
@@ -2780,6 +2911,11 @@ class BotRuntime:
             total_round_trips = sum(s.state.total_round_trips for s in self.slots.values())
             total_orphans = sum(len(s.state.recovery_orders) for s in self.slots.values())
             capacity = self._compute_capacity_health(now)
+            pending_entries = len(self._pending_entry_orders())
+            try:
+                private_api = kraken_client.rate_limit_telemetry()
+            except Exception:
+                private_api = {}
             internal_open_orders_current = int(capacity.get("open_orders_internal") or 0)
             last_balance = dict(self._last_balance_snapshot) if self._last_balance_snapshot else {}
             observed_usd_balance = _usd_balance(last_balance) if last_balance else None
@@ -2854,6 +2990,7 @@ class BotRuntime:
                 "pnl_reference_price": pnl_ref_price,
                 "s2_orphan_after_sec": float(config.S2_ORPHAN_AFTER_SEC),
                 "stale_price_max_age_sec": float(config.STALE_PRICE_MAX_AGE_SEC),
+                "reentry_base_cooldown_sec": float(config.REENTRY_BASE_COOLDOWN_SEC),
                 "capacity_fill_health": {
                     "open_orders_current": open_orders_current,
                     "open_orders_source": open_orders_source,
@@ -2875,6 +3012,29 @@ class BotRuntime:
                     "auto_soft_close_total": self._auto_soft_close_total,
                     "auto_soft_close_last_at": self._auto_soft_close_last_at or None,
                     "auto_soft_close_threshold_pct": float(config.AUTO_SOFT_CLOSE_CAPACITY_PCT),
+                    "private_api_metronome": {
+                        "enabled": bool(private_api.get("enabled", False)),
+                        "wave_calls": int(private_api.get("wave_calls", 0) or 0),
+                        "wave_seconds": float(private_api.get("wave_seconds", 0.0) or 0.0),
+                        "wave_calls_used": int(private_api.get("wave_calls_used", 0) or 0),
+                        "wave_window_remaining_sec": float(private_api.get("wave_window_remaining_sec", 0.0) or 0.0),
+                        "wait_events": int(private_api.get("wait_events", 0) or 0),
+                        "wait_total_sec": float(private_api.get("wait_total_sec", 0.0) or 0.0),
+                        "last_wait_sec": float(private_api.get("last_wait_sec", 0.0) or 0.0),
+                        "calls_last_60s": int(private_api.get("calls_last_60s", 0) or 0),
+                        "effective_calls_per_sec": float(private_api.get("effective_calls_per_sec", 0.0) or 0.0),
+                        "budget_available": float(private_api.get("budget_available", 0.0) or 0.0),
+                        "consecutive_rate_errors": int(private_api.get("consecutive_rate_errors", 0) or 0),
+                    },
+                    "entry_scheduler": {
+                        "cap_per_loop": int(self.entry_adds_per_loop_cap),
+                        "used_this_loop": int(self.entry_adds_per_loop_used),
+                        "pending_entries": int(pending_entries),
+                        "deferred_total": int(self._entry_adds_deferred_total),
+                        "drained_total": int(self._entry_adds_drained_total),
+                        "last_deferred_at": self._entry_adds_last_deferred_at or None,
+                        "last_drained_at": self._entry_adds_last_drained_at or None,
+                    },
                 },
                 "balance_health": {
                     "usd_observed": observed_usd_balance,

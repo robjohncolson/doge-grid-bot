@@ -572,6 +572,7 @@ def _build_engine_config(args: argparse.Namespace, constraints: dict) -> sm.Engi
         loss_backoff_start=int(config.LOSS_BACKOFF_START),
         loss_cooldown_start=int(config.LOSS_COOLDOWN_START),
         loss_cooldown_sec=float(config.LOSS_COOLDOWN_SEC),
+        reentry_base_cooldown_sec=float(config.REENTRY_BASE_COOLDOWN_SEC),
         backoff_factor=float(config.ENTRY_BACKOFF_FACTOR),
         backoff_max_multiplier=float(config.ENTRY_BACKOFF_MAX_MULTIPLIER),
     )

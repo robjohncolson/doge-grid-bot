@@ -40,6 +40,7 @@ class EngineConfig:
     loss_backoff_start: int = 3
     loss_cooldown_start: int = 5
     loss_cooldown_sec: float = 900.0
+    reentry_base_cooldown_sec: float = 0.0
     backoff_factor: float = 0.5
     backoff_max_multiplier: float = 5.0
     max_consecutive_refreshes: int = 3
@@ -609,10 +610,14 @@ def _update_loss_counters(
     cb = state.cooldown_until_b
 
     if trade_id == "A":
+        if cfg.reentry_base_cooldown_sec > 0:
+            ca = max(ca, state.now + cfg.reentry_base_cooldown_sec)
         la = la + 1 if net_profit < 0 else 0
         if la >= cfg.loss_cooldown_start:
             ca = max(ca, state.now + cfg.loss_cooldown_sec)
     else:
+        if cfg.reentry_base_cooldown_sec > 0:
+            cb = max(cb, state.now + cfg.reentry_base_cooldown_sec)
         lb = lb + 1 if net_profit < 0 else 0
         if lb >= cfg.loss_cooldown_start:
             cb = max(cb, state.now + cfg.loss_cooldown_sec)
@@ -680,6 +685,8 @@ def _orphan_exit(
 
     # Advance orphaned trade cycle and re-place entry for that side.
     if order.trade_id == "A":
+        if cfg.reentry_base_cooldown_sec > 0:
+            st = replace(st, cooldown_until_a=max(st.cooldown_until_a, st.now + cfg.reentry_base_cooldown_sec))
         st = replace(st, cycle_a=st.cycle_a + 1)
         effective_size = order_sizes.get("A", order_size_usd) if order_sizes else order_size_usd
         st, entry_actions = _place_followup_entry_after_cycle(
@@ -690,6 +697,8 @@ def _orphan_exit(
             reason="orphan_A",
         )
     else:
+        if cfg.reentry_base_cooldown_sec > 0:
+            st = replace(st, cooldown_until_b=max(st.cooldown_until_b, st.now + cfg.reentry_base_cooldown_sec))
         st = replace(st, cycle_b=st.cycle_b + 1)
         effective_size = order_sizes.get("B", order_size_usd) if order_sizes else order_size_usd
         st, entry_actions = _place_followup_entry_after_cycle(
@@ -981,6 +990,10 @@ def add_entry_order(
     """
     Public helper for runtime bootstrap/reseed paths.
     """
+    if trade_id == "A" and state.now < state.cooldown_until_a:
+        return state, None
+    if trade_id == "B" and state.now < state.cooldown_until_b:
+        return state, None
     st, order, action = _new_entry_order(
         state,
         cfg,
