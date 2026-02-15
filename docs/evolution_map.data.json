@@ -1,0 +1,4838 @@
+{
+  "meta": {
+    "generated_at_utc": "2026-02-10T23:15:47.978671+00:00",
+    "source_branch": "master",
+    "timezone": "America/New_York",
+    "commit_count": 103,
+    "state_section_count": 17,
+    "feature_count": 9,
+    "generator": "tools/build_evolution_map.py",
+    "build_unix": 1770765347
+  },
+  "lanes": [
+    {
+      "id": "lifecycle",
+      "label": "Lifecycle",
+      "order": 1
+    },
+    {
+      "id": "ai_control",
+      "label": "AI / Control",
+      "order": 2
+    },
+    {
+      "id": "pair_core",
+      "label": "Pair Core",
+      "order": 3
+    },
+    {
+      "id": "recovery",
+      "label": "Recovery / Exit",
+      "order": 4
+    },
+    {
+      "id": "swarm",
+      "label": "Swarm / Multi-Pair",
+      "order": 5
+    },
+    {
+      "id": "risk_capital",
+      "label": "Risk / Capital",
+      "order": 6
+    },
+    {
+      "id": "ux",
+      "label": "UX / Dashboard",
+      "order": 7
+    }
+  ],
+  "state_sections": [
+    {
+      "id": "section:1",
+      "section": 1,
+      "title": "Bot Lifecycle (Top-Level)",
+      "lane_id": "lifecycle"
+    },
+    {
+      "id": "section:2",
+      "section": 2,
+      "title": "Main Loop Detail (per iteration)",
+      "lane_id": "lifecycle"
+    },
+    {
+      "id": "section:3",
+      "section": 3,
+      "title": "GridOrder State Machine",
+      "lane_id": "lifecycle"
+    },
+    {
+      "id": "section:4",
+      "section": 4,
+      "title": "Risk / Pause State Machine",
+      "lane_id": "risk_capital"
+    },
+    {
+      "id": "section:5",
+      "section": 5,
+      "title": "Startup Reconciliation Flow",
+      "lane_id": "lifecycle"
+    },
+    {
+      "id": "section:6",
+      "section": 6,
+      "title": "State Persistence Flow",
+      "lane_id": "lifecycle"
+    },
+    {
+      "id": "section:7",
+      "section": 7,
+      "title": "Fill Pair Cycling (The Profit Engine)",
+      "lane_id": "lifecycle"
+    },
+    {
+      "id": "section:8",
+      "section": 8,
+      "title": "Transition Summary Table",
+      "lane_id": "lifecycle"
+    },
+    {
+      "id": "section:9",
+      "section": 9,
+      "title": "Pair Strategy State Machine (`STRATEGY_MODE=pair`)",
+      "lane_id": "pair_core"
+    },
+    {
+      "id": "section:10",
+      "section": 10,
+      "title": "PairStats (Pair Mode Statistical Engine)",
+      "lane_id": "pair_core"
+    },
+    {
+      "id": "section:11",
+      "section": 11,
+      "title": "AI Council Payload & Quorum",
+      "lane_id": "ai_control"
+    },
+    {
+      "id": "section:12",
+      "section": 12,
+      "title": "Exit Lifecycle Management (Stale Exits, S2 Break-Glass, Recovery)",
+      "lane_id": "recovery"
+    },
+    {
+      "id": "section:13",
+      "section": 13,
+      "title": "Long-Only Mode (Spot Pairs Without Inventory)",
+      "lane_id": "pair_core"
+    },
+    {
+      "id": "section:14",
+      "section": 14,
+      "title": "Multi-Pair Swarm Architecture",
+      "lane_id": "swarm"
+    },
+    {
+      "id": "section:15",
+      "section": 15,
+      "title": "Dashboard View Routing",
+      "lane_id": "ux"
+    },
+    {
+      "id": "section:16",
+      "section": 16,
+      "title": "Anti-Loss-Spiral System",
+      "lane_id": "risk_capital"
+    },
+    {
+      "id": "section:17",
+      "section": 17,
+      "title": "Swarm Scanner Phase 2 \u2014 Multi-Quote, Scoring, Force Liquidation",
+      "lane_id": "swarm"
+    }
+  ],
+  "state_nodes": [
+    {
+      "id": "state:S0",
+      "name": "S0",
+      "lane_id": "pair_core"
+    },
+    {
+      "id": "state:S1a",
+      "name": "S1a",
+      "lane_id": "pair_core"
+    },
+    {
+      "id": "state:S1b",
+      "name": "S1b",
+      "lane_id": "pair_core"
+    },
+    {
+      "id": "state:S2",
+      "name": "S2",
+      "lane_id": "pair_core"
+    }
+  ],
+  "features": [
+    {
+      "id": "feature:foundation_bootstrap",
+      "feature_id": "foundation_bootstrap",
+      "label": "Foundation / Bootstrap",
+      "lane_id": "lifecycle",
+      "order": 1,
+      "deprecated_candidate": false,
+      "state_sections": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6"
+      ],
+      "commit_count": 14,
+      "first_commit_unix": 1770440632,
+      "last_commit_unix": 1770764140
+    },
+    {
+      "id": "feature:ai_telegram_control",
+      "feature_id": "ai_telegram_control",
+      "label": "AI Advisor + Telegram Control",
+      "lane_id": "ai_control",
+      "order": 2,
+      "deprecated_candidate": true,
+      "state_sections": [
+        "section:11"
+      ],
+      "commit_count": 8,
+      "first_commit_unix": 1770442764,
+      "last_commit_unix": 1770597326
+    },
+    {
+      "id": "feature:dashboard_stats_layer",
+      "feature_id": "dashboard_stats_layer",
+      "label": "Dashboard / Stats Layer",
+      "lane_id": "ux",
+      "order": 3,
+      "deprecated_candidate": false,
+      "state_sections": [
+        "section:10",
+        "section:15"
+      ],
+      "commit_count": 9,
+      "first_commit_unix": 1770484737,
+      "last_commit_unix": 1770735580
+    },
+    {
+      "id": "feature:pair_state_machine_core",
+      "feature_id": "pair_state_machine_core",
+      "label": "Pair State Machine Core",
+      "lane_id": "pair_core",
+      "order": 4,
+      "deprecated_candidate": false,
+      "state_sections": [
+        "section:9",
+        "section:10",
+        "section:13"
+      ],
+      "commit_count": 17,
+      "first_commit_unix": 1770513484,
+      "last_commit_unix": 1770759464
+    },
+    {
+      "id": "feature:recovery_exit_lifecycle",
+      "feature_id": "recovery_exit_lifecycle",
+      "label": "Recovery / Exit Lifecycle",
+      "lane_id": "recovery",
+      "order": 5,
+      "deprecated_candidate": false,
+      "state_sections": [
+        "section:12"
+      ],
+      "commit_count": 11,
+      "first_commit_unix": 1770526667,
+      "last_commit_unix": 1770740950
+    },
+    {
+      "id": "feature:swarm_multi_pair",
+      "feature_id": "swarm_multi_pair",
+      "label": "Swarm / Multi-Pair Platform",
+      "lane_id": "swarm",
+      "order": 6,
+      "deprecated_candidate": false,
+      "state_sections": [
+        "section:14",
+        "section:17"
+      ],
+      "commit_count": 8,
+      "first_commit_unix": 1770596469,
+      "last_commit_unix": 1770748419
+    },
+    {
+      "id": "feature:risk_capital_compounding",
+      "feature_id": "risk_capital_compounding",
+      "label": "Risk, Capital, Compounding",
+      "lane_id": "risk_capital",
+      "order": 7,
+      "deprecated_candidate": false,
+      "state_sections": [
+        "section:4",
+        "section:16"
+      ],
+      "commit_count": 13,
+      "first_commit_unix": 1770690196,
+      "last_commit_unix": 1770761286
+    },
+    {
+      "id": "feature:factory_visualization",
+      "feature_id": "factory_visualization",
+      "label": "Factory Visualization",
+      "lane_id": "ux",
+      "order": 8,
+      "deprecated_candidate": true,
+      "state_sections": [
+        "section:15"
+      ],
+      "commit_count": 2,
+      "first_commit_unix": 1770664076,
+      "last_commit_unix": 1770665663
+    },
+    {
+      "id": "feature:ops_hardening",
+      "feature_id": "ops_hardening",
+      "label": "Ops / Concurrency Hardening",
+      "lane_id": "lifecycle",
+      "order": 9,
+      "deprecated_candidate": false,
+      "state_sections": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6",
+        "section:8"
+      ],
+      "commit_count": 21,
+      "first_commit_unix": 1770497759,
+      "last_commit_unix": 1770758735
+    }
+  ],
+  "commits": [
+    {
+      "id": "commit:02725f1",
+      "hash": "02725f1",
+      "index": 0,
+      "timestamp_unix": 1770440632,
+      "timestamp_local": "2026-02-07 00:03:52 EST",
+      "subject": "Initial commit: DOGE grid trading bot for Kraken",
+      "feature_id": "foundation_bootstrap",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6"
+      ],
+      "matched_keywords": [
+        "initial commit"
+      ],
+      "classification_confidence": 0.143
+    },
+    {
+      "id": "commit:1d6b11c",
+      "hash": "1d6b11c",
+      "index": 1,
+      "timestamp_unix": 1770441662,
+      "timestamp_local": "2026-02-07 00:21:02 EST",
+      "subject": "Add empty requirements.txt for Nixpacks Python detection",
+      "feature_id": "foundation_bootstrap",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6"
+      ],
+      "matched_keywords": [
+        "requirements",
+        "nixpacks"
+      ],
+      "classification_confidence": 0.286
+    },
+    {
+      "id": "commit:c651b03",
+      "hash": "c651b03",
+      "index": 2,
+      "timestamp_unix": 1770442764,
+      "timestamp_local": "2026-02-07 00:39:24 EST",
+      "subject": "Switch AI advisor from Groq to NVIDIA build.nvidia.com",
+      "feature_id": "ai_telegram_control",
+      "lane_id": "ai_control",
+      "state_section_ids": [
+        "section:11"
+      ],
+      "matched_keywords": [
+        "ai advisor"
+      ],
+      "classification_confidence": 0.125
+    },
+    {
+      "id": "commit:3f437c0",
+      "hash": "3f437c0",
+      "index": 3,
+      "timestamp_unix": 1770444074,
+      "timestamp_local": "2026-02-07 01:01:14 EST",
+      "subject": "Fix NoneType error in AI advisor response parsing",
+      "feature_id": "ai_telegram_control",
+      "lane_id": "ai_control",
+      "state_section_ids": [
+        "section:11"
+      ],
+      "matched_keywords": [
+        "ai advisor"
+      ],
+      "classification_confidence": 0.125
+    },
+    {
+      "id": "commit:79808e7",
+      "hash": "79808e7",
+      "index": 4,
+      "timestamp_unix": 1770444439,
+      "timestamp_local": "2026-02-07 01:07:19 EST",
+      "subject": "Switch AI model from Kimi 2.5 to Llama 3.1 8B Instruct",
+      "feature_id": "foundation_bootstrap",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6"
+      ],
+      "matched_keywords": [],
+      "classification_confidence": 0.0
+    },
+    {
+      "id": "commit:7af2f3a",
+      "hash": "7af2f3a",
+      "index": 5,
+      "timestamp_unix": 1770446136,
+      "timestamp_local": "2026-02-07 01:35:36 EST",
+      "subject": "Add interactive Telegram approval for AI recommendations",
+      "feature_id": "ai_telegram_control",
+      "lane_id": "ai_control",
+      "state_section_ids": [
+        "section:11"
+      ],
+      "matched_keywords": [
+        "approval",
+        "telegram"
+      ],
+      "classification_confidence": 0.25
+    },
+    {
+      "id": "commit:705bc12",
+      "hash": "705bc12",
+      "index": 6,
+      "timestamp_unix": 1770448122,
+      "timestamp_local": "2026-02-07 02:08:42 EST",
+      "subject": "Add Telegram text commands for bot control (/status, /interval, /check, /spacing, /help)",
+      "feature_id": "ai_telegram_control",
+      "lane_id": "ai_control",
+      "state_section_ids": [
+        "section:11"
+      ],
+      "matched_keywords": [
+        "telegram",
+        "command",
+        "/check"
+      ],
+      "classification_confidence": 0.375
+    },
+    {
+      "id": "commit:fdef27e",
+      "hash": "fdef27e",
+      "index": 7,
+      "timestamp_unix": 1770484737,
+      "timestamp_local": "2026-02-07 12:18:57 EST",
+      "subject": "Add web dashboard with live grid visualization and config controls",
+      "feature_id": "dashboard_stats_layer",
+      "lane_id": "ux",
+      "state_section_ids": [
+        "section:10",
+        "section:15"
+      ],
+      "matched_keywords": [
+        "dashboard"
+      ],
+      "classification_confidence": 0.111
+    },
+    {
+      "id": "commit:6cb2a9c",
+      "hash": "6cb2a9c",
+      "index": 8,
+      "timestamp_unix": 1770488667,
+      "timestamp_local": "2026-02-07 13:24:27 EST",
+      "subject": "Add statistical advisory board with 5 inferential analyzers",
+      "feature_id": "foundation_bootstrap",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6"
+      ],
+      "matched_keywords": [],
+      "classification_confidence": 0.0
+    },
+    {
+      "id": "commit:ed94351",
+      "hash": "ed94351",
+      "index": 9,
+      "timestamp_unix": 1770491828,
+      "timestamp_local": "2026-02-07 14:17:08 EST",
+      "subject": "Add SSE live feed, Telegram menus, data export, and audio alerts",
+      "feature_id": "dashboard_stats_layer",
+      "lane_id": "ux",
+      "state_section_ids": [
+        "section:10",
+        "section:15"
+      ],
+      "matched_keywords": [
+        "sse",
+        "live feed",
+        "audio"
+      ],
+      "classification_confidence": 0.333
+    },
+    {
+      "id": "commit:be4b3bc",
+      "hash": "be4b3bc",
+      "index": 10,
+      "timestamp_unix": 1770492681,
+      "timestamp_local": "2026-02-07 14:31:21 EST",
+      "subject": "Add statistical methodology modals to dashboard",
+      "feature_id": "dashboard_stats_layer",
+      "lane_id": "ux",
+      "state_section_ids": [
+        "section:10",
+        "section:15"
+      ],
+      "matched_keywords": [
+        "dashboard",
+        "modal",
+        "methodology"
+      ],
+      "classification_confidence": 0.333
+    },
+    {
+      "id": "commit:cf4bcc7",
+      "hash": "cf4bcc7",
+      "index": 11,
+      "timestamp_unix": 1770496270,
+      "timestamp_local": "2026-02-07 15:31:10 EST",
+      "subject": "Fix 7 safety-critical gaps: targeted cancel, cost-basis tracking, stop-floor accuracy, partial fills, startup reconciliation, state persistence, validation guardrails",
+      "feature_id": "foundation_bootstrap",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6"
+      ],
+      "matched_keywords": [
+        "startup",
+        "validation",
+        "state persistence"
+      ],
+      "classification_confidence": 0.429
+    },
+    {
+      "id": "commit:d00e98f",
+      "hash": "d00e98f",
+      "index": 12,
+      "timestamp_unix": 1770497759,
+      "timestamp_local": "2026-02-07 15:55:59 EST",
+      "subject": "Fix build_grid order count to only keep open (adopted) orders",
+      "feature_id": "ops_hardening",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6",
+        "section:8"
+      ],
+      "matched_keywords": [
+        "fix"
+      ],
+      "classification_confidence": 0.1
+    },
+    {
+      "id": "commit:f0b3d66",
+      "hash": "f0b3d66",
+      "index": 13,
+      "timestamp_unix": 1770500995,
+      "timestamp_local": "2026-02-07 16:49:55 EST",
+      "subject": "Fix 5 audit bugs + add multi-model AI council",
+      "feature_id": "ops_hardening",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6",
+        "section:8"
+      ],
+      "matched_keywords": [
+        "bug",
+        "fix"
+      ],
+      "classification_confidence": 0.2
+    },
+    {
+      "id": "commit:bcb8375",
+      "hash": "bcb8375",
+      "index": 14,
+      "timestamp_unix": 1770502861,
+      "timestamp_local": "2026-02-07 17:21:01 EST",
+      "subject": "Add Supabase persistence layer for cross-deploy data survival",
+      "feature_id": "foundation_bootstrap",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6"
+      ],
+      "matched_keywords": [
+        "supabase persistence"
+      ],
+      "classification_confidence": 0.143
+    },
+    {
+      "id": "commit:93a58c5",
+      "hash": "93a58c5",
+      "index": 15,
+      "timestamp_unix": 1770503793,
+      "timestamp_local": "2026-02-07 17:36:33 EST",
+      "subject": "Fix uptime display: add seconds and local ticker between server updates",
+      "feature_id": "ops_hardening",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6",
+        "section:8"
+      ],
+      "matched_keywords": [
+        "fix"
+      ],
+      "classification_confidence": 0.1
+    },
+    {
+      "id": "commit:a62a8d0",
+      "hash": "a62a8d0",
+      "index": 16,
+      "timestamp_unix": 1770504247,
+      "timestamp_local": "2026-02-07 17:44:07 EST",
+      "subject": "Fix state loss across deploys: restore counters and config from Supabase",
+      "feature_id": "ops_hardening",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6",
+        "section:8"
+      ],
+      "matched_keywords": [
+        "deploy",
+        "fix"
+      ],
+      "classification_confidence": 0.2
+    },
+    {
+      "id": "commit:f529613",
+      "hash": "f529613",
+      "index": 17,
+      "timestamp_unix": 1770504653,
+      "timestamp_local": "2026-02-07 17:50:53 EST",
+      "subject": "Fix uptime timer loop and surface AI council error details",
+      "feature_id": "ai_telegram_control",
+      "lane_id": "ai_control",
+      "state_section_ids": [
+        "section:11"
+      ],
+      "matched_keywords": [
+        "ai council"
+      ],
+      "classification_confidence": 0.125
+    },
+    {
+      "id": "commit:5970ae9",
+      "hash": "5970ae9",
+      "index": 18,
+      "timestamp_unix": 1770505771,
+      "timestamp_local": "2026-02-07 18:09:31 EST",
+      "subject": "Fix Supabase upsert: add resolution=merge-duplicates header",
+      "feature_id": "ops_hardening",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6",
+        "section:8"
+      ],
+      "matched_keywords": [
+        "fix"
+      ],
+      "classification_confidence": 0.1
+    },
+    {
+      "id": "commit:707c5c2",
+      "hash": "707c5c2",
+      "index": 19,
+      "timestamp_unix": 1770512358,
+      "timestamp_local": "2026-02-07 19:59:18 EST",
+      "subject": "Add single-pair market making strategy (STRATEGY_MODE=pair)",
+      "feature_id": "foundation_bootstrap",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6"
+      ],
+      "matched_keywords": [],
+      "classification_confidence": 0.0
+    },
+    {
+      "id": "commit:44efac5",
+      "hash": "44efac5",
+      "index": 20,
+      "timestamp_unix": 1770513443,
+      "timestamp_local": "2026-02-07 20:17:23 EST",
+      "subject": "Update dashboard UI to conditionally render pair mode elements",
+      "feature_id": "dashboard_stats_layer",
+      "lane_id": "ux",
+      "state_section_ids": [
+        "section:10",
+        "section:15"
+      ],
+      "matched_keywords": [
+        "dashboard"
+      ],
+      "classification_confidence": 0.111
+    },
+    {
+      "id": "commit:049c470",
+      "hash": "049c470",
+      "index": 21,
+      "timestamp_unix": 1770513484,
+      "timestamp_local": "2026-02-07 20:18:04 EST",
+      "subject": "Add pair strategy state machine documentation (section 9)",
+      "feature_id": "pair_state_machine_core",
+      "lane_id": "pair_core",
+      "state_section_ids": [
+        "section:9",
+        "section:10",
+        "section:13"
+      ],
+      "matched_keywords": [
+        "pair strategy",
+        "state machine"
+      ],
+      "classification_confidence": 0.167
+    },
+    {
+      "id": "commit:43b6098",
+      "hash": "43b6098",
+      "index": 22,
+      "timestamp_unix": 1770516150,
+      "timestamp_local": "2026-02-07 21:02:30 EST",
+      "subject": "Fix pair mode fill detection: diagnostics, fallback, race conditions",
+      "feature_id": "pair_state_machine_core",
+      "lane_id": "pair_core",
+      "state_section_ids": [
+        "section:9",
+        "section:10",
+        "section:13"
+      ],
+      "matched_keywords": [
+        "pair mode",
+        "fill detection"
+      ],
+      "classification_confidence": 0.167
+    },
+    {
+      "id": "commit:6fea2d4",
+      "hash": "6fea2d4",
+      "index": 23,
+      "timestamp_unix": 1770516992,
+      "timestamp_local": "2026-02-07 21:16:32 EST",
+      "subject": "Add offline fill recovery to pair mode startup reconciliation",
+      "feature_id": "pair_state_machine_core",
+      "lane_id": "pair_core",
+      "state_section_ids": [
+        "section:9",
+        "section:10",
+        "section:13"
+      ],
+      "matched_keywords": [
+        "pair mode",
+        "offline fill recovery"
+      ],
+      "classification_confidence": 0.167
+    },
+    {
+      "id": "commit:ab65088",
+      "hash": "ab65088",
+      "index": 24,
+      "timestamp_unix": 1770519217,
+      "timestamp_local": "2026-02-07 21:53:37 EST",
+      "subject": "Fix pair mode order sizing, stats engine, and race condition PnL tracking",
+      "feature_id": "ops_hardening",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6",
+        "section:8"
+      ],
+      "matched_keywords": [
+        "race condition",
+        "fix"
+      ],
+      "classification_confidence": 0.2
+    },
+    {
+      "id": "commit:0edf1c2",
+      "hash": "0edf1c2",
+      "index": 25,
+      "timestamp_unix": 1770520951,
+      "timestamp_local": "2026-02-07 22:22:31 EST",
+      "subject": "Fix offline fill recovery: detect dual-fill race conditions",
+      "feature_id": "ops_hardening",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6",
+        "section:8"
+      ],
+      "matched_keywords": [
+        "race condition",
+        "fix"
+      ],
+      "classification_confidence": 0.2
+    },
+    {
+      "id": "commit:3ac63bf",
+      "hash": "3ac63bf",
+      "index": 26,
+      "timestamp_unix": 1770521056,
+      "timestamp_local": "2026-02-07 22:24:16 EST",
+      "subject": "Update state machine docs with dual-fill race condition handling",
+      "feature_id": "pair_state_machine_core",
+      "lane_id": "pair_core",
+      "state_section_ids": [
+        "section:9",
+        "section:10",
+        "section:13"
+      ],
+      "matched_keywords": [
+        "state machine"
+      ],
+      "classification_confidence": 0.083
+    },
+    {
+      "id": "commit:d4832eb",
+      "hash": "d4832eb",
+      "index": 27,
+      "timestamp_unix": 1770521824,
+      "timestamp_local": "2026-02-07 22:37:04 EST",
+      "subject": "Fix fee double-counting in pair mode exit handlers",
+      "feature_id": "pair_state_machine_core",
+      "lane_id": "pair_core",
+      "state_section_ids": [
+        "section:9",
+        "section:10",
+        "section:13"
+      ],
+      "matched_keywords": [
+        "pair mode"
+      ],
+      "classification_confidence": 0.083
+    },
+    {
+      "id": "commit:ec3ae33",
+      "hash": "ec3ae33",
+      "index": 28,
+      "timestamp_unix": 1770522771,
+      "timestamp_local": "2026-02-07 22:52:51 EST",
+      "subject": "Fix offline fill recovery: classify fills as exit vs entry",
+      "feature_id": "pair_state_machine_core",
+      "lane_id": "pair_core",
+      "state_section_ids": [
+        "section:9",
+        "section:10",
+        "section:13"
+      ],
+      "matched_keywords": [
+        "offline fill recovery"
+      ],
+      "classification_confidence": 0.083
+    },
+    {
+      "id": "commit:dc612ee",
+      "hash": "dc612ee",
+      "index": 29,
+      "timestamp_unix": 1770522819,
+      "timestamp_local": "2026-02-07 22:53:39 EST",
+      "subject": "Update state machine: offline fill classification flow",
+      "feature_id": "pair_state_machine_core",
+      "lane_id": "pair_core",
+      "state_section_ids": [
+        "section:9",
+        "section:10",
+        "section:13"
+      ],
+      "matched_keywords": [
+        "state machine"
+      ],
+      "classification_confidence": 0.083
+    },
+    {
+      "id": "commit:761bae6",
+      "hash": "761bae6",
+      "index": 30,
+      "timestamp_unix": 1770525693,
+      "timestamp_local": "2026-02-07 23:41:33 EST",
+      "subject": "Fix pair state machine: entry fills no longer place same-side entry",
+      "feature_id": "pair_state_machine_core",
+      "lane_id": "pair_core",
+      "state_section_ids": [
+        "section:9",
+        "section:10",
+        "section:13"
+      ],
+      "matched_keywords": [
+        "state machine"
+      ],
+      "classification_confidence": 0.083
+    },
+    {
+      "id": "commit:8a88d30",
+      "hash": "8a88d30",
+      "index": 31,
+      "timestamp_unix": 1770526667,
+      "timestamp_local": "2026-02-07 23:57:47 EST",
+      "subject": "Fix position-unaware build_pair and offline recovery companion entries",
+      "feature_id": "recovery_exit_lifecycle",
+      "lane_id": "recovery",
+      "state_section_ids": [
+        "section:12"
+      ],
+      "matched_keywords": [
+        "recovery"
+      ],
+      "classification_confidence": 0.1
+    },
+    {
+      "id": "commit:d6e61d3",
+      "hash": "d6e61d3",
+      "index": 32,
+      "timestamp_unix": 1770527742,
+      "timestamp_local": "2026-02-08 00:15:42 EST",
+      "subject": "Keep opposite-side entry on book after entry fills",
+      "feature_id": "foundation_bootstrap",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6"
+      ],
+      "matched_keywords": [],
+      "classification_confidence": 0.0
+    },
+    {
+      "id": "commit:4179972",
+      "hash": "4179972",
+      "index": 33,
+      "timestamp_unix": 1770561035,
+      "timestamp_local": "2026-02-08 09:30:35 EST",
+      "subject": "Add AI council tuning + multi-pair trading support",
+      "feature_id": "ai_telegram_control",
+      "lane_id": "ai_control",
+      "state_section_ids": [
+        "section:11"
+      ],
+      "matched_keywords": [
+        "ai council"
+      ],
+      "classification_confidence": 0.125
+    },
+    {
+      "id": "commit:fad2534",
+      "hash": "fad2534",
+      "index": 34,
+      "timestamp_unix": 1770563492,
+      "timestamp_local": "2026-02-08 10:11:32 EST",
+      "subject": "Fix multi-pair bugs: use per-pair state properties instead of global config",
+      "feature_id": "ops_hardening",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6",
+        "section:8"
+      ],
+      "matched_keywords": [
+        "bug",
+        "fix"
+      ],
+      "classification_confidence": 0.2
+    },
+    {
+      "id": "commit:bb70318",
+      "hash": "bb70318",
+      "index": 35,
+      "timestamp_unix": 1770566334,
+      "timestamp_local": "2026-02-08 10:58:54 EST",
+      "subject": "debug a-b trades",
+      "feature_id": "ops_hardening",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6",
+        "section:8"
+      ],
+      "matched_keywords": [
+        "bug"
+      ],
+      "classification_confidence": 0.1
+    },
+    {
+      "id": "commit:2e23f59",
+      "hash": "2e23f59",
+      "index": 36,
+      "timestamp_unix": 1770567277,
+      "timestamp_local": "2026-02-08 11:14:37 EST",
+      "subject": "debug a-b pt 2",
+      "feature_id": "ops_hardening",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6",
+        "section:8"
+      ],
+      "matched_keywords": [
+        "bug"
+      ],
+      "classification_confidence": 0.1
+    },
+    {
+      "id": "commit:fb44ffe",
+      "hash": "fb44ffe",
+      "index": 37,
+      "timestamp_unix": 1770567816,
+      "timestamp_local": "2026-02-08 11:23:36 EST",
+      "subject": "a/b trade debug 3",
+      "feature_id": "ops_hardening",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6",
+        "section:8"
+      ],
+      "matched_keywords": [
+        "bug"
+      ],
+      "classification_confidence": 0.1
+    },
+    {
+      "id": "commit:dc93798",
+      "hash": "dc93798",
+      "index": 38,
+      "timestamp_unix": 1770568273,
+      "timestamp_local": "2026-02-08 11:31:13 EST",
+      "subject": "ab debug 4",
+      "feature_id": "ops_hardening",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6",
+        "section:8"
+      ],
+      "matched_keywords": [
+        "bug"
+      ],
+      "classification_confidence": 0.1
+    },
+    {
+      "id": "commit:7c3091d",
+      "hash": "7c3091d",
+      "index": 39,
+      "timestamp_unix": 1770582407,
+      "timestamp_local": "2026-02-08 15:26:47 EST",
+      "subject": "Refactor pair strategy: Trade A/B identity, state machine, and dashboard",
+      "feature_id": "pair_state_machine_core",
+      "lane_id": "pair_core",
+      "state_section_ids": [
+        "section:9",
+        "section:10",
+        "section:13"
+      ],
+      "matched_keywords": [
+        "pair strategy",
+        "trade a",
+        "state machine"
+      ],
+      "classification_confidence": 0.25
+    },
+    {
+      "id": "commit:31aeba3",
+      "hash": "31aeba3",
+      "index": 40,
+      "timestamp_unix": 1770585603,
+      "timestamp_local": "2026-02-08 16:20:03 EST",
+      "subject": "Update STATE_MACHINE.md for pair strategy refactor",
+      "feature_id": "pair_state_machine_core",
+      "lane_id": "pair_core",
+      "state_section_ids": [
+        "section:9",
+        "section:10",
+        "section:13"
+      ],
+      "matched_keywords": [
+        "pair strategy"
+      ],
+      "classification_confidence": 0.083
+    },
+    {
+      "id": "commit:6a44976",
+      "hash": "6a44976",
+      "index": 41,
+      "timestamp_unix": 1770590869,
+      "timestamp_local": "2026-02-08 17:47:49 EST",
+      "subject": "Post-review fixes: anti-chase reset, price-based P&L migration, signed unrealized risk, AI council restructure, PairStats None handling, grid-mode cleanup",
+      "feature_id": "ai_telegram_control",
+      "lane_id": "ai_control",
+      "state_section_ids": [
+        "section:11"
+      ],
+      "matched_keywords": [
+        "ai council"
+      ],
+      "classification_confidence": 0.125
+    },
+    {
+      "id": "commit:8591500",
+      "hash": "8591500",
+      "index": 42,
+      "timestamp_unix": 1770596469,
+      "timestamp_local": "2026-02-08 19:21:09 EST",
+      "subject": "UX overhaul: fill identity, manual AI, entry hot-reload, multi-pair prep",
+      "feature_id": "swarm_multi_pair",
+      "lane_id": "swarm",
+      "state_section_ids": [
+        "section:14",
+        "section:17"
+      ],
+      "matched_keywords": [
+        "multi-pair"
+      ],
+      "classification_confidence": 0.1
+    },
+    {
+      "id": "commit:691b540",
+      "hash": "691b540",
+      "index": 43,
+      "timestamp_unix": 1770597326,
+      "timestamp_local": "2026-02-08 19:35:26 EST",
+      "subject": "Remove stale AI interval references (now manual-only)",
+      "feature_id": "ai_telegram_control",
+      "lane_id": "ai_control",
+      "state_section_ids": [
+        "section:11"
+      ],
+      "matched_keywords": [
+        "manual-only"
+      ],
+      "classification_confidence": 0.125
+    },
+    {
+      "id": "commit:ea789d5",
+      "hash": "ea789d5",
+      "index": 44,
+      "timestamp_unix": 1770597595,
+      "timestamp_local": "2026-02-08 19:39:55 EST",
+      "subject": "Fix: skip cancelled-order replacement in pair mode",
+      "feature_id": "pair_state_machine_core",
+      "lane_id": "pair_core",
+      "state_section_ids": [
+        "section:9",
+        "section:10",
+        "section:13"
+      ],
+      "matched_keywords": [
+        "pair mode"
+      ],
+      "classification_confidence": 0.083
+    },
+    {
+      "id": "commit:8d3e06f",
+      "hash": "8d3e06f",
+      "index": 45,
+      "timestamp_unix": 1770597929,
+      "timestamp_local": "2026-02-08 19:45:29 EST",
+      "subject": "Add pair-mode order dedup on startup",
+      "feature_id": "foundation_bootstrap",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6"
+      ],
+      "matched_keywords": [
+        "startup"
+      ],
+      "classification_confidence": 0.143
+    },
+    {
+      "id": "commit:c60afab",
+      "hash": "c60afab",
+      "index": 46,
+      "timestamp_unix": 1770599497,
+      "timestamp_local": "2026-02-08 20:11:37 EST",
+      "subject": "Fix 3-order bug: detect position from adopted exits in build_pair",
+      "feature_id": "ops_hardening",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6",
+        "section:8"
+      ],
+      "matched_keywords": [
+        "bug",
+        "fix"
+      ],
+      "classification_confidence": 0.2
+    },
+    {
+      "id": "commit:7b4b7c7",
+      "hash": "7b4b7c7",
+      "index": 47,
+      "timestamp_unix": 1770602386,
+      "timestamp_local": "2026-02-08 20:59:46 EST",
+      "subject": "Add multi-pair swarm: batch API, scanner, dashboard manager",
+      "feature_id": "swarm_multi_pair",
+      "lane_id": "swarm",
+      "state_section_ids": [
+        "section:14",
+        "section:17"
+      ],
+      "matched_keywords": [
+        "multi-pair",
+        "swarm",
+        "scanner"
+      ],
+      "classification_confidence": 0.3
+    },
+    {
+      "id": "commit:01d6117",
+      "hash": "01d6117",
+      "index": 48,
+      "timestamp_unix": 1770602865,
+      "timestamp_local": "2026-02-08 21:07:45 EST",
+      "subject": "Fix blank dashboard: CSS display:none overrode JS show/hide",
+      "feature_id": "dashboard_stats_layer",
+      "lane_id": "ux",
+      "state_section_ids": [
+        "section:10",
+        "section:15"
+      ],
+      "matched_keywords": [
+        "dashboard"
+      ],
+      "classification_confidence": 0.111
+    },
+    {
+      "id": "commit:8a9f216",
+      "hash": "8a9f216",
+      "index": 49,
+      "timestamp_unix": 1770603090,
+      "timestamp_local": "2026-02-08 21:11:30 EST",
+      "subject": "Add Browse Pairs button to detail view header",
+      "feature_id": "dashboard_stats_layer",
+      "lane_id": "ux",
+      "state_section_ids": [
+        "section:10",
+        "section:15"
+      ],
+      "matched_keywords": [
+        "detail view",
+        "browse pairs"
+      ],
+      "classification_confidence": 0.222
+    },
+    {
+      "id": "commit:0f3b252",
+      "hash": "0f3b252",
+      "index": 50,
+      "timestamp_unix": 1770604826,
+      "timestamp_local": "2026-02-08 21:40:26 EST",
+      "subject": "Add recovery orders: cascading trades for stranded exits",
+      "feature_id": "recovery_exit_lifecycle",
+      "lane_id": "recovery",
+      "state_section_ids": [
+        "section:12"
+      ],
+      "matched_keywords": [
+        "recovery"
+      ],
+      "classification_confidence": 0.1
+    },
+    {
+      "id": "commit:96d4623",
+      "hash": "96d4623",
+      "index": 51,
+      "timestamp_unix": 1770606896,
+      "timestamp_local": "2026-02-08 22:14:56 EST",
+      "subject": "Add exit lifecycle management: repricing, S2 break-glass, directional signals",
+      "feature_id": "recovery_exit_lifecycle",
+      "lane_id": "recovery",
+      "state_section_ids": [
+        "section:12"
+      ],
+      "matched_keywords": [
+        "exit lifecycle",
+        "break-glass"
+      ],
+      "classification_confidence": 0.2
+    },
+    {
+      "id": "commit:1d9703a",
+      "hash": "1d9703a",
+      "index": 52,
+      "timestamp_unix": 1770607104,
+      "timestamp_local": "2026-02-08 22:18:24 EST",
+      "subject": "Update state machine docs for Section 12 exit lifecycle",
+      "feature_id": "pair_state_machine_core",
+      "lane_id": "pair_core",
+      "state_section_ids": [
+        "section:9",
+        "section:10",
+        "section:12",
+        "section:13"
+      ],
+      "matched_keywords": [
+        "state machine"
+      ],
+      "classification_confidence": 0.083
+    },
+    {
+      "id": "commit:008e06e",
+      "hash": "008e06e",
+      "index": 53,
+      "timestamp_unix": 1770609145,
+      "timestamp_local": "2026-02-08 22:52:25 EST",
+      "subject": "Add executable state machine model for pair trading simulation",
+      "feature_id": "pair_state_machine_core",
+      "lane_id": "pair_core",
+      "state_section_ids": [
+        "section:9",
+        "section:10",
+        "section:13"
+      ],
+      "matched_keywords": [
+        "state machine"
+      ],
+      "classification_confidence": 0.083
+    },
+    {
+      "id": "commit:b0ac634",
+      "hash": "b0ac634",
+      "index": 54,
+      "timestamp_unix": 1770609186,
+      "timestamp_local": "2026-02-08 22:53:06 EST",
+      "subject": "Add dynamic pair labels and auto long-only mode for spot pairs",
+      "feature_id": "pair_state_machine_core",
+      "lane_id": "pair_core",
+      "state_section_ids": [
+        "section:9",
+        "section:10",
+        "section:13"
+      ],
+      "matched_keywords": [
+        "long-only"
+      ],
+      "classification_confidence": 0.083
+    },
+    {
+      "id": "commit:67a0c71",
+      "hash": "67a0c71",
+      "index": 55,
+      "timestamp_unix": 1770610141,
+      "timestamp_local": "2026-02-08 23:09:01 EST",
+      "subject": "Add scanner upgrade: Supabase pair persistence, sortable columns, all pairs",
+      "feature_id": "swarm_multi_pair",
+      "lane_id": "swarm",
+      "state_section_ids": [
+        "section:14",
+        "section:17"
+      ],
+      "matched_keywords": [
+        "scanner"
+      ],
+      "classification_confidence": 0.1
+    },
+    {
+      "id": "commit:29de3a9",
+      "hash": "29de3a9",
+      "index": 56,
+      "timestamp_unix": 1770610756,
+      "timestamp_local": "2026-02-08 23:19:16 EST",
+      "subject": "Fix detail view showing wrong pair: close SSE and poll selected pair",
+      "feature_id": "dashboard_stats_layer",
+      "lane_id": "ux",
+      "state_section_ids": [
+        "section:10",
+        "section:15"
+      ],
+      "matched_keywords": [
+        "sse",
+        "detail view"
+      ],
+      "classification_confidence": 0.222
+    },
+    {
+      "id": "commit:e46b022",
+      "hash": "e46b022",
+      "index": 57,
+      "timestamp_unix": 1770611574,
+      "timestamp_local": "2026-02-08 23:32:54 EST",
+      "subject": "Update state machine docs and model for long-only mode, swarm, dashboard",
+      "feature_id": "pair_state_machine_core",
+      "lane_id": "pair_core",
+      "state_section_ids": [
+        "section:9",
+        "section:10",
+        "section:13"
+      ],
+      "matched_keywords": [
+        "long-only",
+        "state machine"
+      ],
+      "classification_confidence": 0.167
+    },
+    {
+      "id": "commit:0ec27d3",
+      "hash": "0ec27d3",
+      "index": 58,
+      "timestamp_unix": 1770611900,
+      "timestamp_local": "2026-02-08 23:38:20 EST",
+      "subject": "Fix volume/price formatting for high-price pairs like XBT/USD",
+      "feature_id": "ops_hardening",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6",
+        "section:8"
+      ],
+      "matched_keywords": [
+        "fix"
+      ],
+      "classification_confidence": 0.1
+    },
+    {
+      "id": "commit:0d05cac",
+      "hash": "0d05cac",
+      "index": 59,
+      "timestamp_unix": 1770664076,
+      "timestamp_local": "2026-02-09 14:07:56 EST",
+      "subject": "Add anti-loss-spiral protections and Factorio-style factory dashboard",
+      "feature_id": "factory_visualization",
+      "lane_id": "ux",
+      "state_section_ids": [
+        "section:15"
+      ],
+      "matched_keywords": [
+        "factorio",
+        "factory",
+        "factory dashboard"
+      ],
+      "classification_confidence": 0.6
+    },
+    {
+      "id": "commit:4bfc9cd",
+      "hash": "4bfc9cd",
+      "index": 60,
+      "timestamp_unix": 1770665663,
+      "timestamp_local": "2026-02-09 14:34:23 EST",
+      "subject": "Improve factory viz: larger machines, bigger fonts, SSE diffs",
+      "feature_id": "factory_visualization",
+      "lane_id": "ux",
+      "state_section_ids": [
+        "section:15"
+      ],
+      "matched_keywords": [
+        "factory",
+        "factory viz",
+        "machine"
+      ],
+      "classification_confidence": 0.6
+    },
+    {
+      "id": "commit:fad1ffe",
+      "hash": "fad1ffe",
+      "index": 61,
+      "timestamp_unix": 1770671258,
+      "timestamp_local": "2026-02-09 16:07:38 EST",
+      "subject": "Add exit drift check and fix pair_state recomputation bug",
+      "feature_id": "ops_hardening",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6",
+        "section:8"
+      ],
+      "matched_keywords": [
+        "bug",
+        "fix"
+      ],
+      "classification_confidence": 0.2
+    },
+    {
+      "id": "commit:53f40d7",
+      "hash": "53f40d7",
+      "index": 62,
+      "timestamp_unix": 1770674751,
+      "timestamp_local": "2026-02-09 17:05:51 EST",
+      "subject": "Suppress QueryOrders warning when extras are recovery orders",
+      "feature_id": "recovery_exit_lifecycle",
+      "lane_id": "recovery",
+      "state_section_ids": [
+        "section:12"
+      ],
+      "matched_keywords": [
+        "recovery"
+      ],
+      "classification_confidence": 0.1
+    },
+    {
+      "id": "commit:292e413",
+      "hash": "292e413",
+      "index": 63,
+      "timestamp_unix": 1770676914,
+      "timestamp_local": "2026-02-09 17:41:54 EST",
+      "subject": "Add directional squeeze to profit targets: tighten in trends, widen in ranges",
+      "feature_id": "foundation_bootstrap",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6"
+      ],
+      "matched_keywords": [],
+      "classification_confidence": 0.0
+    },
+    {
+      "id": "commit:702eb2b",
+      "hash": "702eb2b",
+      "index": 64,
+      "timestamp_unix": 1770679340,
+      "timestamp_local": "2026-02-09 18:22:20 EST",
+      "subject": "Add S1 rebalance: orphan stranded exit to restore balanced S0 state",
+      "feature_id": "recovery_exit_lifecycle",
+      "lane_id": "recovery",
+      "state_section_ids": [
+        "section:12"
+      ],
+      "matched_keywords": [
+        "orphan",
+        "s1 rebalance"
+      ],
+      "classification_confidence": 0.2
+    },
+    {
+      "id": "commit:3aa4af6",
+      "hash": "3aa4af6",
+      "index": 65,
+      "timestamp_unix": 1770680782,
+      "timestamp_local": "2026-02-09 18:46:22 EST",
+      "subject": "Fix deploy killing orders: skip cancel_grid on SIGTERM (rolling restart)",
+      "feature_id": "ops_hardening",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6",
+        "section:8"
+      ],
+      "matched_keywords": [
+        "sigterm",
+        "deploy",
+        "fix"
+      ],
+      "classification_confidence": 0.3
+    },
+    {
+      "id": "commit:30e74a1",
+      "hash": "30e74a1",
+      "index": 66,
+      "timestamp_unix": 1770681323,
+      "timestamp_local": "2026-02-09 18:55:23 EST",
+      "subject": "Fix S1 rebalance firing too aggressively: add drift threshold",
+      "feature_id": "recovery_exit_lifecycle",
+      "lane_id": "recovery",
+      "state_section_ids": [
+        "section:12"
+      ],
+      "matched_keywords": [
+        "s1 rebalance"
+      ],
+      "classification_confidence": 0.1
+    },
+    {
+      "id": "commit:4dc2605",
+      "hash": "4dc2605",
+      "index": 67,
+      "timestamp_unix": 1770685639,
+      "timestamp_local": "2026-02-09 20:07:19 EST",
+      "subject": "Show recovery lottery tickets in status log",
+      "feature_id": "recovery_exit_lifecycle",
+      "lane_id": "recovery",
+      "state_section_ids": [
+        "section:12"
+      ],
+      "matched_keywords": [
+        "recovery",
+        "lottery"
+      ],
+      "classification_confidence": 0.2
+    },
+    {
+      "id": "commit:a36c2e2",
+      "hash": "a36c2e2",
+      "index": 68,
+      "timestamp_unix": 1770687902,
+      "timestamp_local": "2026-02-09 20:45:02 EST",
+      "subject": "Add swarm scanner phase 2: multi-quote scanning, composite scoring, force liquidation",
+      "feature_id": "swarm_multi_pair",
+      "lane_id": "swarm",
+      "state_section_ids": [
+        "section:14",
+        "section:17"
+      ],
+      "matched_keywords": [
+        "swarm",
+        "scanner",
+        "phase 2",
+        "multi-quote",
+        "composite scoring"
+      ],
+      "classification_confidence": 0.5
+    },
+    {
+      "id": "commit:3e1264d",
+      "hash": "3e1264d",
+      "index": 69,
+      "timestamp_unix": 1770688109,
+      "timestamp_local": "2026-02-09 20:48:29 EST",
+      "subject": "Update state machine: document swarm scanner phase 2",
+      "feature_id": "swarm_multi_pair",
+      "lane_id": "swarm",
+      "state_section_ids": [
+        "section:14",
+        "section:17"
+      ],
+      "matched_keywords": [
+        "swarm",
+        "scanner",
+        "phase 2"
+      ],
+      "classification_confidence": 0.3
+    },
+    {
+      "id": "commit:a1259f2",
+      "hash": "a1259f2",
+      "index": 70,
+      "timestamp_unix": 1770689033,
+      "timestamp_local": "2026-02-09 21:03:53 EST",
+      "subject": "Auto-switch dashboard view on pair add/remove",
+      "feature_id": "dashboard_stats_layer",
+      "lane_id": "ux",
+      "state_section_ids": [
+        "section:10",
+        "section:15"
+      ],
+      "matched_keywords": [
+        "dashboard"
+      ],
+      "classification_confidence": 0.111
+    },
+    {
+      "id": "commit:5fedfc5",
+      "hash": "5fedfc5",
+      "index": 71,
+      "timestamp_unix": 1770689730,
+      "timestamp_local": "2026-02-09 21:15:30 EST",
+      "subject": "Add seed buy: market-buy inventory before falling back to long-only",
+      "feature_id": "pair_state_machine_core",
+      "lane_id": "pair_core",
+      "state_section_ids": [
+        "section:9",
+        "section:10",
+        "section:13"
+      ],
+      "matched_keywords": [
+        "long-only"
+      ],
+      "classification_confidence": 0.083
+    },
+    {
+      "id": "commit:6d31f7b",
+      "hash": "6d31f7b",
+      "index": 72,
+      "timestamp_unix": 1770690196,
+      "timestamp_local": "2026-02-09 21:23:16 EST",
+      "subject": "Fix seed buy: handle initial grid build path (not just _place_pair_order)",
+      "feature_id": "risk_capital_compounding",
+      "lane_id": "risk_capital",
+      "state_section_ids": [
+        "section:4",
+        "section:16"
+      ],
+      "matched_keywords": [
+        "seed buy"
+      ],
+      "classification_confidence": 0.091
+    },
+    {
+      "id": "commit:ca5b2f5",
+      "hash": "ca5b2f5",
+      "index": 73,
+      "timestamp_unix": 1770692181,
+      "timestamp_local": "2026-02-09 21:56:21 EST",
+      "subject": "Add compound interest: roll per-pair profits back into trade size",
+      "feature_id": "foundation_bootstrap",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6"
+      ],
+      "matched_keywords": [],
+      "classification_confidence": 0.0
+    },
+    {
+      "id": "commit:d480bd7",
+      "hash": "d480bd7",
+      "index": 74,
+      "timestamp_unix": 1770692692,
+      "timestamp_local": "2026-02-09 22:04:52 EST",
+      "subject": "Fix negative P&L: auto_configure used Kraken schedule fee (0.16%) not actual fee (0.25%)",
+      "feature_id": "risk_capital_compounding",
+      "lane_id": "risk_capital",
+      "state_section_ids": [
+        "section:4",
+        "section:16"
+      ],
+      "matched_keywords": [
+        "p&l"
+      ],
+      "classification_confidence": 0.091
+    },
+    {
+      "id": "commit:717be72",
+      "hash": "717be72",
+      "index": 75,
+      "timestamp_unix": 1770693357,
+      "timestamp_local": "2026-02-09 22:15:57 EST",
+      "subject": "Fix profit_pct floor on startup: persisted pairs were bypassing _add_pair",
+      "feature_id": "foundation_bootstrap",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6"
+      ],
+      "matched_keywords": [
+        "startup"
+      ],
+      "classification_confidence": 0.143
+    },
+    {
+      "id": "commit:4048011",
+      "hash": "4048011",
+      "index": 76,
+      "timestamp_unix": 1770695799,
+      "timestamp_local": "2026-02-09 22:56:39 EST",
+      "subject": "Fix rebalance death spiral + add capital management safety nets",
+      "feature_id": "risk_capital_compounding",
+      "lane_id": "risk_capital",
+      "state_section_ids": [
+        "section:4",
+        "section:16"
+      ],
+      "matched_keywords": [
+        "capital",
+        "balance"
+      ],
+      "classification_confidence": 0.182
+    },
+    {
+      "id": "commit:60f7989",
+      "hash": "60f7989",
+      "index": 77,
+      "timestamp_unix": 1770696221,
+      "timestamp_local": "2026-02-09 23:03:41 EST",
+      "subject": "Fix startup capital budgets: call _rebalance_capital_budgets() before main loop",
+      "feature_id": "risk_capital_compounding",
+      "lane_id": "risk_capital",
+      "state_section_ids": [
+        "section:4",
+        "section:16"
+      ],
+      "matched_keywords": [
+        "capital",
+        "budget",
+        "balance"
+      ],
+      "classification_confidence": 0.273
+    },
+    {
+      "id": "commit:65d5a53",
+      "hash": "65d5a53",
+      "index": 78,
+      "timestamp_unix": 1770697029,
+      "timestamp_local": "2026-02-09 23:17:09 EST",
+      "subject": "Track real exposure in capital budgets + budget-aware orphaning",
+      "feature_id": "risk_capital_compounding",
+      "lane_id": "risk_capital",
+      "state_section_ids": [
+        "section:4",
+        "section:16"
+      ],
+      "matched_keywords": [
+        "capital",
+        "budget",
+        "exposure"
+      ],
+      "classification_confidence": 0.273
+    },
+    {
+      "id": "commit:1148524",
+      "hash": "1148524",
+      "index": 79,
+      "timestamp_unix": 1770697181,
+      "timestamp_local": "2026-02-09 23:19:41 EST",
+      "subject": "Raise profit floor: 0.60% -> 0.70% to guarantee margin over fees",
+      "feature_id": "risk_capital_compounding",
+      "lane_id": "risk_capital",
+      "state_section_ids": [
+        "section:4",
+        "section:16"
+      ],
+      "matched_keywords": [
+        "profit floor",
+        "fees"
+      ],
+      "classification_confidence": 0.182
+    },
+    {
+      "id": "commit:7e72c38",
+      "hash": "7e72c38",
+      "index": 80,
+      "timestamp_unix": 1770697247,
+      "timestamp_local": "2026-02-09 23:20:47 EST",
+      "subject": "Set DOGE-like 1.0% profit floor for all swarm pairs",
+      "feature_id": "swarm_multi_pair",
+      "lane_id": "swarm",
+      "state_section_ids": [
+        "section:14",
+        "section:17"
+      ],
+      "matched_keywords": [
+        "swarm"
+      ],
+      "classification_confidence": 0.1
+    },
+    {
+      "id": "commit:f8ffb44",
+      "hash": "f8ffb44",
+      "index": 81,
+      "timestamp_unix": 1770697461,
+      "timestamp_local": "2026-02-09 23:24:21 EST",
+      "subject": "Add one-time startup reprice of thin exits below profit floor",
+      "feature_id": "foundation_bootstrap",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6"
+      ],
+      "matched_keywords": [
+        "startup"
+      ],
+      "classification_confidence": 0.143
+    },
+    {
+      "id": "commit:2e14977",
+      "hash": "2e14977",
+      "index": 82,
+      "timestamp_unix": 1770698486,
+      "timestamp_local": "2026-02-09 23:41:26 EST",
+      "subject": "Check real Kraken balance before seed buying + startup balance log",
+      "feature_id": "risk_capital_compounding",
+      "lane_id": "risk_capital",
+      "state_section_ids": [
+        "section:4",
+        "section:16"
+      ],
+      "matched_keywords": [
+        "seed buy",
+        "balance"
+      ],
+      "classification_confidence": 0.182
+    },
+    {
+      "id": "commit:e144502",
+      "hash": "e144502",
+      "index": 83,
+      "timestamp_unix": 1770698795,
+      "timestamp_local": "2026-02-09 23:46:35 EST",
+      "subject": "Fix repricing bug: use floor_pct (1.0%) not state.profit_pct (0.60%)",
+      "feature_id": "ops_hardening",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6",
+        "section:8"
+      ],
+      "matched_keywords": [
+        "bug",
+        "fix"
+      ],
+      "classification_confidence": 0.2
+    },
+    {
+      "id": "commit:ec6a210",
+      "hash": "ec6a210",
+      "index": 84,
+      "timestamp_unix": 1770699645,
+      "timestamp_local": "2026-02-10 00:00:45 EST",
+      "subject": "Fix swarm table: multiplier dropdown click navigated to pair detail",
+      "feature_id": "swarm_multi_pair",
+      "lane_id": "swarm",
+      "state_section_ids": [
+        "section:14",
+        "section:17"
+      ],
+      "matched_keywords": [
+        "swarm",
+        "multiplier"
+      ],
+      "classification_confidence": 0.2
+    },
+    {
+      "id": "commit:6649c37",
+      "hash": "6649c37",
+      "index": 85,
+      "timestamp_unix": 1770702782,
+      "timestamp_local": "2026-02-10 00:53:02 EST",
+      "subject": "Add balance-based portfolio P&L + seed buy cost tracking",
+      "feature_id": "risk_capital_compounding",
+      "lane_id": "risk_capital",
+      "state_section_ids": [
+        "section:4",
+        "section:16"
+      ],
+      "matched_keywords": [
+        "seed buy",
+        "p&l",
+        "balance"
+      ],
+      "classification_confidence": 0.273
+    },
+    {
+      "id": "commit:1d2da32",
+      "hash": "1d2da32",
+      "index": 86,
+      "timestamp_unix": 1770703294,
+      "timestamp_local": "2026-02-10 01:01:34 EST",
+      "subject": "Enforce profit compounding: net P&L sizing + budget growth + verification",
+      "feature_id": "risk_capital_compounding",
+      "lane_id": "risk_capital",
+      "state_section_ids": [
+        "section:4",
+        "section:16"
+      ],
+      "matched_keywords": [
+        "budget",
+        "compounding",
+        "p&l"
+      ],
+      "classification_confidence": 0.273
+    },
+    {
+      "id": "commit:80f5bd8",
+      "hash": "80f5bd8",
+      "index": 87,
+      "timestamp_unix": 1770703770,
+      "timestamp_local": "2026-02-10 01:09:30 EST",
+      "subject": "Replace Account P&L / Portfolio with Bot P&L (trade profit - seed costs)",
+      "feature_id": "risk_capital_compounding",
+      "lane_id": "risk_capital",
+      "state_section_ids": [
+        "section:4",
+        "section:16"
+      ],
+      "matched_keywords": [
+        "p&l"
+      ],
+      "classification_confidence": 0.091
+    },
+    {
+      "id": "commit:2ef5605",
+      "hash": "2ef5605",
+      "index": 88,
+      "timestamp_unix": 1770735580,
+      "timestamp_local": "2026-02-10 09:59:40 EST",
+      "subject": "Fix backoff blind spot: count orphaned exits as losses immediately",
+      "feature_id": "dashboard_stats_layer",
+      "lane_id": "ux",
+      "state_section_ids": [
+        "section:10",
+        "section:15"
+      ],
+      "matched_keywords": [
+        "sse"
+      ],
+      "classification_confidence": 0.111
+    },
+    {
+      "id": "commit:55e5c14",
+      "hash": "55e5c14",
+      "index": 89,
+      "timestamp_unix": 1770736123,
+      "timestamp_local": "2026-02-10 10:08:43 EST",
+      "subject": "Set all order sizes to Kraken minimum, rely on compounding to grow",
+      "feature_id": "risk_capital_compounding",
+      "lane_id": "risk_capital",
+      "state_section_ids": [
+        "section:4",
+        "section:16"
+      ],
+      "matched_keywords": [
+        "compounding"
+      ],
+      "classification_confidence": 0.091
+    },
+    {
+      "id": "commit:5b763ad",
+      "hash": "5b763ad",
+      "index": 90,
+      "timestamp_unix": 1770738562,
+      "timestamp_local": "2026-02-10 10:49:22 EST",
+      "subject": "Fix hardcoded DOGE in pair-mode logs + skip no-op reprices",
+      "feature_id": "recovery_exit_lifecycle",
+      "lane_id": "recovery",
+      "state_section_ids": [
+        "section:12"
+      ],
+      "matched_keywords": [
+        "reprice"
+      ],
+      "classification_confidence": 0.1
+    },
+    {
+      "id": "commit:a4ae6a7",
+      "hash": "a4ae6a7",
+      "index": 91,
+      "timestamp_unix": 1770738814,
+      "timestamp_local": "2026-02-10 10:53:34 EST",
+      "subject": "Add /freeorphans command: cancel all recovery tickets across all pairs",
+      "feature_id": "recovery_exit_lifecycle",
+      "lane_id": "recovery",
+      "state_section_ids": [
+        "section:12"
+      ],
+      "matched_keywords": [
+        "recovery",
+        "orphan"
+      ],
+      "classification_confidence": 0.2
+    },
+    {
+      "id": "commit:d725200",
+      "hash": "d725200",
+      "index": 92,
+      "timestamp_unix": 1770740583,
+      "timestamp_local": "2026-02-10 11:23:03 EST",
+      "subject": "Add Free Orphans button to swarm dashboard",
+      "feature_id": "recovery_exit_lifecycle",
+      "lane_id": "recovery",
+      "state_section_ids": [
+        "section:12"
+      ],
+      "matched_keywords": [
+        "orphan",
+        "free orphans"
+      ],
+      "classification_confidence": 0.2
+    },
+    {
+      "id": "commit:77b9223",
+      "hash": "77b9223",
+      "index": 93,
+      "timestamp_unix": 1770740950,
+      "timestamp_local": "2026-02-10 11:29:10 EST",
+      "subject": "Add soft free: replace orphan exits with tight limits 0.2% from market",
+      "feature_id": "recovery_exit_lifecycle",
+      "lane_id": "recovery",
+      "state_section_ids": [
+        "section:12"
+      ],
+      "matched_keywords": [
+        "orphan"
+      ],
+      "classification_confidence": 0.1
+    },
+    {
+      "id": "commit:1cbf2c2",
+      "hash": "1cbf2c2",
+      "index": 94,
+      "timestamp_unix": 1770743958,
+      "timestamp_local": "2026-02-10 12:19:18 EST",
+      "subject": "Fix concurrency bugs: thread-safe rate limiter, recovery locks, free-orphans dedup",
+      "feature_id": "ops_hardening",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6",
+        "section:8"
+      ],
+      "matched_keywords": [
+        "concurrency",
+        "thread-safe",
+        "rate limiter",
+        "bug",
+        "fix"
+      ],
+      "classification_confidence": 0.5
+    },
+    {
+      "id": "commit:c107f5b",
+      "hash": "c107f5b",
+      "index": 95,
+      "timestamp_unix": 1770744714,
+      "timestamp_local": "2026-02-10 12:31:54 EST",
+      "subject": "Fix rate limiter blocking startup: allow overdraft like old code",
+      "feature_id": "ops_hardening",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6",
+        "section:8"
+      ],
+      "matched_keywords": [
+        "rate limiter",
+        "fix"
+      ],
+      "classification_confidence": 0.2
+    },
+    {
+      "id": "commit:5a8f81f",
+      "hash": "5a8f81f",
+      "index": 96,
+      "timestamp_unix": 1770748419,
+      "timestamp_local": "2026-02-10 13:33:39 EST",
+      "subject": "Add multi-slot trading: multiplier creates N independent A/B state machines",
+      "feature_id": "swarm_multi_pair",
+      "lane_id": "swarm",
+      "state_section_ids": [
+        "section:14",
+        "section:17"
+      ],
+      "matched_keywords": [
+        "multiplier",
+        "multi-slot"
+      ],
+      "classification_confidence": 0.2
+    },
+    {
+      "id": "commit:9699f06",
+      "hash": "9699f06",
+      "index": 97,
+      "timestamp_unix": 1770750330,
+      "timestamp_local": "2026-02-10 14:05:30 EST",
+      "subject": "Skip budget check for capital-neutral orphan ops (drift/rebalance)",
+      "feature_id": "risk_capital_compounding",
+      "lane_id": "risk_capital",
+      "state_section_ids": [
+        "section:4",
+        "section:16"
+      ],
+      "matched_keywords": [
+        "capital",
+        "budget",
+        "balance"
+      ],
+      "classification_confidence": 0.273
+    },
+    {
+      "id": "commit:ee64a8f",
+      "hash": "ee64a8f",
+      "index": 98,
+      "timestamp_unix": 1770756940,
+      "timestamp_local": "2026-02-10 15:55:40 EST",
+      "subject": "Systematic hardening: 17 fixes across 5 files",
+      "feature_id": "ops_hardening",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6",
+        "section:8"
+      ],
+      "matched_keywords": [
+        "hardening",
+        "fix"
+      ],
+      "classification_confidence": 0.2
+    },
+    {
+      "id": "commit:85fd63f",
+      "hash": "85fd63f",
+      "index": 99,
+      "timestamp_unix": 1770758735,
+      "timestamp_local": "2026-02-10 16:25:35 EST",
+      "subject": "Hardening: fix persistence/state restore and pair-targeted controls",
+      "feature_id": "ops_hardening",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6",
+        "section:8"
+      ],
+      "matched_keywords": [
+        "hardening",
+        "fix"
+      ],
+      "classification_confidence": 0.2
+    },
+    {
+      "id": "commit:97566e0",
+      "hash": "97566e0",
+      "index": 100,
+      "timestamp_unix": 1770759464,
+      "timestamp_local": "2026-02-10 16:37:44 EST",
+      "subject": "Sync pair_model.py: reset S2 timer on tolerable spread",
+      "feature_id": "pair_state_machine_core",
+      "lane_id": "pair_core",
+      "state_section_ids": [
+        "section:9",
+        "section:10",
+        "section:13"
+      ],
+      "matched_keywords": [
+        "s2"
+      ],
+      "classification_confidence": 0.083
+    },
+    {
+      "id": "commit:2b2eb11",
+      "hash": "2b2eb11",
+      "index": 101,
+      "timestamp_unix": 1770761286,
+      "timestamp_local": "2026-02-10 17:08:06 EST",
+      "subject": "Capital budget rework, factory deprecation, S2 break-glass hardening",
+      "feature_id": "risk_capital_compounding",
+      "lane_id": "risk_capital",
+      "state_section_ids": [
+        "section:4",
+        "section:16"
+      ],
+      "matched_keywords": [
+        "capital",
+        "budget"
+      ],
+      "classification_confidence": 0.182
+    },
+    {
+      "id": "commit:5f6be48",
+      "hash": "5f6be48",
+      "index": 102,
+      "timestamp_unix": 1770764140,
+      "timestamp_local": "2026-02-10 17:55:40 EST",
+      "subject": "Min-size trades, profit-funded auto-slots, AI loss analysis",
+      "feature_id": "foundation_bootstrap",
+      "lane_id": "lifecycle",
+      "state_section_ids": [
+        "section:1",
+        "section:2",
+        "section:5",
+        "section:6"
+      ],
+      "matched_keywords": [],
+      "classification_confidence": 0.0
+    }
+  ],
+  "links": [
+    {
+      "id": "commit:02725f1->feature:foundation_bootstrap",
+      "source": "commit:02725f1",
+      "target": "feature:foundation_bootstrap",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:02725f1->section:1",
+      "source": "commit:02725f1",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:02725f1->section:2",
+      "source": "commit:02725f1",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:02725f1->section:5",
+      "source": "commit:02725f1",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:02725f1->section:6",
+      "source": "commit:02725f1",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:1d6b11c->feature:foundation_bootstrap",
+      "source": "commit:1d6b11c",
+      "target": "feature:foundation_bootstrap",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:1d6b11c->section:1",
+      "source": "commit:1d6b11c",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:1d6b11c->section:2",
+      "source": "commit:1d6b11c",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:1d6b11c->section:5",
+      "source": "commit:1d6b11c",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:1d6b11c->section:6",
+      "source": "commit:1d6b11c",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:c651b03->feature:ai_telegram_control",
+      "source": "commit:c651b03",
+      "target": "feature:ai_telegram_control",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:c651b03->section:11",
+      "source": "commit:c651b03",
+      "target": "section:11",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:3f437c0->feature:ai_telegram_control",
+      "source": "commit:3f437c0",
+      "target": "feature:ai_telegram_control",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:3f437c0->section:11",
+      "source": "commit:3f437c0",
+      "target": "section:11",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:79808e7->feature:foundation_bootstrap",
+      "source": "commit:79808e7",
+      "target": "feature:foundation_bootstrap",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:79808e7->section:1",
+      "source": "commit:79808e7",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:79808e7->section:2",
+      "source": "commit:79808e7",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:79808e7->section:5",
+      "source": "commit:79808e7",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:79808e7->section:6",
+      "source": "commit:79808e7",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:7af2f3a->feature:ai_telegram_control",
+      "source": "commit:7af2f3a",
+      "target": "feature:ai_telegram_control",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:7af2f3a->section:11",
+      "source": "commit:7af2f3a",
+      "target": "section:11",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:705bc12->feature:ai_telegram_control",
+      "source": "commit:705bc12",
+      "target": "feature:ai_telegram_control",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:705bc12->section:11",
+      "source": "commit:705bc12",
+      "target": "section:11",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:fdef27e->feature:dashboard_stats_layer",
+      "source": "commit:fdef27e",
+      "target": "feature:dashboard_stats_layer",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:fdef27e->section:10",
+      "source": "commit:fdef27e",
+      "target": "section:10",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:fdef27e->section:15",
+      "source": "commit:fdef27e",
+      "target": "section:15",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:6cb2a9c->feature:foundation_bootstrap",
+      "source": "commit:6cb2a9c",
+      "target": "feature:foundation_bootstrap",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:6cb2a9c->section:1",
+      "source": "commit:6cb2a9c",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:6cb2a9c->section:2",
+      "source": "commit:6cb2a9c",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:6cb2a9c->section:5",
+      "source": "commit:6cb2a9c",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:6cb2a9c->section:6",
+      "source": "commit:6cb2a9c",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:ed94351->feature:dashboard_stats_layer",
+      "source": "commit:ed94351",
+      "target": "feature:dashboard_stats_layer",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:ed94351->section:10",
+      "source": "commit:ed94351",
+      "target": "section:10",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:ed94351->section:15",
+      "source": "commit:ed94351",
+      "target": "section:15",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:be4b3bc->feature:dashboard_stats_layer",
+      "source": "commit:be4b3bc",
+      "target": "feature:dashboard_stats_layer",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:be4b3bc->section:10",
+      "source": "commit:be4b3bc",
+      "target": "section:10",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:be4b3bc->section:15",
+      "source": "commit:be4b3bc",
+      "target": "section:15",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:cf4bcc7->feature:foundation_bootstrap",
+      "source": "commit:cf4bcc7",
+      "target": "feature:foundation_bootstrap",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:cf4bcc7->section:1",
+      "source": "commit:cf4bcc7",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:cf4bcc7->section:2",
+      "source": "commit:cf4bcc7",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:cf4bcc7->section:5",
+      "source": "commit:cf4bcc7",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:cf4bcc7->section:6",
+      "source": "commit:cf4bcc7",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:d00e98f->feature:ops_hardening",
+      "source": "commit:d00e98f",
+      "target": "feature:ops_hardening",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:d00e98f->section:1",
+      "source": "commit:d00e98f",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:d00e98f->section:2",
+      "source": "commit:d00e98f",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:d00e98f->section:5",
+      "source": "commit:d00e98f",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:d00e98f->section:6",
+      "source": "commit:d00e98f",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:d00e98f->section:8",
+      "source": "commit:d00e98f",
+      "target": "section:8",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:f0b3d66->feature:ops_hardening",
+      "source": "commit:f0b3d66",
+      "target": "feature:ops_hardening",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:f0b3d66->section:1",
+      "source": "commit:f0b3d66",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:f0b3d66->section:2",
+      "source": "commit:f0b3d66",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:f0b3d66->section:5",
+      "source": "commit:f0b3d66",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:f0b3d66->section:6",
+      "source": "commit:f0b3d66",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:f0b3d66->section:8",
+      "source": "commit:f0b3d66",
+      "target": "section:8",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:bcb8375->feature:foundation_bootstrap",
+      "source": "commit:bcb8375",
+      "target": "feature:foundation_bootstrap",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:bcb8375->section:1",
+      "source": "commit:bcb8375",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:bcb8375->section:2",
+      "source": "commit:bcb8375",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:bcb8375->section:5",
+      "source": "commit:bcb8375",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:bcb8375->section:6",
+      "source": "commit:bcb8375",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:93a58c5->feature:ops_hardening",
+      "source": "commit:93a58c5",
+      "target": "feature:ops_hardening",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:93a58c5->section:1",
+      "source": "commit:93a58c5",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:93a58c5->section:2",
+      "source": "commit:93a58c5",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:93a58c5->section:5",
+      "source": "commit:93a58c5",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:93a58c5->section:6",
+      "source": "commit:93a58c5",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:93a58c5->section:8",
+      "source": "commit:93a58c5",
+      "target": "section:8",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:a62a8d0->feature:ops_hardening",
+      "source": "commit:a62a8d0",
+      "target": "feature:ops_hardening",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:a62a8d0->section:1",
+      "source": "commit:a62a8d0",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:a62a8d0->section:2",
+      "source": "commit:a62a8d0",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:a62a8d0->section:5",
+      "source": "commit:a62a8d0",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:a62a8d0->section:6",
+      "source": "commit:a62a8d0",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:a62a8d0->section:8",
+      "source": "commit:a62a8d0",
+      "target": "section:8",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:f529613->feature:ai_telegram_control",
+      "source": "commit:f529613",
+      "target": "feature:ai_telegram_control",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:f529613->section:11",
+      "source": "commit:f529613",
+      "target": "section:11",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:5970ae9->feature:ops_hardening",
+      "source": "commit:5970ae9",
+      "target": "feature:ops_hardening",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:5970ae9->section:1",
+      "source": "commit:5970ae9",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:5970ae9->section:2",
+      "source": "commit:5970ae9",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:5970ae9->section:5",
+      "source": "commit:5970ae9",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:5970ae9->section:6",
+      "source": "commit:5970ae9",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:5970ae9->section:8",
+      "source": "commit:5970ae9",
+      "target": "section:8",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:707c5c2->feature:foundation_bootstrap",
+      "source": "commit:707c5c2",
+      "target": "feature:foundation_bootstrap",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:707c5c2->section:1",
+      "source": "commit:707c5c2",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:707c5c2->section:2",
+      "source": "commit:707c5c2",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:707c5c2->section:5",
+      "source": "commit:707c5c2",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:707c5c2->section:6",
+      "source": "commit:707c5c2",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:44efac5->feature:dashboard_stats_layer",
+      "source": "commit:44efac5",
+      "target": "feature:dashboard_stats_layer",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:44efac5->section:10",
+      "source": "commit:44efac5",
+      "target": "section:10",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:44efac5->section:15",
+      "source": "commit:44efac5",
+      "target": "section:15",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:049c470->feature:pair_state_machine_core",
+      "source": "commit:049c470",
+      "target": "feature:pair_state_machine_core",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:049c470->section:9",
+      "source": "commit:049c470",
+      "target": "section:9",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:049c470->section:10",
+      "source": "commit:049c470",
+      "target": "section:10",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:049c470->section:13",
+      "source": "commit:049c470",
+      "target": "section:13",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:43b6098->feature:pair_state_machine_core",
+      "source": "commit:43b6098",
+      "target": "feature:pair_state_machine_core",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:43b6098->section:9",
+      "source": "commit:43b6098",
+      "target": "section:9",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:43b6098->section:10",
+      "source": "commit:43b6098",
+      "target": "section:10",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:43b6098->section:13",
+      "source": "commit:43b6098",
+      "target": "section:13",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:6fea2d4->feature:pair_state_machine_core",
+      "source": "commit:6fea2d4",
+      "target": "feature:pair_state_machine_core",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:6fea2d4->section:9",
+      "source": "commit:6fea2d4",
+      "target": "section:9",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:6fea2d4->section:10",
+      "source": "commit:6fea2d4",
+      "target": "section:10",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:6fea2d4->section:13",
+      "source": "commit:6fea2d4",
+      "target": "section:13",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:ab65088->feature:ops_hardening",
+      "source": "commit:ab65088",
+      "target": "feature:ops_hardening",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:ab65088->section:1",
+      "source": "commit:ab65088",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:ab65088->section:2",
+      "source": "commit:ab65088",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:ab65088->section:5",
+      "source": "commit:ab65088",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:ab65088->section:6",
+      "source": "commit:ab65088",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:ab65088->section:8",
+      "source": "commit:ab65088",
+      "target": "section:8",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:0edf1c2->feature:ops_hardening",
+      "source": "commit:0edf1c2",
+      "target": "feature:ops_hardening",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:0edf1c2->section:1",
+      "source": "commit:0edf1c2",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:0edf1c2->section:2",
+      "source": "commit:0edf1c2",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:0edf1c2->section:5",
+      "source": "commit:0edf1c2",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:0edf1c2->section:6",
+      "source": "commit:0edf1c2",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:0edf1c2->section:8",
+      "source": "commit:0edf1c2",
+      "target": "section:8",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:3ac63bf->feature:pair_state_machine_core",
+      "source": "commit:3ac63bf",
+      "target": "feature:pair_state_machine_core",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:3ac63bf->section:9",
+      "source": "commit:3ac63bf",
+      "target": "section:9",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:3ac63bf->section:10",
+      "source": "commit:3ac63bf",
+      "target": "section:10",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:3ac63bf->section:13",
+      "source": "commit:3ac63bf",
+      "target": "section:13",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:d4832eb->feature:pair_state_machine_core",
+      "source": "commit:d4832eb",
+      "target": "feature:pair_state_machine_core",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:d4832eb->section:9",
+      "source": "commit:d4832eb",
+      "target": "section:9",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:d4832eb->section:10",
+      "source": "commit:d4832eb",
+      "target": "section:10",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:d4832eb->section:13",
+      "source": "commit:d4832eb",
+      "target": "section:13",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:ec3ae33->feature:pair_state_machine_core",
+      "source": "commit:ec3ae33",
+      "target": "feature:pair_state_machine_core",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:ec3ae33->section:9",
+      "source": "commit:ec3ae33",
+      "target": "section:9",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:ec3ae33->section:10",
+      "source": "commit:ec3ae33",
+      "target": "section:10",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:ec3ae33->section:13",
+      "source": "commit:ec3ae33",
+      "target": "section:13",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:dc612ee->feature:pair_state_machine_core",
+      "source": "commit:dc612ee",
+      "target": "feature:pair_state_machine_core",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:dc612ee->section:9",
+      "source": "commit:dc612ee",
+      "target": "section:9",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:dc612ee->section:10",
+      "source": "commit:dc612ee",
+      "target": "section:10",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:dc612ee->section:13",
+      "source": "commit:dc612ee",
+      "target": "section:13",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:761bae6->feature:pair_state_machine_core",
+      "source": "commit:761bae6",
+      "target": "feature:pair_state_machine_core",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:761bae6->section:9",
+      "source": "commit:761bae6",
+      "target": "section:9",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:761bae6->section:10",
+      "source": "commit:761bae6",
+      "target": "section:10",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:761bae6->section:13",
+      "source": "commit:761bae6",
+      "target": "section:13",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:8a88d30->feature:recovery_exit_lifecycle",
+      "source": "commit:8a88d30",
+      "target": "feature:recovery_exit_lifecycle",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:8a88d30->section:12",
+      "source": "commit:8a88d30",
+      "target": "section:12",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:d6e61d3->feature:foundation_bootstrap",
+      "source": "commit:d6e61d3",
+      "target": "feature:foundation_bootstrap",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:d6e61d3->section:1",
+      "source": "commit:d6e61d3",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:d6e61d3->section:2",
+      "source": "commit:d6e61d3",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:d6e61d3->section:5",
+      "source": "commit:d6e61d3",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:d6e61d3->section:6",
+      "source": "commit:d6e61d3",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:4179972->feature:ai_telegram_control",
+      "source": "commit:4179972",
+      "target": "feature:ai_telegram_control",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:4179972->section:11",
+      "source": "commit:4179972",
+      "target": "section:11",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:fad2534->feature:ops_hardening",
+      "source": "commit:fad2534",
+      "target": "feature:ops_hardening",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:fad2534->section:1",
+      "source": "commit:fad2534",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:fad2534->section:2",
+      "source": "commit:fad2534",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:fad2534->section:5",
+      "source": "commit:fad2534",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:fad2534->section:6",
+      "source": "commit:fad2534",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:fad2534->section:8",
+      "source": "commit:fad2534",
+      "target": "section:8",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:bb70318->feature:ops_hardening",
+      "source": "commit:bb70318",
+      "target": "feature:ops_hardening",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:bb70318->section:1",
+      "source": "commit:bb70318",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:bb70318->section:2",
+      "source": "commit:bb70318",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:bb70318->section:5",
+      "source": "commit:bb70318",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:bb70318->section:6",
+      "source": "commit:bb70318",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:bb70318->section:8",
+      "source": "commit:bb70318",
+      "target": "section:8",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:2e23f59->feature:ops_hardening",
+      "source": "commit:2e23f59",
+      "target": "feature:ops_hardening",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:2e23f59->section:1",
+      "source": "commit:2e23f59",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:2e23f59->section:2",
+      "source": "commit:2e23f59",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:2e23f59->section:5",
+      "source": "commit:2e23f59",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:2e23f59->section:6",
+      "source": "commit:2e23f59",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:2e23f59->section:8",
+      "source": "commit:2e23f59",
+      "target": "section:8",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:fb44ffe->feature:ops_hardening",
+      "source": "commit:fb44ffe",
+      "target": "feature:ops_hardening",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:fb44ffe->section:1",
+      "source": "commit:fb44ffe",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:fb44ffe->section:2",
+      "source": "commit:fb44ffe",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:fb44ffe->section:5",
+      "source": "commit:fb44ffe",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:fb44ffe->section:6",
+      "source": "commit:fb44ffe",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:fb44ffe->section:8",
+      "source": "commit:fb44ffe",
+      "target": "section:8",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:dc93798->feature:ops_hardening",
+      "source": "commit:dc93798",
+      "target": "feature:ops_hardening",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:dc93798->section:1",
+      "source": "commit:dc93798",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:dc93798->section:2",
+      "source": "commit:dc93798",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:dc93798->section:5",
+      "source": "commit:dc93798",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:dc93798->section:6",
+      "source": "commit:dc93798",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:dc93798->section:8",
+      "source": "commit:dc93798",
+      "target": "section:8",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:7c3091d->feature:pair_state_machine_core",
+      "source": "commit:7c3091d",
+      "target": "feature:pair_state_machine_core",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:7c3091d->section:9",
+      "source": "commit:7c3091d",
+      "target": "section:9",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:7c3091d->section:10",
+      "source": "commit:7c3091d",
+      "target": "section:10",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:7c3091d->section:13",
+      "source": "commit:7c3091d",
+      "target": "section:13",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:31aeba3->feature:pair_state_machine_core",
+      "source": "commit:31aeba3",
+      "target": "feature:pair_state_machine_core",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:31aeba3->section:9",
+      "source": "commit:31aeba3",
+      "target": "section:9",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:31aeba3->section:10",
+      "source": "commit:31aeba3",
+      "target": "section:10",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:31aeba3->section:13",
+      "source": "commit:31aeba3",
+      "target": "section:13",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:6a44976->feature:ai_telegram_control",
+      "source": "commit:6a44976",
+      "target": "feature:ai_telegram_control",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:6a44976->section:11",
+      "source": "commit:6a44976",
+      "target": "section:11",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:8591500->feature:swarm_multi_pair",
+      "source": "commit:8591500",
+      "target": "feature:swarm_multi_pair",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:8591500->section:14",
+      "source": "commit:8591500",
+      "target": "section:14",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:8591500->section:17",
+      "source": "commit:8591500",
+      "target": "section:17",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:691b540->feature:ai_telegram_control",
+      "source": "commit:691b540",
+      "target": "feature:ai_telegram_control",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:691b540->section:11",
+      "source": "commit:691b540",
+      "target": "section:11",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:ea789d5->feature:pair_state_machine_core",
+      "source": "commit:ea789d5",
+      "target": "feature:pair_state_machine_core",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:ea789d5->section:9",
+      "source": "commit:ea789d5",
+      "target": "section:9",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:ea789d5->section:10",
+      "source": "commit:ea789d5",
+      "target": "section:10",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:ea789d5->section:13",
+      "source": "commit:ea789d5",
+      "target": "section:13",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:8d3e06f->feature:foundation_bootstrap",
+      "source": "commit:8d3e06f",
+      "target": "feature:foundation_bootstrap",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:8d3e06f->section:1",
+      "source": "commit:8d3e06f",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:8d3e06f->section:2",
+      "source": "commit:8d3e06f",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:8d3e06f->section:5",
+      "source": "commit:8d3e06f",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:8d3e06f->section:6",
+      "source": "commit:8d3e06f",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:c60afab->feature:ops_hardening",
+      "source": "commit:c60afab",
+      "target": "feature:ops_hardening",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:c60afab->section:1",
+      "source": "commit:c60afab",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:c60afab->section:2",
+      "source": "commit:c60afab",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:c60afab->section:5",
+      "source": "commit:c60afab",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:c60afab->section:6",
+      "source": "commit:c60afab",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:c60afab->section:8",
+      "source": "commit:c60afab",
+      "target": "section:8",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:7b4b7c7->feature:swarm_multi_pair",
+      "source": "commit:7b4b7c7",
+      "target": "feature:swarm_multi_pair",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:7b4b7c7->section:14",
+      "source": "commit:7b4b7c7",
+      "target": "section:14",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:7b4b7c7->section:17",
+      "source": "commit:7b4b7c7",
+      "target": "section:17",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:01d6117->feature:dashboard_stats_layer",
+      "source": "commit:01d6117",
+      "target": "feature:dashboard_stats_layer",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:01d6117->section:10",
+      "source": "commit:01d6117",
+      "target": "section:10",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:01d6117->section:15",
+      "source": "commit:01d6117",
+      "target": "section:15",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:8a9f216->feature:dashboard_stats_layer",
+      "source": "commit:8a9f216",
+      "target": "feature:dashboard_stats_layer",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:8a9f216->section:10",
+      "source": "commit:8a9f216",
+      "target": "section:10",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:8a9f216->section:15",
+      "source": "commit:8a9f216",
+      "target": "section:15",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:0f3b252->feature:recovery_exit_lifecycle",
+      "source": "commit:0f3b252",
+      "target": "feature:recovery_exit_lifecycle",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:0f3b252->section:12",
+      "source": "commit:0f3b252",
+      "target": "section:12",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:96d4623->feature:recovery_exit_lifecycle",
+      "source": "commit:96d4623",
+      "target": "feature:recovery_exit_lifecycle",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:96d4623->section:12",
+      "source": "commit:96d4623",
+      "target": "section:12",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:1d9703a->feature:pair_state_machine_core",
+      "source": "commit:1d9703a",
+      "target": "feature:pair_state_machine_core",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:1d9703a->section:9",
+      "source": "commit:1d9703a",
+      "target": "section:9",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:1d9703a->section:10",
+      "source": "commit:1d9703a",
+      "target": "section:10",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:1d9703a->section:12",
+      "source": "commit:1d9703a",
+      "target": "section:12",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:1d9703a->section:13",
+      "source": "commit:1d9703a",
+      "target": "section:13",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:008e06e->feature:pair_state_machine_core",
+      "source": "commit:008e06e",
+      "target": "feature:pair_state_machine_core",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:008e06e->section:9",
+      "source": "commit:008e06e",
+      "target": "section:9",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:008e06e->section:10",
+      "source": "commit:008e06e",
+      "target": "section:10",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:008e06e->section:13",
+      "source": "commit:008e06e",
+      "target": "section:13",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:b0ac634->feature:pair_state_machine_core",
+      "source": "commit:b0ac634",
+      "target": "feature:pair_state_machine_core",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:b0ac634->section:9",
+      "source": "commit:b0ac634",
+      "target": "section:9",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:b0ac634->section:10",
+      "source": "commit:b0ac634",
+      "target": "section:10",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:b0ac634->section:13",
+      "source": "commit:b0ac634",
+      "target": "section:13",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:67a0c71->feature:swarm_multi_pair",
+      "source": "commit:67a0c71",
+      "target": "feature:swarm_multi_pair",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:67a0c71->section:14",
+      "source": "commit:67a0c71",
+      "target": "section:14",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:67a0c71->section:17",
+      "source": "commit:67a0c71",
+      "target": "section:17",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:29de3a9->feature:dashboard_stats_layer",
+      "source": "commit:29de3a9",
+      "target": "feature:dashboard_stats_layer",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:29de3a9->section:10",
+      "source": "commit:29de3a9",
+      "target": "section:10",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:29de3a9->section:15",
+      "source": "commit:29de3a9",
+      "target": "section:15",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:e46b022->feature:pair_state_machine_core",
+      "source": "commit:e46b022",
+      "target": "feature:pair_state_machine_core",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:e46b022->section:9",
+      "source": "commit:e46b022",
+      "target": "section:9",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:e46b022->section:10",
+      "source": "commit:e46b022",
+      "target": "section:10",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:e46b022->section:13",
+      "source": "commit:e46b022",
+      "target": "section:13",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:0ec27d3->feature:ops_hardening",
+      "source": "commit:0ec27d3",
+      "target": "feature:ops_hardening",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:0ec27d3->section:1",
+      "source": "commit:0ec27d3",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:0ec27d3->section:2",
+      "source": "commit:0ec27d3",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:0ec27d3->section:5",
+      "source": "commit:0ec27d3",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:0ec27d3->section:6",
+      "source": "commit:0ec27d3",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:0ec27d3->section:8",
+      "source": "commit:0ec27d3",
+      "target": "section:8",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:0d05cac->feature:factory_visualization",
+      "source": "commit:0d05cac",
+      "target": "feature:factory_visualization",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:0d05cac->section:15",
+      "source": "commit:0d05cac",
+      "target": "section:15",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:4bfc9cd->feature:factory_visualization",
+      "source": "commit:4bfc9cd",
+      "target": "feature:factory_visualization",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:4bfc9cd->section:15",
+      "source": "commit:4bfc9cd",
+      "target": "section:15",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:fad1ffe->feature:ops_hardening",
+      "source": "commit:fad1ffe",
+      "target": "feature:ops_hardening",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:fad1ffe->section:1",
+      "source": "commit:fad1ffe",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:fad1ffe->section:2",
+      "source": "commit:fad1ffe",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:fad1ffe->section:5",
+      "source": "commit:fad1ffe",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:fad1ffe->section:6",
+      "source": "commit:fad1ffe",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:fad1ffe->section:8",
+      "source": "commit:fad1ffe",
+      "target": "section:8",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:53f40d7->feature:recovery_exit_lifecycle",
+      "source": "commit:53f40d7",
+      "target": "feature:recovery_exit_lifecycle",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:53f40d7->section:12",
+      "source": "commit:53f40d7",
+      "target": "section:12",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:292e413->feature:foundation_bootstrap",
+      "source": "commit:292e413",
+      "target": "feature:foundation_bootstrap",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:292e413->section:1",
+      "source": "commit:292e413",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:292e413->section:2",
+      "source": "commit:292e413",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:292e413->section:5",
+      "source": "commit:292e413",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:292e413->section:6",
+      "source": "commit:292e413",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:702eb2b->feature:recovery_exit_lifecycle",
+      "source": "commit:702eb2b",
+      "target": "feature:recovery_exit_lifecycle",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:702eb2b->section:12",
+      "source": "commit:702eb2b",
+      "target": "section:12",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:3aa4af6->feature:ops_hardening",
+      "source": "commit:3aa4af6",
+      "target": "feature:ops_hardening",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:3aa4af6->section:1",
+      "source": "commit:3aa4af6",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:3aa4af6->section:2",
+      "source": "commit:3aa4af6",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:3aa4af6->section:5",
+      "source": "commit:3aa4af6",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:3aa4af6->section:6",
+      "source": "commit:3aa4af6",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:3aa4af6->section:8",
+      "source": "commit:3aa4af6",
+      "target": "section:8",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:30e74a1->feature:recovery_exit_lifecycle",
+      "source": "commit:30e74a1",
+      "target": "feature:recovery_exit_lifecycle",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:30e74a1->section:12",
+      "source": "commit:30e74a1",
+      "target": "section:12",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:4dc2605->feature:recovery_exit_lifecycle",
+      "source": "commit:4dc2605",
+      "target": "feature:recovery_exit_lifecycle",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:4dc2605->section:12",
+      "source": "commit:4dc2605",
+      "target": "section:12",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:a36c2e2->feature:swarm_multi_pair",
+      "source": "commit:a36c2e2",
+      "target": "feature:swarm_multi_pair",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:a36c2e2->section:14",
+      "source": "commit:a36c2e2",
+      "target": "section:14",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:a36c2e2->section:17",
+      "source": "commit:a36c2e2",
+      "target": "section:17",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:3e1264d->feature:swarm_multi_pair",
+      "source": "commit:3e1264d",
+      "target": "feature:swarm_multi_pair",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:3e1264d->section:14",
+      "source": "commit:3e1264d",
+      "target": "section:14",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:3e1264d->section:17",
+      "source": "commit:3e1264d",
+      "target": "section:17",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:a1259f2->feature:dashboard_stats_layer",
+      "source": "commit:a1259f2",
+      "target": "feature:dashboard_stats_layer",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:a1259f2->section:10",
+      "source": "commit:a1259f2",
+      "target": "section:10",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:a1259f2->section:15",
+      "source": "commit:a1259f2",
+      "target": "section:15",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:5fedfc5->feature:pair_state_machine_core",
+      "source": "commit:5fedfc5",
+      "target": "feature:pair_state_machine_core",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:5fedfc5->section:9",
+      "source": "commit:5fedfc5",
+      "target": "section:9",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:5fedfc5->section:10",
+      "source": "commit:5fedfc5",
+      "target": "section:10",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:5fedfc5->section:13",
+      "source": "commit:5fedfc5",
+      "target": "section:13",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:6d31f7b->feature:risk_capital_compounding",
+      "source": "commit:6d31f7b",
+      "target": "feature:risk_capital_compounding",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:6d31f7b->section:4",
+      "source": "commit:6d31f7b",
+      "target": "section:4",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:6d31f7b->section:16",
+      "source": "commit:6d31f7b",
+      "target": "section:16",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:ca5b2f5->feature:foundation_bootstrap",
+      "source": "commit:ca5b2f5",
+      "target": "feature:foundation_bootstrap",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:ca5b2f5->section:1",
+      "source": "commit:ca5b2f5",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:ca5b2f5->section:2",
+      "source": "commit:ca5b2f5",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:ca5b2f5->section:5",
+      "source": "commit:ca5b2f5",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:ca5b2f5->section:6",
+      "source": "commit:ca5b2f5",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:d480bd7->feature:risk_capital_compounding",
+      "source": "commit:d480bd7",
+      "target": "feature:risk_capital_compounding",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:d480bd7->section:4",
+      "source": "commit:d480bd7",
+      "target": "section:4",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:d480bd7->section:16",
+      "source": "commit:d480bd7",
+      "target": "section:16",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:717be72->feature:foundation_bootstrap",
+      "source": "commit:717be72",
+      "target": "feature:foundation_bootstrap",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:717be72->section:1",
+      "source": "commit:717be72",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:717be72->section:2",
+      "source": "commit:717be72",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:717be72->section:5",
+      "source": "commit:717be72",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:717be72->section:6",
+      "source": "commit:717be72",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:4048011->feature:risk_capital_compounding",
+      "source": "commit:4048011",
+      "target": "feature:risk_capital_compounding",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:4048011->section:4",
+      "source": "commit:4048011",
+      "target": "section:4",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:4048011->section:16",
+      "source": "commit:4048011",
+      "target": "section:16",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:60f7989->feature:risk_capital_compounding",
+      "source": "commit:60f7989",
+      "target": "feature:risk_capital_compounding",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:60f7989->section:4",
+      "source": "commit:60f7989",
+      "target": "section:4",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:60f7989->section:16",
+      "source": "commit:60f7989",
+      "target": "section:16",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:65d5a53->feature:risk_capital_compounding",
+      "source": "commit:65d5a53",
+      "target": "feature:risk_capital_compounding",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:65d5a53->section:4",
+      "source": "commit:65d5a53",
+      "target": "section:4",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:65d5a53->section:16",
+      "source": "commit:65d5a53",
+      "target": "section:16",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:1148524->feature:risk_capital_compounding",
+      "source": "commit:1148524",
+      "target": "feature:risk_capital_compounding",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:1148524->section:4",
+      "source": "commit:1148524",
+      "target": "section:4",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:1148524->section:16",
+      "source": "commit:1148524",
+      "target": "section:16",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:7e72c38->feature:swarm_multi_pair",
+      "source": "commit:7e72c38",
+      "target": "feature:swarm_multi_pair",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:7e72c38->section:14",
+      "source": "commit:7e72c38",
+      "target": "section:14",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:7e72c38->section:17",
+      "source": "commit:7e72c38",
+      "target": "section:17",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:f8ffb44->feature:foundation_bootstrap",
+      "source": "commit:f8ffb44",
+      "target": "feature:foundation_bootstrap",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:f8ffb44->section:1",
+      "source": "commit:f8ffb44",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:f8ffb44->section:2",
+      "source": "commit:f8ffb44",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:f8ffb44->section:5",
+      "source": "commit:f8ffb44",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:f8ffb44->section:6",
+      "source": "commit:f8ffb44",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:2e14977->feature:risk_capital_compounding",
+      "source": "commit:2e14977",
+      "target": "feature:risk_capital_compounding",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:2e14977->section:4",
+      "source": "commit:2e14977",
+      "target": "section:4",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:2e14977->section:16",
+      "source": "commit:2e14977",
+      "target": "section:16",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:e144502->feature:ops_hardening",
+      "source": "commit:e144502",
+      "target": "feature:ops_hardening",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:e144502->section:1",
+      "source": "commit:e144502",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:e144502->section:2",
+      "source": "commit:e144502",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:e144502->section:5",
+      "source": "commit:e144502",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:e144502->section:6",
+      "source": "commit:e144502",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:e144502->section:8",
+      "source": "commit:e144502",
+      "target": "section:8",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:ec6a210->feature:swarm_multi_pair",
+      "source": "commit:ec6a210",
+      "target": "feature:swarm_multi_pair",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:ec6a210->section:14",
+      "source": "commit:ec6a210",
+      "target": "section:14",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:ec6a210->section:17",
+      "source": "commit:ec6a210",
+      "target": "section:17",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:6649c37->feature:risk_capital_compounding",
+      "source": "commit:6649c37",
+      "target": "feature:risk_capital_compounding",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:6649c37->section:4",
+      "source": "commit:6649c37",
+      "target": "section:4",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:6649c37->section:16",
+      "source": "commit:6649c37",
+      "target": "section:16",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:1d2da32->feature:risk_capital_compounding",
+      "source": "commit:1d2da32",
+      "target": "feature:risk_capital_compounding",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:1d2da32->section:4",
+      "source": "commit:1d2da32",
+      "target": "section:4",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:1d2da32->section:16",
+      "source": "commit:1d2da32",
+      "target": "section:16",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:80f5bd8->feature:risk_capital_compounding",
+      "source": "commit:80f5bd8",
+      "target": "feature:risk_capital_compounding",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:80f5bd8->section:4",
+      "source": "commit:80f5bd8",
+      "target": "section:4",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:80f5bd8->section:16",
+      "source": "commit:80f5bd8",
+      "target": "section:16",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:2ef5605->feature:dashboard_stats_layer",
+      "source": "commit:2ef5605",
+      "target": "feature:dashboard_stats_layer",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:2ef5605->section:10",
+      "source": "commit:2ef5605",
+      "target": "section:10",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:2ef5605->section:15",
+      "source": "commit:2ef5605",
+      "target": "section:15",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:55e5c14->feature:risk_capital_compounding",
+      "source": "commit:55e5c14",
+      "target": "feature:risk_capital_compounding",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:55e5c14->section:4",
+      "source": "commit:55e5c14",
+      "target": "section:4",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:55e5c14->section:16",
+      "source": "commit:55e5c14",
+      "target": "section:16",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:5b763ad->feature:recovery_exit_lifecycle",
+      "source": "commit:5b763ad",
+      "target": "feature:recovery_exit_lifecycle",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:5b763ad->section:12",
+      "source": "commit:5b763ad",
+      "target": "section:12",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:a4ae6a7->feature:recovery_exit_lifecycle",
+      "source": "commit:a4ae6a7",
+      "target": "feature:recovery_exit_lifecycle",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:a4ae6a7->section:12",
+      "source": "commit:a4ae6a7",
+      "target": "section:12",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:d725200->feature:recovery_exit_lifecycle",
+      "source": "commit:d725200",
+      "target": "feature:recovery_exit_lifecycle",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:d725200->section:12",
+      "source": "commit:d725200",
+      "target": "section:12",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:77b9223->feature:recovery_exit_lifecycle",
+      "source": "commit:77b9223",
+      "target": "feature:recovery_exit_lifecycle",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:77b9223->section:12",
+      "source": "commit:77b9223",
+      "target": "section:12",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:1cbf2c2->feature:ops_hardening",
+      "source": "commit:1cbf2c2",
+      "target": "feature:ops_hardening",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:1cbf2c2->section:1",
+      "source": "commit:1cbf2c2",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:1cbf2c2->section:2",
+      "source": "commit:1cbf2c2",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:1cbf2c2->section:5",
+      "source": "commit:1cbf2c2",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:1cbf2c2->section:6",
+      "source": "commit:1cbf2c2",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:1cbf2c2->section:8",
+      "source": "commit:1cbf2c2",
+      "target": "section:8",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:c107f5b->feature:ops_hardening",
+      "source": "commit:c107f5b",
+      "target": "feature:ops_hardening",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:c107f5b->section:1",
+      "source": "commit:c107f5b",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:c107f5b->section:2",
+      "source": "commit:c107f5b",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:c107f5b->section:5",
+      "source": "commit:c107f5b",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:c107f5b->section:6",
+      "source": "commit:c107f5b",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:c107f5b->section:8",
+      "source": "commit:c107f5b",
+      "target": "section:8",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:5a8f81f->feature:swarm_multi_pair",
+      "source": "commit:5a8f81f",
+      "target": "feature:swarm_multi_pair",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:5a8f81f->section:14",
+      "source": "commit:5a8f81f",
+      "target": "section:14",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:5a8f81f->section:17",
+      "source": "commit:5a8f81f",
+      "target": "section:17",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:9699f06->feature:risk_capital_compounding",
+      "source": "commit:9699f06",
+      "target": "feature:risk_capital_compounding",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:9699f06->section:4",
+      "source": "commit:9699f06",
+      "target": "section:4",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:9699f06->section:16",
+      "source": "commit:9699f06",
+      "target": "section:16",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:ee64a8f->feature:ops_hardening",
+      "source": "commit:ee64a8f",
+      "target": "feature:ops_hardening",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:ee64a8f->section:1",
+      "source": "commit:ee64a8f",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:ee64a8f->section:2",
+      "source": "commit:ee64a8f",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:ee64a8f->section:5",
+      "source": "commit:ee64a8f",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:ee64a8f->section:6",
+      "source": "commit:ee64a8f",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:ee64a8f->section:8",
+      "source": "commit:ee64a8f",
+      "target": "section:8",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:85fd63f->feature:ops_hardening",
+      "source": "commit:85fd63f",
+      "target": "feature:ops_hardening",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:85fd63f->section:1",
+      "source": "commit:85fd63f",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:85fd63f->section:2",
+      "source": "commit:85fd63f",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:85fd63f->section:5",
+      "source": "commit:85fd63f",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:85fd63f->section:6",
+      "source": "commit:85fd63f",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:85fd63f->section:8",
+      "source": "commit:85fd63f",
+      "target": "section:8",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:97566e0->feature:pair_state_machine_core",
+      "source": "commit:97566e0",
+      "target": "feature:pair_state_machine_core",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:97566e0->section:9",
+      "source": "commit:97566e0",
+      "target": "section:9",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:97566e0->section:10",
+      "source": "commit:97566e0",
+      "target": "section:10",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:97566e0->section:13",
+      "source": "commit:97566e0",
+      "target": "section:13",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:2b2eb11->feature:risk_capital_compounding",
+      "source": "commit:2b2eb11",
+      "target": "feature:risk_capital_compounding",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:2b2eb11->section:4",
+      "source": "commit:2b2eb11",
+      "target": "section:4",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:2b2eb11->section:16",
+      "source": "commit:2b2eb11",
+      "target": "section:16",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:5f6be48->feature:foundation_bootstrap",
+      "source": "commit:5f6be48",
+      "target": "feature:foundation_bootstrap",
+      "type": "commit_implements_feature"
+    },
+    {
+      "id": "commit:5f6be48->section:1",
+      "source": "commit:5f6be48",
+      "target": "section:1",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:5f6be48->section:2",
+      "source": "commit:5f6be48",
+      "target": "section:2",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:5f6be48->section:5",
+      "source": "commit:5f6be48",
+      "target": "section:5",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "commit:5f6be48->section:6",
+      "source": "commit:5f6be48",
+      "target": "section:6",
+      "type": "commit_touches_state_section"
+    },
+    {
+      "id": "feature:foundation_bootstrap->section:1",
+      "source": "feature:foundation_bootstrap",
+      "target": "section:1",
+      "type": "feature_affects_state_section"
+    },
+    {
+      "id": "feature:foundation_bootstrap->section:2",
+      "source": "feature:foundation_bootstrap",
+      "target": "section:2",
+      "type": "feature_affects_state_section"
+    },
+    {
+      "id": "feature:foundation_bootstrap->section:5",
+      "source": "feature:foundation_bootstrap",
+      "target": "section:5",
+      "type": "feature_affects_state_section"
+    },
+    {
+      "id": "feature:foundation_bootstrap->section:6",
+      "source": "feature:foundation_bootstrap",
+      "target": "section:6",
+      "type": "feature_affects_state_section"
+    },
+    {
+      "id": "feature:ai_telegram_control->section:11",
+      "source": "feature:ai_telegram_control",
+      "target": "section:11",
+      "type": "feature_affects_state_section"
+    },
+    {
+      "id": "feature:dashboard_stats_layer->section:10",
+      "source": "feature:dashboard_stats_layer",
+      "target": "section:10",
+      "type": "feature_affects_state_section"
+    },
+    {
+      "id": "feature:dashboard_stats_layer->section:15",
+      "source": "feature:dashboard_stats_layer",
+      "target": "section:15",
+      "type": "feature_affects_state_section"
+    },
+    {
+      "id": "feature:pair_state_machine_core->section:9",
+      "source": "feature:pair_state_machine_core",
+      "target": "section:9",
+      "type": "feature_affects_state_section"
+    },
+    {
+      "id": "feature:pair_state_machine_core->section:10",
+      "source": "feature:pair_state_machine_core",
+      "target": "section:10",
+      "type": "feature_affects_state_section"
+    },
+    {
+      "id": "feature:pair_state_machine_core->section:13",
+      "source": "feature:pair_state_machine_core",
+      "target": "section:13",
+      "type": "feature_affects_state_section"
+    },
+    {
+      "id": "feature:recovery_exit_lifecycle->section:12",
+      "source": "feature:recovery_exit_lifecycle",
+      "target": "section:12",
+      "type": "feature_affects_state_section"
+    },
+    {
+      "id": "feature:swarm_multi_pair->section:14",
+      "source": "feature:swarm_multi_pair",
+      "target": "section:14",
+      "type": "feature_affects_state_section"
+    },
+    {
+      "id": "feature:swarm_multi_pair->section:17",
+      "source": "feature:swarm_multi_pair",
+      "target": "section:17",
+      "type": "feature_affects_state_section"
+    },
+    {
+      "id": "feature:risk_capital_compounding->section:4",
+      "source": "feature:risk_capital_compounding",
+      "target": "section:4",
+      "type": "feature_affects_state_section"
+    },
+    {
+      "id": "feature:risk_capital_compounding->section:16",
+      "source": "feature:risk_capital_compounding",
+      "target": "section:16",
+      "type": "feature_affects_state_section"
+    },
+    {
+      "id": "feature:factory_visualization->section:15",
+      "source": "feature:factory_visualization",
+      "target": "section:15",
+      "type": "feature_affects_state_section"
+    },
+    {
+      "id": "feature:ops_hardening->section:1",
+      "source": "feature:ops_hardening",
+      "target": "section:1",
+      "type": "feature_affects_state_section"
+    },
+    {
+      "id": "feature:ops_hardening->section:2",
+      "source": "feature:ops_hardening",
+      "target": "section:2",
+      "type": "feature_affects_state_section"
+    },
+    {
+      "id": "feature:ops_hardening->section:5",
+      "source": "feature:ops_hardening",
+      "target": "section:5",
+      "type": "feature_affects_state_section"
+    },
+    {
+      "id": "feature:ops_hardening->section:6",
+      "source": "feature:ops_hardening",
+      "target": "section:6",
+      "type": "feature_affects_state_section"
+    },
+    {
+      "id": "feature:ops_hardening->section:8",
+      "source": "feature:ops_hardening",
+      "target": "section:8",
+      "type": "feature_affects_state_section"
+    }
+  ],
+  "feature_tree": {
+    "id": "feature-tree:root",
+    "label": "DOGE Grid Bot -> Pair-State Swarm",
+    "children": [
+      "feature:foundation_bootstrap",
+      "feature:ai_telegram_control",
+      "feature:dashboard_stats_layer",
+      "feature:pair_state_machine_core",
+      "feature:recovery_exit_lifecycle",
+      "feature:swarm_multi_pair",
+      "feature:risk_capital_compounding",
+      "feature:factory_visualization",
+      "feature:ops_hardening"
+    ]
+  }
+}

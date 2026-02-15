@@ -1,0 +1,265 @@
+{
+  "timezone": "America/New_York",
+  "feature_tree_root": "DOGE Grid Bot -> Pair-State Swarm",
+  "fallback_feature_id": "ops_hardening",
+  "lanes": [
+    {
+      "id": "lifecycle",
+      "label": "Lifecycle",
+      "order": 1
+    },
+    {
+      "id": "ai_control",
+      "label": "AI / Control",
+      "order": 2
+    },
+    {
+      "id": "pair_core",
+      "label": "Pair Core",
+      "order": 3
+    },
+    {
+      "id": "recovery",
+      "label": "Recovery / Exit",
+      "order": 4
+    },
+    {
+      "id": "swarm",
+      "label": "Swarm / Multi-Pair",
+      "order": 5
+    },
+    {
+      "id": "risk_capital",
+      "label": "Risk / Capital",
+      "order": 6
+    },
+    {
+      "id": "ux",
+      "label": "UX / Dashboard",
+      "order": 7
+    }
+  ],
+  "section_lane_overrides": {
+    "1": "lifecycle",
+    "2": "lifecycle",
+    "3": "lifecycle",
+    "4": "risk_capital",
+    "5": "lifecycle",
+    "6": "lifecycle",
+    "7": "lifecycle",
+    "8": "lifecycle",
+    "9": "pair_core",
+    "10": "pair_core",
+    "11": "ai_control",
+    "12": "recovery",
+    "13": "pair_core",
+    "14": "swarm",
+    "15": "ux",
+    "16": "risk_capital",
+    "17": "swarm"
+  },
+  "features": [
+    {
+      "id": "foundation_bootstrap",
+      "label": "Foundation / Bootstrap",
+      "lane_id": "lifecycle",
+      "order": 1,
+      "deprecated_candidate": false,
+      "state_sections": [
+        1,
+        2,
+        5,
+        6
+      ],
+      "keywords": [
+        "initial commit",
+        "requirements",
+        "nixpacks",
+        "startup",
+        "validation",
+        "state persistence",
+        "supabase persistence"
+      ]
+    },
+    {
+      "id": "ai_telegram_control",
+      "label": "AI Advisor + Telegram Control",
+      "lane_id": "ai_control",
+      "order": 2,
+      "deprecated_candidate": true,
+      "state_sections": [
+        11
+      ],
+      "keywords": [
+        "ai advisor",
+        "ai council",
+        "approval",
+        "telegram",
+        "command",
+        "/check",
+        "manual-only",
+        "callback"
+      ]
+    },
+    {
+      "id": "dashboard_stats_layer",
+      "label": "Dashboard / Stats Layer",
+      "lane_id": "ux",
+      "order": 3,
+      "deprecated_candidate": false,
+      "state_sections": [
+        10,
+        15
+      ],
+      "keywords": [
+        "dashboard",
+        "sse",
+        "live feed",
+        "modal",
+        "audio",
+        "stats",
+        "methodology",
+        "detail view",
+        "browse pairs"
+      ]
+    },
+    {
+      "id": "pair_state_machine_core",
+      "label": "Pair State Machine Core",
+      "lane_id": "pair_core",
+      "order": 4,
+      "deprecated_candidate": false,
+      "state_sections": [
+        9,
+        10,
+        13
+      ],
+      "keywords": [
+        "pair strategy",
+        "pair mode",
+        "s0",
+        "s1a",
+        "s1b",
+        "s2",
+        "trade a",
+        "trade b",
+        "fill detection",
+        "offline fill recovery",
+        "long-only",
+        "state machine"
+      ]
+    },
+    {
+      "id": "recovery_exit_lifecycle",
+      "label": "Recovery / Exit Lifecycle",
+      "lane_id": "recovery",
+      "order": 5,
+      "deprecated_candidate": false,
+      "state_sections": [
+        12
+      ],
+      "keywords": [
+        "recovery",
+        "orphan",
+        "exit lifecycle",
+        "reprice",
+        "break-glass",
+        "s1 rebalance",
+        "exit drift",
+        "free orphans",
+        "lottery",
+        "force liquidation"
+      ]
+    },
+    {
+      "id": "swarm_multi_pair",
+      "label": "Swarm / Multi-Pair Platform",
+      "lane_id": "swarm",
+      "order": 6,
+      "deprecated_candidate": false,
+      "state_sections": [
+        14,
+        17
+      ],
+      "keywords": [
+        "multi-pair",
+        "swarm",
+        "scanner",
+        "phase 2",
+        "multi-quote",
+        "composite scoring",
+        "pair add",
+        "pair remove",
+        "multiplier",
+        "multi-slot"
+      ]
+    },
+    {
+      "id": "risk_capital_compounding",
+      "label": "Risk, Capital, Compounding",
+      "lane_id": "risk_capital",
+      "order": 7,
+      "deprecated_candidate": false,
+      "state_sections": [
+        4,
+        16
+      ],
+      "keywords": [
+        "anti-loss",
+        "backoff",
+        "capital",
+        "budget",
+        "compounding",
+        "profit floor",
+        "seed buy",
+        "p&l",
+        "exposure",
+        "balance",
+        "fees"
+      ]
+    },
+    {
+      "id": "factory_visualization",
+      "label": "Factory Visualization",
+      "lane_id": "ux",
+      "order": 8,
+      "deprecated_candidate": true,
+      "state_sections": [
+        15
+      ],
+      "keywords": [
+        "factorio",
+        "factory",
+        "factory viz",
+        "machine",
+        "factory dashboard"
+      ]
+    },
+    {
+      "id": "ops_hardening",
+      "label": "Ops / Concurrency Hardening",
+      "lane_id": "lifecycle",
+      "order": 9,
+      "deprecated_candidate": false,
+      "state_sections": [
+        1,
+        2,
+        5,
+        6,
+        8
+      ],
+      "keywords": [
+        "hardening",
+        "concurrency",
+        "thread-safe",
+        "race condition",
+        "rate limiter",
+        "sigterm",
+        "deploy",
+        "reconciliation",
+        "bug",
+        "fix"
+      ]
+    }
+  ]
+}
