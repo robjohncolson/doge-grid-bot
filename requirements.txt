@@ -1,1 +1,3 @@
-# No external dependencies — pure Python standard library only.
+# HMM regime detector (optional — bot degrades gracefully if missing)
+numpy
+hmmlearn
