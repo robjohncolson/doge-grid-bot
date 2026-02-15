@@ -471,9 +471,12 @@ HMM_OHLCV_RETENTION_DAYS: int = _env("HMM_OHLCV_RETENTION_DAYS", 14, int)
 # One-time startup backfill to accelerate first HMM training window.
 HMM_OHLCV_BACKFILL_ON_STARTUP: bool = _env("HMM_OHLCV_BACKFILL_ON_STARTUP", True, bool)
 HMM_OHLCV_BACKFILL_MAX_PAGES: int = _env("HMM_OHLCV_BACKFILL_MAX_PAGES", 40, int)
+# Max consecutive startup/manual backfills that can return zero new candles
+# before the backfill circuit-breaker skips further attempts.
+HMM_BACKFILL_MAX_STALLS: int = _env("HMM_BACKFILL_MAX_STALLS", 3, int)
 
 # Readiness targets for HMM training/inference windows.
-HMM_TRAINING_CANDLES: int = _env("HMM_TRAINING_CANDLES", 2000, int)
+HMM_TRAINING_CANDLES: int = _env("HMM_TRAINING_CANDLES", 720, int)
 HMM_RECENT_CANDLES: int = _env("HMM_RECENT_CANDLES", 100, int)
 HMM_MIN_TRAIN_SAMPLES: int = _env("HMM_MIN_TRAIN_SAMPLES", 500, int)
 HMM_READINESS_CACHE_SEC: float = _env("HMM_READINESS_CACHE_SEC", 300.0, float)
@@ -495,7 +498,7 @@ HMM_MULTI_TIMEFRAME_SOURCE: str = _env("HMM_MULTI_TIMEFRAME_SOURCE", "primary", 
 HMM_SECONDARY_INTERVAL_MIN: int = _env("HMM_SECONDARY_INTERVAL_MIN", 15, int)
 HMM_SECONDARY_OHLCV_ENABLED: bool = _env("HMM_SECONDARY_OHLCV_ENABLED", False, bool)
 HMM_SECONDARY_SYNC_INTERVAL_SEC: float = _env("HMM_SECONDARY_SYNC_INTERVAL_SEC", 300.0, float)
-HMM_SECONDARY_TRAINING_CANDLES: int = _env("HMM_SECONDARY_TRAINING_CANDLES", 1000, int)
+HMM_SECONDARY_TRAINING_CANDLES: int = _env("HMM_SECONDARY_TRAINING_CANDLES", 720, int)
 HMM_SECONDARY_RECENT_CANDLES: int = _env("HMM_SECONDARY_RECENT_CANDLES", 50, int)
 HMM_SECONDARY_MIN_TRAIN_SAMPLES: int = _env("HMM_SECONDARY_MIN_TRAIN_SAMPLES", 200, int)
 CONSENSUS_1M_WEIGHT: float = _env("CONSENSUS_1M_WEIGHT", 0.3, float)

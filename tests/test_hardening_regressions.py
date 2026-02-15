@@ -1357,6 +1357,7 @@ class BotEventLogTests(unittest.TestCase):
     def test_sync_ohlcv_candles_queues_closed_rows_only(self):
         rt = bot.BotRuntime()
         rt._ohlcv_last_sync_ts = 0.0
+        ns_cursor = 1700000000000000000
         rows = [
             [1500, "0.10", "0.11", "0.09", "0.105", "0.103", "1200.0", "42"],
             [1800, "0.105", "0.12", "0.10", "0.11", "0.108", "900.0", "35"],
@@ -1364,7 +1365,7 @@ class BotEventLogTests(unittest.TestCase):
         with mock.patch.object(config, "HMM_OHLCV_ENABLED", True):
             with mock.patch.object(config, "HMM_OHLCV_INTERVAL_MIN", 5):
                 with mock.patch.object(config, "HMM_OHLCV_SYNC_INTERVAL_SEC", 300.0):
-                    with mock.patch("kraken_client.get_ohlc_page", return_value=(rows, 9999)):
+                    with mock.patch("kraken_client.get_ohlc_page", return_value=(rows, ns_cursor)):
                         with mock.patch("supabase_store.queue_ohlcv_candles") as queue_mock:
                             rt._sync_ohlcv_candles(now=2000.0)
 
@@ -1372,8 +1373,145 @@ class BotEventLogTests(unittest.TestCase):
         queued = queue_mock.call_args.args[0]
         self.assertEqual(len(queued), 1)
         self.assertAlmostEqual(float(queued[0]["time"]), 1500.0)
-        self.assertEqual(rt._ohlcv_since_cursor, 9999)
+        self.assertEqual(rt._ohlcv_since_cursor, ns_cursor)
         self.assertEqual(rt._ohlcv_last_rows_queued, 1)
+
+    def test_backfill_ohlcv_history_first_page_uses_since_none(self):
+        rt = bot.BotRuntime()
+        parsed = [{"time": 1000.0}]
+        with mock.patch.object(config, "HMM_OHLCV_ENABLED", True):
+            with mock.patch.object(config, "HMM_BACKFILL_MAX_STALLS", 3):
+                with mock.patch("supabase_store.load_ohlcv_candles", return_value=[]):
+                    with mock.patch.object(rt, "_normalize_kraken_ohlcv_rows", return_value=parsed):
+                        with mock.patch("kraken_client.get_ohlc_page", return_value=([["raw"]], 42)) as ohlc_mock:
+                            with mock.patch("supabase_store.queue_ohlcv_candles"):
+                                ok, _msg = rt.backfill_ohlcv_history(
+                                    target_candles=1,
+                                    max_pages=1,
+                                    interval_min=1,
+                                    state_key="primary",
+                                )
+
+        self.assertTrue(ok)
+        self.assertIsNone(ohlc_mock.call_args.kwargs["since"])
+
+    def test_backfill_ohlcv_history_stall_breaker_skips_api_after_limit(self):
+        rt = bot.BotRuntime()
+        with mock.patch.object(config, "HMM_OHLCV_ENABLED", True):
+            with mock.patch.object(config, "HMM_BACKFILL_MAX_STALLS", 2):
+                with mock.patch("supabase_store.load_ohlcv_candles", return_value=[]):
+                    with mock.patch.object(rt, "_normalize_kraken_ohlcv_rows", return_value=[]):
+                        with mock.patch("kraken_client.get_ohlc_page", return_value=([], 7)) as ohlc_mock:
+                            with mock.patch("supabase_store.queue_ohlcv_candles"):
+                                ok1, _ = rt.backfill_ohlcv_history(target_candles=1, max_pages=1, interval_min=1)
+                                ok2, _ = rt.backfill_ohlcv_history(target_candles=1, max_pages=1, interval_min=1)
+                                ok3, msg3 = rt.backfill_ohlcv_history(target_candles=1, max_pages=1, interval_min=1)
+
+        self.assertFalse(ok1)
+        self.assertFalse(ok2)
+        self.assertFalse(ok3)
+        self.assertEqual(ohlc_mock.call_count, 2)
+        self.assertEqual(rt._hmm_backfill_stall_count, 2)
+        self.assertIn("circuit-breaker open", msg3)
+        self.assertEqual(rt._hmm_backfill_last_message, "backfill_circuit_open:stalls=2/2")
+
+    def test_backfill_ohlcv_history_resets_stalls_on_progress(self):
+        rt = bot.BotRuntime()
+        rt._hmm_backfill_stall_count = 1
+        parsed = [{"time": 1000.0}]
+        with mock.patch.object(config, "HMM_OHLCV_ENABLED", True):
+            with mock.patch.object(config, "HMM_BACKFILL_MAX_STALLS", 3):
+                with mock.patch("supabase_store.load_ohlcv_candles", return_value=[]):
+                    with mock.patch.object(rt, "_normalize_kraken_ohlcv_rows", return_value=parsed):
+                        with mock.patch("kraken_client.get_ohlc_page", return_value=([["raw"]], None)):
+                            with mock.patch("supabase_store.queue_ohlcv_candles"):
+                                ok, _msg = rt.backfill_ohlcv_history(
+                                    target_candles=1,
+                                    max_pages=1,
+                                    interval_min=1,
+                                    state_key="primary",
+                                )
+
+        self.assertTrue(ok)
+        self.assertEqual(rt._hmm_backfill_stall_count, 0)
+        self.assertNotIn("stalls=", rt._hmm_backfill_last_message)
+
+    def test_backfill_ohlcv_history_already_ready_skips_api(self):
+        rt = bot.BotRuntime()
+        existing = [{"time": float(i)} for i in range(720)]
+        with mock.patch("supabase_store.load_ohlcv_candles", return_value=existing):
+            with mock.patch("kraken_client.get_ohlc_page") as ohlc_mock:
+                ok, msg = rt.backfill_ohlcv_history(
+                    target_candles=720,
+                    max_pages=1,
+                    interval_min=1,
+                    state_key="primary",
+                )
+
+        self.assertTrue(ok)
+        self.assertIn("already sufficient: 720/720", msg)
+        self.assertEqual(rt._hmm_backfill_last_message, "already_ready:720/720")
+        ohlc_mock.assert_not_called()
+
+    def test_backfill_ohlcv_history_respects_training_target_override(self):
+        rt = bot.BotRuntime()
+        with mock.patch.object(config, "HMM_TRAINING_CANDLES", 2000):
+            with mock.patch.object(config, "HMM_OHLCV_ENABLED", True):
+                with mock.patch("supabase_store.load_ohlcv_candles", return_value=[]) as load_mock:
+                    with mock.patch.object(rt, "_normalize_kraken_ohlcv_rows", return_value=[]):
+                        with mock.patch("kraken_client.get_ohlc_page", return_value=([], None)):
+                            with mock.patch("supabase_store.queue_ohlcv_candles"):
+                                rt.backfill_ohlcv_history(
+                                    target_candles=None,
+                                    max_pages=1,
+                                    interval_min=1,
+                                    state_key="primary",
+                                )
+
+        self.assertEqual(load_mock.call_args.kwargs["limit"], 2000)
+
+    def test_hmm_data_readiness_reports_target_window_against_720(self):
+        rt = bot.BotRuntime()
+        rows = []
+        for i in range(500):
+            rows.append(
+                {
+                    "time": float(i * 60),
+                    "close": 0.1 + i * 1e-8,
+                    "volume": 1000.0,
+                }
+            )
+
+        with mock.patch.object(config, "HMM_OHLCV_ENABLED", True):
+            with mock.patch.object(config, "HMM_TRAINING_CANDLES", 720):
+                with mock.patch.object(config, "HMM_MIN_TRAIN_SAMPLES", 500):
+                    with mock.patch.object(config, "HMM_OHLCV_INTERVAL_MIN", 1):
+                        with mock.patch("supabase_store.load_ohlcv_candles", return_value=rows) as load_mock:
+                            out = rt._hmm_data_readiness(float(rows[-1]["time"] + 60.0))
+
+        self.assertEqual(load_mock.call_args.kwargs["limit"], 720)
+        self.assertIn("below_target_window:500/720", out["gaps"])
+
+    def test_backfill_command_resets_stall_counter_for_resolved_state_key(self):
+        rt = bot.BotRuntime()
+        rt._hmm_backfill_stall_count = 4
+        rt._hmm_backfill_stall_count_secondary = 6
+
+        with mock.patch.object(config, "HMM_OHLCV_INTERVAL_MIN", 1):
+            with mock.patch.object(config, "HMM_SECONDARY_INTERVAL_MIN", 15):
+                with mock.patch("notifier._send_message"):
+                    with mock.patch.object(rt, "backfill_ohlcv_history", return_value=(True, "queued")):
+                        with mock.patch("notifier.poll_updates", return_value=([], [{"text": "/backfill_ohlcv 10 1 1"}])):
+                            rt.poll_telegram()
+                        self.assertEqual(rt._hmm_backfill_stall_count, 0)
+                        self.assertEqual(rt._hmm_backfill_stall_count_secondary, 6)
+
+                        rt._hmm_backfill_stall_count = 5
+                        rt._hmm_backfill_stall_count_secondary = 7
+                        with mock.patch("notifier.poll_updates", return_value=([], [{"text": "/backfill_ohlcv 10 1 15"}])):
+                            rt.poll_telegram()
+                        self.assertEqual(rt._hmm_backfill_stall_count, 5)
+                        self.assertEqual(rt._hmm_backfill_stall_count_secondary, 0)
 
     def test_fetch_training_candles_prefers_supabase_ohlcv(self):
         rt = bot.BotRuntime()

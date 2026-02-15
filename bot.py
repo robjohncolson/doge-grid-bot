@@ -317,9 +317,11 @@ class BotRuntime:
         self._hmm_backfill_last_at: float = 0.0
         self._hmm_backfill_last_rows: int = 0
         self._hmm_backfill_last_message: str = ""
+        self._hmm_backfill_stall_count: int = 0
         self._hmm_backfill_last_at_secondary: float = 0.0
         self._hmm_backfill_last_rows_secondary: int = 0
         self._hmm_backfill_last_message_secondary: str = ""
+        self._hmm_backfill_stall_count_secondary: int = 0
         self._regime_tier: int = 0
         self._regime_tier_entered_at: float = 0.0
         self._regime_tier2_grace_start: float = 0.0
@@ -1105,9 +1107,11 @@ class BotRuntime:
             "hmm_backfill_last_at": self._hmm_backfill_last_at,
             "hmm_backfill_last_rows": self._hmm_backfill_last_rows,
             "hmm_backfill_last_message": self._hmm_backfill_last_message,
+            "hmm_backfill_stall_count": self._hmm_backfill_stall_count,
             "hmm_backfill_last_at_secondary": self._hmm_backfill_last_at_secondary,
             "hmm_backfill_last_rows_secondary": self._hmm_backfill_last_rows_secondary,
             "hmm_backfill_last_message_secondary": self._hmm_backfill_last_message_secondary,
+            "hmm_backfill_stall_count_secondary": self._hmm_backfill_stall_count_secondary,
             "regime_tier": int(self._regime_tier),
             "regime_tier_entered_at": float(self._regime_tier_entered_at),
             "regime_tier2_grace_start": float(self._regime_tier2_grace_start),
@@ -1245,6 +1249,9 @@ class BotRuntime:
             self._hmm_backfill_last_message = str(
                 snap.get("hmm_backfill_last_message", self._hmm_backfill_last_message) or ""
             )
+            self._hmm_backfill_stall_count = int(
+                snap.get("hmm_backfill_stall_count", self._hmm_backfill_stall_count)
+            )
             self._hmm_backfill_last_at_secondary = float(
                 snap.get("hmm_backfill_last_at_secondary", self._hmm_backfill_last_at_secondary)
             )
@@ -1257,6 +1264,12 @@ class BotRuntime:
                     self._hmm_backfill_last_message_secondary,
                 )
                 or ""
+            )
+            self._hmm_backfill_stall_count_secondary = int(
+                snap.get(
+                    "hmm_backfill_stall_count_secondary",
+                    self._hmm_backfill_stall_count_secondary,
+                )
             )
             raw_hmm_state_secondary = snap.get("hmm_state_secondary", self._hmm_state_secondary)
             if isinstance(raw_hmm_state_secondary, dict):
@@ -1943,7 +1956,7 @@ class BotRuntime:
         self._hmm_last_train_attempt_ts = now_ts
         interval_min = max(1, int(getattr(config, "HMM_OHLCV_INTERVAL_MIN", 1)))
         closes, volumes = self._fetch_training_candles(
-            count=int(getattr(config, "HMM_TRAINING_CANDLES", 2000)),
+            count=int(getattr(config, "HMM_TRAINING_CANDLES", 720)),
             interval_min=interval_min,
         )
         if not closes or not volumes:
@@ -1995,7 +2008,7 @@ class BotRuntime:
         self._hmm_last_train_attempt_ts_secondary = now_ts
         interval_min = max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15)))
         closes, volumes = self._fetch_training_candles(
-            count=int(getattr(config, "HMM_SECONDARY_TRAINING_CANDLES", 1000)),
+            count=int(getattr(config, "HMM_SECONDARY_TRAINING_CANDLES", 720)),
             interval_min=interval_min,
         )
         if not closes or not volumes:
@@ -2917,9 +2930,9 @@ class BotRuntime:
             return False, msg
 
         default_target = (
-            int(getattr(config, "HMM_SECONDARY_TRAINING_CANDLES", 1000))
+            int(getattr(config, "HMM_SECONDARY_TRAINING_CANDLES", 720))
             if state_key == "secondary"
-            else int(getattr(config, "HMM_TRAINING_CANDLES", 2000))
+            else int(getattr(config, "HMM_TRAINING_CANDLES", 720))
         )
         target = max(1, int(target_candles if target_candles is not None else default_target))
         pages = max(1, int(max_pages if max_pages is not None else getattr(config, "HMM_OHLCV_BACKFILL_MAX_PAGES", 40)))
@@ -2934,8 +2947,6 @@ class BotRuntime:
             )
         else:
             interval = max(1, int(interval_min))
-        interval_sec = interval * 60
-
         existing = supabase_store.load_ohlcv_candles(
             limit=target,
             pair=self.pair,
@@ -2959,12 +2970,27 @@ class BotRuntime:
                 self._hmm_backfill_last_message = f"already_ready:{existing_count}/{target}"
             return True, f"OHLCV already sufficient: {existing_count}/{target}"
 
-        missing = max(0, target - existing_count)
-        oldest_ts = min(existing_ts) if existing_ts else 0.0
-        if oldest_ts > 0:
-            cursor = max(0, int(oldest_ts - (missing + 24) * interval_sec))
-        else:
-            cursor = 0
+        stall_limit = max(1, int(getattr(config, "HMM_BACKFILL_MAX_STALLS", 3)))
+        stall_count = (
+            self._hmm_backfill_stall_count_secondary
+            if state_key == "secondary"
+            else self._hmm_backfill_stall_count
+        )
+        if stall_count >= stall_limit:
+            msg = f"backfill_circuit_open:stalls={stall_count}/{stall_limit}"
+            if state_key == "secondary":
+                self._hmm_backfill_last_at_secondary = _now()
+                self._hmm_backfill_last_rows_secondary = 0
+                self._hmm_backfill_last_message_secondary = msg
+            else:
+                self._hmm_backfill_last_at = _now()
+                self._hmm_backfill_last_rows = 0
+                self._hmm_backfill_last_message = msg
+            return False, f"Backfill circuit-breaker open ({stall_count} consecutive stalls)"
+
+        # Kraken OHLC uses an opaque cursor; start without `since` and paginate
+        # only with Kraken's returned `last` value.
+        cursor = 0
 
         fetched: dict[float, dict[str, float | int | None]] = {}
         for _ in range(pages):
@@ -3011,14 +3037,29 @@ class BotRuntime:
             queued_rows = len(payload)
             new_unique = sum(1 for ts in fetched.keys() if ts not in existing_ts)
 
+        if new_unique == 0:
+            if state_key == "secondary":
+                self._hmm_backfill_stall_count_secondary += 1
+            else:
+                self._hmm_backfill_stall_count += 1
+        else:
+            if state_key == "secondary":
+                self._hmm_backfill_stall_count_secondary = 0
+            else:
+                self._hmm_backfill_stall_count = 0
+
         if state_key == "secondary":
             self._hmm_backfill_last_at_secondary = _now()
             self._hmm_backfill_last_rows_secondary = int(queued_rows)
+            current_stalls = self._hmm_backfill_stall_count_secondary
         else:
             self._hmm_backfill_last_at = _now()
             self._hmm_backfill_last_rows = int(queued_rows)
+            current_stalls = self._hmm_backfill_stall_count
         est_total = existing_count + new_unique
         backfill_msg = f"queued={queued_rows} new={new_unique} est_total={est_total}/{target}"
+        if current_stalls > 0:
+            backfill_msg += f" stalls={current_stalls}"
         if state_key == "secondary":
             self._hmm_backfill_last_message_secondary = backfill_msg
         else:
@@ -3047,7 +3088,7 @@ class BotRuntime:
             logger.info("OHLCV startup backfill skipped (primary already ready)")
         else:
             ok, msg = self.backfill_ohlcv_history(
-                target_candles=int(getattr(config, "HMM_TRAINING_CANDLES", 2000)),
+                target_candles=int(getattr(config, "HMM_TRAINING_CANDLES", 720)),
                 max_pages=int(getattr(config, "HMM_OHLCV_BACKFILL_MAX_PAGES", 40)),
                 interval_min=max(1, int(getattr(config, "HMM_OHLCV_INTERVAL_MIN", 1))),
                 state_key="primary",
@@ -3066,7 +3107,7 @@ class BotRuntime:
         secondary_readiness = self._hmm_data_readiness(
             now_ts,
             interval_min=max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15))),
-            training_target=max(1, int(getattr(config, "HMM_SECONDARY_TRAINING_CANDLES", 1000))),
+            training_target=max(1, int(getattr(config, "HMM_SECONDARY_TRAINING_CANDLES", 720))),
             min_samples=max(1, int(getattr(config, "HMM_SECONDARY_MIN_TRAIN_SAMPLES", 200))),
             sync_interval_sec=max(
                 30.0,
@@ -3085,7 +3126,7 @@ class BotRuntime:
             return
 
         ok, msg = self.backfill_ohlcv_history(
-            target_candles=int(getattr(config, "HMM_SECONDARY_TRAINING_CANDLES", 1000)),
+            target_candles=int(getattr(config, "HMM_SECONDARY_TRAINING_CANDLES", 720)),
             max_pages=int(getattr(config, "HMM_OHLCV_BACKFILL_MAX_PAGES", 40)),
             interval_min=max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15))),
             state_key="secondary",
@@ -3153,7 +3194,7 @@ class BotRuntime:
                 else interval_min
             ),
         )
-        target = max(1, int(count if count is not None else getattr(config, "HMM_TRAINING_CANDLES", 2000)))
+        target = max(1, int(count if count is not None else getattr(config, "HMM_TRAINING_CANDLES", 720)))
         rows = self._load_recent_ohlcv_rows(target, interval_min=interval)
         return self._extract_close_volume(rows)
 
@@ -3206,9 +3247,9 @@ class BotRuntime:
             target = max(
                 1,
                 int(
-                    getattr(config, "HMM_SECONDARY_TRAINING_CANDLES", 1000)
+                    getattr(config, "HMM_SECONDARY_TRAINING_CANDLES", 720)
                     if use_state_key == "secondary"
-                    else getattr(config, "HMM_TRAINING_CANDLES", 2000)
+                    else getattr(config, "HMM_TRAINING_CANDLES", 720)
                 ),
             )
         else:
@@ -5674,6 +5715,10 @@ class BotRuntime:
                     )
                     secondary_interval = max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15)))
                     state_key = "secondary" if interval == secondary_interval else "primary"
+                    if state_key == "secondary":
+                        self._hmm_backfill_stall_count_secondary = 0
+                    else:
+                        self._hmm_backfill_stall_count = 0
                     ok, msg = self.backfill_ohlcv_history(
                         target_candles=target,
                         max_pages=pages,
@@ -6251,7 +6296,7 @@ class BotRuntime:
                 hmm_data_pipeline_secondary = self._hmm_data_readiness(
                     now,
                     interval_min=max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15))),
-                    training_target=max(1, int(getattr(config, "HMM_SECONDARY_TRAINING_CANDLES", 1000))),
+                    training_target=max(1, int(getattr(config, "HMM_SECONDARY_TRAINING_CANDLES", 720))),
                     min_samples=max(1, int(getattr(config, "HMM_SECONDARY_MIN_TRAIN_SAMPLES", 200))),
                     sync_interval_sec=max(
                         30.0,
