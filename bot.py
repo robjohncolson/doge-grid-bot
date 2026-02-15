@@ -284,6 +284,12 @@ class BotRuntime:
         self._trend_smoothed_target: float = base_target
         self._trend_target_locked_until: float = 0.0
         self._trend_last_update_ts: float = 0.0
+        self._ohlcv_since_cursor: int | None = None
+        self._ohlcv_last_sync_ts: float = 0.0
+        self._ohlcv_last_candle_ts: float = 0.0
+        self._ohlcv_last_rows_queued: int = 0
+        self._hmm_readiness_cache: dict[str, Any] | None = None
+        self._hmm_readiness_last_ts: float = 0.0
 
         # Daily loss lock (aggregate bot-level, UTC day).
         self._daily_loss_lock_active: bool = False
@@ -939,6 +945,9 @@ class BotRuntime:
             "trend_smoothed_target": self._trend_smoothed_target,
             "trend_target_locked_until": self._trend_target_locked_until,
             "trend_last_update_ts": self._trend_last_update_ts,
+            "ohlcv_since_cursor": self._ohlcv_since_cursor,
+            "ohlcv_last_sync_ts": self._ohlcv_last_sync_ts,
+            "ohlcv_last_candle_ts": self._ohlcv_last_candle_ts,
             "entry_adds_deferred_total": self._entry_adds_deferred_total,
             "entry_adds_drained_total": self._entry_adds_drained_total,
             "entry_adds_last_deferred_at": self._entry_adds_last_deferred_at,
@@ -1037,6 +1046,13 @@ class BotRuntime:
                 snap.get("trend_target_locked_until", self._trend_target_locked_until)
             )
             self._trend_last_update_ts = float(snap.get("trend_last_update_ts", self._trend_last_update_ts))
+            raw_cursor = snap.get("ohlcv_since_cursor", self._ohlcv_since_cursor)
+            try:
+                self._ohlcv_since_cursor = int(raw_cursor) if raw_cursor is not None else None
+            except (TypeError, ValueError):
+                self._ohlcv_since_cursor = None
+            self._ohlcv_last_sync_ts = float(snap.get("ohlcv_last_sync_ts", self._ohlcv_last_sync_ts))
+            self._ohlcv_last_candle_ts = float(snap.get("ohlcv_last_candle_ts", self._ohlcv_last_candle_ts))
             self._entry_adds_deferred_total = int(snap.get("entry_adds_deferred_total", self._entry_adds_deferred_total))
             self._entry_adds_drained_total = int(snap.get("entry_adds_drained_total", self._entry_adds_drained_total))
             self._entry_adds_last_deferred_at = float(
@@ -1327,6 +1343,254 @@ class BotRuntime:
                 raise
             if self.consecutive_api_errors >= config.MAX_CONSECUTIVE_ERRORS:
                 self.pause(f"{self.consecutive_api_errors} consecutive API errors")
+
+    def _normalize_kraken_ohlcv_rows(
+        self,
+        rows: list,
+        *,
+        interval_min: int,
+        now_ts: float | None = None,
+    ) -> list[dict[str, float | int | None]]:
+        """
+        Parse Kraken OHLC rows into normalized candle dicts sorted by time.
+        """
+        interval_sec = max(60, int(interval_min) * 60)
+        now_ref = float(now_ts if now_ts is not None else _now())
+        out: dict[float, dict[str, float | int | None]] = {}
+
+        for row in rows or []:
+            if not isinstance(row, (list, tuple)) or len(row) < 7:
+                continue
+            try:
+                ts = float(row[0])
+                o = float(row[1])
+                h = float(row[2])
+                l = float(row[3])
+                c = float(row[4])
+                v = float(row[6])
+                tc = int(float(row[7])) if len(row) > 7 else None
+            except (TypeError, ValueError):
+                continue
+
+            if ts <= 0 or min(o, h, l, c) <= 0 or v < 0:
+                continue
+
+            # Skip the still-forming bar.
+            if (ts + interval_sec) > now_ref + 1e-9:
+                continue
+
+            out[ts] = {
+                "time": ts,
+                "open": o,
+                "high": h,
+                "low": l,
+                "close": c,
+                "volume": v,
+                "trade_count": tc,
+            }
+
+        return [out[k] for k in sorted(out.keys())]
+
+    @staticmethod
+    def _extract_close_volume(
+        candles: list[dict[str, float | int | None]],
+    ) -> tuple[list[float], list[float]]:
+        closes: list[float] = []
+        volumes: list[float] = []
+        for row in candles:
+            try:
+                c = float(row.get("close", 0.0))
+                v = float(row.get("volume", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if c <= 0:
+                continue
+            closes.append(c)
+            volumes.append(max(0.0, v))
+        return closes, volumes
+
+    def _sync_ohlcv_candles(self, now: float | None = None) -> None:
+        """
+        Pull recent Kraken OHLCV and queue upserts to Supabase.
+        """
+        if not bool(getattr(config, "HMM_OHLCV_ENABLED", True)):
+            return
+
+        now_ts = float(now if now is not None else _now())
+        sync_interval = max(30.0, float(getattr(config, "HMM_OHLCV_SYNC_INTERVAL_SEC", 300.0)))
+        if self._ohlcv_last_sync_ts > 0 and (now_ts - self._ohlcv_last_sync_ts) < sync_interval:
+            return
+
+        self._ohlcv_last_sync_ts = now_ts
+        interval_min = max(1, int(getattr(config, "HMM_OHLCV_INTERVAL_MIN", 5)))
+        since_cursor = int(self._ohlcv_since_cursor) if self._ohlcv_since_cursor else None
+
+        try:
+            rows, last_cursor = kraken_client.get_ohlc_page(
+                pair=self.pair,
+                interval=interval_min,
+                since=since_cursor,
+            )
+            candles = self._normalize_kraken_ohlcv_rows(
+                rows,
+                interval_min=interval_min,
+                now_ts=now_ts,
+            )
+            if candles:
+                supabase_store.queue_ohlcv_candles(
+                    candles,
+                    pair=self.pair,
+                    interval_min=interval_min,
+                )
+                self._ohlcv_last_rows_queued = len(candles)
+                self._ohlcv_last_candle_ts = float(candles[-1]["time"])
+            else:
+                self._ohlcv_last_rows_queued = 0
+
+            if last_cursor is not None:
+                try:
+                    self._ohlcv_since_cursor = int(last_cursor)
+                except (TypeError, ValueError):
+                    pass
+            elif candles:
+                self._ohlcv_since_cursor = int(float(candles[-1]["time"]))
+        except Exception as e:
+            logger.warning("OHLCV sync failed: %s", e)
+
+    def _load_recent_ohlcv_rows(self, count: int) -> list[dict[str, float | int | None]]:
+        """
+        Load recent OHLCV candles, preferring Supabase and falling back to Kraken.
+        """
+        limit = max(1, int(count))
+        interval_min = max(1, int(getattr(config, "HMM_OHLCV_INTERVAL_MIN", 5)))
+        supa_rows = supabase_store.load_ohlcv_candles(
+            limit=limit,
+            pair=self.pair,
+            interval_min=interval_min,
+        )
+
+        merged: dict[float, dict[str, float | int | None]] = {}
+        for row in supa_rows:
+            try:
+                ts = float(row.get("time"))
+            except (TypeError, ValueError):
+                continue
+            merged[ts] = row
+
+        need_fallback = len(merged) < limit
+        if need_fallback:
+            try:
+                kr_rows = kraken_client.get_ohlc(pair=self.pair, interval=interval_min)
+                parsed = self._normalize_kraken_ohlcv_rows(
+                    kr_rows,
+                    interval_min=interval_min,
+                    now_ts=_now(),
+                )
+                for row in parsed:
+                    merged[float(row["time"])] = row
+            except Exception as e:
+                logger.debug("OHLCV fallback fetch failed: %s", e)
+
+        out = [merged[k] for k in sorted(merged.keys())]
+        if len(out) > limit:
+            out = out[-limit:]
+        return out
+
+    def _fetch_training_candles(self, count: int | None = None) -> tuple[list[float], list[float]]:
+        target = max(1, int(count if count is not None else getattr(config, "HMM_TRAINING_CANDLES", 2000)))
+        rows = self._load_recent_ohlcv_rows(target)
+        return self._extract_close_volume(rows)
+
+    def _fetch_recent_candles(self, count: int | None = None) -> tuple[list[float], list[float]]:
+        target = max(1, int(count if count is not None else getattr(config, "HMM_RECENT_CANDLES", 100)))
+        rows = self._load_recent_ohlcv_rows(target)
+        return self._extract_close_volume(rows)
+
+    def _hmm_data_readiness(self, now: float | None = None) -> dict[str, Any]:
+        """
+        Runtime readiness summary for HMM training data.
+        """
+        now_ts = float(now if now is not None else _now())
+        ttl = max(5.0, float(getattr(config, "HMM_READINESS_CACHE_SEC", 300.0)))
+        if self._hmm_readiness_cache and (now_ts - self._hmm_readiness_last_ts) < ttl:
+            return dict(self._hmm_readiness_cache)
+
+        try:
+            interval_min = max(1, int(getattr(config, "HMM_OHLCV_INTERVAL_MIN", 5)))
+            training_target = max(1, int(getattr(config, "HMM_TRAINING_CANDLES", 2000)))
+            min_samples = max(1, int(getattr(config, "HMM_MIN_TRAIN_SAMPLES", 500)))
+            rows = supabase_store.load_ohlcv_candles(
+                limit=training_target,
+                pair=self.pair,
+                interval_min=interval_min,
+            )
+            source = "supabase" if rows else "none"
+
+            closes, volumes = self._extract_close_volume(rows)
+            sample_count = min(len(closes), len(volumes))
+            span_sec = 0.0
+            last_candle_ts = None
+            if rows:
+                try:
+                    first_ts = float(rows[0].get("time", 0.0))
+                    last_candle_ts = float(rows[-1].get("time", 0.0))
+                    span_sec = max(0.0, last_candle_ts - first_ts)
+                except (TypeError, ValueError):
+                    last_candle_ts = None
+                    span_sec = 0.0
+
+            freshness_sec = (now_ts - last_candle_ts) if last_candle_ts is not None else None
+            interval_sec = interval_min * 60.0
+            freshness_ok = bool(freshness_sec is not None and freshness_sec <= max(900.0, interval_sec * 3.0))
+            volume_nonzero_count = sum(1 for v in volumes if v > 0)
+            volume_coverage_pct = (volume_nonzero_count / sample_count * 100.0) if sample_count else 0.0
+            coverage_pct = sample_count / training_target * 100.0 if training_target > 0 else 0.0
+
+            gaps: list[str] = []
+            if sample_count < min_samples:
+                gaps.append(f"insufficient_samples:{sample_count}/{min_samples}")
+            if sample_count < training_target:
+                gaps.append(f"below_target_window:{sample_count}/{training_target}")
+            if not freshness_ok:
+                gaps.append("stale_candles")
+            if volume_coverage_pct < 95.0:
+                gaps.append(f"low_volume_coverage:{volume_coverage_pct:.1f}%")
+            if source != "supabase":
+                gaps.append("no_supabase_ohlcv")
+
+            out = {
+                "enabled": bool(getattr(config, "HMM_OHLCV_ENABLED", True)),
+                "source": source,
+                "interval_min": interval_min,
+                "training_target": training_target,
+                "min_train_samples": min_samples,
+                "samples": sample_count,
+                "coverage_pct": round(coverage_pct, 2),
+                "span_hours": round(span_sec / 3600.0, 2),
+                "last_candle_ts": last_candle_ts,
+                "freshness_sec": freshness_sec,
+                "freshness_ok": freshness_ok,
+                "volume_coverage_pct": round(volume_coverage_pct, 2),
+                "ready_for_min_train": sample_count >= min_samples and freshness_ok,
+                "ready_for_target_window": sample_count >= training_target and freshness_ok,
+                "gaps": gaps,
+                "sync_interval_sec": float(getattr(config, "HMM_OHLCV_SYNC_INTERVAL_SEC", 300.0)),
+                "last_sync_ts": float(self._ohlcv_last_sync_ts),
+                "last_sync_rows_queued": int(self._ohlcv_last_rows_queued),
+                "sync_cursor": self._ohlcv_since_cursor,
+            }
+        except Exception as e:
+            out = {
+                "enabled": bool(getattr(config, "HMM_OHLCV_ENABLED", True)),
+                "error": str(e),
+                "ready_for_min_train": False,
+                "ready_for_target_window": False,
+                "gaps": ["readiness_check_failed"],
+            }
+
+        self._hmm_readiness_cache = dict(out)
+        self._hmm_readiness_last_ts = now_ts
+        return out
 
     def _price_age_sec(self) -> float:
         if self.last_price_ts <= 0:
@@ -3298,6 +3562,7 @@ class BotRuntime:
             self._refresh_price(strict=False)
             if self._price_age_sec() > config.STALE_PRICE_MAX_AGE_SEC:
                 self.pause("stale price data > 60s")
+            self._sync_ohlcv_candles(_now())
             self._update_daily_loss_lock(_now())
             self._update_rebalancer(_now())
             # Prioritize older deferred entries each loop, while avoiding stale placements
@@ -4011,6 +4276,7 @@ class BotRuntime:
             layer_metrics = self._recompute_effective_layers(mark_price=pnl_ref_price)
             orders_at_funded_size = self._count_orders_at_funded_size()
             slot_vintage = self._slot_vintage_metrics_locked(now)
+            hmm_data_pipeline = self._hmm_data_readiness(now)
             oldest_exit_age_sec = float(slot_vintage.get("oldest_exit_age_sec", 0.0) or 0.0)
             stuck_capital_pct = float(slot_vintage.get("stuck_capital_pct", 0.0) or 0.0)
             slot_vintage["vintage_warn"] = oldest_exit_age_sec >= 3.0 * 86400.0
@@ -4121,6 +4387,7 @@ class BotRuntime:
                     "auto_release_enabled": bool(config.RELEASE_AUTO_ENABLED),
                 },
                 "slot_vintage": slot_vintage,
+                "hmm_data_pipeline": hmm_data_pipeline,
                 "release_health": {
                     "sticky_release_total": int(self._sticky_release_total),
                     "sticky_release_last_at": self._sticky_release_last_at or None,

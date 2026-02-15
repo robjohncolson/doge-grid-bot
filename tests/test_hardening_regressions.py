@@ -1089,6 +1089,56 @@ class BotEventLogTests(unittest.TestCase):
         self.assertEqual(payload["release_health"]["sticky_release_total"], 3)
         self.assertEqual(payload["release_health"]["sticky_release_last_at"], 1234.0)
 
+    def test_sync_ohlcv_candles_queues_closed_rows_only(self):
+        rt = bot.BotRuntime()
+        rt._ohlcv_last_sync_ts = 0.0
+        rows = [
+            [1500, "0.10", "0.11", "0.09", "0.105", "0.103", "1200.0", "42"],
+            [1800, "0.105", "0.12", "0.10", "0.11", "0.108", "900.0", "35"],
+        ]
+        with mock.patch.object(config, "HMM_OHLCV_ENABLED", True):
+            with mock.patch.object(config, "HMM_OHLCV_INTERVAL_MIN", 5):
+                with mock.patch.object(config, "HMM_OHLCV_SYNC_INTERVAL_SEC", 300.0):
+                    with mock.patch("kraken_client.get_ohlc_page", return_value=(rows, 9999)):
+                        with mock.patch("supabase_store.queue_ohlcv_candles") as queue_mock:
+                            rt._sync_ohlcv_candles(now=2000.0)
+
+        queue_mock.assert_called_once()
+        queued = queue_mock.call_args.args[0]
+        self.assertEqual(len(queued), 1)
+        self.assertAlmostEqual(float(queued[0]["time"]), 1500.0)
+        self.assertEqual(rt._ohlcv_since_cursor, 9999)
+        self.assertEqual(rt._ohlcv_last_rows_queued, 1)
+
+    def test_fetch_training_candles_prefers_supabase_ohlcv(self):
+        rt = bot.BotRuntime()
+        rows = [
+            {"time": 1000.0, "open": 0.10, "high": 0.11, "low": 0.09, "close": 0.101, "volume": 1000.0, "trade_count": 10},
+            {"time": 1300.0, "open": 0.101, "high": 0.112, "low": 0.10, "close": 0.102, "volume": 1100.0, "trade_count": 11},
+            {"time": 1600.0, "open": 0.102, "high": 0.113, "low": 0.101, "close": 0.103, "volume": 1200.0, "trade_count": 12},
+        ]
+        with mock.patch("supabase_store.load_ohlcv_candles", return_value=rows):
+            with mock.patch("kraken_client.get_ohlc") as kraken_mock:
+                closes, volumes = rt._fetch_training_candles(count=3)
+        self.assertEqual(closes, [0.101, 0.102, 0.103])
+        self.assertEqual(volumes, [1000.0, 1100.0, 1200.0])
+        kraken_mock.assert_not_called()
+
+    def test_status_payload_exposes_hmm_data_pipeline_block(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(market_price=0.1, now=1000.0),
+            )
+        }
+        with mock.patch.object(rt, "_hmm_data_readiness", return_value={"ready_for_min_train": True, "samples": 2000}):
+            payload = rt.status_payload()
+        self.assertIn("hmm_data_pipeline", payload)
+        self.assertTrue(payload["hmm_data_pipeline"]["ready_for_min_train"])
+        self.assertEqual(payload["hmm_data_pipeline"]["samples"], 2000)
+
     def test_dynamic_idle_target_cold_start_uses_base_target(self):
         rt = bot.BotRuntime()
         rt.last_price = 0.1

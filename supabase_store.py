@@ -43,12 +43,14 @@ logger = logging.getLogger(__name__)
 
 def _note_missing_column(err_body: str):
     """Detect missing columns from Supabase error responses."""
-    global _pair_column_supported, _identity_columns_supported
+    global _pair_column_supported, _identity_columns_supported, _ohlcv_table_supported
     if "does not exist" in err_body:
         if "pair" in err_body and _pair_column_supported is not False:
             _pair_column_supported = False
         if ("trade_id" in err_body or "cycle" in err_body) and _identity_columns_supported is not False:
             _identity_columns_supported = False
+        if "ohlcv_candles" in err_body:
+            _ohlcv_table_supported = False
 
 
 def _strip_unsupported_columns(row: dict) -> dict:
@@ -80,6 +82,7 @@ _price_buffer_lock = threading.Lock()
 # Column support flags (older schemas may not have these)
 _pair_column_supported = None        # auto-detect on first write; None = untested
 _identity_columns_supported = None  # trade_id, cycle columns
+_ohlcv_table_supported = None       # ohlcv_candles table availability
 
 # Writer thread state
 _writer_thread: threading.Thread = None
@@ -280,6 +283,69 @@ def queue_price_point(timestamp: float, price: float, pair: str = "XDGUSD"):
         _price_buffer.append(_strip_unsupported_columns(row))
 
 
+def queue_ohlcv_candles(
+    candles: list[dict],
+    pair: str = "XDGUSD",
+    interval_min: int = 5,
+):
+    """
+    Queue OHLCV candles for upsert into ohlcv_candles.
+
+    Each input row should include:
+      time, open, high, low, close, volume, [trade_count]
+    """
+    if not _enabled() or _ohlcv_table_supported is False:
+        return
+    if not candles:
+        return
+
+    norm_pair = str(pair or "XDGUSD").upper()
+    norm_interval = max(1, int(interval_min))
+    dedup: dict[tuple[str, int, float], dict] = {}
+
+    for raw in candles:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            ts = float(raw.get("time"))
+            o = float(raw.get("open"))
+            h = float(raw.get("high"))
+            l = float(raw.get("low"))
+            c = float(raw.get("close"))
+            v = float(raw.get("volume"))
+        except (TypeError, ValueError):
+            continue
+
+        if ts <= 0 or min(o, h, l, c, v) < 0:
+            continue
+
+        trade_count = raw.get("trade_count", None)
+        if trade_count is not None:
+            try:
+                trade_count = int(trade_count)
+            except (TypeError, ValueError):
+                trade_count = None
+
+        key = (norm_pair, norm_interval, ts)
+        dedup[key] = {
+            "time": ts,
+            "pair": norm_pair,
+            "interval_min": norm_interval,
+            "open": o,
+            "high": h,
+            "low": l,
+            "close": c,
+            "volume": v,
+            "trade_count": trade_count,
+        }
+
+    if not dedup:
+        return
+
+    # Store as one batch payload. _flush_queue flattens and upserts.
+    _write_queue.append(("ohlcv_candles", list(dedup.values())))
+
+
 # ---------------------------------------------------------------------------
 # Read operations (startup only)
 # ---------------------------------------------------------------------------
@@ -362,6 +428,60 @@ def load_price_history(since: float = None, pair: str = "XDGUSD") -> list:
     prices = [(row["time"], row["price"]) for row in result]
     logger.info("Supabase: loaded %d price samples", len(prices))
     return prices
+
+
+def load_ohlcv_candles(
+    limit: int = 2000,
+    pair: str = "XDGUSD",
+    interval_min: int = 5,
+    since: float | None = None,
+) -> list[dict]:
+    """
+    Load recent OHLCV candles from Supabase.
+
+    Returns rows sorted oldest -> newest.
+    """
+    if not _enabled() or _ohlcv_table_supported is False:
+        return []
+
+    params = {
+        "select": "time,open,high,low,close,volume,trade_count",
+        "order": "time.desc",
+        "limit": str(max(1, int(limit))),
+        "pair": f"eq.{str(pair or 'XDGUSD').upper()}",
+        "interval_min": f"eq.{max(1, int(interval_min))}",
+    }
+    if since is not None:
+        try:
+            params["time"] = f"gt.{float(since)}"
+        except (TypeError, ValueError):
+            pass
+
+    result = _request("GET", "/rest/v1/ohlcv_candles", params=params)
+    if result is None:
+        return []
+    if not isinstance(result, list):
+        return []
+
+    out: list[dict] = []
+    for row in reversed(result):
+        try:
+            out.append({
+                "time": float(row.get("time")),
+                "open": float(row.get("open")),
+                "high": float(row.get("high")),
+                "low": float(row.get("low")),
+                "close": float(row.get("close")),
+                "volume": float(row.get("volume")),
+                "trade_count": (
+                    int(row.get("trade_count"))
+                    if row.get("trade_count") is not None
+                    else None
+                ),
+            })
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 def load_state(pair: str = "XDGUSD") -> dict:
@@ -455,6 +575,47 @@ def _flush_queue():
                 logger.debug("Supabase: pairs upsert failed (%d rows)", len(pair_rows))
             else:
                 logger.debug("Supabase: upserted %d pairs", len(pair_rows))
+        elif table == "ohlcv_candles":
+            if _ohlcv_table_supported is False:
+                continue
+
+            # Flatten queued chunks and dedupe by (pair, interval_min, time).
+            merged: dict[tuple[str, int, float], dict] = {}
+            for chunk in rows:
+                if isinstance(chunk, list):
+                    items = chunk
+                elif isinstance(chunk, dict):
+                    items = [chunk]
+                else:
+                    continue
+                for row in items:
+                    if not isinstance(row, dict):
+                        continue
+                    try:
+                        key = (
+                            str(row.get("pair") or "XDGUSD").upper(),
+                            int(row.get("interval_min") or 5),
+                            float(row.get("time")),
+                        )
+                    except (TypeError, ValueError):
+                        continue
+                    merged[key] = row
+
+            payload = list(merged.values())
+            if not payload:
+                continue
+
+            result = _request(
+                "POST",
+                "/rest/v1/ohlcv_candles",
+                body=payload,
+                params={"on_conflict": "pair,interval_min,time"},
+                upsert=True,
+            )
+            if result is None:
+                logger.debug("Supabase: ohlcv_candles upsert failed (%d rows)", len(payload))
+            else:
+                logger.debug("Supabase: upserted %d ohlcv candles", len(payload))
         elif table == "bot_events":
             # Keep event writes resilient across crash/restart windows where the
             # last event_id snapshot may lag the DB by a few rows.
@@ -506,6 +667,22 @@ def _cleanup_old_prices():
         logger.debug("Supabase: cleaned up price_history older than 48h")
 
 
+def _cleanup_old_ohlcv():
+    """Delete ohlcv_candles rows older than configured retention."""
+    if _ohlcv_table_supported is False:
+        return
+
+    retention_days = max(1, int(getattr(config, "HMM_OHLCV_RETENTION_DAYS", 14)))
+    cutoff = time.time() - retention_days * 86400
+    result = _request(
+        "DELETE",
+        "/rest/v1/ohlcv_candles",
+        params={"time": f"lt.{cutoff}"},
+    )
+    if result is not None:
+        logger.debug("Supabase: cleaned up ohlcv_candles older than %d days", retention_days)
+
+
 def _writer_loop():
     """Background writer: flush queue every 10s, prices every 5 min, cleanup hourly."""
     global _last_cleanup
@@ -528,6 +705,7 @@ def _writer_loop():
             # Cleanup old prices every hour
             if now - _last_cleanup >= 3600:
                 _cleanup_old_prices()
+                _cleanup_old_ohlcv()
                 _last_cleanup = now
 
         except Exception as e:

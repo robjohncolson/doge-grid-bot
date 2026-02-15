@@ -49,7 +49,25 @@ create table if not exists public.price_history (
 
 create index if not exists idx_price_history_pair_time on public.price_history(pair, time desc);
 
--- 4) Structured transition/event log (new for v1)
+-- 4) OHLCV candles for HMM/trend analytics
+create table if not exists public.ohlcv_candles (
+  id bigserial primary key,
+  time double precision not null,
+  pair text not null,
+  interval_min integer not null default 5,
+  open double precision not null,
+  high double precision not null,
+  low double precision not null,
+  close double precision not null,
+  volume double precision not null,
+  trade_count integer,
+  created_at timestamptz not null default now(),
+  unique(pair, interval_min, time)
+);
+
+create index if not exists idx_ohlcv_pair_interval_time on public.ohlcv_candles(pair, interval_min, time desc);
+
+-- 5) Structured transition/event log (new for v1)
 create table if not exists public.bot_events (
   event_id bigint primary key,
   "timestamp" timestamptz not null,
@@ -65,7 +83,7 @@ create table if not exists public.bot_events (
 create index if not exists idx_bot_events_pair_slot_ts
   on public.bot_events(pair, slot_id, "timestamp" desc);
 
--- 5) Optional helper view for latest runtime snapshot
+-- 6) Optional helper view for latest runtime snapshot
 create or replace view public.v1_runtime as
 select
   bs.key,

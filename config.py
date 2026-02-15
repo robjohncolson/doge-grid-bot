@@ -457,6 +457,24 @@ REBALANCE_NEUTRAL_BAND: float = _env("REBALANCE_NEUTRAL_BAND", 0.05, float)
 REBALANCE_EMA_HALFLIFE: float = _env("REBALANCE_EMA_HALFLIFE", 1800.0, float)
 REBALANCE_INTERVAL_SEC: float = _env("REBALANCE_INTERVAL_SEC", 300.0, float)
 
+# ---------------------------------------------------------------------------
+# HMM data pipeline (OHLCV collection/readiness)
+# ---------------------------------------------------------------------------
+
+# Persist 5-minute OHLCV candles for HMM training/readiness checks.
+HMM_OHLCV_ENABLED: bool = _env("HMM_OHLCV_ENABLED", True, bool)
+HMM_OHLCV_INTERVAL_MIN: int = _env("HMM_OHLCV_INTERVAL_MIN", 5, int)
+# How often runtime pulls Kraken OHLC and upserts into Supabase.
+HMM_OHLCV_SYNC_INTERVAL_SEC: float = _env("HMM_OHLCV_SYNC_INTERVAL_SEC", 300.0, float)
+# Retention for persisted candles (days). 14 days ~= 4032 5m candles.
+HMM_OHLCV_RETENTION_DAYS: int = _env("HMM_OHLCV_RETENTION_DAYS", 14, int)
+
+# Readiness targets for HMM training/inference windows.
+HMM_TRAINING_CANDLES: int = _env("HMM_TRAINING_CANDLES", 2000, int)
+HMM_RECENT_CANDLES: int = _env("HMM_RECENT_CANDLES", 100, int)
+HMM_MIN_TRAIN_SAMPLES: int = _env("HMM_MIN_TRAIN_SAMPLES", 500, int)
+HMM_READINESS_CACHE_SEC: float = _env("HMM_READINESS_CACHE_SEC", 300.0, float)
+
 # Mapping from skew signal -> size multiplier.
 REBALANCE_SIZE_SENSITIVITY: float = _env("REBALANCE_SIZE_SENSITIVITY", 1.0, float)
 REBALANCE_MAX_SIZE_MULT: float = _env("REBALANCE_MAX_SIZE_MULT", 1.5, float)
