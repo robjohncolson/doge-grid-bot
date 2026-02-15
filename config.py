@@ -489,6 +489,33 @@ HMM_RETRAIN_INTERVAL_SEC: float = _env("HMM_RETRAIN_INTERVAL_SEC", 86400.0, floa
 HMM_BIAS_GAIN: float = _env("HMM_BIAS_GAIN", 1.0, float)
 HMM_BLEND_WITH_TREND: float = _env("HMM_BLEND_WITH_TREND", 0.5, float)
 
+# ---------------------------------------------------------------------------
+# Directional regime controls (Phase 0 shadow mode defaults)
+# ---------------------------------------------------------------------------
+
+# Master actuation switch. Keep disabled during Phase 0.
+REGIME_DIRECTIONAL_ENABLED: bool = _env("REGIME_DIRECTIONAL_ENABLED", False, bool)
+# Shadow-only evaluator (computes/logs tiers, no order-flow changes).
+REGIME_SHADOW_ENABLED: bool = _env("REGIME_SHADOW_ENABLED", False, bool)
+
+# Tier confidence thresholds.
+REGIME_TIER1_CONFIDENCE: float = _env("REGIME_TIER1_CONFIDENCE", 0.20, float)
+REGIME_TIER2_CONFIDENCE: float = _env("REGIME_TIER2_CONFIDENCE", 0.50, float)
+
+# Directional evidence floors using abs(HMM bias_signal).
+REGIME_TIER1_BIAS_FLOOR: float = _env("REGIME_TIER1_BIAS_FLOOR", 0.10, float)
+REGIME_TIER2_BIAS_FLOOR: float = _env("REGIME_TIER2_BIAS_FLOOR", 0.25, float)
+
+# Stability controls.
+REGIME_HYSTERESIS: float = _env("REGIME_HYSTERESIS", 0.05, float)
+REGIME_MIN_DWELL_SEC: float = _env("REGIME_MIN_DWELL_SEC", 300.0, float)
+REGIME_SUPPRESSION_GRACE_SEC: float = _env("REGIME_SUPPRESSION_GRACE_SEC", 60.0, float)
+REGIME_EVAL_INTERVAL_SEC: float = _env("REGIME_EVAL_INTERVAL_SEC", 300.0, float)
+
+# Optional manual override (empty string = auto/HMM-driven).
+REGIME_MANUAL_OVERRIDE: str = _env("REGIME_MANUAL_OVERRIDE", "", str)
+REGIME_MANUAL_CONFIDENCE: float = _env("REGIME_MANUAL_CONFIDENCE", 0.75, float)
+
 # Mapping from skew signal -> size multiplier.
 REBALANCE_SIZE_SENSITIVITY: float = _env("REBALANCE_SIZE_SENSITIVITY", 1.0, float)
 REBALANCE_MAX_SIZE_MULT: float = _env("REBALANCE_MAX_SIZE_MULT", 1.5, float)

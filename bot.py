@@ -298,6 +298,27 @@ class BotRuntime:
         self._hmm_backfill_last_at: float = 0.0
         self._hmm_backfill_last_rows: int = 0
         self._hmm_backfill_last_message: str = ""
+        self._regime_tier: int = 0
+        self._regime_tier_entered_at: float = 0.0
+        self._regime_side_suppressed: str | None = None
+        self._regime_last_eval_ts: float = 0.0
+        self._regime_shadow_state: dict[str, Any] = {
+            "enabled": False,
+            "shadow_enabled": False,
+            "actuation_enabled": False,
+            "tier": 0,
+            "regime": "RANGING",
+            "confidence": 0.0,
+            "bias_signal": 0.0,
+            "abs_bias": 0.0,
+            "suppressed_side": None,
+            "favored_side": None,
+            "directional_ok_tier1": False,
+            "directional_ok_tier2": False,
+            "hmm_ready": False,
+            "last_eval_ts": 0.0,
+            "reason": "init",
+        }
 
         # Daily loss lock (aggregate bot-level, UTC day).
         self._daily_loss_lock_active: bool = False
@@ -960,6 +981,11 @@ class BotRuntime:
             "hmm_backfill_last_at": self._hmm_backfill_last_at,
             "hmm_backfill_last_rows": self._hmm_backfill_last_rows,
             "hmm_backfill_last_message": self._hmm_backfill_last_message,
+            "regime_tier": int(self._regime_tier),
+            "regime_tier_entered_at": float(self._regime_tier_entered_at),
+            "regime_side_suppressed": self._regime_side_suppressed,
+            "regime_last_eval_ts": float(self._regime_last_eval_ts),
+            "regime_shadow_state": dict(self._regime_shadow_state or {}),
             "entry_adds_deferred_total": self._entry_adds_deferred_total,
             "entry_adds_drained_total": self._entry_adds_drained_total,
             "entry_adds_last_deferred_at": self._entry_adds_last_deferred_at,
@@ -1072,6 +1098,15 @@ class BotRuntime:
             self._hmm_backfill_last_message = str(
                 snap.get("hmm_backfill_last_message", self._hmm_backfill_last_message) or ""
             )
+            self._regime_tier = int(snap.get("regime_tier", self._regime_tier))
+            self._regime_tier = max(0, min(2, self._regime_tier))
+            self._regime_tier_entered_at = float(snap.get("regime_tier_entered_at", self._regime_tier_entered_at))
+            raw_suppressed = snap.get("regime_side_suppressed", self._regime_side_suppressed)
+            self._regime_side_suppressed = raw_suppressed if raw_suppressed in ("A", "B", None) else None
+            self._regime_last_eval_ts = float(snap.get("regime_last_eval_ts", self._regime_last_eval_ts))
+            raw_regime_shadow_state = snap.get("regime_shadow_state", self._regime_shadow_state)
+            if isinstance(raw_regime_shadow_state, dict):
+                self._regime_shadow_state = dict(raw_regime_shadow_state)
             self._entry_adds_deferred_total = int(snap.get("entry_adds_deferred_total", self._entry_adds_deferred_total))
             self._entry_adds_drained_total = int(snap.get("entry_adds_drained_total", self._entry_adds_drained_total))
             self._entry_adds_last_deferred_at = float(
@@ -1278,7 +1313,9 @@ class BotRuntime:
         self._maybe_backfill_ohlcv_on_startup()
         self._hmm_readiness_cache = None
         self._hmm_readiness_last_ts = 0.0
-        self._update_hmm(_now())
+        startup_now = _now()
+        self._update_hmm(startup_now)
+        self._update_regime_tier(startup_now)
 
         # Push price into all slots.
         for sid, slot in self.slots.items():
@@ -1619,6 +1656,168 @@ class BotRuntime:
             "error": str(state.get("error", "")),
         }
         return out
+
+    def _manual_regime_override(self) -> tuple[str | None, float]:
+        raw = str(getattr(config, "REGIME_MANUAL_OVERRIDE", "") or "").strip().upper()
+        if raw in {"BULLISH", "BEARISH"}:
+            conf = max(0.0, min(1.0, float(getattr(config, "REGIME_MANUAL_CONFIDENCE", 0.75))))
+            return raw, conf
+        return None, 0.0
+
+    def _update_regime_tier(self, now: float) -> None:
+        interval_sec = max(1.0, float(getattr(config, "REGIME_EVAL_INTERVAL_SEC", 300.0)))
+        if self._regime_last_eval_ts > 0 and (now - self._regime_last_eval_ts) < interval_sec:
+            return
+        self._regime_last_eval_ts = now
+
+        actuation_enabled = bool(getattr(config, "REGIME_DIRECTIONAL_ENABLED", False))
+        shadow_enabled = bool(getattr(config, "REGIME_SHADOW_ENABLED", False))
+        enabled = bool(actuation_enabled or shadow_enabled)
+
+        if enabled:
+            last_hmm_update_ts = float(self._hmm_state.get("last_update_ts", 0.0) or 0.0)
+            if (now - last_hmm_update_ts) >= interval_sec:
+                self._update_hmm(now)
+
+        hmm_ready = (
+            bool(getattr(config, "HMM_ENABLED", False))
+            and bool(self._hmm_state.get("available"))
+            and bool(self._hmm_state.get("trained"))
+        )
+        regime = str(self._hmm_state.get("regime", "RANGING")).upper()
+        confidence = max(0.0, min(1.0, float(self._hmm_state.get("confidence", 0.0) or 0.0)))
+        bias = float(self._hmm_state.get("bias_signal", 0.0) or 0.0)
+        reason = "disabled"
+
+        override, override_conf = self._manual_regime_override()
+        if override is not None:
+            regime = override
+            confidence = override_conf
+            bias = 1.0 if override == "BULLISH" else -1.0
+            hmm_ready = True
+            reason = "manual_override"
+
+        current_tier = int(self._regime_tier)
+        current_tier = max(0, min(2, current_tier))
+        target_tier = 0
+        suppressed_side: str | None = None
+        directional_ok_tier1 = False
+        directional_ok_tier2 = False
+
+        if enabled and hmm_ready:
+            tier1_conf = max(0.0, min(1.0, float(getattr(config, "REGIME_TIER1_CONFIDENCE", 0.20))))
+            tier2_conf = max(0.0, min(1.0, float(getattr(config, "REGIME_TIER2_CONFIDENCE", 0.50))))
+            tier1_bias_floor = max(0.0, min(1.0, float(getattr(config, "REGIME_TIER1_BIAS_FLOOR", 0.10))))
+            tier2_bias_floor = max(0.0, min(1.0, float(getattr(config, "REGIME_TIER2_BIAS_FLOOR", 0.25))))
+            hysteresis = max(0.0, min(1.0, float(getattr(config, "REGIME_HYSTERESIS", 0.05))))
+            min_dwell_sec = max(0.0, float(getattr(config, "REGIME_MIN_DWELL_SEC", 300.0)))
+            entered_at = float(self._regime_tier_entered_at)
+            dwell_elapsed = max(0.0, now - entered_at) if entered_at > 0 else min_dwell_sec
+            abs_bias = abs(float(bias))
+            directional = regime in ("BULLISH", "BEARISH")
+            directional_ok_tier1 = bool(directional and abs_bias >= tier1_bias_floor)
+            directional_ok_tier2 = bool(directional and abs_bias >= tier2_bias_floor)
+
+            if confidence >= tier2_conf:
+                target_tier = 2
+            elif confidence >= tier1_conf:
+                target_tier = 1
+            else:
+                target_tier = 0
+
+            if target_tier == 2 and not directional_ok_tier2:
+                target_tier = 1 if directional_ok_tier1 else 0
+            elif target_tier == 1 and not directional_ok_tier1:
+                target_tier = 0
+
+            # Hysteresis on downgrades only.
+            if target_tier < current_tier:
+                threshold = [0.0, tier1_conf, tier2_conf][current_tier]
+                if confidence > (threshold - hysteresis):
+                    target_tier = current_tier
+
+            # Minimum dwell between transitions.
+            if target_tier != current_tier and dwell_elapsed < min_dwell_sec:
+                target_tier = current_tier
+
+            reason = "hmm_eval"
+        elif enabled:
+            reason = "hmm_not_ready"
+
+        changed = target_tier != current_tier
+        if changed:
+            self._regime_tier = int(target_tier)
+            self._regime_tier_entered_at = float(now)
+
+        if int(target_tier) == 2 and regime in ("BULLISH", "BEARISH"):
+            suppressed_side = "A" if bias > 0 else "B"
+        self._regime_side_suppressed = suppressed_side
+
+        if changed:
+            logger.info(
+                "[REGIME][shadow] tier %d -> %d regime=%s conf=%.3f bias=%.3f suppressed=%s",
+                current_tier,
+                int(target_tier),
+                regime,
+                confidence,
+                bias,
+                suppressed_side or "-",
+            )
+
+        self._regime_shadow_state = {
+            "enabled": enabled,
+            "shadow_enabled": shadow_enabled,
+            "actuation_enabled": actuation_enabled,
+            "tier": int(target_tier),
+            "regime": regime,
+            "confidence": float(confidence),
+            "bias_signal": float(bias),
+            "abs_bias": abs(float(bias)),
+            "suppressed_side": suppressed_side,
+            "favored_side": ("B" if suppressed_side == "A" else "A" if suppressed_side == "B" else None),
+            "directional_ok_tier1": bool(directional_ok_tier1),
+            "directional_ok_tier2": bool(directional_ok_tier2),
+            "hmm_ready": bool(hmm_ready),
+            "last_eval_ts": float(now),
+            "reason": reason,
+        }
+
+    def _regime_status_payload(self, now: float | None = None) -> dict[str, Any]:
+        now_ts = float(now if now is not None else _now())
+        state = dict(self._regime_shadow_state or {})
+        tier = int(state.get("tier", self._regime_tier))
+        tier = max(0, min(2, tier))
+        suppressed = state.get("suppressed_side", self._regime_side_suppressed)
+        suppressed = suppressed if suppressed in ("A", "B") else None
+        if suppressed == "A":
+            favored = "B"
+        elif suppressed == "B":
+            favored = "A"
+        else:
+            favored = None
+        tier_label = {0: "symmetric", 1: "biased", 2: "directional"}[tier]
+        dwell_sec = max(0.0, now_ts - float(self._regime_tier_entered_at or now_ts))
+        return {
+            "enabled": bool(state.get("enabled", False)),
+            "shadow_enabled": bool(state.get("shadow_enabled", False)),
+            "actuation_enabled": bool(state.get("actuation_enabled", False)),
+            "tier": tier,
+            "tier_label": tier_label,
+            "suppressed_side": suppressed,
+            "favored_side": favored,
+            "regime": str(state.get("regime", self._hmm_state.get("regime", "RANGING"))),
+            "confidence": float(state.get("confidence", self._hmm_state.get("confidence", 0.0) or 0.0)),
+            "bias_signal": float(state.get("bias_signal", self._hmm_state.get("bias_signal", 0.0) or 0.0)),
+            "abs_bias": float(state.get("abs_bias", abs(float(self._hmm_state.get("bias_signal", 0.0) or 0.0)))),
+            "directional_ok_tier1": bool(state.get("directional_ok_tier1", False)),
+            "directional_ok_tier2": bool(state.get("directional_ok_tier2", False)),
+            "hmm_ready": bool(state.get("hmm_ready", False)),
+            "dwell_sec": float(dwell_sec),
+            "hysteresis_buffer": float(getattr(config, "REGIME_HYSTERESIS", 0.05)),
+            "grace_remaining_sec": 0.0,
+            "last_eval_ts": float(state.get("last_eval_ts", self._regime_last_eval_ts)),
+            "reason": str(state.get("reason", "")),
+        }
 
     def _normalize_kraken_ohlcv_rows(
         self,
@@ -2260,7 +2459,7 @@ class BotRuntime:
             st, a2 = sm.add_entry_order(st, cfg, side="buy", trade_id="B", cycle=st.cycle_b, order_size_usd=self._slot_order_size_usd(slot), reason="bootstrap_B")
             if a2:
                 actions.append(a2)
-            self.slots[slot_id].state = replace(st, long_only=False, short_only=False)
+            self.slots[slot_id].state = replace(st, long_only=False, short_only=False, mode_source="none")
             if actions:
                 self._execute_actions(slot_id, actions, "bootstrap")
             else:
@@ -2280,7 +2479,7 @@ class BotRuntime:
 
         # Symmetric auto-reseed.
         if usd < min_cost and doge >= 2 * min_vol:
-            st = replace(slot.state, short_only=True, long_only=False)
+            st = replace(slot.state, short_only=True, long_only=False, mode_source="balance")
             target_usd = market * (2 * min_vol)
             st, a = sm.add_entry_order(st, cfg, side="sell", trade_id="A", cycle=st.cycle_a, order_size_usd=target_usd, reason="reseed_usd")
             self.slots[slot_id].state = st
@@ -2291,7 +2490,7 @@ class BotRuntime:
             return
 
         if doge < min_vol and usd >= 2 * min_cost:
-            st = replace(slot.state, long_only=True, short_only=False)
+            st = replace(slot.state, long_only=True, short_only=False, mode_source="balance")
             target_usd = market * (2 * min_vol)
             st, a = sm.add_entry_order(st, cfg, side="buy", trade_id="B", cycle=st.cycle_b, order_size_usd=target_usd, reason="reseed_doge")
             self.slots[slot_id].state = st
@@ -2303,7 +2502,7 @@ class BotRuntime:
 
         # Graceful degradation fallback: place whichever side can run.
         if doge >= min_vol:
-            st = replace(slot.state, short_only=True, long_only=False)
+            st = replace(slot.state, short_only=True, long_only=False, mode_source="balance")
             st, a = sm.add_entry_order(st, cfg, side="sell", trade_id="A", cycle=st.cycle_a, order_size_usd=market * min_vol, reason="fallback_short_only")
             self.slots[slot_id].state = st
             if a:
@@ -2313,7 +2512,7 @@ class BotRuntime:
             return
 
         if usd >= min_cost:
-            st = replace(slot.state, long_only=True, short_only=False)
+            st = replace(slot.state, long_only=True, short_only=False, mode_source="balance")
             st, a = sm.add_entry_order(st, cfg, side="buy", trade_id="B", cycle=st.cycle_b, order_size_usd=market * min_vol, reason="fallback_long_only")
             self.slots[slot_id].state = st
             if a:
@@ -2412,7 +2611,7 @@ class BotRuntime:
 
         post = self.slots[slot_id].state
         if any(sm.find_order(post, action.local_id) is not None for action in actions):
-            self.slots[slot_id].state = replace(post, long_only=False, short_only=False)
+            self.slots[slot_id].state = replace(post, long_only=False, short_only=False, mode_source="none")
             self._validate_slot(slot_id)
             logger.info("slot %s auto-repaired degraded %s state", slot_id, phase)
 
@@ -2534,9 +2733,9 @@ class BotRuntime:
             if action.role != "entry":
                 return
             if action.side == "sell":
-                slot.state = replace(slot.state, long_only=True, short_only=False)
+                slot.state = replace(slot.state, long_only=True, short_only=False, mode_source="balance")
             elif action.side == "buy":
-                slot.state = replace(slot.state, short_only=True, long_only=False)
+                slot.state = replace(slot.state, short_only=True, long_only=False, mode_source="balance")
 
         # Pre-compute order capacity for gating new entries.
         _internal_order_count = self._internal_open_order_count()
@@ -2661,8 +2860,74 @@ class BotRuntime:
                     f"{' [recovery]' if action.from_recovery else ''}"
                 )
                 notifier._send_message(text)
+                self._record_exit_outcome(slot_id, action)
 
         self._normalize_slot_mode(slot_id)
+
+    def _record_exit_outcome(self, slot_id: int, action: sm.BookCycleAction) -> None:
+        slot = self.slots.get(slot_id)
+        if slot is None:
+            return
+
+        cycle_record = next(
+            (
+                c
+                for c in reversed(slot.state.completed_cycles)
+                if c.trade_id == action.trade_id and int(c.cycle) == int(action.cycle)
+            ),
+            None,
+        )
+        if cycle_record is None:
+            logger.debug(
+                "exit_outcomes: cycle record missing for slot=%s trade=%s cycle=%s",
+                slot_id,
+                action.trade_id,
+                action.cycle,
+            )
+            return
+
+        hmm_regime = self._hmm_status_payload()
+        regime_name = str(hmm_regime.get("regime", "RANGING") or "RANGING").upper()
+        regime_confidence = float(hmm_regime.get("confidence", 0.0) or 0.0)
+        regime_bias = float(hmm_regime.get("bias_signal", 0.0) or 0.0)
+
+        against_trend = False
+        if regime_name == "BULLISH":
+            against_trend = action.trade_id == "A"
+        elif regime_name == "BEARISH":
+            against_trend = action.trade_id == "B"
+
+        entry_time = float(cycle_record.entry_time or 0.0)
+        exit_time = float(cycle_record.exit_time or 0.0)
+        if entry_time > 0 and exit_time > 0:
+            total_age_sec = max(0.0, exit_time - entry_time)
+        else:
+            total_age_sec = 0.0
+
+        row = {
+            "time": float(exit_time if exit_time > 0 else _now()),
+            "pair": str(self.pair),
+            "trade": str(action.trade_id),
+            "cycle": int(action.cycle),
+            "resolution": "recovery" if bool(action.from_recovery) else "normal",
+            "from_recovery": bool(action.from_recovery),
+            "entry_time": entry_time if entry_time > 0 else None,
+            "exit_time": exit_time if exit_time > 0 else None,
+            "total_age_sec": float(total_age_sec),
+            "entry_price": float(cycle_record.entry_price),
+            "exit_price": float(cycle_record.exit_price),
+            "volume": float(cycle_record.volume),
+            "gross_profit_usd": float(action.gross_profit),
+            "fees_usd": float(action.fees),
+            "net_profit_usd": float(action.net_profit),
+            # Phase 0: best-effort regime snapshot at outcome time.
+            "regime_at_entry": regime_name,
+            "regime_confidence": float(regime_confidence),
+            "regime_bias_signal": float(regime_bias),
+            "against_trend": bool(against_trend),
+            "regime_tier": int(self._regime_tier),
+        }
+        supabase_store.save_exit_outcome(row)
 
     def _poll_order_status(self) -> None:
         # Query active + recovery txids once per loop.
@@ -2893,9 +3158,10 @@ class BotRuntime:
         st = self.slots[slot_id].state
         entries = [o for o in st.orders if o.role == "entry"]
         exits = [o for o in st.orders if o.role == "exit"]
+        one_sided_source = "regime" if str(getattr(st, "mode_source", "none")) == "regime" else "balance"
         if not entries and not exits:
             # Prevent stale snapshot flags from causing false S0 single-sided halts.
-            self.slots[slot_id].state = replace(st, long_only=False, short_only=False)
+            self.slots[slot_id].state = replace(st, long_only=False, short_only=False, mode_source="none")
             return
         if exits:
             # Degraded S1 states are legal when only one exit side survives
@@ -2903,23 +3169,27 @@ class BotRuntime:
             if not entries and len(exits) == 1:
                 exit_side = exits[0].side
                 if exit_side == "sell":
-                    self.slots[slot_id].state = replace(st, long_only=True, short_only=False)
+                    self.slots[slot_id].state = replace(
+                        st, long_only=True, short_only=False, mode_source=one_sided_source
+                    )
                 elif exit_side == "buy":
-                    self.slots[slot_id].state = replace(st, long_only=False, short_only=True)
+                    self.slots[slot_id].state = replace(
+                        st, long_only=False, short_only=True, mode_source=one_sided_source
+                    )
             elif len(exits) == 2:
-                self.slots[slot_id].state = replace(st, long_only=False, short_only=False)
+                self.slots[slot_id].state = replace(st, long_only=False, short_only=False, mode_source="none")
             elif len(exits) == 1 and len(entries) == 1 and entries[0].side == exits[0].side:
                 # Normal S1 shape (exit + same-side entry) should not keep degraded flags.
-                self.slots[slot_id].state = replace(st, long_only=False, short_only=False)
+                self.slots[slot_id].state = replace(st, long_only=False, short_only=False, mode_source="none")
             return
         buy_entries = [o for o in entries if o.side == "buy"]
         sell_entries = [o for o in entries if o.side == "sell"]
         if len(buy_entries) == 1 and len(sell_entries) == 0:
-            self.slots[slot_id].state = replace(st, long_only=True, short_only=False)
+            self.slots[slot_id].state = replace(st, long_only=True, short_only=False, mode_source=one_sided_source)
         elif len(sell_entries) == 1 and len(buy_entries) == 0:
-            self.slots[slot_id].state = replace(st, long_only=False, short_only=True)
+            self.slots[slot_id].state = replace(st, long_only=False, short_only=True, mode_source=one_sided_source)
         elif len(sell_entries) == 1 and len(buy_entries) == 1:
-            self.slots[slot_id].state = replace(st, long_only=False, short_only=False)
+            self.slots[slot_id].state = replace(st, long_only=False, short_only=False, mode_source="none")
 
     # ------------------ Commands ------------------
 
@@ -3966,9 +4236,11 @@ class BotRuntime:
             self._refresh_price(strict=False)
             if self._price_age_sec() > config.STALE_PRICE_MAX_AGE_SEC:
                 self.pause("stale price data > 60s")
-            self._sync_ohlcv_candles(_now())
-            self._update_daily_loss_lock(_now())
-            self._update_rebalancer(_now())
+            loop_now = _now()
+            self._sync_ohlcv_candles(loop_now)
+            self._update_daily_loss_lock(loop_now)
+            self._update_rebalancer(loop_now)
+            self._update_regime_tier(loop_now)
             # Prioritize older deferred entries each loop, while avoiding stale placements
             # that the upcoming price tick is likely to refresh anyway.
             self._drain_pending_entry_orders("entry_scheduler_pre_tick", skip_stale=True)
@@ -4633,6 +4905,7 @@ class BotRuntime:
                     "phase": phase,
                     "long_only": st.long_only,
                     "short_only": st.short_only,
+                    "mode_source": str(getattr(st, "mode_source", "none") or "none"),
                     "s2_entered_at": st.s2_entered_at,
                     "market_price": st.market_price,
                     "cycle_a": st.cycle_a,
@@ -4712,6 +4985,7 @@ class BotRuntime:
             slot_vintage = self._slot_vintage_metrics_locked(now)
             hmm_data_pipeline = self._hmm_data_readiness(now)
             hmm_regime = self._hmm_status_payload()
+            regime_directional = self._regime_status_payload(now)
             oldest_exit_age_sec = float(slot_vintage.get("oldest_exit_age_sec", 0.0) or 0.0)
             stuck_capital_pct = float(slot_vintage.get("stuck_capital_pct", 0.0) or 0.0)
             slot_vintage["vintage_warn"] = oldest_exit_age_sec >= 3.0 * 86400.0
@@ -4824,6 +5098,7 @@ class BotRuntime:
                 "slot_vintage": slot_vintage,
                 "hmm_data_pipeline": hmm_data_pipeline,
                 "hmm_regime": hmm_regime,
+                "regime_directional": regime_directional,
                 "release_health": {
                     "sticky_release_total": int(self._sticky_release_total),
                     "sticky_release_last_at": self._sticky_release_last_at or None,

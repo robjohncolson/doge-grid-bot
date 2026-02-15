@@ -38,7 +38,36 @@ create table if not exists public.fills (
 
 create index if not exists idx_fills_pair_time on public.fills(pair, time desc);
 
--- 3) Price history
+-- 3) Exit outcomes (vintage data for regime/tier tuning)
+create table if not exists public.exit_outcomes (
+  id bigserial primary key,
+  time double precision not null,
+  pair text not null,
+  trade text not null,
+  cycle integer not null default 0,
+  resolution text not null default 'normal',
+  from_recovery boolean not null default false,
+  entry_time double precision,
+  exit_time double precision,
+  total_age_sec double precision not null default 0,
+  entry_price double precision,
+  exit_price double precision,
+  volume double precision,
+  gross_profit_usd double precision,
+  fees_usd double precision,
+  net_profit_usd double precision not null,
+  regime_at_entry text,
+  regime_confidence numeric,
+  regime_bias_signal numeric,
+  against_trend boolean,
+  regime_tier integer,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists idx_exit_outcomes_pair_time on public.exit_outcomes(pair, time desc);
+create index if not exists idx_exit_outcomes_regime_trade on public.exit_outcomes(regime_at_entry, trade);
+
+-- 4) Price history
 create table if not exists public.price_history (
   id bigserial primary key,
   time double precision not null,
@@ -49,7 +78,7 @@ create table if not exists public.price_history (
 
 create index if not exists idx_price_history_pair_time on public.price_history(pair, time desc);
 
--- 4) OHLCV candles for HMM/trend analytics
+-- 5) OHLCV candles for HMM/trend analytics
 create table if not exists public.ohlcv_candles (
   id bigserial primary key,
   time double precision not null,
@@ -67,7 +96,7 @@ create table if not exists public.ohlcv_candles (
 
 create index if not exists idx_ohlcv_pair_interval_time on public.ohlcv_candles(pair, interval_min, time desc);
 
--- 5) Structured transition/event log (new for v1)
+-- 6) Structured transition/event log (new for v1)
 create table if not exists public.bot_events (
   event_id bigint primary key,
   "timestamp" timestamptz not null,
@@ -83,7 +112,7 @@ create table if not exists public.bot_events (
 create index if not exists idx_bot_events_pair_slot_ts
   on public.bot_events(pair, slot_id, "timestamp" desc);
 
--- 6) Optional helper view for latest runtime snapshot
+-- 7) Optional helper view for latest runtime snapshot
 create or replace view public.v1_runtime as
 select
   bs.key,

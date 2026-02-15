@@ -119,6 +119,8 @@ class PairState:
     cooldown_until_b: float = 0.0
     long_only: bool = False
     short_only: bool = False
+    # Why slot is one-sided: "none" | "balance" | "regime".
+    mode_source: str = "none"
     # Anti-chase entry refresh tracking
     consecutive_refreshes_a: int = 0
     consecutive_refreshes_b: int = 0
@@ -413,11 +415,11 @@ def bootstrap_orders(
         actions.append(sell_action)
 
     if allow_long_only and buy_order and not sell_order:
-        st = replace(st, long_only=True, short_only=False)
+        st = replace(st, long_only=True, short_only=False, mode_source="balance")
     elif allow_short_only and sell_order and not buy_order:
-        st = replace(st, short_only=True, long_only=False)
+        st = replace(st, short_only=True, long_only=False, mode_source="balance")
     else:
-        st = replace(st, long_only=False, short_only=False)
+        st = replace(st, long_only=False, short_only=False, mode_source="none")
 
     return st, actions, tuple(orders)
 
@@ -508,6 +510,7 @@ def to_dict(state: PairState) -> dict:
         "cooldown_until_b": state.cooldown_until_b,
         "long_only": state.long_only,
         "short_only": state.short_only,
+        "mode_source": state.mode_source,
         "consecutive_refreshes_a": state.consecutive_refreshes_a,
         "consecutive_refreshes_b": state.consecutive_refreshes_b,
         "last_refresh_direction_a": state.last_refresh_direction_a,
@@ -519,6 +522,9 @@ def to_dict(state: PairState) -> dict:
 
 
 def from_dict(data: dict) -> PairState:
+    mode_source = str(data.get("mode_source", "none") or "none").strip().lower()
+    if mode_source not in {"none", "balance", "regime"}:
+        mode_source = "none"
     return PairState(
         market_price=float(data.get("market_price", 0.0)),
         now=float(data.get("now", 0.0)),
@@ -541,6 +547,7 @@ def from_dict(data: dict) -> PairState:
         cooldown_until_b=float(data.get("cooldown_until_b", 0.0)),
         long_only=bool(data.get("long_only", False)),
         short_only=bool(data.get("short_only", False)),
+        mode_source=mode_source,
         consecutive_refreshes_a=int(data.get("consecutive_refreshes_a", 0)),
         consecutive_refreshes_b=int(data.get("consecutive_refreshes_b", 0)),
         last_refresh_direction_a=data.get("last_refresh_direction_a"),

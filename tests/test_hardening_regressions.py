@@ -420,6 +420,17 @@ class DogeV1StateMachineTests(unittest.TestCase):
         vol = sm.compute_order_volume(price=1.0, cfg=cfg, order_size_usd=5.0)
         self.assertIsNone(vol)
 
+    def test_pair_state_mode_source_round_trips_and_sanitizes(self):
+        st = sm.PairState(market_price=0.1, now=1000.0, mode_source="balance")
+        raw = sm.to_dict(st)
+        self.assertEqual(raw["mode_source"], "balance")
+        restored = sm.from_dict(raw)
+        self.assertEqual(restored.mode_source, "balance")
+
+        raw["mode_source"] = "unexpected"
+        restored_bad = sm.from_dict(raw)
+        self.assertEqual(restored_bad.mode_source, "none")
+
 
 class BotEventLogTests(unittest.TestCase):
     @mock.patch("supabase_store.save_event")
@@ -1141,6 +1152,153 @@ class BotEventLogTests(unittest.TestCase):
         self.assertEqual(payload["hmm_data_pipeline"]["samples"], 2000)
         self.assertIn("bias_signal", payload["hmm_regime"])
         self.assertIn("probabilities", payload["hmm_regime"])
+
+    def test_status_payload_exposes_regime_directional_shadow_block(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(market_price=0.1, now=1000.0),
+            )
+        }
+        rt._hmm_state.update({
+            "available": True,
+            "trained": True,
+            "regime": "BULLISH",
+            "confidence": 0.80,
+            "bias_signal": 0.70,
+            "last_update_ts": 1000.0,
+        })
+
+        with mock.patch.object(config, "HMM_ENABLED", True):
+            with mock.patch.object(config, "REGIME_SHADOW_ENABLED", True):
+                with mock.patch.object(config, "REGIME_DIRECTIONAL_ENABLED", False):
+                    rt._update_regime_tier(now=1000.0)
+                    payload = rt.status_payload()
+
+        self.assertIn("regime_directional", payload)
+        regime = payload["regime_directional"]
+        self.assertEqual(regime["tier"], 2)
+        self.assertEqual(regime["suppressed_side"], "A")
+        self.assertTrue(regime["shadow_enabled"])
+        self.assertFalse(regime["actuation_enabled"])
+
+    def test_update_regime_tier_shadow_does_not_actuate_slot_modes(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    orders=(
+                        sm.OrderState(
+                            local_id=1,
+                            side="sell",
+                            role="entry",
+                            price=0.1002,
+                            volume=13.0,
+                            trade_id="A",
+                            cycle=1,
+                            txid="TX-A-ENTRY",
+                            placed_at=999.0,
+                        ),
+                        sm.OrderState(
+                            local_id=2,
+                            side="buy",
+                            role="entry",
+                            price=0.0998,
+                            volume=13.0,
+                            trade_id="B",
+                            cycle=1,
+                            txid="TX-B-ENTRY",
+                            placed_at=999.0,
+                        ),
+                    ),
+                    long_only=False,
+                    short_only=False,
+                    mode_source="none",
+                ),
+            )
+        }
+        rt._hmm_state.update({
+            "available": True,
+            "trained": True,
+            "regime": "BEARISH",
+            "confidence": 0.90,
+            "bias_signal": -0.80,
+            "last_update_ts": 1000.0,
+        })
+
+        with mock.patch.object(config, "HMM_ENABLED", True):
+            with mock.patch.object(config, "REGIME_SHADOW_ENABLED", True):
+                with mock.patch.object(config, "REGIME_DIRECTIONAL_ENABLED", False):
+                    rt._update_regime_tier(now=1000.0)
+
+        self.assertEqual(rt._regime_tier, 2)
+        self.assertEqual(rt._regime_side_suppressed, "B")
+        self.assertFalse(rt.slots[0].state.long_only)
+        self.assertFalse(rt.slots[0].state.short_only)
+        self.assertEqual(rt.slots[0].state.mode_source, "none")
+
+    def test_execute_actions_books_exit_outcome_row(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        cycle = sm.CycleRecord(
+            trade_id="A",
+            cycle=3,
+            entry_price=0.101,
+            exit_price=0.099,
+            volume=13.0,
+            gross_profit=0.026,
+            fees=0.002,
+            net_profit=0.024,
+            entry_time=900.0,
+            exit_time=1000.0,
+            from_recovery=False,
+        )
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    completed_cycles=(cycle,),
+                ),
+            )
+        }
+        rt._hmm_state.update({
+            "regime": "BEARISH",
+            "confidence": 0.60,
+            "bias_signal": -0.40,
+        })
+        rt._regime_tier = 1
+
+        action = sm.BookCycleAction(
+            trade_id="A",
+            cycle=3,
+            net_profit=0.024,
+            gross_profit=0.026,
+            fees=0.002,
+            from_recovery=False,
+        )
+
+        with mock.patch("notifier._send_message"):
+            with mock.patch("supabase_store.save_exit_outcome") as save_outcome:
+                rt._execute_actions(0, [action], "unit_test")
+
+        save_outcome.assert_called_once()
+        row = save_outcome.call_args.args[0]
+        self.assertEqual(row["pair"], rt.pair)
+        self.assertEqual(row["trade"], "A")
+        self.assertEqual(row["cycle"], 3)
+        self.assertEqual(row["resolution"], "normal")
+        self.assertEqual(row["regime_at_entry"], "BEARISH")
+        self.assertEqual(row["regime_tier"], 1)
+        self.assertEqual(row["against_trend"], False)
+        self.assertAlmostEqual(row["total_age_sec"], 100.0)
 
     def test_dynamic_idle_target_blends_with_hmm_bias_when_enabled(self):
         def _mk_runtime() -> bot.BotRuntime:
