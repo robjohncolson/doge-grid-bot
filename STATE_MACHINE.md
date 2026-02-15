@@ -1,7 +1,7 @@
 # DOGE State-Machine Bot v1
 
 Last updated: 2026-02-14
-Primary code references: `bot.py`, `state_machine.py`, `config.py`, `dashboard.py`, `supabase_store.py`
+Primary code references: `bot.py`, `state_machine.py`, `config.py`, `dashboard.py`, `supabase_store.py`, `hmm_regime_detector.py`
 
 ## 1. Scope
 
@@ -9,8 +9,8 @@ This document is the implementation contract for the current runtime.
 
 - Market: Kraken `XDGUSD` (`DOGE/USD`) only
 - Strategy: slot-based pair engine (`A` and `B` legs) with independent per-slot compounding
-- Persistence: Supabase-first (`bot_state`, `fills`, `price_history`, `bot_events`)
-- Execution: fully rule-based reducer; no AI in execution path
+- Persistence: Supabase-first (`bot_state`, `fills`, `price_history`, `ohlcv_candles`, `bot_events`)
+- Execution: fully rule-based reducer; HMM regime detector is advisory-only (read-only, no reducer modifications)
 - Control plane: dashboard + Telegram commands
 
 Out of scope for v1:
@@ -38,10 +38,11 @@ Core data model (`PairState`) is per slot and contains:
 
 ```text
 START
-  -> INIT (logging, signals, Supabase writer)
-  -> LOAD SNAPSHOT (Supabase key __v1__)
+  -> INIT (logging, signals, Supabase writer, HMM runtime)
+  -> LOAD SNAPSHOT (Supabase key __v1__, restore HMM state)
   -> FETCH CONSTRAINTS + FEES (Kraken)
   -> FETCH INITIAL PRICE (strict)
+  -> SYNC OHLCV + PRIME HMM (initial candle pull, first training attempt)
   -> RECONCILE TRACKED ORDERS
   -> REPLAY MISSED FILLS (trade history)
   -> ENSURE BOOTSTRAP PER SLOT
@@ -64,23 +65,24 @@ Per iteration in `bot.py`:
 1. `begin_loop()` enables private API budget accounting.
 2. `_refresh_price(strict=False)`.
 3. If price age exceeds `STALE_PRICE_MAX_AGE_SEC`, call `pause(...)`.
-4. Compute volatility-adaptive runtime profit target.
-5. **Daily loss lock check** (`_update_daily_loss_lock`): auto-pauses if aggregate UTC-day loss exceeds `DAILY_LOSS_LIMIT`.
-6. **Entry scheduler pre-tick drain**: drain up to `MAX_ENTRY_ADDS_PER_LOOP` deferred entries.
-7. For each slot:
+4. **OHLCV sync** (`_sync_ohlcv_candles`): pull Kraken 5-min candles, queue upserts to Supabase (see §16).
+5. Compute volatility-adaptive runtime profit target.
+6. **Daily loss lock check** (`_update_daily_loss_lock`): auto-pauses if aggregate UTC-day loss exceeds `DAILY_LOSS_LIMIT`.
+7. **Entry scheduler pre-tick drain**: drain up to `MAX_ENTRY_ADDS_PER_LOOP` deferred entries.
+8. For each slot:
    - Apply `PriceTick`
    - Apply `TimerTick`
    - Call `_ensure_slot_bootstrapped(slot_id)`
    - Call `_auto_repair_degraded_slot(slot_id)` to restore missing entry legs when fundable
-8. Poll status for all tracked order txids (`_poll_order_status`).
-9. Refresh pair open-order telemetry (`_refresh_open_order_telemetry`) when budget allows.
-10. **Auto soft-close** (`_auto_soft_close_if_capacity_pressure`): reprices farthest recoveries when utilization exceeds threshold.
-11. **Persistent open-order drift alert** (`_maybe_alert_persistent_open_order_drift`).
-12. **Rebalancer update** (`_update_rebalancer`): every `REBALANCE_INTERVAL_SEC`.
-13. Emit orphan-pressure notification at `ORPHAN_PRESSURE_WARN_AT` multiples.
-14. Persist snapshot (`save_state` to `bot_state`).
-15. Poll Telegram commands.
-16. `end_loop()` resets budget/cache.
+9. Poll status for all tracked order txids (`_poll_order_status`).
+10. Refresh pair open-order telemetry (`_refresh_open_order_telemetry`) when budget allows.
+11. **Auto soft-close** (`_auto_soft_close_if_capacity_pressure`): reprices farthest recoveries when utilization exceeds threshold.
+12. **Persistent open-order drift alert** (`_maybe_alert_persistent_open_order_drift`).
+13. **Rebalancer update** (`_update_rebalancer`): every `REBALANCE_INTERVAL_SEC`. Calls `_update_hmm()` (see §17) before computing dynamic idle target.
+14. Emit orphan-pressure notification at `ORPHAN_PRESSURE_WARN_AT` multiples.
+15. Persist snapshot (`save_state` to `bot_state`).
+16. Poll Telegram commands.
+17. `end_loop()` resets budget/cache.
 
 ## 5. Pair Phases (`S0`, `S1a`, `S1b`, `S2`)
 
@@ -362,10 +364,15 @@ trend_score = (fast_ema - slow_ema) / slow_ema    # ratio form
 
 ### 15.2 Target Mapping
 
+When HMM is enabled, trained, and available (see §17), `trend_score` is blended with the HMM `bias_signal`:
+
 ```
-raw_target = REBALANCE_TARGET_IDLE_PCT - TREND_IDLE_SENSITIVITY * trend_score
+signal = HMM_BLEND_WITH_TREND * trend_score + (1 - HMM_BLEND_WITH_TREND) * hmm_bias
+raw_target = REBALANCE_TARGET_IDLE_PCT - TREND_IDLE_SENSITIVITY * signal
 dynamic_target = clamp(raw_target, TREND_IDLE_FLOOR, TREND_IDLE_CEILING)
 ```
+
+When HMM is disabled or unavailable, `signal = trend_score` (no blend).
 
 ### 15.3 Hysteresis
 
@@ -395,7 +402,116 @@ Three stages in strict order:
 | `TREND_HYSTERESIS_SEC` | 600.0 | Hold duration |
 | `TREND_HYSTERESIS_SMOOTH_HALFLIFE` | 900.0 | Smoothing EMA halflife |
 
-## 16. Capital Layers
+## 16. OHLCV Data Pipeline
+
+Persists 5-minute OHLCV candles from Kraken into Supabase for HMM training and inference.
+
+### 16.1 Collection
+
+- `_sync_ohlcv_candles()`: called every main loop iteration, rate-limited to `HMM_OHLCV_SYNC_INTERVAL_SEC` (default 300s).
+- Pulls one page from Kraken's OHLC endpoint (`get_ohlc_page`), normalizes rows, filters out the still-forming candle.
+- Queues closed candles for upsert into `ohlcv_candles` table via `supabase_store.queue_ohlcv_candles()`.
+- Cursor (`_ohlcv_since_cursor`) persisted in snapshot for incremental fetches across restarts.
+
+### 16.2 Storage
+
+Supabase table `ohlcv_candles`:
+
+- Columns: `time`, `pair`, `interval_min`, `open`, `high`, `low`, `close`, `volume`, `trade_count`
+- Unique constraint: `(pair, interval_min, time)` — upsert-safe.
+- Retention: `_cleanup_old_ohlcv()` deletes rows older than `HMM_OHLCV_RETENTION_DAYS` (default 14 days, ~4032 candles).
+
+### 16.3 Data Access
+
+- `_fetch_training_candles(count)`: loads up to `HMM_TRAINING_CANDLES` (default 2000) candles. Prefers Supabase; falls back to Kraken OHLC if Supabase has insufficient data.
+- `_fetch_recent_candles(count)`: loads `HMM_RECENT_CANDLES` (default 100) candles for inference.
+- Both return `(closes, volumes)` tuple of float lists.
+
+### 16.4 Readiness Check
+
+`_hmm_data_readiness()` returns a cached diagnostic block:
+
+- `samples`: current candle count in Supabase
+- `coverage_pct`: samples / training_target * 100
+- `freshness_ok`: newest candle within 3x interval
+- `volume_coverage_pct`: % of candles with non-zero volume
+- `ready_for_min_train`: samples >= `HMM_MIN_TRAIN_SAMPLES` and fresh
+- `ready_for_target_window`: samples >= `HMM_TRAINING_CANDLES` and fresh
+- `gaps`: list of actionable gap descriptions
+
+### 16.5 Config
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `HMM_OHLCV_ENABLED` | True | Master switch for candle collection |
+| `HMM_OHLCV_INTERVAL_MIN` | 5 | Candle interval in minutes |
+| `HMM_OHLCV_SYNC_INTERVAL_SEC` | 300.0 | How often to pull from Kraken |
+| `HMM_OHLCV_RETENTION_DAYS` | 14 | Supabase retention period |
+| `HMM_TRAINING_CANDLES` | 2000 | Target training window size |
+| `HMM_RECENT_CANDLES` | 100 | Inference window size |
+| `HMM_MIN_TRAIN_SAMPLES` | 500 | Minimum candles for training |
+| `HMM_READINESS_CACHE_SEC` | 300.0 | Readiness check cache TTL |
+
+## 17. HMM Regime Detector (Advisory Layer)
+
+Read-only regime classifier that sits alongside the trend detector (§15). Does **not** modify the reducer (§6), emit actions, or touch event transition rules. Lives entirely in `bot.py` runtime.
+
+Module: `hmm_regime_detector.py` (requires `numpy`, `hmmlearn`).
+
+### 17.1 Architecture
+
+```
+Kraken OHLC → ohlcv_candles (§16) → FeatureExtractor → GaussianHMM → RegimeState
+                                                                          │
+                                          bias_signal ─── blend ──► §15 idle target
+                                                            ↑
+                                                       trend_score
+```
+
+Three hidden states: `BEARISH` (0), `RANGING` (1), `BULLISH` (2). Labels assigned post-training by inspecting EMA-spread emission means.
+
+Four observation features: MACD histogram slope, EMA spread %, RSI zone, volume ratio.
+
+### 17.2 Lifecycle
+
+1. **Init** (`_init_hmm_runtime`): imports `numpy` + `hmm_regime_detector` inside try/except. If import fails, logs warning and continues with trend-only logic.
+2. **Training** (`_train_hmm`): called on startup and when `needs_retrain()` returns true (daily by default). Uses `_fetch_training_candles()` from §16.
+3. **Inference** (`_update_hmm`): called every rebalancer tick (inside `_update_rebalancer`). Uses `_fetch_recent_candles()`. Outputs `RegimeState` with regime, probabilities, confidence, and `bias_signal`.
+4. **Blend**: `signal = blend * trend_score + (1 - blend) * hmm_bias` feeds into §15.2 target mapping.
+5. **Persistence**: `_snapshot_hmm_state()` / `_restore_hmm_snapshot()` save/restore `RegimeState` and train timestamp. Model itself is **not** serialized — retrained from candle data on startup.
+
+### 17.3 Degradation Guarantees
+
+- If `HMM_ENABLED=false` (default): no init, no inference, zero overhead.
+- If `hmmlearn`/`numpy` not installed: graceful fallback to trend-only.
+- If training fails or data insufficient: stays in `RANGING` with zero bias.
+- `HMM_BLEND_WITH_TREND=1.0`: pure trend_score, HMM has zero influence (shadow mode).
+- Default `RegimeState`: `RANGING`, `bias_signal=0.0`, `confidence=0.0`.
+
+### 17.4 Tuning Phases
+
+| Phase | `HMM_BLEND_WITH_TREND` | Effect |
+|-------|------------------------|--------|
+| Shadow | 1.0 | HMM classifies but has zero influence |
+| Gentle | 0.7 | 30% HMM, 70% trend |
+| Equal | 0.5 | Equal weight |
+| HMM-primary | 0.3 | 70% HMM, 30% trend |
+
+### 17.5 Config
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `HMM_ENABLED` | False | Master enable |
+| `HMM_N_STATES` | 3 | Hidden states |
+| `HMM_N_ITER` | 100 | Baum-Welch iterations |
+| `HMM_COVARIANCE_TYPE` | "diag" | Gaussian covariance structure |
+| `HMM_INFERENCE_WINDOW` | 50 | Observations per inference |
+| `HMM_CONFIDENCE_THRESHOLD` | 0.15 | Min confidence for non-zero bias |
+| `HMM_RETRAIN_INTERVAL_SEC` | 86400.0 | Retrain period (1 day) |
+| `HMM_BIAS_GAIN` | 1.0 | Scales bias magnitude |
+| `HMM_BLEND_WITH_TREND` | 0.5 | Blend ratio (0=HMM, 1=trend) |
+
+## 18. Capital Layers
 
 Manual vertical scaling system for order sizes.
 
@@ -413,7 +529,7 @@ Manual vertical scaling system for order sizes.
 | `CAPITAL_LAYER_BALANCE_BUFFER` | 1.5 | Safety margin for balance check |
 | `CAPITAL_LAYER_DEFAULT_SOURCE` | "auto" | Funding source (auto/doge/usd) |
 
-## 17. Slot Aliases
+## 19. Slot Aliases
 
 Human-friendly names for slots from configurable pool.
 
@@ -422,7 +538,7 @@ Human-friendly names for slots from configurable pool.
 - Fallback when pool exhausted: `doge-NN` (incrementing counter).
 - Config: `SLOT_ALIAS_POOL` (comma-separated env var).
 
-## 18. Reconciliation and Exactly-Once Fill Accounting
+## 20. Reconciliation and Exactly-Once Fill Accounting
 
 Startup reconciliation (`_reconcile_open_orders`):
 
@@ -443,7 +559,7 @@ Exactly-once guard:
 - `seen_fill_txids` in memory + persisted snapshot
 - Closed-order polling and replay both honor this set
 
-## 19. Persistence Model
+## 21. Persistence Model
 
 Primary snapshot key:
 
@@ -460,6 +576,8 @@ Snapshot payload includes:
 - **trend state**: `_trend_fast_ema`, `_trend_slow_ema`, `_trend_score`, `_trend_dynamic_target`, `_trend_smoothed_target`, `_trend_target_locked_until`, `_trend_last_update_ts`
 - **daily loss lock state**: `_daily_loss_lock_active`, `_daily_loss_lock_utc_day`, `_daily_realized_loss_utc`
 - **capital layer state**: `target_layers`, `effective_layers`
+- **OHLCV pipeline state**: `ohlcv_since_cursor`, `ohlcv_last_sync_ts`, `ohlcv_last_candle_ts`
+- **HMM regime state**: `_hmm_regime_state` (RegimeState dict), `_hmm_last_train_ts`, `_hmm_trained`
 
 Fields absent from old snapshots default to safe values (backward compatible).
 
@@ -471,7 +589,7 @@ Event log:
 
 If Supabase tables are missing, bot logs warnings and continues running.
 
-## 20. Dashboard and API Contract
+## 22. Dashboard and API Contract
 
 HTTP server:
 
@@ -498,7 +616,7 @@ Supported dashboard actions:
 - `reconcile_drift` (cancel Kraken-only orders not tracked internally)
 - `audit_pnl` (recompute P&L from completed cycles)
 
-### 20.1 `/api/status` Payload Blocks
+### 22.1 `/api/status` Payload Blocks
 
 **`capacity_fill_health`**: manual scaling diagnostics:
 
@@ -527,13 +645,27 @@ Supported dashboard actions:
 
 **`open_order_drift_hint`**: persistent drift alert state.
 
-### 20.2 `status_band` thresholds
+**`hmm_data_pipeline`**: OHLCV collection readiness (§16):
+
+- `enabled`, `source`, `interval_min`, `samples`, `coverage_pct`
+- `ready_for_min_train`, `ready_for_target_window`, `gaps`
+- `freshness_ok`, `volume_coverage_pct`, `span_hours`
+- `sync_interval_sec`, `last_sync_ts`, `last_sync_rows_queued`, `sync_cursor`
+
+**`hmm_regime`**: HMM regime detector state (§17):
+
+- `enabled`, `available`, `trained`, `regime`, `regime_id`
+- `confidence`, `bias_signal`, `blend_factor`
+- `probabilities` (`bearish`, `ranging`, `bullish`)
+- `observation_count`, `last_update_ts`, `last_train_ts`, `error`
+
+### 22.2 `status_band` thresholds
 
 - `stop` when `open_order_headroom < 10` or `partial_fill_cancel_events_1d > 0`
 - `caution` when `open_order_headroom < 20` (and stop conditions are false)
 - `normal` otherwise
 
-## 21. Telegram Command Contract
+## 23. Telegram Command Contract
 
 Supported commands:
 
@@ -550,7 +682,7 @@ Callback format for interactive soft-close:
 
 - `sc:<slot_id>:<recovery_id>`
 
-## 22. Operational Guardrails
+## 24. Operational Guardrails
 
 Automatic pauses:
 
@@ -578,13 +710,14 @@ Signal handling:
 
 - `SIGTERM`, `SIGINT` (and `SIGBREAK` on Windows) trigger graceful shutdown
 
-## 23. Developer Notes
+## 25. Developer Notes
 
 When updating behavior, update these files together:
 
 1. `state_machine.py` for reducer semantics and invariants
 2. `bot.py` for runtime side effects / bootstrap / guardrails
-3. `tests/test_hardening_regressions.py` for regression coverage
-4. `STATE_MACHINE.md` for contract parity
+3. `hmm_regime_detector.py` for HMM model / feature extraction / integration helpers
+4. `tests/test_hardening_regressions.py` for regression coverage
+5. `STATE_MACHINE.md` for contract parity
 
 This document is intentionally code-truth first: if this file and code diverge, code wins and doc must be updated in the same change.
