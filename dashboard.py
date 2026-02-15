@@ -362,6 +362,8 @@ DASHBOARD_HTML = """<!doctype html>
         <div class=\"row\"><span class=\"k\">Status</span><span id=\"hmmStatus\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Source</span><span id=\"hmmSource\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Regime</span><span id=\"hmmRegime\" class=\"v\"></span></div>
+        <div class=\"row\" id=\"hmmRegime1mRow\" style=\"display:none\"><span class=\"k\">&nbsp;&nbsp;1m</span><span id=\"hmmRegime1m\" class=\"v\"></span></div>
+        <div class=\"row\" id=\"hmmRegime15mRow\" style=\"display:none\"><span class=\"k\">&nbsp;&nbsp;15m</span><span id=\"hmmRegime15m\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Confidence</span><span id=\"hmmConfidence\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Bias Signal</span><span id=\"hmmBias\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Blend</span><span id=\"hmmBlend\" class=\"v\"></span></div>
@@ -1259,6 +1261,25 @@ DASHBOARD_HTML = """<!doctype html>
       const regimeId = hmm.regime_id;
       document.getElementById('hmmRegime').textContent =
         regimeId === null || regimeId === undefined ? regimeLabel : `${regimeLabel} (id ${regimeId})`;
+
+      const hmmPrimary = hmm.primary || {};
+      const hmmSecondary = hmm.secondary || {};
+      const isMultiTF = Boolean(hmm.multi_timeframe) && hmmPrimary.regime && hmmSecondary.regime;
+      const row1m = document.getElementById('hmmRegime1mRow');
+      const row15m = document.getElementById('hmmRegime15mRow');
+      if (isMultiTF) {
+        row1m.style.display = '';
+        row15m.style.display = '';
+        const conf1m = hmmPrimary.confidence;
+        const conf15m = hmmSecondary.confidence;
+        const confStr1m = conf1m === null || conf1m === undefined ? '' : ` (${fmt(Number(conf1m) * 100, 0)}%)`;
+        const confStr15m = conf15m === null || conf15m === undefined ? '' : ` (${fmt(Number(conf15m) * 100, 0)}%)`;
+        document.getElementById('hmmRegime1m').textContent = `${String(hmmPrimary.regime)}${confStr1m}`;
+        document.getElementById('hmmRegime15m').textContent = `${String(hmmSecondary.regime)}${confStr15m}`;
+      } else {
+        row1m.style.display = 'none';
+        row15m.style.display = 'none';
+      }
 
       const confidence = hmm.confidence;
       document.getElementById('hmmConfidence').textContent =
