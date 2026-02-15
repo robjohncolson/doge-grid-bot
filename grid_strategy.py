@@ -42,6 +42,29 @@ logger = logging.getLogger(__name__)
 # Lock serializing all recovery operations (soft_free, cancel_all)
 _recovery_lock = threading.Lock()
 
+_REGIME_TEXT_TO_ID = {"BEARISH": 0, "RANGING": 1, "BULLISH": 2}
+
+
+def _normalize_regime_id(raw) -> int | None:
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return int(raw)
+    if isinstance(raw, int):
+        return raw if raw in (0, 1, 2) else None
+    if isinstance(raw, float):
+        i = int(raw)
+        return i if i in (0, 1, 2) else None
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return None
+        if s.isdigit():
+            i = int(s)
+            return i if i in (0, 1, 2) else None
+        return _REGIME_TEXT_TO_ID.get(s.upper())
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -67,7 +90,8 @@ class CompletedCycle:
     def __init__(self, trade_id: str, cycle: int, entry_side: str,
                  entry_price: float, exit_price: float, volume: float,
                  gross_profit: float, fees: float, net_profit: float,
-                 entry_time: float = 0.0, exit_time: float = 0.0):
+                 entry_time: float = 0.0, exit_time: float = 0.0,
+                 regime_at_entry: int | None = None):
         self.trade_id = trade_id
         self.cycle = cycle
         self.entry_side = entry_side
@@ -79,6 +103,7 @@ class CompletedCycle:
         self.net_profit = net_profit
         self.entry_time = entry_time
         self.exit_time = exit_time
+        self.regime_at_entry = _normalize_regime_id(regime_at_entry)
 
     def to_dict(self) -> dict:
         return {
@@ -93,6 +118,7 @@ class CompletedCycle:
             "net_profit": round(self.net_profit, 6),
             "entry_time": self.entry_time,
             "exit_time": self.exit_time,
+            "regime_at_entry": self.regime_at_entry,
         }
 
     @staticmethod
@@ -109,6 +135,7 @@ class CompletedCycle:
             net_profit=d.get("net_profit", 0.0),
             entry_time=d.get("entry_time", 0.0),
             exit_time=d.get("exit_time", 0.0),
+            regime_at_entry=_normalize_regime_id(d.get("regime_at_entry")),
         )
 
     def __repr__(self):

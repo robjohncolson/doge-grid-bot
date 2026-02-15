@@ -62,6 +62,80 @@ class DogeV1StateMachineTests(unittest.TestCase):
         self.assertEqual(exit_order.volume, 27.0)
         self.assertTrue(any(isinstance(x, sm.PlaceOrderAction) and x.role == "exit" for x in actions))
 
+    def test_entry_fill_carries_regime_tag_to_exit_order(self):
+        st = sm.PairState(
+            market_price=0.1,
+            now=1000.0,
+            orders=(
+                sm.OrderState(
+                    local_id=1,
+                    side="buy",
+                    role="entry",
+                    price=0.0998,
+                    volume=13.0,
+                    trade_id="B",
+                    cycle=1,
+                    txid="TX-B-ENTRY",
+                    placed_at=999.0,
+                    regime_at_entry=2,
+                ),
+            ),
+            next_order_id=2,
+        )
+        cfg = self._cfg()
+        fill = sm.FillEvent(
+            order_local_id=1,
+            txid="TX-B-ENTRY",
+            side="buy",
+            price=0.0998,
+            volume=13.0,
+            fee=0.01,
+            timestamp=1010.0,
+        )
+
+        st2, _ = sm.transition(st, fill, cfg, order_size_usd=2.0)
+        exit_order = next(o for o in st2.orders if o.role == "exit")
+        self.assertEqual(exit_order.regime_at_entry, 2)
+
+    def test_exit_fill_carries_regime_tag_to_cycle_record(self):
+        st = sm.PairState(
+            market_price=0.1,
+            now=1000.0,
+            orders=(
+                sm.OrderState(
+                    local_id=1,
+                    side="sell",
+                    role="exit",
+                    price=0.1008,
+                    volume=13.0,
+                    trade_id="A",
+                    cycle=1,
+                    txid="TX-A-EXIT",
+                    placed_at=999.0,
+                    entry_price=0.1,
+                    entry_fee=0.0,
+                    entry_filled_at=950.0,
+                    regime_at_entry=0,
+                ),
+            ),
+            cycle_a=1,
+            cycle_b=1,
+        )
+        cfg = self._cfg()
+        fill = sm.FillEvent(
+            order_local_id=1,
+            txid="TX-A-EXIT",
+            side="sell",
+            price=0.1008,
+            volume=13.0,
+            fee=0.01,
+            timestamp=1010.0,
+        )
+
+        st2, _ = sm.transition(st, fill, cfg, order_size_usd=2.0)
+        self.assertTrue(st2.completed_cycles)
+        self.assertEqual(st2.completed_cycles[-1].regime_at_entry, 0)
+
     def test_exit_fill_applies_base_reentry_cooldown(self):
         st = sm.PairState(
             market_price=0.1,
@@ -615,6 +689,29 @@ class BotEventLogTests(unittest.TestCase):
             cfg_active = rt._engine_cfg(slot)
         self.assertAlmostEqual(float(cfg_active.entry_pct_a), 0.525)
         self.assertAlmostEqual(float(cfg_active.entry_pct_b), 0.245)
+
+    def test_slot_order_size_usd_applies_kelly_multiplier(self):
+        rt = bot.BotRuntime()
+        rt._kelly = mock.Mock()
+        rt._kelly.size_for_slot.return_value = (3.5, "kelly_aggregate")
+        slot = bot.SlotRuntime(
+            slot_id=0,
+            state=sm.PairState(
+                market_price=0.1,
+                now=1000.0,
+                total_profit=0.0,
+            ),
+        )
+
+        with mock.patch.object(config, "ORDER_SIZE_USD", 2.0):
+            with mock.patch.object(config, "REBALANCE_ENABLED", False):
+                with mock.patch.object(rt, "_recompute_effective_layers", return_value={"effective_layers": 0}):
+                    with mock.patch.object(rt, "_layer_mark_price", return_value=0.1):
+                        with mock.patch.object(rt, "_current_regime_id", return_value=2):
+                            out = rt._slot_order_size_usd(slot, trade_id="A")
+
+        self.assertAlmostEqual(out, 3.5)
+        rt._kelly.size_for_slot.assert_called_once_with(2.0, regime_label="bullish")
 
     @mock.patch("supabase_store.save_fill")
     def test_replay_missed_fills_aggregates_and_applies_once(self, _save_fill):
@@ -1900,6 +1997,7 @@ class BotEventLogTests(unittest.TestCase):
             entry_time=900.0,
             exit_time=1000.0,
             from_recovery=False,
+            regime_at_entry=0,
         )
         rt.slots = {
             0: bot.SlotRuntime(
@@ -1912,9 +2010,9 @@ class BotEventLogTests(unittest.TestCase):
             )
         }
         rt._hmm_state.update({
-            "regime": "BEARISH",
+            "regime": "BULLISH",
             "confidence": 0.60,
-            "bias_signal": -0.40,
+            "bias_signal": 0.40,
         })
         rt._regime_tier = 1
 
@@ -1937,10 +2035,67 @@ class BotEventLogTests(unittest.TestCase):
         self.assertEqual(row["trade"], "A")
         self.assertEqual(row["cycle"], 3)
         self.assertEqual(row["resolution"], "normal")
-        self.assertEqual(row["regime_at_entry"], "BEARISH")
+        self.assertEqual(row["regime_at_entry"], 0)
         self.assertEqual(row["regime_tier"], 1)
-        self.assertEqual(row["against_trend"], False)
+        self.assertEqual(row["against_trend"], True)
         self.assertAlmostEqual(row["total_age_sec"], 100.0)
+
+    def test_execute_actions_stamps_exit_order_regime_at_entry(self):
+        rt = bot.BotRuntime()
+        now = time.time()
+        rt.last_price = 0.1
+        rt.last_price_ts = now
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=now,
+                    orders=(
+                        sm.OrderState(
+                            local_id=2,
+                            side="sell",
+                            role="exit",
+                            price=0.101,
+                            volume=13.0,
+                            trade_id="B",
+                            cycle=1,
+                            txid="",
+                            placed_at=now,
+                            entry_price=0.1,
+                            entry_fee=0.01,
+                            entry_filled_at=now - 5.0,
+                        ),
+                    ),
+                    next_order_id=3,
+                ),
+            ),
+        }
+        rt._hmm_state.update({
+            "available": True,
+            "trained": True,
+            "regime_id": 2,
+        })
+        action = sm.PlaceOrderAction(
+            local_id=2,
+            side="sell",
+            role="exit",
+            price=0.101,
+            volume=13.0,
+            trade_id="B",
+            cycle=1,
+            reason="entry_fill_exit",
+        )
+
+        with mock.patch.object(config, "HMM_ENABLED", True):
+            with mock.patch.object(rt, "_try_reserve_loop_funds", return_value=True):
+                with mock.patch.object(rt, "_place_order", return_value="TX-EXIT"):
+                    rt._execute_actions(0, [action], "unit_test")
+
+        stamped = sm.find_order(rt.slots[0].state, 2)
+        self.assertIsNotNone(stamped)
+        self.assertEqual(stamped.regime_at_entry, 2)
+        self.assertEqual(stamped.txid, "TX-EXIT")
 
     def test_dynamic_idle_target_blends_with_hmm_bias_when_enabled(self):
         def _mk_runtime() -> bot.BotRuntime:

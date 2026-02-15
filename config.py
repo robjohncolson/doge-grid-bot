@@ -503,6 +503,31 @@ CONSENSUS_15M_WEIGHT: float = _env("CONSENSUS_15M_WEIGHT", 0.7, float)
 CONSENSUS_DAMPEN_FACTOR: float = _env("CONSENSUS_DAMPEN_FACTOR", 0.5, float)
 
 # ---------------------------------------------------------------------------
+# Kelly criterion position sizing (advisory sizing layer)
+# ---------------------------------------------------------------------------
+
+# Master toggle: when disabled, runtime sizing is unchanged.
+KELLY_ENABLED: bool = _env("KELLY_ENABLED", False, bool)
+# Fractional Kelly multiplier (0.25 = quarter Kelly).
+KELLY_FRACTION: float = _env("KELLY_FRACTION", 0.25, float)
+# Global sample gate before Kelly activates.
+KELLY_MIN_SAMPLES: int = _env("KELLY_MIN_SAMPLES", 30, int)
+# Per-regime sample gate before regime-specific Kelly is used.
+KELLY_MIN_REGIME_SAMPLES: int = _env("KELLY_MIN_REGIME_SAMPLES", 15, int)
+# Rolling window size for cycle history used in Kelly computation.
+KELLY_LOOKBACK: int = _env("KELLY_LOOKBACK", 500, int)
+# Lower/upper bounds for Kelly sizing multiplier.
+KELLY_FLOOR_MULT: float = _env("KELLY_FLOOR_MULT", 0.5, float)
+KELLY_CEILING_MULT: float = _env("KELLY_CEILING_MULT", 2.0, float)
+# Multiplier used when Kelly detects no edge (still clamped by floor/ceiling).
+KELLY_NEGATIVE_EDGE_MULT: float = _env("KELLY_NEGATIVE_EDGE_MULT", 0.5, float)
+# Recency weighting controls.
+KELLY_RECENCY_WEIGHTING: bool = _env("KELLY_RECENCY_WEIGHTING", True, bool)
+KELLY_RECENCY_HALFLIFE: int = _env("KELLY_RECENCY_HALFLIFE", 100, int)
+# Emit Kelly summary logs at update cadence.
+KELLY_LOG_UPDATES: bool = _env("KELLY_LOG_UPDATES", True, bool)
+
+# ---------------------------------------------------------------------------
 # Directional regime controls (Phase 0 shadow mode defaults)
 # ---------------------------------------------------------------------------
 

@@ -56,7 +56,7 @@ create table if not exists public.exit_outcomes (
   gross_profit_usd double precision,
   fees_usd double precision,
   net_profit_usd double precision not null,
-  regime_at_entry text,
+  regime_at_entry integer,
   regime_confidence numeric,
   regime_bias_signal numeric,
   against_trend boolean,

@@ -389,6 +389,13 @@ DASHBOARD_HTML = """<!doctype html>
         <div class=\"row\"><span class=\"k\">Data Window (15m)</span><span id=\"hmmWindowSecondary\" class=\"v\"></span></div>
         <div id=\"hmmHints\" class=\"tiny\"></div>
 
+        <h3 style=\"margin-top:14px\">Kelly Sizing</h3>
+        <div class=\"row\"><span class=\"k\">Status</span><span id=\"kellyStatus\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Active Regime</span><span id=\"kellyActive\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Fraction</span><span id=\"kellyFraction\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Samples</span><span id=\"kellySamples\" class=\"v\"></span></div>
+        <div id=\"kellyBuckets\" class=\"tiny\"></div>
+
         <h3 style=\"margin-top:14px\">Directional Regime</h3>
         <div class=\"row\"><span class=\"k\">Tier</span><span id=\"regTier\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Suppressed</span><span id=\"regSuppressed\" class=\"v\"></span></div>
@@ -1386,6 +1393,48 @@ DASHBOARD_HTML = """<!doctype html>
       }
       document.getElementById('hmmHints').textContent =
         hmmHints.length ? `Hints: ${hmmHints.join(' | ')}` : '';
+
+      const kelly = s.kelly || { enabled: false };
+      const kellyStatusEl = document.getElementById('kellyStatus');
+      const kellyEnabled = Boolean(kelly.enabled);
+      const kellyAggregate = (kelly && typeof kelly.aggregate === 'object') ? kelly.aggregate : null;
+      const kellyActive = Boolean(kellyAggregate && kellyAggregate.sufficient_data);
+      if (!kellyEnabled) {
+        kellyStatusEl.textContent = 'OFF';
+        kellyStatusEl.style.color = '';
+      } else if (kellyActive) {
+        kellyStatusEl.textContent = 'ACTIVE';
+        kellyStatusEl.style.color = 'var(--good)';
+      } else {
+        kellyStatusEl.textContent = 'WARMING';
+        kellyStatusEl.style.color = 'var(--warn)';
+      }
+      document.getElementById('kellyActive').textContent = String(kelly.active_regime || '-');
+      const kellyFraction = Number(kelly.kelly_fraction || 0);
+      document.getElementById('kellyFraction').textContent =
+        kellyEnabled ? `${fmt(kellyFraction * 100, 1)}%` : '-';
+      document.getElementById('kellySamples').textContent =
+        kellyEnabled ? String(Number(kelly.last_update_n || 0)) : '-';
+
+      const kellyBucketNames = ['aggregate', 'bullish', 'ranging', 'bearish'];
+      const kellyBits = [];
+      for (const name of kellyBucketNames) {
+        const row = (kelly && typeof kelly[name] === 'object') ? kelly[name] : null;
+        if (!row) {
+          kellyBits.push(`${name}: no_data`);
+          continue;
+        }
+        const n = Number(row.n_total || 0);
+        if (Boolean(row.sufficient_data)) {
+          const mult = row.multiplier;
+          const edge = row.edge;
+          kellyBits.push(`${name}: m=${fmt(mult, 3)} edge=${fmt(edge, 3)} n=${n}`);
+        } else {
+          kellyBits.push(`${name}: ${String(row.reason || 'insufficient_samples')} n=${n}`);
+        }
+      }
+      document.getElementById('kellyBuckets').textContent =
+        kellyEnabled ? kellyBits.join(' | ') : 'Kelly disabled';
 
       // --- Directional Regime ---
       const reg = s.regime_directional || {};

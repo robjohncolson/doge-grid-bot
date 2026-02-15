@@ -22,6 +22,33 @@ Role = Literal["entry", "exit"]
 TradeId = Literal["A", "B"]
 PairPhase = Literal["S0", "S1a", "S1b", "S2"]
 
+_REGIME_TEXT_TO_ID = {
+    "BEARISH": 0,
+    "RANGING": 1,
+    "BULLISH": 2,
+}
+
+
+def _normalize_regime_id(raw: object) -> int | None:
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return int(raw)
+    if isinstance(raw, int):
+        return raw if raw in (0, 1, 2) else None
+    if isinstance(raw, float):
+        i = int(raw)
+        return i if i in (0, 1, 2) else None
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return None
+        if s.isdigit():
+            i = int(s)
+            return i if i in (0, 1, 2) else None
+        return _REGIME_TEXT_TO_ID.get(s.upper())
+    return None
+
 
 @dataclass(frozen=True)
 class EngineConfig:
@@ -67,6 +94,7 @@ class OrderState:
     entry_price: float = 0.0
     entry_fee: float = 0.0
     entry_filled_at: float = 0.0
+    regime_at_entry: int | None = None
 
 
 @dataclass(frozen=True)
@@ -83,6 +111,7 @@ class RecoveryOrder:
     entry_filled_at: float = 0.0
     txid: str = ""
     reason: str = "stale"
+    regime_at_entry: int | None = None
 
 
 @dataclass(frozen=True)
@@ -98,6 +127,7 @@ class CycleRecord:
     entry_time: float = 0.0
     exit_time: float = 0.0
     from_recovery: bool = False
+    regime_at_entry: int | None = None
 
 
 @dataclass(frozen=True)
@@ -543,16 +573,72 @@ def to_dict(state: PairState) -> dict:
     }
 
 
+def _order_from_dict(data: dict) -> OrderState:
+    return OrderState(
+        local_id=int(data.get("local_id", 0)),
+        side=str(data.get("side") or "buy"),  # type: ignore[arg-type]
+        role=str(data.get("role") or "entry"),  # type: ignore[arg-type]
+        price=float(data.get("price", 0.0)),
+        volume=float(data.get("volume", 0.0)),
+        trade_id=str(data.get("trade_id") or "A"),  # type: ignore[arg-type]
+        cycle=int(data.get("cycle", 0)),
+        txid=str(data.get("txid") or ""),
+        placed_at=float(data.get("placed_at", 0.0)),
+        entry_price=float(data.get("entry_price", 0.0)),
+        entry_fee=float(data.get("entry_fee", 0.0)),
+        entry_filled_at=float(data.get("entry_filled_at", 0.0)),
+        regime_at_entry=_normalize_regime_id(data.get("regime_at_entry")),
+    )
+
+
+def _recovery_from_dict(data: dict) -> RecoveryOrder:
+    return RecoveryOrder(
+        recovery_id=int(data.get("recovery_id", 0)),
+        side=str(data.get("side") or "buy"),  # type: ignore[arg-type]
+        price=float(data.get("price", 0.0)),
+        volume=float(data.get("volume", 0.0)),
+        trade_id=str(data.get("trade_id") or "A"),  # type: ignore[arg-type]
+        cycle=int(data.get("cycle", 0)),
+        entry_price=float(data.get("entry_price", 0.0)),
+        orphaned_at=float(data.get("orphaned_at", 0.0)),
+        entry_fee=float(data.get("entry_fee", 0.0)),
+        entry_filled_at=float(data.get("entry_filled_at", 0.0)),
+        txid=str(data.get("txid") or ""),
+        reason=str(data.get("reason") or "stale"),
+        regime_at_entry=_normalize_regime_id(data.get("regime_at_entry")),
+    )
+
+
+def _cycle_from_dict(data: dict) -> CycleRecord:
+    return CycleRecord(
+        trade_id=str(data.get("trade_id") or "A"),  # type: ignore[arg-type]
+        cycle=int(data.get("cycle", 0)),
+        entry_price=float(data.get("entry_price", 0.0)),
+        exit_price=float(data.get("exit_price", 0.0)),
+        volume=float(data.get("volume", 0.0)),
+        gross_profit=float(data.get("gross_profit", 0.0)),
+        fees=float(data.get("fees", 0.0)),
+        net_profit=float(data.get("net_profit", 0.0)),
+        entry_time=float(data.get("entry_time", 0.0)),
+        exit_time=float(data.get("exit_time", 0.0)),
+        from_recovery=bool(data.get("from_recovery", False)),
+        regime_at_entry=_normalize_regime_id(data.get("regime_at_entry")),
+    )
+
+
 def from_dict(data: dict) -> PairState:
     mode_source = str(data.get("mode_source", "none") or "none").strip().lower()
     if mode_source not in {"none", "balance", "regime"}:
         mode_source = "none"
+    raw_orders = data.get("orders", [])
+    raw_recovery = data.get("recovery_orders", [])
+    raw_cycles = data.get("completed_cycles", [])
     return PairState(
         market_price=float(data.get("market_price", 0.0)),
         now=float(data.get("now", 0.0)),
-        orders=tuple(OrderState(**o) for o in data.get("orders", [])),
-        recovery_orders=tuple(RecoveryOrder(**r) for r in data.get("recovery_orders", [])),
-        completed_cycles=tuple(CycleRecord(**c) for c in data.get("completed_cycles", [])),
+        orders=tuple(_order_from_dict(o) for o in raw_orders if isinstance(o, dict)),
+        recovery_orders=tuple(_recovery_from_dict(r) for r in raw_recovery if isinstance(r, dict)),
+        completed_cycles=tuple(_cycle_from_dict(c) for c in raw_cycles if isinstance(c, dict)),
         cycle_a=int(data.get("cycle_a", 1)),
         cycle_b=int(data.get("cycle_b", 1)),
         next_order_id=int(data.get("next_order_id", 1)),
@@ -610,6 +696,7 @@ def _book_cycle(
         entry_time=order.entry_filled_at,
         exit_time=timestamp,
         from_recovery=from_recovery,
+        regime_at_entry=order.regime_at_entry,
     )
     total_loss = state.today_realized_loss + (abs(net) if net < 0 else 0.0)
     st = replace(
@@ -740,6 +827,7 @@ def _orphan_exit(
                     entry_price=rec.entry_price,
                     entry_fee=float(rec.entry_fee),
                     entry_filled_at=float(rec.entry_filled_at if rec.entry_filled_at > 0 else rec.orphaned_at),
+                    regime_at_entry=rec.regime_at_entry,
                 )
                 st, cycle_record, book_action = _book_cycle(
                     st,
@@ -769,6 +857,7 @@ def _orphan_exit(
         orphaned_at=st.now,
         txid=order.txid,
         reason=reason,
+        regime_at_entry=order.regime_at_entry,
     )
     st = replace(
         st,
@@ -995,6 +1084,7 @@ def transition(
                 entry_price=event.price,
                 entry_fee=event.fee,
                 entry_filled_at=event.timestamp,
+                regime_at_entry=order.regime_at_entry,
             )
             st = replace(st, orders=st.orders + (exit_order,), next_order_id=exit_local + 1)
             actions.append(
@@ -1052,6 +1142,7 @@ def transition(
             entry_price=rec.entry_price,
             entry_fee=rec.entry_fee,
             entry_filled_at=rec.entry_filled_at if rec.entry_filled_at > 0 else rec.orphaned_at,
+            regime_at_entry=rec.regime_at_entry,
         )
         st, cycle_record, book_action = _book_cycle(st, pseudo_order, event.price, event.fee, event.timestamp, from_recovery=True)
         st = _update_loss_counters(st, rec.trade_id, cycle_record.net_profit, cfg)
@@ -1073,6 +1164,16 @@ def transition(
 
 def apply_order_txid(state: PairState, local_id: int, txid: str) -> PairState:
     return _bind_order_txid(state, local_id, txid)
+
+
+def apply_order_regime_at_entry(state: PairState, local_id: int, regime_at_entry: int | None) -> PairState:
+    patched = []
+    for o in state.orders:
+        if o.local_id == local_id:
+            patched.append(replace(o, regime_at_entry=_normalize_regime_id(regime_at_entry)))
+        else:
+            patched.append(o)
+    return replace(state, orders=tuple(patched))
 
 
 def apply_recovery_txid(state: PairState, recovery_id: int, txid: str) -> PairState:

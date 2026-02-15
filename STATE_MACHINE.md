@@ -235,6 +235,8 @@ layer_usd = effective_layers * CAPITAL_LAYER_DOGE_PER_ORDER * market_price
 base_with_layers = max(base, base + layer_usd)
 ```
 
+Kelly criterion sizing (master toggle `KELLY_ENABLED`) is an advisory layer applied after `base_with_layers` and before rebalancer skew. Contract and rollout details: `KELLY_SPEC.md` and `docs/KELLY_IMPLEMENTATION_PLAN.md`.
+
 If rebalancer is enabled and skew is nonzero, the favored side is scaled up:
 
 ```

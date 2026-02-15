@@ -30,6 +30,7 @@ from typing import Any
 import config
 import dashboard
 import kraken_client
+from kelly_sizer import KellyConfig, KellySizer
 import notifier
 import state_machine as sm
 import supabase_store
@@ -353,6 +354,22 @@ class BotRuntime:
         self._sticky_release_last_at: float = 0.0
         self._release_recon_blocked: bool = False
         self._release_recon_blocked_reason: str = ""
+        self._kelly: KellySizer | None = None
+        if bool(getattr(config, "KELLY_ENABLED", False)):
+            self._kelly = KellySizer(
+                KellyConfig(
+                    kelly_fraction=float(getattr(config, "KELLY_FRACTION", 0.25)),
+                    min_samples_total=int(getattr(config, "KELLY_MIN_SAMPLES", 30)),
+                    min_samples_per_regime=int(getattr(config, "KELLY_MIN_REGIME_SAMPLES", 15)),
+                    lookback_cycles=int(getattr(config, "KELLY_LOOKBACK", 500)),
+                    kelly_floor_mult=float(getattr(config, "KELLY_FLOOR_MULT", 0.5)),
+                    kelly_ceiling_mult=float(getattr(config, "KELLY_CEILING_MULT", 2.0)),
+                    negative_edge_mult=float(getattr(config, "KELLY_NEGATIVE_EDGE_MULT", 0.5)),
+                    use_recency_weighting=bool(getattr(config, "KELLY_RECENCY_WEIGHTING", True)),
+                    recency_halflife_cycles=int(getattr(config, "KELLY_RECENCY_HALFLIFE", 100)),
+                    log_kelly_updates=bool(getattr(config, "KELLY_LOG_UPDATES", True)),
+                )
+            )
         self._init_hmm_runtime()
 
     # ------------------ Config/State ------------------
@@ -653,6 +670,12 @@ class BotRuntime:
         if layer_price > 0:
             layer_usd = effective_layers * max(0.0, float(config.CAPITAL_LAYER_DOGE_PER_ORDER)) * layer_price
         base_with_layers = max(base, base + layer_usd)
+        if self._kelly is not None:
+            kelly_usd, _ = self._kelly.size_for_slot(
+                base_with_layers,
+                regime_label=self._kelly_regime_label(self._current_regime_id()),
+            )
+            base_with_layers = max(0.0, float(kelly_usd))
         if trade_id is None or not bool(config.REBALANCE_ENABLED):
             return base_with_layers
 
@@ -1106,6 +1129,8 @@ class BotRuntime:
             "release_recon_blocked": bool(self._release_recon_blocked),
             "release_recon_blocked_reason": str(self._release_recon_blocked_reason or ""),
         }
+        if self._kelly is not None:
+            snap["kelly_state"] = self._kelly.snapshot_state()
         snap.update(self._snapshot_hmm_state())
         return snap
 
@@ -1292,6 +1317,8 @@ class BotRuntime:
             self._rebalancer_sign_flip_history = deque(sorted(cleaned_hist)[-20:])
             self._restore_hmm_snapshot(snap)
             self._hmm_consensus = self._compute_hmm_consensus()
+            if self._kelly is not None:
+                self._kelly.restore_state(snap.get("kelly_state", {}))
 
             self.slots = {}
             slot_aliases = snap.get("slot_aliases", {})
@@ -1635,6 +1662,44 @@ class BotRuntime:
             and bool(source.get("trained"))
         )
         return regime, confidence, bias, ready, source
+
+    def _current_regime_id(self) -> int | None:
+        if not bool(getattr(config, "HMM_ENABLED", False)):
+            return None
+        source = dict(self._policy_hmm_source() or {})
+        if not (bool(source.get("available")) and bool(source.get("trained"))):
+            return None
+        try:
+            regime_id = int(source.get("regime_id", 1))
+        except (TypeError, ValueError):
+            return None
+        return regime_id if regime_id in (0, 1, 2) else None
+
+    @staticmethod
+    def _kelly_regime_label(regime_id: int | None) -> str:
+        return {0: "bearish", 1: "ranging", 2: "bullish"}.get(regime_id, "ranging")
+
+    def _collect_kelly_cycles(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for slot in self.slots.values():
+            for c in slot.state.completed_cycles:
+                rows.append(
+                    {
+                        "net_profit": float(c.net_profit),
+                        "regime_at_entry": c.regime_at_entry,
+                        "exit_time": float(c.exit_time or 0.0),
+                    }
+                )
+        return rows
+
+    def _update_kelly(self) -> None:
+        if self._kelly is None:
+            return
+        rows = self._collect_kelly_cycles()
+        self._kelly.update(
+            rows,
+            regime_label=self._kelly_regime_label(self._current_regime_id()),
+        )
 
     def _hmm_runtime_config(self, *, min_train_samples: int | None = None) -> dict[str, Any]:
         resolved_min_samples = max(
@@ -2484,6 +2549,7 @@ class BotRuntime:
             "last_eval_ts": float(now),
             "reason": reason,
         }
+        self._update_kelly()
 
     def _apply_tier2_suppression(self, now: float) -> None:
         if not bool(getattr(config, "REGIME_DIRECTIONAL_ENABLED", False)):
@@ -3917,6 +3983,12 @@ class BotRuntime:
 
         for action in actions:
             if isinstance(action, sm.PlaceOrderAction):
+                if action.role == "exit" and action.reason == "entry_fill_exit":
+                    slot.state = sm.apply_order_regime_at_entry(
+                        slot.state,
+                        action.local_id,
+                        self._current_regime_id(),
+                    )
                 # Pause/HALT blocks new entry placement; exits still allowed to reduce state risk.
                 if self.mode in ("PAUSED", "HALTED") and action.role == "entry":
                     slot.state = sm.remove_order(slot.state, action.local_id)
@@ -4089,8 +4161,7 @@ class BotRuntime:
             "gross_profit_usd": float(action.gross_profit),
             "fees_usd": float(action.fees),
             "net_profit_usd": float(action.net_profit),
-            # Phase 0: best-effort regime snapshot at outcome time.
-            "regime_at_entry": regime_name,
+            "regime_at_entry": cycle_record.regime_at_entry,
             "regime_confidence": float(regime_confidence),
             "regime_bias_signal": float(regime_bias),
             "against_trend": bool(against_trend),
@@ -6321,6 +6392,7 @@ class BotRuntime:
                 "hmm_data_pipeline_secondary": hmm_data_pipeline_secondary,
                 "hmm_regime": hmm_regime,
                 "hmm_consensus": hmm_consensus,
+                "kelly": (self._kelly.status_payload() if self._kelly is not None else {"enabled": False}),
                 "regime_directional": regime_directional,
                 "release_health": {
                     "sticky_release_total": int(self._sticky_release_total),
