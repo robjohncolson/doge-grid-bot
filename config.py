@@ -461,11 +461,11 @@ REBALANCE_INTERVAL_SEC: float = _env("REBALANCE_INTERVAL_SEC", 300.0, float)
 # HMM data pipeline (OHLCV collection/readiness)
 # ---------------------------------------------------------------------------
 
-# Persist 5-minute OHLCV candles for HMM training/readiness checks.
+# Persist OHLCV candles for HMM training/readiness checks.
 HMM_OHLCV_ENABLED: bool = _env("HMM_OHLCV_ENABLED", True, bool)
-HMM_OHLCV_INTERVAL_MIN: int = _env("HMM_OHLCV_INTERVAL_MIN", 5, int)
+HMM_OHLCV_INTERVAL_MIN: int = _env("HMM_OHLCV_INTERVAL_MIN", 1, int)
 # How often runtime pulls Kraken OHLC and upserts into Supabase.
-HMM_OHLCV_SYNC_INTERVAL_SEC: float = _env("HMM_OHLCV_SYNC_INTERVAL_SEC", 300.0, float)
+HMM_OHLCV_SYNC_INTERVAL_SEC: float = _env("HMM_OHLCV_SYNC_INTERVAL_SEC", 60.0, float)
 # Retention for persisted candles (days). 14 days ~= 4032 5m candles.
 HMM_OHLCV_RETENTION_DAYS: int = _env("HMM_OHLCV_RETENTION_DAYS", 14, int)
 # One-time startup backfill to accelerate first HMM training window.
