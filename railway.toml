@@ -1,9 +1,5 @@
 # Railway deployment configuration
-# This tells Railway how to run the bot as a worker process.
-
-[build]
-# No build step needed — pure Python, no dependencies to install.
-builder = "nixpacks"
+# Build uses Dockerfile in repository root.
 
 [deploy]
 # Run the bot as a long-running worker process.
