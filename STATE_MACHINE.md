@@ -1,6 +1,6 @@
 # DOGE State-Machine Bot v1
 
-Last updated: 2026-02-15 (rev 2)
+Last updated: 2026-02-15 (rev 3)
 Primary code references: `bot.py`, `state_machine.py`, `config.py`, `dashboard.py`, `supabase_store.py`, `hmm_regime_detector.py`
 
 ## 1. Scope
@@ -30,6 +30,7 @@ Core data model (`PairState`) is per slot and contains:
 - Active orders (`orders`)
 - Orphaned exits (`recovery_orders`)
 - Completed cycles (`completed_cycles`)
+- Regime vintage tags on orders/recoveries/cycles (`regime_at_entry`: `0`/`1`/`2` or `None`)
 - Cycle counters (`cycle_a`, `cycle_b`)
 - Risk counters and cooldown timers
 - Mode flags (`long_only`, `short_only`, `mode_source`)
@@ -136,6 +137,12 @@ Properties:
 
 All exchange effects happen in runtime after reducer returns.
 
+Runtime patch helpers in `state_machine.py` preserve reducer purity while allowing
+runtime annotations:
+
+- `apply_order_txid(...)` / `apply_recovery_txid(...)` bind exchange txids
+- `apply_order_regime_at_entry(...)` tags an order with regime vintage metadata
+
 ## 7. Event Transition Rules
 
 ### 7.1 `PriceTick`
@@ -170,12 +177,16 @@ If filled order is an entry:
 - Add opposite-side exit with:
   - exact filled volume
   - exit price via `_exit_price(...)`
+  - `regime_at_entry` copied from the filled entry order
 - Book entry fee immediately into `total_fees`
 - Emit `PlaceOrderAction` for new exit
+- Runtime stamps the newly-created exit order's `regime_at_entry` using current
+  policy HMM regime (`_current_regime_id`) before exchange placement.
 
 If filled order is an exit:
 
 - Book completed cycle (`_book_cycle`)
+- Booked cycle carries `regime_at_entry` from the filled exit order
 - Update realized loss counters and cooldown timers
 - Increment cycle counter for that trade (`cycle_a` or `cycle_b`)
 - Attempt follow-up entry for same trade unless blocked by:
@@ -187,6 +198,7 @@ If filled order is an exit:
 
 - Remove recovery record
 - Book cycle as `from_recovery=True`
+- Booked cycle carries `regime_at_entry` from the recovery record
 - Update loss counters
 
 ### 7.5 `RecoveryCancelEvent`
@@ -235,7 +247,30 @@ layer_usd = effective_layers * CAPITAL_LAYER_DOGE_PER_ORDER * market_price
 base_with_layers = max(base, base + layer_usd)
 ```
 
-Kelly criterion sizing (master toggle `KELLY_ENABLED`) is an advisory layer applied after `base_with_layers` and before rebalancer skew. Contract and rollout details: `KELLY_SPEC.md` and `docs/KELLY_IMPLEMENTATION_PLAN.md`.
+Kelly criterion sizing (master toggle `KELLY_ENABLED`) is an advisory layer
+applied after `base_with_layers` and before rebalancer skew.
+
+Kelly integration contract:
+
+- Runtime component: `KellySizer` (`kelly_sizer.py`) initialized in `bot.py`
+  from `KellyConfig`.
+- Update cadence: `_update_kelly()` is called during regime evaluation cadence
+  (`_update_regime_tier`) and recomputes Kelly stats from slot
+  `completed_cycles`.
+- Data used per cycle: `net_profit`, `exit_time`, and `regime_at_entry`.
+- Buckets: `aggregate` plus regime-specific buckets (`bearish`, `ranging`,
+  `bullish`).
+- Sample gates:
+  - global gate (`KELLY_MIN_SAMPLES`) for aggregate Kelly activation
+  - per-regime gate (`KELLY_MIN_REGIME_SAMPLES`) for regime-specific Kelly activation
+- Sizing application (`KellySizer.size_for_slot`):
+  - prefer current regime bucket; fallback to aggregate
+  - if insufficient data, passthrough base size unchanged
+  - if no edge, use `KELLY_NEGATIVE_EDGE_MULT` (clamped by floor/ceiling)
+  - otherwise apply Kelly multiplier (clamped by floor/ceiling)
+
+Detailed contracts and rollout guidance: `KELLY_SPEC.md`,
+`docs/KELLY_IMPLEMENTATION_PLAN.md`, `docs/KELLY_DEPLOY_CHECKLIST.md`.
 
 If rebalancer is enabled and skew is nonzero, the favored side is scaled up:
 
@@ -245,6 +280,22 @@ effective = base_with_layers * mult
 ```
 
 Fund guard: scaling never exceeds available balance for the favored side.
+
+### 9.1 Kelly Config
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `KELLY_ENABLED` | False | Master toggle for Kelly sizing |
+| `KELLY_FRACTION` | 0.25 | Fractional Kelly factor |
+| `KELLY_MIN_SAMPLES` | 30 | Minimum aggregate samples before activation |
+| `KELLY_MIN_REGIME_SAMPLES` | 15 | Minimum per-regime samples for regime-specific sizing |
+| `KELLY_LOOKBACK` | 500 | Rolling cycle lookback window |
+| `KELLY_FLOOR_MULT` | 0.5 | Minimum size multiplier clamp |
+| `KELLY_CEILING_MULT` | 2.0 | Maximum size multiplier clamp |
+| `KELLY_NEGATIVE_EDGE_MULT` | 0.5 | Multiplier when Kelly says no edge |
+| `KELLY_RECENCY_WEIGHTING` | True | Enable recency weighting |
+| `KELLY_RECENCY_HALFLIFE` | 100 | Recency weighting half-life (cycles) |
+| `KELLY_LOG_UPDATES` | True | Emit Kelly summary logs |
 
 ## 10. Invariants and Halt Policy
 
@@ -438,6 +489,11 @@ Persists interval-based OHLCV candles from Kraken into Supabase for HMM training
 - Normalizes rows, filters out the still-forming candle, and queues upserts to `ohlcv_candles` via `supabase_store.queue_ohlcv_candles()`.
 - Cursor (`_ohlcv_since_cursor`) is persisted in snapshot for incremental fetches across restarts.
 - Startup warmup: `_maybe_backfill_ohlcv_on_startup()` may call `backfill_ohlcv_history()` to queue additional historical candles when below target window.
+- Backfill pagination starts with `since=None` and advances only via Kraken's
+  returned `last` cursor.
+- Backfill stall breaker: if repeated backfills produce zero new unique candles,
+  attempts are blocked after `HMM_BACKFILL_MAX_STALLS` consecutive stalls until
+  operator/manual retry.
 
 ### 16.2 Storage
 
@@ -449,7 +505,7 @@ Supabase table `ohlcv_candles`:
 
 ### 16.3 Data Access
 
-- `_fetch_training_candles(count)`: loads up to `HMM_TRAINING_CANDLES` (default 2000) candles. Prefers Supabase; falls back to Kraken OHLC if Supabase has insufficient data.
+- `_fetch_training_candles(count)`: loads up to `HMM_TRAINING_CANDLES` (default 720) candles. Prefers Supabase; falls back to Kraken OHLC if Supabase has insufficient data.
 - `_fetch_recent_candles(count)`: loads `HMM_RECENT_CANDLES` (default 100) candles for inference.
 - Both return `(closes, volumes)` tuple of float lists.
 
@@ -476,7 +532,8 @@ Supabase table `ohlcv_candles`:
 | `HMM_OHLCV_RETENTION_DAYS` | 14 | Supabase retention period |
 | `HMM_OHLCV_BACKFILL_ON_STARTUP` | True | Attempt warmup backfill on startup |
 | `HMM_OHLCV_BACKFILL_MAX_PAGES` | 40 | Max Kraken pages in one backfill run |
-| `HMM_TRAINING_CANDLES` | 2000 | Target training window size |
+| `HMM_BACKFILL_MAX_STALLS` | 3 | Consecutive zero-progress backfills before breaker opens |
+| `HMM_TRAINING_CANDLES` | 720 | Target training window size |
 | `HMM_RECENT_CANDLES` | 100 | Inference window size |
 | `HMM_MIN_TRAIN_SAMPLES` | 500 | Minimum candles for training |
 | `HMM_READINESS_CACHE_SEC` | 300.0 | Readiness check cache TTL |
@@ -577,7 +634,7 @@ Dual-detector architecture: a fast primary (default 1m) and a slow secondary (de
 | `HMM_SECONDARY_INTERVAL_MIN` | 15 | Secondary candle interval |
 | `HMM_SECONDARY_OHLCV_ENABLED` | False | Enable secondary OHLCV collection |
 | `HMM_SECONDARY_SYNC_INTERVAL_SEC` | 300.0 | Secondary OHLCV pull cadence |
-| `HMM_SECONDARY_TRAINING_CANDLES` | 1000 | Secondary training window |
+| `HMM_SECONDARY_TRAINING_CANDLES` | 720 | Secondary training window |
 | `HMM_SECONDARY_RECENT_CANDLES` | 50 | Secondary inference window |
 | `HMM_SECONDARY_MIN_TRAIN_SAMPLES` | 200 | Minimum candles for secondary training |
 | `CONSENSUS_1M_WEIGHT` | 0.3 | 1m weight in consensus blend |
@@ -606,6 +663,8 @@ Specs: `docs/DIRECTIONAL_REGIME_SPEC.md`, `docs/TIER2_SIDE_SUPPRESSION_SPEC.md`,
 
 - **Hysteresis** (5%): on downgrades only, re-promotes if confidence is within buffer — but NEVER overrides the directional gate. If RANGING caused the downgrade, hysteresis cannot re-promote.
 - **Dwell time** (300s): minimum time at current tier before any transition.
+- **Tier 2 re-entry cooldown** (default 600s): after a 2→(1/0) downgrade,
+  re-entry into tier 2 is blocked for cooldown duration.
 - **Manual override**: `REGIME_MANUAL_OVERRIDE=BULLISH|BEARISH` forces regime with `REGIME_MANUAL_CONFIDENCE`.
 
 ### 18.2 Tier 1: Asymmetric Entry Spacing
@@ -637,6 +696,9 @@ Suppressed side mapping:
 `_ensure_slot_bootstrapped()` checks regime state before placing entries:
 
 - If tier 2 active + grace elapsed + suppressed side set: only place favored-side entry with `mode_source="regime"`
+- If tier is below 2 but cooldown is active (`regime_tier2_last_downgrade_at`
+  still within `REGIME_TIER2_REENTRY_COOLDOWN_SEC`): bootstrap still honors the
+  cooldown-suppressed side until cooldown expiry
 - If favored side isn't fundable: wait (never fall back to against-trend)
 - Priority: balance constraints > regime signal > symmetric
 
@@ -646,7 +708,15 @@ Suppressed side mapping:
 
 ### 18.6 Tier Downgrade Cleanup
 
-When tier drops from 2 to lower: `mode_source="regime"` is cleared to `"none"` on all slots. Auto-repair then restores missing sides when balance allows.
+When tier drops from 2 to lower:
+
+- Runtime records downgrade timestamp and prior suppressed side.
+- If `REGIME_TIER2_REENTRY_COOLDOWN_SEC <= 0`, `mode_source="regime"` is
+  cleared immediately (legacy behavior).
+- If cooldown is enabled (`>0`), regime ownership clear is deferred until
+  cooldown expiry (`_clear_expired_regime_cooldown`), and bootstrap continues
+  honoring the cooldown-suppressed side in the interim.
+- After clear, auto-repair may restore missing sides when balance allows.
 
 ### 18.7 Deferred Entry Purge
 
@@ -672,6 +742,7 @@ When tier drops from 2 to lower: `mode_source="regime"` is cleared to `"none"` o
 | `REGIME_HYSTERESIS` | 0.05 | Downgrade hysteresis buffer |
 | `REGIME_MIN_DWELL_SEC` | 300.0 | Min seconds at current tier |
 | `REGIME_SUPPRESSION_GRACE_SEC` | 60.0 | Grace before tier 2 cancellations |
+| `REGIME_TIER2_REENTRY_COOLDOWN_SEC` | 600.0 | Holdoff before tier-2 re-entry and suppression clear |
 | `REGIME_EVAL_INTERVAL_SEC` | 300.0 | Evaluation frequency |
 | `REGIME_MANUAL_OVERRIDE` | "" | Force regime (BULLISH/BEARISH or empty) |
 | `REGIME_MANUAL_CONFIDENCE` | 0.75 | Confidence for manual override |
@@ -742,10 +813,11 @@ Snapshot payload includes:
 - **daily loss lock state**: `_daily_loss_lock_active`, `_daily_loss_lock_utc_day`, `_daily_realized_loss_utc`
 - **capital layer state**: `target_layers`, `effective_layers`
 - **OHLCV pipeline state**: `ohlcv_since_cursor`, `ohlcv_last_sync_ts`, `ohlcv_last_candle_ts`
-- **HMM backfill state**: `hmm_backfill_last_at`, `hmm_backfill_last_rows`, `hmm_backfill_last_message` (primary + secondary)
+- **HMM backfill state**: `hmm_backfill_last_at`, `hmm_backfill_last_rows`, `hmm_backfill_last_message`, `hmm_backfill_stall_count` (primary + secondary)
 - **HMM regime state**: `_hmm_regime_state` (RegimeState dict), `_hmm_last_train_ts`, `_hmm_trained`
 - **HMM secondary state**: `hmm_state_secondary`, `hmm_consensus` (multi-timeframe)
-- **Directional regime state**: `regime_tier`, `regime_tier_entered_at`, `regime_tier2_grace_start`, `regime_side_suppressed`, `regime_last_eval_ts`, `regime_shadow_state`
+- **Kelly state**: `kelly_state` (active regime, last sample count, cached results)
+- **Directional regime state**: `regime_tier`, `regime_tier_entered_at`, `regime_tier2_grace_start`, `regime_tier2_last_downgrade_at`, `regime_cooldown_suppressed_side`, `regime_tier_history`, `regime_side_suppressed`, `regime_last_eval_ts`, `regime_shadow_state`
 
 Fields absent from old snapshots default to safe values (backward compatible).
 
@@ -815,11 +887,13 @@ Supported dashboard actions:
 
 **`hmm_data_pipeline`**: OHLCV collection readiness (§16):
 
-- `enabled`, `source`, `interval_min`, `samples`, `coverage_pct`
+- `enabled`, `source`, `interval_min`, `training_target`, `min_train_samples`, `samples`, `coverage_pct`
 - `ready_for_min_train`, `ready_for_target_window`, `gaps`
 - `freshness_sec`, `freshness_limit_sec`, `freshness_ok`, `volume_coverage_pct`, `span_hours`
 - `sync_interval_sec`, `last_sync_ts`, `last_sync_rows_queued`, `sync_cursor`
 - `backfill_last_at`, `backfill_last_rows`, `backfill_last_message`
+- Stall/breaker signals are surfaced via `backfill_last_message` tokens
+  (e.g., `stalls=N`, `backfill_circuit_open:...`)
 
 **`hmm_regime`**: HMM regime detector state (§17):
 
@@ -839,6 +913,14 @@ Supported dashboard actions:
 
 - Same fields as `hmm_data_pipeline` but for the secondary interval
 
+**`kelly`**: Kelly sizing runtime state (§9):
+
+- `enabled`, `active_regime`, `last_update_n`, `kelly_fraction`
+- `aggregate`, `bullish`, `ranging`, `bearish` result blocks:
+  - `f_star`, `f_fractional`, `multiplier`, `win_rate`, `avg_win`, `avg_loss`,
+    `payoff_ratio`
+  - `n_total`, `n_wins`, `n_losses`, `edge`, `sufficient_data`, `reason`
+
 **`regime_directional`**: directional regime system state (§18):
 
 - `enabled`, `shadow_enabled`, `actuation_enabled`
@@ -846,8 +928,9 @@ Supported dashboard actions:
 - `suppressed_side` (`A`/`B`/null), `favored_side` (`A`/`B`/null)
 - `regime`, `confidence`, `bias_signal`, `abs_bias`
 - `directional_ok_tier1`, `directional_ok_tier2`, `hmm_ready`
-- `dwell_sec`, `hysteresis_buffer`, `grace_remaining_sec`
+- `dwell_sec`, `hysteresis_buffer`, `grace_remaining_sec`, `cooldown_remaining_sec`, `cooldown_suppressed_side`
 - `regime_suppressed_slots` (count of slots with `mode_source="regime"`)
+- `tier_history` (rolling transition history; capped)
 - `last_eval_ts`, `reason`
 
 ### 23.2 `status_band` thresholds
@@ -863,9 +946,14 @@ Supported commands:
 - `/pause`
 - `/resume`
 - `/add_slot`
+- `/remove_slot [slot_id]`
+- `/remove_slots [count]`
 - `/status`
 - `/help`
-- `/backfill_ohlcv [target_candles] [max_pages]`
+- `/cancel_stale [min_distance_pct]`
+- `/reconcile_drift`
+- `/audit_pnl`
+- `/backfill_ohlcv [target_candles] [max_pages] [interval_min]`
 - `/soft_close [slot_id recovery_id]`
 - `/set_entry_pct <value>`
 - `/set_profit_pct <value>`
