@@ -289,6 +289,10 @@ class BotRuntime:
         self._daily_loss_lock_active: bool = False
         self._daily_loss_lock_utc_day: str = ""
         self._daily_realized_loss_utc: float = 0.0
+        self._sticky_release_total: int = 0
+        self._sticky_release_last_at: float = 0.0
+        self._release_recon_blocked: bool = False
+        self._release_recon_blocked_reason: str = ""
 
     # ------------------ Config/State ------------------
 
@@ -313,6 +317,7 @@ class BotRuntime:
             backoff_factor=float(config.ENTRY_BACKOFF_FACTOR),
             backoff_max_multiplier=float(config.ENTRY_BACKOFF_MAX_MULTIPLIER),
             max_recovery_slots=max(1, int(config.MAX_RECOVERY_SLOTS)),
+            sticky_mode_enabled=bool(config.STICKY_MODE_ENABLED),
         )
 
     def _allocate_slot_alias(self, used_aliases: set[str] | None = None) -> str:
@@ -530,8 +535,13 @@ class BotRuntime:
         return matched
 
     def _slot_order_size_usd(self, slot: SlotRuntime, trade_id: str | None = None) -> float:
-        # Independent compounding per slot.
-        base = max(float(config.ORDER_SIZE_USD), float(config.ORDER_SIZE_USD) + slot.state.total_profit)
+        base_order = float(config.ORDER_SIZE_USD)
+        compound_mode = str(getattr(config, "STICKY_COMPOUNDING_MODE", "legacy_profit")).strip().lower()
+        if bool(config.STICKY_MODE_ENABLED) and compound_mode == "fixed":
+            base = max(base_order, base_order)
+        else:
+            # Independent compounding per slot.
+            base = max(base_order, base_order + slot.state.total_profit)
         layer_metrics = self._recompute_effective_layers(mark_price=self._layer_mark_price(slot))
         effective_layers = int(layer_metrics.get("effective_layers", 0))
         layer_usd = 0.0
@@ -936,6 +946,10 @@ class BotRuntime:
             "daily_loss_lock_active": bool(self._daily_loss_lock_active),
             "daily_loss_lock_utc_day": str(self._daily_loss_lock_utc_day or ""),
             "daily_realized_loss_utc": float(self._daily_realized_loss_utc),
+            "sticky_release_total": int(self._sticky_release_total),
+            "sticky_release_last_at": float(self._sticky_release_last_at),
+            "release_recon_blocked": bool(self._release_recon_blocked),
+            "release_recon_blocked_reason": str(self._release_recon_blocked_reason or ""),
         }
 
     def _save_local_runtime_snapshot(self, snapshot: dict) -> None:
@@ -1034,6 +1048,12 @@ class BotRuntime:
             self._daily_loss_lock_active = bool(snap.get("daily_loss_lock_active", self._daily_loss_lock_active))
             self._daily_loss_lock_utc_day = str(snap.get("daily_loss_lock_utc_day", self._daily_loss_lock_utc_day) or "")
             self._daily_realized_loss_utc = float(snap.get("daily_realized_loss_utc", self._daily_realized_loss_utc))
+            self._sticky_release_total = int(snap.get("sticky_release_total", self._sticky_release_total))
+            self._sticky_release_last_at = float(snap.get("sticky_release_last_at", self._sticky_release_last_at))
+            self._release_recon_blocked = bool(snap.get("release_recon_blocked", self._release_recon_blocked))
+            self._release_recon_blocked_reason = str(
+                snap.get("release_recon_blocked_reason", self._release_recon_blocked_reason) or ""
+            )
             hist = snap.get("rebalancer_sign_flip_history", [])
             cleaned_hist: list[float] = []
             if isinstance(hist, list):
@@ -2325,6 +2345,8 @@ class BotRuntime:
         return True, f"profit_pct set to {self.profit_pct:.3f}%"
 
     def soft_close(self, slot_id: int, recovery_id: int) -> tuple[bool, str]:
+        if bool(config.STICKY_MODE_ENABLED):
+            return False, "soft_close disabled in sticky mode; use release_slot"
         slot = self.slots.get(slot_id)
         if not slot:
             return False, f"unknown slot {slot_id}"
@@ -2369,6 +2391,8 @@ class BotRuntime:
         return True, f"soft-close repriced recovery {recovery_id}"
 
     def soft_close_next(self) -> tuple[bool, str]:
+        if bool(config.STICKY_MODE_ENABLED):
+            return False, "soft_close_next disabled in sticky mode; use release_slot"
         oldest: tuple[int, sm.RecoveryOrder] | None = None
         for sid, slot in self.slots.items():
             for r in slot.state.recovery_orders:
@@ -2649,6 +2673,8 @@ class BotRuntime:
         max_batch per call to stay within Kraken rate limits (2 API calls each:
         cancel old + place new).  Call repeatedly until remaining == 0.
         """
+        if bool(config.STICKY_MODE_ENABLED):
+            return False, "cancel_stale_recoveries disabled in sticky mode; use release_slot"
         if self.last_price <= 0:
             return False, "no market price"
 
@@ -2738,6 +2764,377 @@ class BotRuntime:
             msg += f", {remaining} remaining (call again)"
         return True, msg
 
+    def _trend_strength_proxy_adx(self, period: int = 14) -> float:
+        """
+        Lightweight trend-strength proxy mapped to ADX-like 0-100 scale.
+
+        Uses close-only directionality (net move / total path) over recent
+        samples. This is intentionally conservative for release gating until
+        full OHLC ADX is introduced.
+        """
+        p = max(2, int(period))
+        closes = [float(px) for _, px in self.price_history[-(p + 1):] if float(px) > 0]
+        if len(closes) < p + 1:
+            return 0.0
+
+        path = 0.0
+        for i in range(1, len(closes)):
+            path += abs(closes[i] - closes[i - 1])
+        if path <= 1e-12:
+            return 0.0
+        net = abs(closes[-1] - closes[0])
+        strength = (net / path) * 100.0
+        return max(0.0, min(100.0, strength))
+
+    def _slot_unrealized_profit(self, st: sm.PairState) -> float:
+        market = float(st.market_price if st.market_price > 0 else self.last_price)
+        if market <= 0:
+            return 0.0
+
+        total = 0.0
+        for o in st.orders:
+            if o.role != "exit":
+                continue
+            if o.entry_price <= 0 or o.volume <= 0:
+                continue
+            if o.side == "buy":
+                total += (o.entry_price - market) * o.volume
+            else:
+                total += (market - o.entry_price) * o.volume
+        for r in st.recovery_orders:
+            if r.entry_price <= 0 or r.volume <= 0:
+                continue
+            if r.side == "buy":
+                total += (r.entry_price - market) * r.volume
+            else:
+                total += (market - r.entry_price) * r.volume
+        return total
+
+    def _total_unrealized_profit_locked(self) -> float:
+        return sum(self._slot_unrealized_profit(slot.state) for slot in self.slots.values())
+
+    def _balance_recon_locked(self) -> dict | None:
+        total_profit = sum(slot.state.total_profit for slot in self.slots.values())
+        total_unrealized = self._total_unrealized_profit_locked()
+        return self._compute_balance_recon(total_profit, total_unrealized)
+
+    def _update_release_recon_gate_locked(self) -> tuple[bool, str]:
+        if not bool(config.RELEASE_RECON_HARD_GATE_ENABLED):
+            self._release_recon_blocked = False
+            self._release_recon_blocked_reason = ""
+            return True, "release recon hard-gate disabled"
+
+        recon = self._balance_recon_locked()
+        if not isinstance(recon, dict):
+            # No baseline / no balance -> don't hard-block operator action.
+            self._release_recon_blocked = False
+            self._release_recon_blocked_reason = ""
+            return True, "release recon unavailable"
+
+        status = str(recon.get("status") or "")
+        drift_pct = float(recon.get("drift_pct", 0.0) or 0.0)
+        threshold = float(recon.get("threshold_pct", float(config.BALANCE_RECON_DRIFT_PCT)) or 0.0)
+        if status == "DRIFT" and abs(drift_pct) > threshold + 1e-12:
+            self._release_recon_blocked = True
+            self._release_recon_blocked_reason = (
+                f"release blocked by balance recon drift: {drift_pct:+.4f}% > {threshold:.4f}%"
+            )
+            return False, self._release_recon_blocked_reason
+
+        self._release_recon_blocked = False
+        self._release_recon_blocked_reason = ""
+        return True, "release recon gate clear"
+
+    def _release_gate_flags(
+        self,
+        slot: SlotRuntime,
+        order: sm.OrderState,
+        *,
+        now_ts: float,
+    ) -> dict[str, float | bool]:
+        market = float(slot.state.market_price if slot.state.market_price > 0 else self.last_price)
+        if market <= 0:
+            market = float(order.price if order.price > 0 else 0.0)
+        age_sec = max(0.0, now_ts - float(order.entry_filled_at or order.placed_at or now_ts))
+        distance_pct = abs(float(order.price) - market) / market * 100.0 if market > 0 else 0.0
+        regime_strength = self._trend_strength_proxy_adx(period=14)
+
+        age_ok = age_sec >= float(config.RELEASE_MIN_AGE_SEC)
+        distance_ok = distance_pct >= float(config.RELEASE_MIN_DISTANCE_PCT)
+        regime_ok = regime_strength >= float(config.RELEASE_ADX_THRESHOLD)
+        return {
+            "age_sec": age_sec,
+            "distance_pct": distance_pct,
+            "regime_strength": regime_strength,
+            "age_ok": age_ok,
+            "distance_ok": distance_ok,
+            "regime_ok": regime_ok,
+        }
+
+    def _pick_release_exit(
+        self,
+        slot: SlotRuntime,
+        *,
+        local_id: int | None = None,
+        trade_id: str | None = None,
+    ) -> sm.OrderState | None:
+        exits = [o for o in slot.state.orders if o.role == "exit"]
+        if not exits:
+            return None
+        if local_id is not None:
+            return next((o for o in exits if int(o.local_id) == int(local_id)), None)
+        if trade_id in ("A", "B"):
+            candidates = [o for o in exits if o.trade_id == trade_id]
+            if candidates:
+                candidates.sort(key=lambda o: float(o.entry_filled_at or o.placed_at or 0.0))
+                return candidates[0]
+        exits.sort(key=lambda o: float(o.entry_filled_at or o.placed_at or 0.0))
+        return exits[0]
+
+    def _release_exit_locked(
+        self,
+        slot_id: int,
+        order: sm.OrderState,
+        *,
+        reason: str,
+        now_ts: float,
+    ) -> tuple[bool, str]:
+        slot = self.slots.get(slot_id)
+        if not slot:
+            return False, f"unknown slot {slot_id}"
+
+        live = next((o for o in slot.state.orders if o.local_id == order.local_id and o.role == "exit"), None)
+        if not live:
+            return False, f"slot {slot_id} exit {order.local_id} no longer active"
+
+        if live.txid:
+            try:
+                ok = self._cancel_order(live.txid)
+                if not ok:
+                    return False, f"release cancel failed for {live.txid}"
+            except Exception as e:
+                return False, f"release cancel failed for {live.txid}: {e}"
+
+        fill_price = float(slot.state.market_price if slot.state.market_price > 0 else self.last_price)
+        if fill_price <= 0:
+            fill_price = float(live.price if live.price > 0 else live.entry_price)
+        if fill_price <= 0:
+            return False, "release failed: no valid mark price"
+
+        fill_fee = max(0.0, fill_price * float(live.volume) * (float(self.maker_fee_pct) / 100.0))
+        ev = sm.FillEvent(
+            order_local_id=int(live.local_id),
+            txid=str(live.txid or ""),
+            side=live.side,
+            price=fill_price,
+            volume=float(live.volume),
+            fee=fill_fee,
+            timestamp=now_ts,
+        )
+        self._apply_event(
+            slot_id,
+            ev,
+            "sticky_release",
+            {
+                "order_local_id": int(live.local_id),
+                "trade_id": live.trade_id,
+                "fill_price": fill_price,
+                "fill_fee": fill_fee,
+                "reason": reason,
+            },
+        )
+        self._sticky_release_total += 1
+        self._sticky_release_last_at = now_ts
+        gate_ok, gate_msg = self._update_release_recon_gate_locked()
+        if not gate_ok:
+            return True, f"released exit {live.local_id} on slot {slot_id}; {gate_msg}"
+        return True, f"released exit {live.local_id} on slot {slot_id} @ ${fill_price:.6f}"
+
+    def _slot_vintage_metrics_locked(self, now_ts: float | None = None) -> dict[str, float | int]:
+        now_ts = float(now_ts if now_ts is not None else _now())
+        buckets = {
+            "fresh_0_1h": 0,
+            "aging_1_6h": 0,
+            "stale_6_24h": 0,
+            "old_1_7d": 0,
+            "ancient_7d_plus": 0,
+        }
+        oldest_age = 0.0
+        stuck_capital_usd = 0.0
+        release_eligible = 0
+        period = 14
+
+        for sid in sorted(self.slots.keys()):
+            slot = self.slots[sid]
+            for o in slot.state.orders:
+                if o.role != "exit":
+                    continue
+                age_sec = max(0.0, now_ts - float(o.entry_filled_at or o.placed_at or now_ts))
+                if age_sec < 3600:
+                    buckets["fresh_0_1h"] += 1
+                elif age_sec < 6 * 3600:
+                    buckets["aging_1_6h"] += 1
+                elif age_sec < 24 * 3600:
+                    buckets["stale_6_24h"] += 1
+                elif age_sec < 7 * 86400:
+                    buckets["old_1_7d"] += 1
+                else:
+                    buckets["ancient_7d_plus"] += 1
+                oldest_age = max(oldest_age, age_sec)
+                mark = float(slot.state.market_price if slot.state.market_price > 0 else self.last_price)
+                if mark > 0:
+                    stuck_capital_usd += abs(float(o.volume)) * mark
+                flags = self._release_gate_flags(slot, o, now_ts=now_ts)
+                if bool(flags.get("age_ok")) and bool(flags.get("distance_ok")) and bool(flags.get("regime_ok")):
+                    release_eligible += 1
+
+        bal = self._last_balance_snapshot
+        mark = float(self.last_price)
+        portfolio_usd = 0.0
+        if bal and mark > 0:
+            portfolio_usd = _usd_balance(bal) + _doge_balance(bal) * mark
+        stuck_capital_pct = (stuck_capital_usd / portfolio_usd * 100.0) if portfolio_usd > 0 else 0.0
+
+        sizes = [self._slot_order_size_usd(self.slots[sid]) for sid in sorted(self.slots.keys())]
+        min_size = min(sizes) if sizes else 0.0
+        max_size = max(sizes) if sizes else 0.0
+        med_size = float(median(sizes)) if sizes else 0.0
+
+        out: dict[str, float | int] = {
+            **buckets,
+            "oldest_exit_age_sec": float(oldest_age),
+            "min_slot_size_usd": float(min_size),
+            "median_slot_size_usd": float(med_size),
+            "max_slot_size_usd": float(max_size),
+            "stuck_capital_usd": float(stuck_capital_usd),
+            "stuck_capital_pct": float(stuck_capital_pct),
+            "vintage_release_eligible": int(release_eligible),
+            "regime_strength_adx_proxy": float(self._trend_strength_proxy_adx(period=period)),
+        }
+        return out
+
+    def release_slot(
+        self,
+        slot_id: int,
+        local_id: int | None = None,
+        trade_id: str | None = None,
+    ) -> tuple[bool, str]:
+        slot = self.slots.get(int(slot_id))
+        if not slot:
+            return False, f"unknown slot {slot_id}"
+
+        gate_ok, gate_msg = self._update_release_recon_gate_locked()
+        if not gate_ok:
+            return False, gate_msg
+
+        order = self._pick_release_exit(slot, local_id=local_id, trade_id=trade_id)
+        if not order:
+            return False, f"slot {slot_id}: no matching active exit"
+
+        now_ts = _now()
+        flags = self._release_gate_flags(slot, order, now_ts=now_ts)
+        if not (bool(flags["age_ok"]) and bool(flags["distance_ok"]) and bool(flags["regime_ok"])):
+            return (
+                False,
+                "release blocked by gates: "
+                f"age={flags['age_sec']:.0f}s ({'ok' if flags['age_ok'] else 'no'}) "
+                f"distance={flags['distance_pct']:.2f}% ({'ok' if flags['distance_ok'] else 'no'}) "
+                f"regime={flags['regime_strength']:.2f} ({'ok' if flags['regime_ok'] else 'no'})",
+            )
+        return self._release_exit_locked(int(slot_id), order, reason="manual_release", now_ts=now_ts)
+
+    def release_oldest_eligible(self, slot_id: int) -> tuple[bool, str]:
+        slot = self.slots.get(int(slot_id))
+        if not slot:
+            return False, f"unknown slot {slot_id}"
+
+        gate_ok, gate_msg = self._update_release_recon_gate_locked()
+        if not gate_ok:
+            return False, gate_msg
+
+        now_ts = _now()
+        exits = [o for o in slot.state.orders if o.role == "exit"]
+        exits.sort(key=lambda o: float(o.entry_filled_at or o.placed_at or now_ts))
+        for order in exits:
+            flags = self._release_gate_flags(slot, order, now_ts=now_ts)
+            if bool(flags["age_ok"]) and bool(flags["distance_ok"]) and bool(flags["regime_ok"]):
+                return self._release_exit_locked(
+                    int(slot_id),
+                    order,
+                    reason="manual_release_oldest_eligible",
+                    now_ts=now_ts,
+                )
+
+        return False, f"slot {slot_id}: no release-eligible exits (age/distance/regime)"
+
+    def _auto_release_sticky_slots(self) -> None:
+        if not bool(config.STICKY_MODE_ENABLED):
+            return
+        if not bool(config.RELEASE_AUTO_ENABLED):
+            return
+        gate_ok, _gate_msg = self._update_release_recon_gate_locked()
+        if not gate_ok:
+            return
+
+        vintage = self._slot_vintage_metrics_locked(_now())
+        stuck_pct = float(vintage.get("stuck_capital_pct", 0.0) or 0.0)
+        tier1_threshold = float(config.RELEASE_MAX_STUCK_PCT)
+        tier2_threshold = float(config.RELEASE_PANIC_STUCK_PCT)
+        if stuck_pct <= tier1_threshold:
+            return
+
+        now_ts = _now()
+        tier2 = stuck_pct > tier2_threshold
+        batch_max = max(1, min(int(config.AUTO_RECOVERY_DRAIN_MAX_PER_LOOP), 5))
+        target_pct = float(config.RELEASE_RECOVERY_TARGET_PCT)
+        panic_age = float(config.RELEASE_PANIC_MIN_AGE_SEC)
+
+        candidates: list[tuple[float, int, sm.OrderState]] = []
+        for sid in sorted(self.slots.keys()):
+            slot = self.slots[sid]
+            for o in slot.state.orders:
+                if o.role != "exit":
+                    continue
+                flags = self._release_gate_flags(slot, o, now_ts=now_ts)
+                age_sec = float(flags["age_sec"])
+                if tier2:
+                    if age_sec >= panic_age:
+                        candidates.append((-age_sec, sid, o))
+                else:
+                    if bool(flags["age_ok"]) and bool(flags["distance_ok"]) and bool(flags["regime_ok"]):
+                        candidates.append((-age_sec, sid, o))
+        if not candidates:
+            return
+        candidates.sort()
+
+        released = 0
+        for _neg_age, sid, order in candidates:
+            if released >= batch_max:
+                break
+            ok, _msg = self._release_exit_locked(
+                sid,
+                order,
+                reason=("auto_release_tier2" if tier2 else "auto_release_tier1"),
+                now_ts=now_ts,
+            )
+            if not ok:
+                continue
+            released += 1
+            if self._release_recon_blocked:
+                break
+            if tier2:
+                stuck_pct = float(self._slot_vintage_metrics_locked(now_ts).get("stuck_capital_pct", 0.0) or 0.0)
+                if stuck_pct <= target_pct:
+                    break
+
+        if released > 0:
+            logger.info(
+                "auto_release: released %d exits (%s trigger, stuck_capital_pct=%.2f%%)",
+                released,
+                "tier2" if tier2 else "tier1",
+                float(vintage.get("stuck_capital_pct", 0.0) or 0.0),
+            )
+
     def reconcile_drift(self) -> tuple[bool, str]:
         """Cancel Kraken-only orders not tracked internally (drift orders).
 
@@ -2771,6 +3168,7 @@ class BotRuntime:
                 unknown_txids.append(txid)
 
         if not unknown_txids:
+            self._update_release_recon_gate_locked()
             return True, f"no drift: {len(open_orders)} kraken orders, {len(known_txids)} tracked"
 
         cancelled = 0
@@ -2786,6 +3184,7 @@ class BotRuntime:
         msg = f"cancelled {cancelled}/{len(unknown_txids)} drift orders"
         if failed:
             msg += f", {failed} failures"
+        self._update_release_recon_gate_locked()
         return True, msg
 
     def _pnl_audit_summary(self, tolerance: float = 1e-8) -> dict[str, Any]:
@@ -2943,6 +3342,9 @@ class BotRuntime:
             self._auto_drain_recovery_backlog()
             # Auto-soft-close farthest recoveries when nearing order capacity.
             self._auto_soft_close_if_capacity_pressure()
+            # Keep release hard-gate status fresh and run sticky auto-release tiers.
+            self._update_release_recon_gate_locked()
+            self._auto_release_sticky_slots()
 
             # Pressure notice for orphan growth.
             total_orphans = sum(len(s.state.recovery_orders) for s in self.slots.values())
@@ -3459,6 +3861,7 @@ class BotRuntime:
 
         with self.lock:
             now = _now()
+            self._update_release_recon_gate_locked()
             self._trim_rolling_telemetry(now)
             self._update_doge_eq_snapshot(now)
             slots = []
@@ -3607,6 +4010,13 @@ class BotRuntime:
             pnl_audit = self._pnl_audit_summary()
             layer_metrics = self._recompute_effective_layers(mark_price=pnl_ref_price)
             orders_at_funded_size = self._count_orders_at_funded_size()
+            slot_vintage = self._slot_vintage_metrics_locked(now)
+            oldest_exit_age_sec = float(slot_vintage.get("oldest_exit_age_sec", 0.0) or 0.0)
+            stuck_capital_pct = float(slot_vintage.get("stuck_capital_pct", 0.0) or 0.0)
+            slot_vintage["vintage_warn"] = oldest_exit_age_sec >= 3.0 * 86400.0
+            slot_vintage["vintage_critical"] = stuck_capital_pct > float(config.RELEASE_MAX_STUCK_PCT)
+            slot_vintage["release_recon_gate_blocked"] = bool(self._release_recon_blocked)
+            slot_vintage["release_recon_gate_reason"] = str(self._release_recon_blocked_reason or "")
 
             return {
                 "mode": self.mode,
@@ -3703,6 +4113,21 @@ class BotRuntime:
                     "ledger": self.ledger.snapshot(),
                 },
                 "balance_recon": self._compute_balance_recon(total_profit, total_unrealized_profit),
+                "sticky_mode": {
+                    "enabled": bool(config.STICKY_MODE_ENABLED),
+                    "target_slots": int(config.STICKY_TARGET_SLOTS),
+                    "max_target_slots": int(config.STICKY_MAX_TARGET_SLOTS),
+                    "compounding_mode": str(getattr(config, "STICKY_COMPOUNDING_MODE", "legacy_profit")),
+                    "auto_release_enabled": bool(config.RELEASE_AUTO_ENABLED),
+                },
+                "slot_vintage": slot_vintage,
+                "release_health": {
+                    "sticky_release_total": int(self._sticky_release_total),
+                    "sticky_release_last_at": self._sticky_release_last_at or None,
+                    "recon_hard_gate_enabled": bool(config.RELEASE_RECON_HARD_GATE_ENABLED),
+                    "recon_hard_gate_blocked": bool(self._release_recon_blocked),
+                    "recon_hard_gate_reason": str(self._release_recon_blocked_reason or ""),
+                },
                 "doge_bias_scoreboard": self._compute_doge_bias_scoreboard(),
                 "rebalancer": {
                     "enabled": bool(config.REBALANCE_ENABLED),
@@ -3860,6 +4285,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
             action = (body.get("action") or "").strip()
             parsed: dict[str, float | int | str] = {}
+            sticky_mode_enabled = bool(config.STICKY_MODE_ENABLED)
+            if sticky_mode_enabled and action in ("soft_close", "soft_close_next", "cancel_stale_recoveries"):
+                self._send_json(
+                    {"ok": False, "message": f"{action} disabled in sticky mode; use release_slot"},
+                    400,
+                )
+                return
 
             if action in ("set_entry_pct", "set_profit_pct"):
                 try:
@@ -3875,6 +4307,32 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     parsed["recovery_id"] = int(body.get("recovery_id", 0))
                 except (TypeError, ValueError):
                     self._send_json({"ok": False, "message": "invalid slot/recovery id"}, 400)
+                    return
+            elif action == "release_slot":
+                try:
+                    parsed["slot_id"] = int(body.get("slot_id", 0))
+                except (TypeError, ValueError):
+                    self._send_json({"ok": False, "message": "invalid slot_id"}, 400)
+                    return
+                local_id_raw = body.get("local_id", body.get("exit_local_id"))
+                if local_id_raw not in (None, ""):
+                    try:
+                        parsed["local_id"] = int(local_id_raw)
+                    except (TypeError, ValueError):
+                        self._send_json({"ok": False, "message": "invalid local_id"}, 400)
+                        return
+                trade_id_raw = body.get("trade_id", "")
+                trade_id = str(trade_id_raw).strip().upper()
+                if trade_id:
+                    if trade_id not in {"A", "B"}:
+                        self._send_json({"ok": False, "message": "invalid trade_id (expected A or B)"}, 400)
+                        return
+                    parsed["trade_id"] = trade_id
+            elif action == "release_oldest_eligible":
+                try:
+                    parsed["slot_id"] = int(body.get("slot_id", 0))
+                except (TypeError, ValueError):
+                    self._send_json({"ok": False, "message": "invalid slot_id"}, 400)
                     return
             elif action == "cancel_stale_recoveries":
                 try:
@@ -3930,6 +4388,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     ok, msg = _RUNTIME.set_profit_pct(float(parsed["value"]))
                 elif action == "soft_close":
                     ok, msg = _RUNTIME.soft_close(int(parsed["slot_id"]), int(parsed["recovery_id"]))
+                elif action == "release_slot":
+                    local_id = int(parsed["local_id"]) if "local_id" in parsed else None
+                    trade_id = str(parsed["trade_id"]) if "trade_id" in parsed else None
+                    ok, msg = _RUNTIME.release_slot(int(parsed["slot_id"]), local_id=local_id, trade_id=trade_id)
+                elif action == "release_oldest_eligible":
+                    ok, msg = _RUNTIME.release_oldest_eligible(int(parsed["slot_id"]))
                 elif action == "soft_close_next":
                     ok, msg = _RUNTIME.soft_close_next()
                 elif action == "cancel_stale_recoveries":

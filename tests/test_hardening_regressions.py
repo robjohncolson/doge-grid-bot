@@ -185,6 +185,50 @@ class DogeV1StateMachineTests(unittest.TestCase):
         self.assertEqual(len(st2.recovery_orders), 1)
         self.assertTrue(any(isinstance(x, sm.OrphanOrderAction) for x in actions))
 
+    def test_sticky_timer_tick_does_not_orphan_s1_exit(self):
+        st = sm.PairState(
+            market_price=101.0,
+            now=1000.0,
+            s2_entered_at=900.0,
+            orders=(
+                sm.OrderState(
+                    local_id=1,
+                    side="buy",
+                    role="exit",
+                    price=100.0,
+                    volume=13.0,
+                    trade_id="A",
+                    cycle=1,
+                    txid="TX-A-EXIT",
+                    entry_price=101.5,
+                    entry_fee=0.02,
+                    entry_filled_at=300.0,
+                ),
+                sm.OrderState(
+                    local_id=2,
+                    side="buy",
+                    role="entry",
+                    price=99.5,
+                    volume=13.0,
+                    trade_id="B",
+                    cycle=1,
+                    txid="TX-B-ENTRY",
+                    placed_at=900.0,
+                ),
+            ),
+            cycle_a=1,
+            cycle_b=1,
+            next_order_id=3,
+            next_recovery_id=1,
+        )
+        base_cfg = self._cfg()
+        cfg = sm.EngineConfig(**{**base_cfg.__dict__, "sticky_mode_enabled": True})
+
+        st2, actions = sm.transition(st, sm.TimerTick(timestamp=1000.0), cfg, order_size_usd=2.0)
+        self.assertEqual(len(st2.recovery_orders), 0)
+        self.assertFalse(any(isinstance(x, sm.OrphanOrderAction) for x in actions))
+        self.assertIsNone(st2.s2_entered_at)
+
     def test_s1_orphan_enforces_recovery_cap_furthest_then_oldest(self):
         st = sm.PairState(
             market_price=101.0,
@@ -1003,6 +1047,48 @@ class BotEventLogTests(unittest.TestCase):
         self.assertAlmostEqual(payload["pnl_audit"]["loss_drift"], 0.0)
         self.assertEqual(payload["pnl_audit"]["trips_drift"], 0)
 
+    def test_status_payload_exposes_sticky_vintage_and_release_health(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        rt._last_balance_snapshot = {"ZUSD": "100.0", "XXDG": "1000.0"}
+        rt._sticky_release_total = 3
+        rt._sticky_release_last_at = 1234.0
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    orders=(
+                        sm.OrderState(
+                            local_id=1,
+                            side="sell",
+                            role="exit",
+                            price=0.12,
+                            volume=13.0,
+                            trade_id="A",
+                            cycle=1,
+                            txid="TX-A-EXIT",
+                            placed_at=900.0,
+                            entry_price=0.1,
+                            entry_filled_at=200.0,
+                        ),
+                    ),
+                ),
+            )
+        }
+
+        payload = rt.status_payload()
+        self.assertIn("sticky_mode", payload)
+        self.assertIn("slot_vintage", payload)
+        self.assertIn("release_health", payload)
+        self.assertIn("oldest_exit_age_sec", payload["slot_vintage"])
+        self.assertIn("stuck_capital_pct", payload["slot_vintage"])
+        self.assertIn("vintage_warn", payload["slot_vintage"])
+        self.assertIn("vintage_critical", payload["slot_vintage"])
+        self.assertEqual(payload["release_health"]["sticky_release_total"], 3)
+        self.assertEqual(payload["release_health"]["sticky_release_last_at"], 1234.0)
+
     def test_dynamic_idle_target_cold_start_uses_base_target(self):
         rt = bot.BotRuntime()
         rt.last_price = 0.1
@@ -1805,6 +1891,70 @@ class BotEventLogTests(unittest.TestCase):
         self.assertEqual(len(rt._partial_fill_cancel_events), 1)
         self.assertEqual(len(rt.slots[0].state.orders), 0)
 
+    def test_legacy_manual_recovery_actions_disabled_in_sticky_mode(self):
+        rt = bot.BotRuntime()
+        with mock.patch.object(config, "STICKY_MODE_ENABLED", True):
+            ok_close, msg_close = rt.soft_close(1, 1)
+            ok_next, msg_next = rt.soft_close_next()
+            ok_stale, msg_stale = rt.cancel_stale_recoveries()
+        self.assertFalse(ok_close)
+        self.assertIn("disabled in sticky mode", msg_close)
+        self.assertFalse(ok_next)
+        self.assertIn("disabled in sticky mode", msg_next)
+        self.assertFalse(ok_stale)
+        self.assertIn("disabled in sticky mode", msg_stale)
+
+    def test_release_oldest_eligible_selects_oldest_gate_passing_exit(self):
+        rt = bot.BotRuntime()
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    orders=(
+                        sm.OrderState(
+                            local_id=1,
+                            side="sell",
+                            role="exit",
+                            price=0.11,
+                            volume=13.0,
+                            trade_id="A",
+                            cycle=1,
+                            txid="TX-A-EXIT",
+                            entry_price=0.1,
+                            entry_filled_at=200.0,
+                        ),
+                        sm.OrderState(
+                            local_id=2,
+                            side="buy",
+                            role="exit",
+                            price=0.09,
+                            volume=13.0,
+                            trade_id="B",
+                            cycle=1,
+                            txid="TX-B-EXIT",
+                            entry_price=0.1,
+                            entry_filled_at=300.0,
+                        ),
+                    ),
+                ),
+            ),
+        }
+
+        failing = {"age_ok": False, "distance_ok": True, "regime_ok": True}
+        passing = {"age_ok": True, "distance_ok": True, "regime_ok": True}
+        with mock.patch.object(rt, "_update_release_recon_gate_locked", return_value=(True, "ok")):
+            with mock.patch.object(rt, "_release_gate_flags", side_effect=[failing, passing]):
+                with mock.patch.object(rt, "_release_exit_locked", return_value=(True, "released")) as release_mock:
+                    ok, msg = rt.release_oldest_eligible(0)
+
+        self.assertTrue(ok)
+        self.assertEqual(msg, "released")
+        self.assertEqual(release_mock.call_count, 1)
+        called_order = release_mock.call_args.args[1]
+        self.assertEqual(called_order.local_id, 2)
+
 
 class DashboardApiHardeningTests(unittest.TestCase):
     class _LockStub:
@@ -1819,6 +1969,7 @@ class DashboardApiHardeningTests(unittest.TestCase):
             self.lock = DashboardApiHardeningTests._LockStub()
             self.raise_on_pause = False
             self.resume_result = (True, "running")
+            self.release_slot_calls = []
 
         def pause(self, _reason):
             if self.raise_on_pause:
@@ -1844,6 +1995,14 @@ class DashboardApiHardeningTests(unittest.TestCase):
 
         def soft_close(self, _slot_id, _recovery_id):
             return True, "ok"
+
+        def release_slot(self, slot_id, local_id=None, trade_id=None):
+            self.release_slot_calls.append((slot_id, local_id, trade_id))
+            return True, "released"
+
+        def release_oldest_eligible(self, slot_id):
+            self.release_slot_calls.append((slot_id, "eligible", None))
+            return True, "released eligible"
 
         def soft_close_next(self):
             return True, "ok"
@@ -1961,6 +2120,68 @@ class DashboardApiHardeningTests(unittest.TestCase):
         code, payload = handler.sent[0]
         self.assertEqual(code, 200)
         self.assertEqual(payload, {"ok": True, "message": "layer ok"})
+
+    def test_api_action_release_slot_routes_ok(self):
+        runtime = self._RuntimeStub()
+        bot._RUNTIME = runtime
+        handler = self._HandlerStub({"action": "release_slot", "slot_id": 7, "local_id": 4})
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(runtime.release_slot_calls, [(7, 4, None)])
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 200)
+        self.assertEqual(payload, {"ok": True, "message": "released"})
+
+    def test_api_action_release_slot_invalid_trade_id_returns_json_400(self):
+        bot._RUNTIME = self._RuntimeStub()
+        handler = self._HandlerStub({"action": "release_slot", "slot_id": 7, "trade_id": "C"})
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 400)
+        self.assertEqual(payload, {"ok": False, "message": "invalid trade_id (expected A or B)"})
+
+    def test_api_action_release_oldest_eligible_routes_ok(self):
+        runtime = self._RuntimeStub()
+        bot._RUNTIME = runtime
+        handler = self._HandlerStub({"action": "release_oldest_eligible", "slot_id": 5})
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(runtime.release_slot_calls, [(5, "eligible", None)])
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 200)
+        self.assertEqual(payload, {"ok": True, "message": "released eligible"})
+
+    def test_api_action_soft_close_rejected_when_sticky_enabled(self):
+        bot._RUNTIME = self._RuntimeStub()
+        handler = self._HandlerStub({"action": "soft_close", "slot_id": 1, "recovery_id": 1})
+        with mock.patch.object(config, "STICKY_MODE_ENABLED", True):
+            bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 400)
+        self.assertEqual(payload, {"ok": False, "message": "soft_close disabled in sticky mode; use release_slot"})
+
+    def test_api_action_cancel_stale_rejected_when_sticky_enabled(self):
+        bot._RUNTIME = self._RuntimeStub()
+        handler = self._HandlerStub({"action": "cancel_stale_recoveries"})
+        with mock.patch.object(config, "STICKY_MODE_ENABLED", True):
+            bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 400)
+        self.assertEqual(
+            payload,
+            {"ok": False, "message": "cancel_stale_recoveries disabled in sticky mode; use release_slot"},
+        )
 
     def test_api_action_resume_failure_returns_json_400(self):
         runtime = self._RuntimeStub()

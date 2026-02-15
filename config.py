@@ -294,6 +294,30 @@ S1_ORPHAN_AFTER_SEC: int = _env("S1_ORPHAN_AFTER_SEC", 1350, int)  # 22.5 min
 # - S2 deadlock: orphan worse exit after this age.
 S2_ORPHAN_AFTER_SEC: int = _env("S2_ORPHAN_AFTER_SEC", 1800, int)  # 30 min
 
+# Sticky slots mode: keep exits waiting (no timer orphaning in reducer path).
+STICKY_MODE_ENABLED: bool = _env("STICKY_MODE_ENABLED", False, bool)
+STICKY_TARGET_SLOTS: int = _env("STICKY_TARGET_SLOTS", 80, int)
+STICKY_MAX_TARGET_SLOTS: int = _env("STICKY_MAX_TARGET_SLOTS", 100, int)
+
+# Sticky release gate controls.
+RELEASE_MIN_AGE_SEC: int = _env("RELEASE_MIN_AGE_SEC", 7 * 86400, int)
+RELEASE_MIN_DISTANCE_PCT: float = _env("RELEASE_MIN_DISTANCE_PCT", 10.0, float)
+RELEASE_ADX_THRESHOLD: float = _env("RELEASE_ADX_THRESHOLD", 30.0, float)
+RELEASE_MAX_STUCK_PCT: float = _env("RELEASE_MAX_STUCK_PCT", 50.0, float)
+RELEASE_PANIC_STUCK_PCT: float = _env("RELEASE_PANIC_STUCK_PCT", 80.0, float)
+RELEASE_PANIC_MIN_AGE_SEC: int = _env("RELEASE_PANIC_MIN_AGE_SEC", 86400, int)
+RELEASE_RECOVERY_TARGET_PCT: float = _env("RELEASE_RECOVERY_TARGET_PCT", 60.0, float)
+RELEASE_AUTO_ENABLED: bool = _env("RELEASE_AUTO_ENABLED", False, bool)
+RELEASE_RECON_HARD_GATE_ENABLED: bool = _env("RELEASE_RECON_HARD_GATE_ENABLED", True, bool)
+
+# Sticky compounding mode:
+# - legacy_profit: ORDER_SIZE_USD + slot.total_profit (current behavior)
+# - fixed: ORDER_SIZE_USD only
+_STICKY_COMPOUNDING_MODE_RAW: str = _env("STICKY_COMPOUNDING_MODE", "legacy_profit", str)
+STICKY_COMPOUNDING_MODE: str = str(_STICKY_COMPOUNDING_MODE_RAW).strip().lower()
+if STICKY_COMPOUNDING_MODE not in {"legacy_profit", "fixed"}:
+    STICKY_COMPOUNDING_MODE = "legacy_profit"
+
 # Entry anti-loss behavior:
 # - At N consecutive losses, widen entry distance (backoff).
 # - At M consecutive losses, stop placing new entries for cooldown seconds.

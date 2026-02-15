@@ -46,6 +46,7 @@ class EngineConfig:
     max_consecutive_refreshes: int = 3
     refresh_cooldown_sec: float = 300.0
     max_recovery_slots: int = 2
+    sticky_mode_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -879,6 +880,12 @@ def transition(
 
     if isinstance(event, TimerTick):
         st = replace(st, now=event.timestamp)
+        if cfg.sticky_mode_enabled:
+            # Sticky mode treats long-lived exits as normal waiting state.
+            # Timer ticks do not orphan exits in this path.
+            if st.s2_entered_at is not None:
+                st = replace(st, s2_entered_at=None)
+            return st, actions
         phase = derive_phase(st)
         if phase != "S2" and st.s2_entered_at is not None:
             st = replace(st, s2_entered_at=None)

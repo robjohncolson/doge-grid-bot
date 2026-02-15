@@ -253,6 +253,16 @@ DASHBOARD_HTML = """<!doctype html>
     .toast.success { border-left-color: var(--good); }
     .toast.error { border-left-color: var(--bad); }
     .toast.info { border-left-color: var(--accent); }
+    .vintage-bar {
+      display: flex;
+      height: 10px;
+      border-radius: 999px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      background: #0f141b;
+      margin-top: 4px;
+    }
+    .vintage-seg { height: 100%; }
   </style>
 </head>
 <body>
@@ -275,9 +285,11 @@ DASHBOARD_HTML = """<!doctype html>
           <button id=\"resumeBtn\">Resume</button>
           <button id=\"addSlotBtn\">Add Slot</button>
           <button id=\"removeSlotBtn\" style=\"background:#c0392b\">Remove Slot</button>
-          <button id=\"softCloseBtn\">Soft Close</button>
+          <button id=\"releaseEligibleBtn\" style=\"display:none\">Release Oldest Eligible</button>
+          <button id=\"releaseBtn\" style=\"display:none\">Release Exit</button>
+          <button id=\"softCloseBtn\">Close Oldest Waiting</button>
           <button id=\"reconcileBtn\">Reconcile Drift</button>
-          <button id=\"cancelStaleBtn\">Refresh Recoveries</button>
+          <button id=\"cancelStaleBtn\">Refresh Waiting</button>
         </div>
 
         <div style=\"height:10px\"></div>
@@ -332,7 +344,19 @@ DASHBOARD_HTML = """<!doctype html>
         <div class=\"row\"><span class=\"k\">Today Loss</span><span id=\"todayLoss\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">P&amp;L Audit</span><span id=\"pnlAudit\" class=\"v\"></span></div>
         <div id=\"pnlAuditDetails\" class=\"tiny\"></div>
-        <div class=\"row\"><span class=\"k\">Orphans</span><span id=\"orphans\" class=\"v\"></span></div>
+        <div class=\"row\"><span id=\"orphansLabel\" class=\"k\">Waiting Exits</span><span id=\"orphans\" class=\"v\"></span></div>
+
+        <h3 style=\"margin-top:14px\">Sticky Vintage</h3>
+        <div class=\"row\"><span class=\"k\">Sticky Mode</span><span id=\"stickyModeStatus\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Waiting Exits</span><span id=\"vintageWaiting\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Oldest Exit</span><span id=\"vintageOldest\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Stuck Capital</span><span id=\"vintageStuck\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Release Eligible</span><span id=\"vintageEligible\" class=\"v\"></span></div>
+        <div id=\"vintageBar\" class=\"vintage-bar\"></div>
+        <div id=\"vintageLegend\" class=\"tiny\"></div>
+        <div class=\"row\"><span class=\"k\">Release Gate</span><span id=\"releaseGateStatus\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Releases</span><span id=\"releaseTotals\" class=\"v\"></span></div>
+        <div id=\"releaseGateReason\" class=\"tiny\"></div>
 
         <h3 style=\"margin-top:14px\">Capacity &amp; Fill Health</h3>
         <div class=\"row\"><span class=\"k\">Status</span><span id=\"cfhBand\" class=\"v\"></span></div>
@@ -386,12 +410,12 @@ DASHBOARD_HTML = """<!doctype html>
         <h3 style=\"margin-top:12px\">Open Orders</h3>
         <table>
           <thead>
-            <tr><th>Type</th><th>Trade</th><th>Cycle</th><th>Volume</th><th>Price</th><th>Txid</th></tr>
+            <tr><th>Type</th><th>Trade</th><th>Cycle</th><th>Volume</th><th>Price</th><th>Txid</th><th>Action</th></tr>
           </thead>
           <tbody id=\"ordersBody\"></tbody>
         </table>
 
-        <h3 style=\"margin-top:12px\">Orphaned Exits</h3>
+        <h3 id=\"orphansTitle\" style=\"margin-top:12px\">Waiting Exits</h3>
         <table>
           <thead>
             <tr><th>ID</th><th>Trade</th><th>Side</th><th>Age</th><th>Dist%</th><th>Price</th><th></th></tr>
@@ -434,6 +458,8 @@ DASHBOARD_HTML = """<!doctype html>
 |  COMMAND BAR                          |
 |  :pause  :resume  :add  :remove N     |
 |  :audit  :drift  :stale [d] [n]      |
+|  :release <slot> [local_id|A|B]      |
+|  :release_eligible [slot]            |
 |  :set entry N  :set profit N          |
 |  :layer add [auto|doge|usd]           |
 |  :layer remove                        |
@@ -471,7 +497,7 @@ DASHBOARD_HTML = """<!doctype html>
     let lastRefreshError = '';
     const commandHistory = [];
     const COMMAND_COMPLETIONS = [
-      'pause', 'resume', 'add', 'remove', 'close', 'audit', 'drift', 'stale',
+      'pause', 'resume', 'add', 'remove', 'close', 'release', 'release_eligible', 'audit', 'drift', 'stale',
       'set entry', 'set profit', 'jump', 'layer add', 'layer remove', 'q',
     ];
     const CONTROL_INPUT_IDS = new Set(['entryInput', 'profitInput', 'layerSourceSelect']);
@@ -479,6 +505,24 @@ DASHBOARD_HTML = """<!doctype html>
     function fmt(n, d=6) {
       if (n === null || n === undefined || Number.isNaN(Number(n))) return '-';
       return Number(n).toFixed(d);
+    }
+
+    function fmtAgeSeconds(rawSeconds) {
+      const seconds = Number(rawSeconds || 0);
+      if (!Number.isFinite(seconds) || seconds <= 0) return '0s';
+      if (seconds >= 86400) return `${(seconds / 86400).toFixed(1)}d`;
+      if (seconds >= 3600) return `${(seconds / 3600).toFixed(1)}h`;
+      if (seconds >= 60) return `${(seconds / 60).toFixed(1)}m`;
+      return `${Math.round(seconds)}s`;
+    }
+
+    function isStickyModeEnabled() {
+      return Boolean(state && state.sticky_mode && state.sticky_mode.enabled);
+    }
+
+    function commandCompletions() {
+      if (!isStickyModeEnabled()) return COMMAND_COMPLETIONS;
+      return COMMAND_COMPLETIONS.filter((cmd) => cmd !== 'close' && cmd !== 'stale');
     }
 
     function showToast(message, type='info') {
@@ -621,6 +665,7 @@ DASHBOARD_HTML = """<!doctype html>
       if (verb === 'audit') return {type: 'action', action: 'audit_pnl', payload: {}};
       if (verb === 'drift') return {type: 'action', action: 'reconcile_drift', payload: {}};
       if (verb === 'stale') {
+        if (isStickyModeEnabled()) return {error: 'stale disabled in sticky mode; use :release'};
         let minDistancePct = 3.0;
         let maxBatch = 8;
         if (tokens.length >= 2) {
@@ -680,6 +725,7 @@ DASHBOARD_HTML = """<!doctype html>
       }
 
       if (verb === 'close') {
+        if (isStickyModeEnabled()) return {error: 'close disabled in sticky mode; use :release'};
         if (tokens.length === 1) return {type: 'action', action: 'soft_close_next', payload: {}};
         if (tokens.length < 3) return {error: 'usage: :close <slot> <rid>'};
         const slotId = parseNonNegativeInt(tokens[1]);
@@ -690,6 +736,39 @@ DASHBOARD_HTML = """<!doctype html>
           action: 'soft_close',
           payload: {slot_id: slotId, recovery_id: recoveryId},
         };
+      }
+
+      if (verb === 'release') {
+        if (tokens.length < 2) return {error: 'usage: :release <slot> [local_id|A|B]'};
+        if (tokens.length > 3) return {error: 'usage: :release <slot> [local_id|A|B]'};
+        const slotId = parseNonNegativeInt(tokens[1]);
+        if (slotId === null) return {error: 'slot id must be a non-negative integer'};
+        const payload = {slot_id: slotId};
+        if (tokens.length === 3) {
+          const selector = String(tokens[2] || '').trim();
+          const selectorInt = parseNonNegativeInt(selector);
+          if (selectorInt !== null) {
+            payload.local_id = selectorInt;
+          } else {
+            const tradeId = selector.toUpperCase();
+            if (tradeId !== 'A' && tradeId !== 'B') return {error: 'selector must be local_id or trade A/B'};
+            payload.trade_id = tradeId;
+          }
+        }
+        return {type: 'action', action: 'release_slot', payload};
+      }
+
+      if (verb === 'release_eligible') {
+        if (!isStickyModeEnabled()) return {error: 'release_eligible is for sticky mode'};
+        if (tokens.length > 2) return {error: 'usage: :release_eligible [slot]'};
+        let slotId = selectedSlot;
+        if (tokens.length === 2) {
+          const parsed = parseNonNegativeInt(tokens[1]);
+          if (parsed === null) return {error: 'slot id must be a non-negative integer'};
+          slotId = parsed;
+        }
+        if (!slotId || slotId < 0) return {error: 'no selected slot; use :release_eligible <slot>'};
+        return {type: 'action', action: 'release_oldest_eligible', payload: {slot_id: slotId}};
       }
 
       return {error: `unknown command: ${verb}`};
@@ -769,7 +848,7 @@ DASHBOARD_HTML = """<!doctype html>
     }
 
     function requestSoftCloseNext() {
-      openConfirmDialog('Close oldest recovery?', async () => {
+      openConfirmDialog('Close oldest waiting exit?', async () => {
         await dispatchAction('soft_close_next');
       });
     }
@@ -782,7 +861,7 @@ DASHBOARD_HTML = """<!doctype html>
 
     function requestCancelStaleRecoveries(minDistancePct = 3.0, maxBatch = 8) {
       openConfirmDialog(
-        `Refresh stale recoveries now? min_distance=${minDistancePct}%, max_batch=${maxBatch}.`,
+        `Refresh stale waiting exits now? min_distance=${minDistancePct}%, max_batch=${maxBatch}.`,
         async () => {
           await dispatchAction('cancel_stale_recoveries', {
             min_distance_pct: minDistancePct,
@@ -793,8 +872,25 @@ DASHBOARD_HTML = """<!doctype html>
     }
 
     function requestSoftClose(slotId, recoveryId) {
-      openConfirmDialog(`Close recovery #${recoveryId} on slot #${slotId}?`, async () => {
+      openConfirmDialog(`Close waiting exit #${recoveryId} on slot #${slotId}?`, async () => {
         await dispatchAction('soft_close', {slot_id: slotId, recovery_id: recoveryId});
+      });
+    }
+
+    function requestRelease(slotId, payload = {}) {
+      const localId = payload && payload.local_id !== undefined ? payload.local_id : null;
+      const tradeId = payload && payload.trade_id ? payload.trade_id : '';
+      let selector = 'oldest exit';
+      if (localId !== null) selector = `exit #${localId}`;
+      if (tradeId) selector = `trade ${tradeId}`;
+      openConfirmDialog(`Release ${selector} on slot #${slotId}?`, async () => {
+        await dispatchAction('release_slot', payload);
+      });
+    }
+
+    function requestReleaseOldestEligible(slotId) {
+      openConfirmDialog(`Release oldest eligible exit on slot #${slotId}?`, async () => {
+        await dispatchAction('release_oldest_eligible', {slot_id: slotId});
       });
     }
 
@@ -859,8 +955,9 @@ DASHBOARD_HTML = """<!doctype html>
 
     function commandMatches(rawInput) {
       const pref = normalizeCommandInput(rawInput).toLowerCase();
-      if (!pref) return COMMAND_COMPLETIONS.slice(0, 5);
-      return COMMAND_COMPLETIONS.filter((cmd) => cmd.startsWith(pref)).slice(0, 5);
+      const choices = commandCompletions();
+      if (!pref) return choices.slice(0, 5);
+      return choices.filter((cmd) => cmd.startsWith(pref)).slice(0, 5);
     }
 
     function renderCommandSuggestions() {
@@ -992,6 +1089,14 @@ DASHBOARD_HTML = """<!doctype html>
         requestSoftClose(parsed.payload.slot_id, parsed.payload.recovery_id);
         return;
       }
+      if (parsed.action === 'release_slot') {
+        requestRelease(parsed.payload.slot_id, parsed.payload);
+        return;
+      }
+      if (parsed.action === 'release_oldest_eligible') {
+        requestReleaseOldestEligible(parsed.payload.slot_id);
+        return;
+      }
       if (parsed.type === 'remove_slot') {
         requestRemoveSlot();
         return;
@@ -1041,7 +1146,83 @@ DASHBOARD_HTML = """<!doctype html>
         pnlAuditDetailsEl.textContent = '';
         pnlAuditDetailsEl.title = '';
       }
-      document.getElementById('orphans').textContent = s.total_orphans;
+
+      const sticky = s.sticky_mode || {};
+      const stickyEnabled = Boolean(sticky.enabled);
+      const vintage = s.slot_vintage || {};
+      const waitingFresh = Number(vintage.fresh_0_1h || 0);
+      const waitingAging = Number(vintage.aging_1_6h || 0);
+      const waitingStale = Number(vintage.stale_6_24h || 0);
+      const waitingOld = Number(vintage.old_1_7d || 0);
+      const waitingAncient = Number(vintage.ancient_7d_plus || 0);
+      const waitingTotal = waitingFresh + waitingAging + waitingStale + waitingOld + waitingAncient;
+
+      document.getElementById('orphansLabel').textContent = 'Waiting Exits';
+      document.getElementById('orphans').textContent = stickyEnabled ? waitingTotal : (waitingTotal || s.total_orphans);
+      document.getElementById('stickyModeStatus').textContent = stickyEnabled
+        ? `ON (${String(sticky.compounding_mode || 'legacy_profit')})`
+        : 'OFF';
+      document.getElementById('stickyModeStatus').style.color = stickyEnabled ? 'var(--good)' : '';
+      document.getElementById('vintageWaiting').textContent = String(waitingTotal);
+      document.getElementById('vintageOldest').textContent = fmtAgeSeconds(Number(vintage.oldest_exit_age_sec || 0));
+      document.getElementById('vintageStuck').textContent =
+        `$${fmt(vintage.stuck_capital_usd, 2)} (${fmt(vintage.stuck_capital_pct, 1)}%)`;
+      document.getElementById('vintageEligible').textContent =
+        `${Number(vintage.vintage_release_eligible || 0)} (regime ${fmt(vintage.regime_strength_adx_proxy, 1)})`;
+
+      const vintageBar = document.getElementById('vintageBar');
+      const vintageLegend = document.getElementById('vintageLegend');
+      vintageBar.innerHTML = '';
+      const bucketRows = [
+        {key: 'fresh', count: waitingFresh, color: '#2ea043', label: '0-1h'},
+        {key: 'aging', count: waitingAging, color: '#58a6ff', label: '1-6h'},
+        {key: 'stale', count: waitingStale, color: '#d29922', label: '6-24h'},
+        {key: 'old', count: waitingOld, color: '#f0883e', label: '1-7d'},
+        {key: 'ancient', count: waitingAncient, color: '#f85149', label: '7d+'},
+      ];
+      if (waitingTotal <= 0) {
+        const seg = document.createElement('div');
+        seg.className = 'vintage-seg';
+        seg.style.width = '100%';
+        seg.style.background = '#30363d';
+        vintageBar.appendChild(seg);
+        vintageLegend.textContent = 'No waiting exits';
+      } else {
+        for (const row of bucketRows) {
+          if (row.count <= 0) continue;
+          const seg = document.createElement('div');
+          seg.className = 'vintage-seg';
+          seg.style.width = `${Math.max(2, (row.count / waitingTotal) * 100)}%`;
+          seg.style.background = row.color;
+          seg.title = `${row.label}: ${row.count}`;
+          vintageBar.appendChild(seg);
+        }
+        vintageLegend.textContent =
+          `0-1h:${waitingFresh} | 1-6h:${waitingAging} | 6-24h:${waitingStale} | 1-7d:${waitingOld} | 7d+:${waitingAncient}`;
+      }
+
+      const release = s.release_health || {};
+      const releaseGateStatusEl = document.getElementById('releaseGateStatus');
+      const releaseGateBlocked = Boolean(release.recon_hard_gate_blocked);
+      releaseGateStatusEl.textContent = releaseGateBlocked ? 'BLOCKED' : 'CLEAR';
+      releaseGateStatusEl.style.color = releaseGateBlocked ? 'var(--bad)' : 'var(--good)';
+      const releaseLastAt = release.sticky_release_last_at;
+      const releaseAgo = releaseLastAt ? fmtAgeSeconds((Date.now() / 1000) - Number(releaseLastAt)) : null;
+      document.getElementById('releaseTotals').textContent =
+        releaseLastAt
+          ? `${Number(release.sticky_release_total || 0)} total (${releaseAgo} ago)`
+          : `${Number(release.sticky_release_total || 0)} total`;
+      document.getElementById('releaseGateReason').textContent =
+        releaseGateBlocked ? String(release.recon_hard_gate_reason || '') : '';
+
+      const softCloseBtn = document.getElementById('softCloseBtn');
+      const cancelStaleBtn = document.getElementById('cancelStaleBtn');
+      const releaseBtn = document.getElementById('releaseBtn');
+      const releaseEligibleBtn = document.getElementById('releaseEligibleBtn');
+      softCloseBtn.style.display = stickyEnabled ? 'none' : '';
+      cancelStaleBtn.style.display = stickyEnabled ? 'none' : '';
+      releaseBtn.style.display = stickyEnabled ? '' : 'none';
+      releaseEligibleBtn.style.display = stickyEnabled ? '' : 'none';
 
       const cfh = s.capacity_fill_health || {};
       const band = String(cfh.status_band || '-').toUpperCase();
@@ -1301,6 +1482,9 @@ DASHBOARD_HTML = """<!doctype html>
     function renderSelected(s) {
       const slot = s.slots.find((x) => x.slot_id === selectedSlot) || s.slots[0];
       if (!slot) return;
+      const stickyEnabled = isStickyModeEnabled();
+      const orphansTitle = document.getElementById('orphansTitle');
+      orphansTitle.textContent = 'Waiting Exits';
 
       const sb = document.getElementById('stateBar');
       const alias = slot.slot_alias || slot.slot_label || `slot-${slot.slot_id}`;
@@ -1324,7 +1508,15 @@ DASHBOARD_HTML = """<!doctype html>
       ob.innerHTML = '';
       for (const o of slot.open_orders) {
         const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${o.side}/${o.role}</td><td>${o.trade_id}</td><td>${o.cycle}</td><td>${fmt(o.volume, 4)}</td><td>$${fmt(o.price, 6)}</td><td class=\"mono tiny\">${o.txid || '-'}</td>`;
+        const canRelease = stickyEnabled && o.role === 'exit';
+        const actionHtml = canRelease ? `<button data-local-id=\"${o.local_id}\">release</button>` : '-';
+        tr.innerHTML = `<td>${o.side}/${o.role}</td><td>${o.trade_id}</td><td>${o.cycle}</td><td>${fmt(o.volume, 4)}</td><td>$${fmt(o.price, 6)}</td><td class=\"mono tiny\">${o.txid || '-'}</td><td>${actionHtml}</td>`;
+        if (canRelease) {
+          tr.querySelector('button').onclick = () => requestRelease(slot.slot_id, {
+            slot_id: slot.slot_id,
+            local_id: Number(o.local_id),
+          });
+        }
         ob.appendChild(tr);
       }
 
@@ -1332,6 +1524,7 @@ DASHBOARD_HTML = """<!doctype html>
       rb.innerHTML = '';
       for (const r of slot.recovery_orders) {
         const tr = document.createElement('tr');
+        const actionHtml = stickyEnabled ? '-' : `<button data-rid=\"${r.recovery_id}\">close</button>`;
         tr.innerHTML = `
           <td>${r.recovery_id}</td>
           <td>${r.trade_id}.${r.cycle}</td>
@@ -1339,9 +1532,11 @@ DASHBOARD_HTML = """<!doctype html>
           <td>${Math.round(r.age_sec)}s</td>
           <td>${fmt(r.distance_pct, 3)}</td>
           <td>$${fmt(r.price, 6)}</td>
-          <td><button data-rid=\"${r.recovery_id}\">close</button></td>
+          <td>${actionHtml}</td>
         `;
-        tr.querySelector('button').onclick = () => requestSoftClose(slot.slot_id, r.recovery_id);
+        if (!stickyEnabled) {
+          tr.querySelector('button').onclick = () => requestSoftClose(slot.slot_id, r.recovery_id);
+        }
         rb.appendChild(tr);
       }
 
@@ -1557,6 +1752,18 @@ DASHBOARD_HTML = """<!doctype html>
     document.getElementById('resumeBtn').onclick = () => { void dispatchAction('resume'); };
     document.getElementById('addSlotBtn').onclick = () => { void dispatchAction('add_slot'); };
     document.getElementById('removeSlotBtn').onclick = () => requestRemoveSlot();
+    document.getElementById('releaseEligibleBtn').onclick = () => {
+      const slots = getSlots();
+      if (!slots.length) { showToast('no slots available', 'error'); return; }
+      const slotId = selectedSlot || slots[0].slot_id;
+      requestReleaseOldestEligible(slotId);
+    };
+    document.getElementById('releaseBtn').onclick = () => {
+      const slots = getSlots();
+      if (!slots.length) { showToast('no slots available', 'error'); return; }
+      const slotId = selectedSlot || slots[0].slot_id;
+      requestRelease(slotId, {slot_id: slotId});
+    };
     document.getElementById('softCloseBtn').onclick = () => requestSoftCloseNext();
     document.getElementById('reconcileBtn').onclick = () => requestReconcileDrift();
     document.getElementById('cancelStaleBtn').onclick = () => requestCancelStaleRecoveries();
