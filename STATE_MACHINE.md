@@ -1,6 +1,6 @@
 # DOGE State-Machine Bot v1
 
-Last updated: 2026-02-15
+Last updated: 2026-02-15 (rev 2)
 Primary code references: `bot.py`, `state_machine.py`, `config.py`, `dashboard.py`, `supabase_store.py`, `hmm_regime_detector.py`
 
 ## 1. Scope
@@ -9,8 +9,8 @@ This document is the implementation contract for the current runtime.
 
 - Market: Kraken `XDGUSD` (`DOGE/USD`) only
 - Strategy: slot-based pair engine (`A` and `B` legs) with independent per-slot compounding
-- Persistence: Supabase-first (`bot_state`, `fills`, `price_history`, `ohlcv_candles`, `bot_events`)
-- Execution: fully rule-based reducer; HMM regime detector is advisory-only (read-only, no reducer modifications)
+- Persistence: Supabase-first (`bot_state`, `fills`, `price_history`, `ohlcv_candles`, `bot_events`, `exit_outcomes`, `regime_tier_transitions`)
+- Execution: fully rule-based reducer; HMM regime detector + directional regime system are advisory/actuation layers in `bot.py` runtime (no reducer modifications)
 - Control plane: dashboard + Telegram commands
 
 Out of scope for v1:
@@ -32,7 +32,7 @@ Core data model (`PairState`) is per slot and contains:
 - Completed cycles (`completed_cycles`)
 - Cycle counters (`cycle_a`, `cycle_b`)
 - Risk counters and cooldown timers
-- Mode flags (`long_only`, `short_only`)
+- Mode flags (`long_only`, `short_only`, `mode_source`)
 
 ## 3. Top-Level Lifecycle
 
@@ -65,24 +65,27 @@ Per iteration in `bot.py`:
 1. `begin_loop()` enables private API budget accounting.
 2. `_refresh_price(strict=False)`.
 3. If price age exceeds `STALE_PRICE_MAX_AGE_SEC`, call `pause(...)`.
-4. **OHLCV sync** (`_sync_ohlcv_candles`): pull Kraken OHLC candles (default 1m), queue upserts to Supabase (see §16).
+4. **OHLCV sync** (`_sync_ohlcv_candles`): pull Kraken OHLC candles (default 1m + optional 15m secondary), queue upserts to Supabase (see §16).
 5. Compute volatility-adaptive runtime profit target.
 6. **Daily loss lock check** (`_update_daily_loss_lock`): auto-pauses if aggregate UTC-day loss exceeds `DAILY_LOSS_LIMIT`.
-7. **Entry scheduler pre-tick drain**: drain up to `MAX_ENTRY_ADDS_PER_LOOP` deferred entries.
-8. For each slot:
-   - Apply `PriceTick`
-   - Apply `TimerTick`
-   - Call `_ensure_slot_bootstrapped(slot_id)`
-   - Call `_auto_repair_degraded_slot(slot_id)` to restore missing entry legs when fundable
-9. Poll status for all tracked order txids (`_poll_order_status`).
-10. Refresh pair open-order telemetry (`_refresh_open_order_telemetry`) when budget allows.
-11. **Auto soft-close** (`_auto_soft_close_if_capacity_pressure`): reprices farthest recoveries when utilization exceeds threshold.
-12. **Persistent open-order drift alert** (`_maybe_alert_persistent_open_order_drift`).
-13. **Rebalancer update** (`_update_rebalancer`): every `REBALANCE_INTERVAL_SEC`. Calls `_update_hmm()` (see §17) before computing dynamic idle target.
-14. Emit orphan-pressure notification at `ORPHAN_PRESSURE_WARN_AT` multiples.
-15. Persist snapshot (`save_state` to `bot_state`).
-16. Poll Telegram commands.
-17. `end_loop()` resets budget/cache.
+7. **Rebalancer update** (`_update_rebalancer`): every `REBALANCE_INTERVAL_SEC`. Currently disabled (`REBALANCE_ENABLED=False`) — conflicts with directional regime system (see §18).
+8. **Regime tier evaluation** (`_update_regime_tier`): every `REGIME_EVAL_INTERVAL_SEC` (default 300s). Triggers `_update_hmm()` if HMM is stale, then evaluates tier 0/1/2 (see §18).
+9. **Tier 2 suppression** (`_apply_tier2_suppression`): runs every loop. Cancels against-trend entries in S0 slots when tier 2 is active and grace has elapsed (see §18.3).
+10. **Entry scheduler pre-tick drain**: drain up to `MAX_ENTRY_ADDS_PER_LOOP` deferred entries. Purges suppressed-side deferred entries during tier 2.
+11. For each slot:
+    - Apply `PriceTick`
+    - Apply `TimerTick`
+    - Call `_ensure_slot_bootstrapped(slot_id)` — respects regime suppression (see §18.4)
+    - Call `_auto_repair_degraded_slot(slot_id)` — skips slots with `mode_source="regime"` (see §18.5)
+12. Post-tick entry drain (`_drain_pending_entry_orders`).
+13. Poll status for all tracked order txids (`_poll_order_status`).
+14. Refresh pair open-order telemetry (`_refresh_open_order_telemetry`) when budget allows.
+15. **Auto soft-close** (`_auto_soft_close_if_capacity_pressure`): reprices farthest recoveries when utilization exceeds threshold.
+16. **Persistent open-order drift alert** (`_maybe_alert_persistent_open_order_drift`).
+17. Emit orphan-pressure notification at `ORPHAN_PRESSURE_WARN_AT` multiples.
+18. Persist snapshot (`save_state` to `bot_state`).
+19. Poll Telegram commands.
+20. `end_loop()` resets budget/cache.
 
 ## 5. Pair Phases (`S0`, `S1a`, `S1b`, `S2`)
 
@@ -103,9 +106,24 @@ Fallback flags:
 - `long_only=True`: only B-side entry flow should continue
 - `short_only=True`: only A-side entry flow should continue
 
+Mode source (`mode_source` on `PairState`):
+
+- `"none"`: default symmetric state
+- `"balance"`: one-sided due to insufficient balance for one side
+- `"regime"`: one-sided due to directional regime suppression (§18)
+
 ## 6. Reducer Contract
 
 `transition(state, event, cfg, order_size_usd) -> (next_state, actions)`
+
+`EngineConfig` fields:
+
+- `entry_pct`: base entry distance from market (sacred — never modified by rebalancer)
+- `entry_pct_a`: per-trade override for A-side entry distance (set by regime spacing bias §18.2, or `None` for base)
+- `entry_pct_b`: per-trade override for B-side entry distance (set by regime spacing bias §18.2, or `None` for base)
+- `profit_pct`, `refresh_pct`, `max_consecutive_refreshes`, `refresh_cooldown_sec`, etc.
+
+Entry distance selection (`_entry_pct_for_trade`): uses `entry_pct_a` for trade A or `entry_pct_b` for trade B when set and >0; otherwise falls back to base `entry_pct`.
 
 Properties:
 
@@ -300,7 +318,12 @@ UTC-day-based aggregate realized-loss circuit breaker.
 - Resume is blocked while lock is active.
 - Counts both normal cycle losses and recovery eviction booked losses.
 
-## 14. Inventory Rebalancer
+## 14. Inventory Rebalancer (Currently Disabled)
+
+> **Note:** `REBALANCE_ENABLED=False` in production. The rebalancer's size-skew
+> actuator conflicts with the directional regime system (§18) — the rebalancer
+> may push "sell DOGE" while the regime says BULLISH. The regime system supersedes
+> rebalancer for directional adaptation. Full removal is deferred.
 
 PD controller that adjusts entry order sizes to maintain target idle-USD ratio.
 
@@ -478,9 +501,9 @@ Four observation features: MACD histogram slope, EMA spread %, RSI zone, volume 
 
 ### 17.2 Lifecycle
 
-1. **Init** (`_init_hmm_runtime`): imports `numpy` + `hmm_regime_detector` inside try/except. If import fails, logs warning and continues with trend-only logic.
-2. **Training** (`_train_hmm`): called on startup and when `needs_retrain()` returns true (daily by default). Uses `_fetch_training_candles()` from §16.
-3. **Inference** (`_update_hmm`): called every rebalancer tick (inside `_update_rebalancer`). Uses `_fetch_recent_candles()`. Outputs `RegimeState` with regime, probabilities, confidence, and `bias_signal`.
+1. **Init** (`_init_hmm_runtime`): imports `numpy` + `hmm_regime_detector` inside try/except. If import fails, logs warning and continues with trend-only logic. Also initializes secondary detector if `HMM_MULTI_TIMEFRAME_ENABLED=True`.
+2. **Training** (`_train_hmm` / `_train_hmm_secondary`): called on startup and when `needs_retrain()` returns true (daily by default). Uses `_fetch_training_candles()` from §16.
+3. **Inference** (`_update_hmm`): called from `_update_regime_tier()` every `REGIME_EVAL_INTERVAL_SEC` (default 300s). Also called from `_update_rebalancer()` when rebalancer is enabled. Uses `_fetch_recent_candles()`. Updates primary detector, then secondary if multi-timeframe enabled, then recomputes consensus.
 4. **Blend**: `signal = blend * trend_score + (1 - blend) * hmm_bias` feeds into §15.2 target mapping.
 5. **Persistence**: `_snapshot_hmm_state()` / `_restore_hmm_snapshot()` save/restore `RegimeState` and train timestamp. Model itself is **not** serialized — retrained from candle data on startup.
 
@@ -515,7 +538,143 @@ Four observation features: MACD histogram slope, EMA spread %, RSI zone, volume 
 | `HMM_BIAS_GAIN` | 1.0 | Scales bias magnitude |
 | `HMM_BLEND_WITH_TREND` | 0.5 | Blend ratio (0=HMM, 1=trend) |
 
-## 18. Capital Layers
+### 17.6 Multi-Timeframe HMM
+
+Dual-detector architecture: a fast primary (default 1m) and a slow secondary (default 15m) HMM run in parallel. A consensus function merges their signals for policy consumption.
+
+**Source selector** (`_policy_hmm_source`): all policy consumers (regime tier, rebalancer, trend blend) read from a single shared source determined by `HMM_MULTI_TIMEFRAME_SOURCE`:
+
+- `"primary"`: only primary HMM drives policy (secondary collects data but is not consumed)
+- `"consensus"`: merged consensus signal drives policy (requires `HMM_MULTI_TIMEFRAME_ENABLED=True`)
+
+**Consensus computation** (`_compute_hmm_consensus`):
+
+- If both HMMs agree on direction: full confidence, weighted blend of bias signals (15m weight 0.7, 1m weight 0.3)
+- If 1m is cooling (RANGING) but 15m is directional: 15m direction held with dampened confidence
+- If 15m is neutral: fall back to primary signal
+- If conflict (opposing directions): RANGING with zero bias (conservative)
+
+**Gated confirmation model**: the 15m sets *direction* (BULLISH/BEARISH gate), the 1m sets *timing* (confidence modulation). Agreement boosts confidence; disagreement forces neutral.
+
+**Secondary OHLCV pipeline**: separate `_sync_ohlcv_candles_secondary()` with its own cursor, sync interval, and backfill state. Uses `HMM_SECONDARY_INTERVAL_MIN` (default 15).
+
+**Activation phases** (config flips, no code changes):
+
+| Phase | Config | Effect |
+|-------|--------|--------|
+| A (Shadow) | `HMM_SECONDARY_OHLCV_ENABLED=True` | Collect 15m data, no policy influence |
+| B (Dual inference) | + `HMM_MULTI_TIMEFRAME_ENABLED=True` | Both HMMs run, consensus computed, source still primary |
+| C (Consensus policy) | + `HMM_MULTI_TIMEFRAME_SOURCE=consensus` | Consensus drives all policy consumers |
+
+### 17.7 Multi-Timeframe Config
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `HMM_MULTI_TIMEFRAME_ENABLED` | False | Enable secondary HMM detector |
+| `HMM_MULTI_TIMEFRAME_SOURCE` | "primary" | Policy source: "primary" or "consensus" |
+| `HMM_SECONDARY_INTERVAL_MIN` | 15 | Secondary candle interval |
+| `HMM_SECONDARY_OHLCV_ENABLED` | False | Enable secondary OHLCV collection |
+| `HMM_SECONDARY_SYNC_INTERVAL_SEC` | 300.0 | Secondary OHLCV pull cadence |
+| `HMM_SECONDARY_TRAINING_CANDLES` | 1000 | Secondary training window |
+| `HMM_SECONDARY_RECENT_CANDLES` | 50 | Secondary inference window |
+| `HMM_SECONDARY_MIN_TRAIN_SAMPLES` | 200 | Minimum candles for secondary training |
+| `CONSENSUS_1M_WEIGHT` | 0.3 | 1m weight in consensus blend |
+| `CONSENSUS_15M_WEIGHT` | 0.7 | 15m weight in consensus blend |
+| `CONSENSUS_DAMPEN_FACTOR` | 0.5 | Confidence dampening on partial agreement |
+
+## 18. Directional Regime System
+
+Three-tier graduated response to directional market conditions. Gated by HMM confidence and bias signal magnitude. The reducer (§6) is **not modified** — all influence flows through `EngineConfig` parameters and runtime suppression in `bot.py`.
+
+Specs: `docs/DIRECTIONAL_REGIME_SPEC.md`, `docs/TIER2_SIDE_SUPPRESSION_SPEC.md`, `docs/REGIME_OBSERVABILITY_AND_STABILITY_SPEC.md`
+
+### 18.1 Tier Model
+
+| Tier | Label | Confidence | Bias Floor | Effect |
+|------|-------|-----------|------------|--------|
+| 0 | symmetric | < 0.20 | — | No directional adaptation |
+| 1 | biased | ≥ 0.20 | abs(bias) ≥ 0.10 | Asymmetric entry spacing via `entry_pct_a`/`entry_pct_b` |
+| 2 | directional | ≥ 0.50 | abs(bias) ≥ 0.25 | Side suppression: against-trend entries cancelled, bootstrap one-sided |
+
+**Directional gate**: tier 2 requires regime in (`BULLISH`, `BEARISH`) AND abs(bias_signal) ≥ `REGIME_TIER2_BIAS_FLOOR`. RANGING always forces tier 0.
+
+**Evaluation**: `_update_regime_tier()` runs every `REGIME_EVAL_INTERVAL_SEC` (default 300s). Reads signal from `_policy_hmm_signal()` (shared source selector — respects multi-timeframe config). Triggers `_update_hmm()` if HMM data is stale.
+
+**Stability controls**:
+
+- **Hysteresis** (5%): on downgrades only, re-promotes if confidence is within buffer — but NEVER overrides the directional gate. If RANGING caused the downgrade, hysteresis cannot re-promote.
+- **Dwell time** (300s): minimum time at current tier before any transition.
+- **Manual override**: `REGIME_MANUAL_OVERRIDE=BULLISH|BEARISH` forces regime with `REGIME_MANUAL_CONFIDENCE`.
+
+### 18.2 Tier 1: Asymmetric Entry Spacing
+
+`_regime_entry_spacing_multipliers()` calls `hmm_regime_detector.compute_grid_bias()` to get per-side multipliers:
+
+- **BULLISH**: A-side (sell entry) spacing widens, B-side (buy entry) spacing tightens
+- **BEARISH**: opposite — B widens, A tightens
+
+These feed into `_engine_cfg()` as `entry_pct_a` and `entry_pct_b` on `EngineConfig`. The reducer's `_entry_pct_for_trade()` selects the correct distance per trade.
+
+### 18.3 Tier 2: Side Suppression
+
+`_apply_tier2_suppression()` runs every main loop cycle. When tier 2 is active and grace has elapsed:
+
+1. **Entry cancellation**: cancels against-trend entries in S0 slots on Kraken, removes from state, sets `mode_source="regime"` + `long_only`/`short_only`
+2. **Regime-flip cleanup**: if suppressed side changes (BULLISH→BEARISH), clears old-side regime ownership before applying new side
+3. **Idempotent**: skips slots already in correct regime mode
+
+Suppressed side mapping:
+
+- BULLISH (bias > 0): suppress A (sell entries), favor B (buy entries)
+- BEARISH (bias < 0): suppress B (buy entries), favor A (sell entries)
+
+**Grace period**: `REGIME_SUPPRESSION_GRACE_SEC` (default 60s) delay between tier 2 activation and first cancellation. Prevents premature suppression during tier oscillation.
+
+### 18.4 Bootstrap Regime Awareness
+
+`_ensure_slot_bootstrapped()` checks regime state before placing entries:
+
+- If tier 2 active + grace elapsed + suppressed side set: only place favored-side entry with `mode_source="regime"`
+- If favored side isn't fundable: wait (never fall back to against-trend)
+- Priority: balance constraints > regime signal > symmetric
+
+### 18.5 Auto-Repair Guard
+
+`_auto_repair_degraded_slot()` early-returns when `mode_source="regime"`. This prevents auto-repair from undoing regime suppression by restoring the suppressed side.
+
+### 18.6 Tier Downgrade Cleanup
+
+When tier drops from 2 to lower: `mode_source="regime"` is cleared to `"none"` on all slots. Auto-repair then restores missing sides when balance allows.
+
+### 18.7 Deferred Entry Purge
+
+`_drain_pending_entry_orders()` filters out suppressed-side deferred entries (orders with no txid waiting in queue) during tier 2.
+
+### 18.8 Exit Outcomes (Vintage Data)
+
+`exit_outcomes` Supabase table tracks exit resolution with regime context:
+
+- `regime_at_entry`, `regime_confidence`, `against_trend`, `regime_tier`
+- Used for future threshold calibration (Phase 3)
+
+### 18.9 Config
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `REGIME_DIRECTIONAL_ENABLED` | False | Master actuation switch |
+| `REGIME_SHADOW_ENABLED` | False | Shadow-only evaluator (logs tiers, no actuations) |
+| `REGIME_TIER1_CONFIDENCE` | 0.20 | Tier 1 confidence threshold |
+| `REGIME_TIER2_CONFIDENCE` | 0.50 | Tier 2 confidence threshold |
+| `REGIME_TIER1_BIAS_FLOOR` | 0.10 | Min abs(bias) for tier 1 |
+| `REGIME_TIER2_BIAS_FLOOR` | 0.25 | Min abs(bias) for tier 2 |
+| `REGIME_HYSTERESIS` | 0.05 | Downgrade hysteresis buffer |
+| `REGIME_MIN_DWELL_SEC` | 300.0 | Min seconds at current tier |
+| `REGIME_SUPPRESSION_GRACE_SEC` | 60.0 | Grace before tier 2 cancellations |
+| `REGIME_EVAL_INTERVAL_SEC` | 300.0 | Evaluation frequency |
+| `REGIME_MANUAL_OVERRIDE` | "" | Force regime (BULLISH/BEARISH or empty) |
+| `REGIME_MANUAL_CONFIDENCE` | 0.75 | Confidence for manual override |
+
+## 19. Capital Layers
 
 Manual vertical scaling system for order sizes.
 
@@ -524,7 +683,7 @@ Manual vertical scaling system for order sizes.
 - `effective_layers = min(target_layers, max_from_doge, max_from_usd)`
 - Dashboard exposes layer metrics: target, effective, funding gap, propagation progress.
 
-### Config
+### 19.1 Config
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -533,7 +692,7 @@ Manual vertical scaling system for order sizes.
 | `CAPITAL_LAYER_BALANCE_BUFFER` | 1.5 | Safety margin for balance check |
 | `CAPITAL_LAYER_DEFAULT_SOURCE` | "auto" | Funding source (auto/doge/usd) |
 
-## 19. Slot Aliases
+## 20. Slot Aliases
 
 Human-friendly names for slots from configurable pool.
 
@@ -542,7 +701,7 @@ Human-friendly names for slots from configurable pool.
 - Fallback when pool exhausted: `doge-NN` (incrementing counter).
 - Config: `SLOT_ALIAS_POOL` (comma-separated env var).
 
-## 20. Reconciliation and Exactly-Once Fill Accounting
+## 21. Reconciliation and Exactly-Once Fill Accounting
 
 Startup reconciliation (`_reconcile_open_orders`):
 
@@ -563,7 +722,7 @@ Exactly-once guard:
 - `seen_fill_txids` in memory + persisted snapshot
 - Closed-order polling and replay both honor this set
 
-## 21. Persistence Model
+## 22. Persistence Model
 
 Primary snapshot key:
 
@@ -581,8 +740,10 @@ Snapshot payload includes:
 - **daily loss lock state**: `_daily_loss_lock_active`, `_daily_loss_lock_utc_day`, `_daily_realized_loss_utc`
 - **capital layer state**: `target_layers`, `effective_layers`
 - **OHLCV pipeline state**: `ohlcv_since_cursor`, `ohlcv_last_sync_ts`, `ohlcv_last_candle_ts`
-- **HMM backfill state**: `hmm_backfill_last_at`, `hmm_backfill_last_rows`, `hmm_backfill_last_message`
+- **HMM backfill state**: `hmm_backfill_last_at`, `hmm_backfill_last_rows`, `hmm_backfill_last_message` (primary + secondary)
 - **HMM regime state**: `_hmm_regime_state` (RegimeState dict), `_hmm_last_train_ts`, `_hmm_trained`
+- **HMM secondary state**: `hmm_state_secondary`, `hmm_consensus` (multi-timeframe)
+- **Directional regime state**: `regime_tier`, `regime_tier_entered_at`, `regime_tier2_grace_start`, `regime_side_suppressed`, `regime_last_eval_ts`, `regime_shadow_state`
 
 Fields absent from old snapshots default to safe values (backward compatible).
 
@@ -594,7 +755,7 @@ Event log:
 
 If Supabase tables are missing, bot logs warnings and continues running.
 
-## 22. Dashboard and API Contract
+## 23. Dashboard and API Contract
 
 HTTP server:
 
@@ -621,7 +782,7 @@ Supported dashboard actions:
 - `reconcile_drift` (cancel Kraken-only orders not tracked internally)
 - `audit_pnl` (recompute P&L from completed cycles)
 
-### 22.1 `/api/status` Payload Blocks
+### 23.1 `/api/status` Payload Blocks
 
 **`capacity_fill_health`**: manual scaling diagnostics:
 
@@ -664,14 +825,36 @@ Supported dashboard actions:
 - `confidence`, `bias_signal`, `blend_factor`
 - `probabilities` (`bearish`, `ranging`, `bullish`)
 - `observation_count`, `last_update_ts`, `last_train_ts`, `error`
+- `source_mode` (`primary` or `consensus`), `multi_timeframe`, `agreement`
+- `primary`, `secondary`, `consensus` (nested sub-objects with per-detector state)
 
-### 22.2 `status_band` thresholds
+**`hmm_consensus`**: multi-timeframe consensus state (§17.6):
+
+- `regime`, `confidence`, `bias_signal`, `agreement` (`full`, `1m_cooling`, `15m_neutral`, `conflict`, `primary_only`)
+- `source_mode`, `multi_timeframe`
+
+**`hmm_data_pipeline_secondary`**: secondary OHLCV pipeline (§16, 15m candles):
+
+- Same fields as `hmm_data_pipeline` but for the secondary interval
+
+**`regime_directional`**: directional regime system state (§18):
+
+- `enabled`, `shadow_enabled`, `actuation_enabled`
+- `tier` (0/1/2), `tier_label` (`symmetric`/`biased`/`directional`)
+- `suppressed_side` (`A`/`B`/null), `favored_side` (`A`/`B`/null)
+- `regime`, `confidence`, `bias_signal`, `abs_bias`
+- `directional_ok_tier1`, `directional_ok_tier2`, `hmm_ready`
+- `dwell_sec`, `hysteresis_buffer`, `grace_remaining_sec`
+- `regime_suppressed_slots` (count of slots with `mode_source="regime"`)
+- `last_eval_ts`, `reason`
+
+### 23.2 `status_band` thresholds
 
 - `stop` when `open_order_headroom < 10` or `partial_fill_cancel_events_1d > 0`
 - `caution` when `open_order_headroom < 20` (and stop conditions are false)
 - `normal` otherwise
 
-## 23. Telegram Command Contract
+## 24. Telegram Command Contract
 
 Supported commands:
 
@@ -689,7 +872,7 @@ Callback format for interactive soft-close:
 
 - `sc:<slot_id>:<recovery_id>`
 
-## 24. Operational Guardrails
+## 25. Operational Guardrails
 
 Automatic pauses:
 
@@ -717,7 +900,7 @@ Signal handling:
 
 - `SIGTERM`, `SIGINT` (and `SIGBREAK` on Windows) trigger graceful shutdown
 
-## 25. Developer Notes
+## 26. Developer Notes
 
 When updating behavior, update these files together:
 
