@@ -1136,8 +1136,44 @@ class BotEventLogTests(unittest.TestCase):
         with mock.patch.object(rt, "_hmm_data_readiness", return_value={"ready_for_min_train": True, "samples": 2000}):
             payload = rt.status_payload()
         self.assertIn("hmm_data_pipeline", payload)
+        self.assertIn("hmm_regime", payload)
         self.assertTrue(payload["hmm_data_pipeline"]["ready_for_min_train"])
         self.assertEqual(payload["hmm_data_pipeline"]["samples"], 2000)
+        self.assertIn("bias_signal", payload["hmm_regime"])
+        self.assertIn("probabilities", payload["hmm_regime"])
+
+    def test_dynamic_idle_target_blends_with_hmm_bias_when_enabled(self):
+        def _mk_runtime() -> bot.BotRuntime:
+            rt = bot.BotRuntime()
+            rt.last_price = 0.102
+            rt.price_history = []
+            rt._trend_fast_ema = 0.102
+            rt._trend_slow_ema = 0.100
+            rt._trend_last_update_ts = 1000.0
+            rt._trend_dynamic_target = 0.40
+            rt._trend_smoothed_target = 0.40
+            rt._trend_target_locked_until = 0.0
+            return rt
+
+        now = 1300.0
+        base_rt = _mk_runtime()
+        hmm_rt = _mk_runtime()
+        hmm_rt._hmm_state.update({
+            "available": True,
+            "trained": True,
+            "bias_signal": -1.0,
+            "blend_factor": 0.0,
+        })
+
+        with mock.patch.object(config, "HMM_ENABLED", False):
+            base_target = base_rt._compute_dynamic_idle_target(now)
+
+        with mock.patch.object(config, "HMM_ENABLED", True):
+            with mock.patch.object(config, "HMM_BLEND_WITH_TREND", 0.0):
+                hmm_target = hmm_rt._compute_dynamic_idle_target(now)
+
+        self.assertGreater(hmm_target, base_target)
+        self.assertLessEqual(hmm_target, float(config.TREND_IDLE_CEILING))
 
     def test_dynamic_idle_target_cold_start_uses_base_target(self):
         rt = bot.BotRuntime()

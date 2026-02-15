@@ -475,6 +475,17 @@ HMM_RECENT_CANDLES: int = _env("HMM_RECENT_CANDLES", 100, int)
 HMM_MIN_TRAIN_SAMPLES: int = _env("HMM_MIN_TRAIN_SAMPLES", 500, int)
 HMM_READINESS_CACHE_SEC: float = _env("HMM_READINESS_CACHE_SEC", 300.0, float)
 
+# HMM detector runtime knobs (advisory-only layer; reducer remains unchanged).
+HMM_ENABLED: bool = _env("HMM_ENABLED", False, bool)
+HMM_N_STATES: int = _env("HMM_N_STATES", 3, int)
+HMM_N_ITER: int = _env("HMM_N_ITER", 100, int)
+HMM_COVARIANCE_TYPE: str = _env("HMM_COVARIANCE_TYPE", "diag", str)
+HMM_INFERENCE_WINDOW: int = _env("HMM_INFERENCE_WINDOW", 50, int)
+HMM_CONFIDENCE_THRESHOLD: float = _env("HMM_CONFIDENCE_THRESHOLD", 0.15, float)
+HMM_RETRAIN_INTERVAL_SEC: float = _env("HMM_RETRAIN_INTERVAL_SEC", 86400.0, float)
+HMM_BIAS_GAIN: float = _env("HMM_BIAS_GAIN", 1.0, float)
+HMM_BLEND_WITH_TREND: float = _env("HMM_BLEND_WITH_TREND", 0.5, float)
+
 # Mapping from skew signal -> size multiplier.
 REBALANCE_SIZE_SENSITIVITY: float = _env("REBALANCE_SIZE_SENSITIVITY", 1.0, float)
 REBALANCE_MAX_SIZE_MULT: float = _env("REBALANCE_MAX_SIZE_MULT", 1.5, float)

@@ -290,6 +290,11 @@ class BotRuntime:
         self._ohlcv_last_rows_queued: int = 0
         self._hmm_readiness_cache: dict[str, Any] | None = None
         self._hmm_readiness_last_ts: float = 0.0
+        self._hmm_detector: Any = None
+        self._hmm_module: Any = None
+        self._hmm_numpy: Any = None
+        self._hmm_state: dict[str, Any] = self._hmm_default_state()
+        self._hmm_last_train_attempt_ts: float = 0.0
 
         # Daily loss lock (aggregate bot-level, UTC day).
         self._daily_loss_lock_active: bool = False
@@ -299,6 +304,7 @@ class BotRuntime:
         self._sticky_release_last_at: float = 0.0
         self._release_recon_blocked: bool = False
         self._release_recon_blocked_reason: str = ""
+        self._init_hmm_runtime()
 
     # ------------------ Config/State ------------------
 
@@ -905,7 +911,7 @@ class BotRuntime:
         )
 
     def _global_snapshot(self) -> dict:
-        return {
+        snap = {
             "version": "doge-v1",
             "saved_at": _now(),
             "mode": self.mode,
@@ -960,6 +966,8 @@ class BotRuntime:
             "release_recon_blocked": bool(self._release_recon_blocked),
             "release_recon_blocked_reason": str(self._release_recon_blocked_reason or ""),
         }
+        snap.update(self._snapshot_hmm_state())
+        return snap
 
     def _save_local_runtime_snapshot(self, snapshot: dict) -> None:
         try:
@@ -1079,6 +1087,7 @@ class BotRuntime:
                     except Exception:
                         continue
             self._rebalancer_sign_flip_history = deque(sorted(cleaned_hist)[-20:])
+            self._restore_hmm_snapshot(snap)
 
             self.slots = {}
             slot_aliases = snap.get("slot_aliases", {})
@@ -1253,6 +1262,9 @@ class BotRuntime:
 
         # Get initial market price.
         self._refresh_price(strict=True)
+        # Prime OHLCV + HMM state before entering the loop.
+        self._sync_ohlcv_candles(_now())
+        self._update_hmm(_now())
 
         # Push price into all slots.
         for sid, slot in self.slots.items():
@@ -1343,6 +1355,256 @@ class BotRuntime:
                 raise
             if self.consecutive_api_errors >= config.MAX_CONSECUTIVE_ERRORS:
                 self.pause(f"{self.consecutive_api_errors} consecutive API errors")
+
+    def _hmm_default_state(self) -> dict[str, Any]:
+        blend = max(0.0, min(1.0, float(getattr(config, "HMM_BLEND_WITH_TREND", 0.5))))
+        return {
+            "enabled": bool(getattr(config, "HMM_ENABLED", False)),
+            "available": False,
+            "trained": False,
+            "regime": "RANGING",
+            "regime_id": 1,
+            "confidence": 0.0,
+            "bias_signal": 0.0,
+            "probabilities": {
+                "bearish": 0.0,
+                "ranging": 1.0,
+                "bullish": 0.0,
+            },
+            "observation_count": 0,
+            "blend_factor": blend,
+            "last_update_ts": 0.0,
+            "last_train_ts": 0.0,
+            "error": "",
+        }
+
+    def _hmm_runtime_config(self) -> dict[str, Any]:
+        return {
+            "HMM_N_STATES": max(2, int(getattr(config, "HMM_N_STATES", 3))),
+            "HMM_N_ITER": max(10, int(getattr(config, "HMM_N_ITER", 100))),
+            "HMM_COVARIANCE_TYPE": str(getattr(config, "HMM_COVARIANCE_TYPE", "diag") or "diag"),
+            "HMM_INFERENCE_WINDOW": max(5, int(getattr(config, "HMM_INFERENCE_WINDOW", 50))),
+            "HMM_CONFIDENCE_THRESHOLD": max(
+                0.0, float(getattr(config, "HMM_CONFIDENCE_THRESHOLD", 0.15))
+            ),
+            "HMM_RETRAIN_INTERVAL_SEC": max(
+                300.0, float(getattr(config, "HMM_RETRAIN_INTERVAL_SEC", 86400.0))
+            ),
+            "HMM_MIN_TRAIN_SAMPLES": max(50, int(getattr(config, "HMM_MIN_TRAIN_SAMPLES", 500))),
+            "HMM_BIAS_GAIN": max(0.0, float(getattr(config, "HMM_BIAS_GAIN", 1.0))),
+            "HMM_BLEND_WITH_TREND": max(
+                0.0, min(1.0, float(getattr(config, "HMM_BLEND_WITH_TREND", 0.5)))
+            ),
+        }
+
+    def _refresh_hmm_state_from_detector(self) -> None:
+        if not self._hmm_detector:
+            self._hmm_state["available"] = False
+            self._hmm_state["trained"] = False
+            self._hmm_state["blend_factor"] = max(
+                0.0, min(1.0, float(getattr(config, "HMM_BLEND_WITH_TREND", 0.5)))
+            )
+            return
+
+        st = getattr(self._hmm_detector, "state", None)
+        probs = [0.0, 1.0, 0.0]
+        if st is not None:
+            raw_probs = list(getattr(st, "probabilities", []) or [])
+            if len(raw_probs) >= 3:
+                try:
+                    probs = [float(raw_probs[0]), float(raw_probs[1]), float(raw_probs[2])]
+                except (TypeError, ValueError):
+                    probs = [0.0, 1.0, 0.0]
+
+        regime_id = 1
+        if st is not None:
+            try:
+                regime_id = int(getattr(st, "regime", 1))
+            except (TypeError, ValueError):
+                regime_id = 1
+        regime_name = "RANGING"
+        try:
+            if self._hmm_module and hasattr(self._hmm_module, "Regime"):
+                regime_name = str(self._hmm_module.Regime(regime_id).name)
+            else:
+                regime_name = {0: "BEARISH", 1: "RANGING", 2: "BULLISH"}.get(regime_id, "RANGING")
+        except Exception:
+            regime_name = "RANGING"
+
+        self._hmm_state.update({
+            "enabled": bool(getattr(config, "HMM_ENABLED", False)),
+            "available": True,
+            "trained": bool(getattr(self._hmm_detector, "_trained", False)),
+            "regime": regime_name,
+            "regime_id": regime_id,
+            "confidence": float(getattr(st, "confidence", 0.0) if st is not None else 0.0),
+            "bias_signal": float(getattr(st, "bias_signal", 0.0) if st is not None else 0.0),
+            "probabilities": {
+                "bearish": probs[0],
+                "ranging": probs[1],
+                "bullish": probs[2],
+            },
+            "observation_count": int(getattr(st, "observation_count", 0) if st is not None else 0),
+            "blend_factor": max(
+                0.0, min(1.0, float(getattr(config, "HMM_BLEND_WITH_TREND", 0.5)))
+            ),
+            "last_update_ts": float(getattr(st, "last_update_ts", 0.0) if st is not None else 0.0),
+            "last_train_ts": float(getattr(self._hmm_detector, "_last_train_ts", 0.0) or 0.0),
+        })
+
+    def _init_hmm_runtime(self) -> None:
+        self._hmm_state = self._hmm_default_state()
+        self._hmm_detector = None
+        self._hmm_module = None
+        self._hmm_numpy = None
+
+        if not bool(getattr(config, "HMM_ENABLED", False)):
+            return
+
+        try:
+            import numpy as np  # type: ignore
+            import hmm_regime_detector as hmm_mod  # type: ignore
+
+            self._hmm_numpy = np
+            self._hmm_module = hmm_mod
+            self._hmm_detector = hmm_mod.RegimeDetector(config=self._hmm_runtime_config())
+            self._hmm_state["available"] = True
+            self._hmm_state["error"] = ""
+            self._refresh_hmm_state_from_detector()
+            logger.info("HMM runtime initialized (advisory mode enabled)")
+        except Exception as e:
+            self._hmm_state["available"] = False
+            self._hmm_state["trained"] = False
+            self._hmm_state["error"] = str(e)
+            logger.warning("HMM runtime unavailable, continuing with trend-only logic: %s", e)
+
+    def _snapshot_hmm_state(self) -> dict[str, Any]:
+        if not self._hmm_detector or not self._hmm_module:
+            return {}
+        try:
+            if hasattr(self._hmm_module, "serialize_for_snapshot"):
+                snap = self._hmm_module.serialize_for_snapshot(self._hmm_detector)
+                if isinstance(snap, dict):
+                    return dict(snap)
+        except Exception as e:
+            logger.warning("HMM snapshot serialization failed: %s", e)
+        return {}
+
+    def _restore_hmm_snapshot(self, snapshot: dict[str, Any]) -> None:
+        if not isinstance(snapshot, dict):
+            return
+        if not self._hmm_detector or not self._hmm_module:
+            return
+        if "_hmm_regime_state" not in snapshot:
+            return
+        try:
+            if hasattr(self._hmm_module, "restore_from_snapshot"):
+                self._hmm_module.restore_from_snapshot(self._hmm_detector, snapshot)
+        except Exception as e:
+            logger.warning("HMM snapshot restore failed: %s", e)
+        finally:
+            self._refresh_hmm_state_from_detector()
+
+    def _train_hmm(self, *, now: float | None = None, reason: str = "scheduled") -> bool:
+        if not self._hmm_detector or self._hmm_numpy is None:
+            return False
+
+        now_ts = float(now if now is not None else _now())
+        retry_sec = max(60.0, float(getattr(config, "HMM_OHLCV_SYNC_INTERVAL_SEC", 300.0)))
+        is_trained = bool(getattr(self._hmm_detector, "_trained", False))
+        if (not is_trained) and (now_ts - self._hmm_last_train_attempt_ts) < retry_sec and reason != "startup":
+            return False
+
+        self._hmm_last_train_attempt_ts = now_ts
+        closes, volumes = self._fetch_training_candles(
+            count=int(getattr(config, "HMM_TRAINING_CANDLES", 2000))
+        )
+        if not closes or not volumes:
+            self._hmm_state["error"] = "no_training_candles"
+            self._refresh_hmm_state_from_detector()
+            return False
+
+        try:
+            closes_arr = self._hmm_numpy.asarray(closes, dtype=float)
+            volumes_arr = self._hmm_numpy.asarray(volumes, dtype=float)
+            ok = bool(self._hmm_detector.train(closes_arr, volumes_arr))
+        except Exception as e:
+            logger.warning("HMM train failed (%s): %s", reason, e)
+            self._hmm_state["error"] = f"train_failed:{e}"
+            self._refresh_hmm_state_from_detector()
+            return False
+
+        if ok:
+            self._hmm_state["error"] = ""
+            logger.info("HMM trained (%s) with %d candles", reason, len(closes))
+        else:
+            self._hmm_state["error"] = "train_skipped_or_failed"
+        self._refresh_hmm_state_from_detector()
+        return ok
+
+    def _update_hmm(self, now: float) -> None:
+        if not bool(getattr(config, "HMM_ENABLED", False)):
+            return
+        if not self._hmm_detector or self._hmm_numpy is None:
+            return
+
+        trained = bool(getattr(self._hmm_detector, "_trained", False))
+        if not trained:
+            self._train_hmm(now=now, reason="startup")
+            trained = bool(getattr(self._hmm_detector, "_trained", False))
+        else:
+            try:
+                if bool(self._hmm_detector.needs_retrain()):
+                    self._train_hmm(now=now, reason="periodic")
+            except Exception as e:
+                logger.debug("HMM retrain check failed: %s", e)
+
+        if not trained:
+            self._refresh_hmm_state_from_detector()
+            return
+
+        closes, volumes = self._fetch_recent_candles(
+            count=int(getattr(config, "HMM_RECENT_CANDLES", 100))
+        )
+        if not closes or not volumes:
+            self._refresh_hmm_state_from_detector()
+            return
+
+        try:
+            closes_arr = self._hmm_numpy.asarray(closes, dtype=float)
+            volumes_arr = self._hmm_numpy.asarray(volumes, dtype=float)
+            self._hmm_detector.update(closes_arr, volumes_arr)
+            self._hmm_state["error"] = ""
+        except Exception as e:
+            logger.warning("HMM inference failed: %s", e)
+            self._hmm_state["error"] = f"inference_failed:{e}"
+        finally:
+            self._refresh_hmm_state_from_detector()
+
+    def _hmm_status_payload(self) -> dict[str, Any]:
+        state = dict(self._hmm_state or self._hmm_default_state())
+        raw_probs = state.get("probabilities")
+        probs = (
+            dict(raw_probs)
+            if isinstance(raw_probs, dict)
+            else {"bearish": 0.0, "ranging": 1.0, "bullish": 0.0}
+        )
+        out = {
+            "enabled": bool(state.get("enabled", False)),
+            "available": bool(state.get("available", False)),
+            "trained": bool(state.get("trained", False)),
+            "regime": str(state.get("regime", "RANGING")),
+            "regime_id": int(state.get("regime_id", 1)),
+            "confidence": float(state.get("confidence", 0.0)),
+            "bias_signal": float(state.get("bias_signal", 0.0)),
+            "probabilities": probs,
+            "observation_count": int(state.get("observation_count", 0)),
+            "blend_factor": float(state.get("blend_factor", getattr(config, "HMM_BLEND_WITH_TREND", 0.5))),
+            "last_update_ts": float(state.get("last_update_ts", 0.0)),
+            "last_train_ts": float(state.get("last_train_ts", 0.0)),
+            "error": str(state.get("error", "")),
+        }
+        return out
 
     def _normalize_kraken_ohlcv_rows(
         self,
@@ -3947,15 +4209,28 @@ class BotRuntime:
         else:
             self._trend_score = (float(self._trend_fast_ema) - slow) / slow
 
+        signal_for_target = float(self._trend_score)
+        hmm_enabled = bool(getattr(config, "HMM_ENABLED", False))
+        hmm_ready = bool(self._hmm_state.get("available")) and bool(self._hmm_state.get("trained"))
+        if hmm_enabled and hmm_ready:
+            blend_factor = max(
+                0.0,
+                min(1.0, float(self._hmm_state.get("blend_factor", getattr(config, "HMM_BLEND_WITH_TREND", 0.5)))),
+            )
+            hmm_bias = float(self._hmm_state.get("bias_signal", 0.0) or 0.0)
+            signal_for_target = blend_factor * float(self._trend_score) + (1.0 - blend_factor) * hmm_bias
+            self._hmm_state["blend_factor"] = blend_factor
+        self._hmm_state["blended_signal"] = float(signal_for_target)
+
         # Dead zone first: collapse to base target and skip hold/smoothing stages.
-        if abs(float(self._trend_score)) < dead_zone:
+        if abs(float(signal_for_target)) < dead_zone:
             self._trend_dynamic_target = base_target
             self._trend_smoothed_target = base_target
             self._trend_target_locked_until = 0.0
             self._trend_last_update_ts = now
             return base_target
 
-        raw_target = base_target - sensitivity * float(self._trend_score)
+        raw_target = base_target - sensitivity * float(signal_for_target)
         clamped_target = max(floor_target, min(ceil_target, raw_target))
 
         # Hold second: freeze output and smoothing state.
@@ -3992,6 +4267,7 @@ class BotRuntime:
         if last_ts > 0 and (now - last_ts) < interval_sec:
             return
 
+        self._update_hmm(now)
         target = self._compute_dynamic_idle_target(now)
 
         capacity = self._compute_capacity_health(now)
@@ -4277,6 +4553,7 @@ class BotRuntime:
             orders_at_funded_size = self._count_orders_at_funded_size()
             slot_vintage = self._slot_vintage_metrics_locked(now)
             hmm_data_pipeline = self._hmm_data_readiness(now)
+            hmm_regime = self._hmm_status_payload()
             oldest_exit_age_sec = float(slot_vintage.get("oldest_exit_age_sec", 0.0) or 0.0)
             stuck_capital_pct = float(slot_vintage.get("stuck_capital_pct", 0.0) or 0.0)
             slot_vintage["vintage_warn"] = oldest_exit_age_sec >= 3.0 * 86400.0
@@ -4388,6 +4665,7 @@ class BotRuntime:
                 },
                 "slot_vintage": slot_vintage,
                 "hmm_data_pipeline": hmm_data_pipeline,
+                "hmm_regime": hmm_regime,
                 "release_health": {
                     "sticky_release_total": int(self._sticky_release_total),
                     "sticky_release_last_at": self._sticky_release_last_at or None,
