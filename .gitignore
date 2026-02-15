@@ -21,3 +21,17 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# Node / frontend local deps
+node_modules/
+
+# Local evolution-map sandbox (deprecated for now)
+evolution-map-app/
+tools/build_evolution_map.py
+state_machine_visual.py
+media/
+
+# Local scratch artifacts
+nul
+package.json
+package-lock.json
