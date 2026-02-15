@@ -2162,7 +2162,9 @@ class BotRuntime:
 
             freshness_sec = (now_ts - last_candle_ts) if last_candle_ts is not None else None
             interval_sec = interval_min * 60.0
-            freshness_ok = bool(freshness_sec is not None and freshness_sec <= max(900.0, interval_sec * 3.0))
+            # Keep short-interval feeds honest (e.g., 1m should not tolerate 15m stale data).
+            freshness_limit_sec = max(180.0, interval_sec * 3.0)
+            freshness_ok = bool(freshness_sec is not None and freshness_sec <= freshness_limit_sec)
             volume_nonzero_count = sum(1 for v in volumes if v > 0)
             volume_coverage_pct = (volume_nonzero_count / sample_count * 100.0) if sample_count else 0.0
             coverage_pct = sample_count / training_target * 100.0 if training_target > 0 else 0.0
@@ -2190,6 +2192,7 @@ class BotRuntime:
                 "span_hours": round(span_sec / 3600.0, 2),
                 "last_candle_ts": last_candle_ts,
                 "freshness_sec": freshness_sec,
+                "freshness_limit_sec": freshness_limit_sec,
                 "freshness_ok": freshness_ok,
                 "volume_coverage_pct": round(volume_coverage_pct, 2),
                 "ready_for_min_train": sample_count >= min_samples and freshness_ok,
