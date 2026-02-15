@@ -1619,12 +1619,210 @@ class BotEventLogTests(unittest.TestCase):
                 with mock.patch.object(config, "REGIME_DIRECTIONAL_ENABLED", True):
                     with mock.patch.object(config, "REGIME_EVAL_INTERVAL_SEC", 1.0):
                         with mock.patch.object(config, "REGIME_MIN_DWELL_SEC", 0.0):
-                            rt._update_regime_tier(now=1000.0)
+                            with mock.patch.object(config, "REGIME_TIER2_REENTRY_COOLDOWN_SEC", 0.0):
+                                rt._update_regime_tier(now=1000.0)
 
         self.assertEqual(rt._regime_tier, 0)
         self.assertEqual(rt._regime_tier2_grace_start, 0.0)
         self.assertEqual(rt.slots[0].state.mode_source, "none")
         self.assertEqual(rt.slots[1].state.mode_source, "none")
+
+    def test_tier2_reentry_cooldown_blocks_repromotion(self):
+        rt = bot.BotRuntime()
+        rt._regime_tier = 2
+        rt._regime_tier_entered_at = 900.0
+        rt._regime_tier2_grace_start = 900.0
+        rt._regime_side_suppressed = "A"
+        rt._hmm_state.update({
+            "available": True,
+            "trained": True,
+            "regime": "RANGING",
+            "confidence": 0.0,
+            "bias_signal": 0.0,
+            "last_update_ts": 1000.0,
+        })
+
+        with mock.patch.object(config, "HMM_ENABLED", True):
+            with mock.patch.object(config, "REGIME_SHADOW_ENABLED", True):
+                with mock.patch.object(config, "REGIME_DIRECTIONAL_ENABLED", False):
+                    with mock.patch.object(config, "REGIME_EVAL_INTERVAL_SEC", 1.0):
+                        with mock.patch.object(config, "REGIME_MIN_DWELL_SEC", 0.0):
+                            with mock.patch.object(config, "REGIME_TIER2_REENTRY_COOLDOWN_SEC", 600.0):
+                                with mock.patch("bot.supabase_store.save_regime_tier_transition"):
+                                    rt._update_regime_tier(now=1000.0)
+                                    self.assertEqual(rt._regime_tier, 0)
+                                    self.assertAlmostEqual(rt._regime_tier2_last_downgrade_at, 1000.0)
+
+                                    rt._hmm_state.update({
+                                        "regime": "BULLISH",
+                                        "confidence": 0.95,
+                                        "bias_signal": 0.80,
+                                        "last_update_ts": 1030.0,
+                                    })
+                                    rt._update_regime_tier(now=1030.0)
+                                    self.assertIn(rt._regime_tier, (0, 1))
+
+                                    rt._hmm_state["last_update_ts"] = 1701.0
+                                    rt._update_regime_tier(now=1701.0)
+
+        self.assertEqual(rt._regime_tier, 2)
+
+    def test_cooldown_preserves_mode_source_regime(self):
+        rt = bot.BotRuntime()
+        rt._regime_tier = 2
+        rt._regime_tier_entered_at = 900.0
+        rt._regime_tier2_grace_start = 900.0
+        rt._regime_side_suppressed = "A"
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    long_only=True,
+                    short_only=False,
+                    mode_source="regime",
+                ),
+            )
+        }
+        rt._hmm_state.update({
+            "available": True,
+            "trained": True,
+            "regime": "RANGING",
+            "confidence": 0.0,
+            "bias_signal": 0.0,
+            "last_update_ts": 1000.0,
+        })
+
+        with mock.patch.object(config, "HMM_ENABLED", True):
+            with mock.patch.object(config, "REGIME_SHADOW_ENABLED", True):
+                with mock.patch.object(config, "REGIME_DIRECTIONAL_ENABLED", True):
+                    with mock.patch.object(config, "REGIME_EVAL_INTERVAL_SEC", 1.0):
+                        with mock.patch.object(config, "REGIME_MIN_DWELL_SEC", 0.0):
+                            with mock.patch.object(config, "REGIME_TIER2_REENTRY_COOLDOWN_SEC", 600.0):
+                                with mock.patch("bot.supabase_store.save_regime_tier_transition"):
+                                    rt._update_regime_tier(now=1000.0)
+
+                                self.assertEqual(rt._regime_tier, 0)
+                                self.assertEqual(rt.slots[0].state.mode_source, "regime")
+                                self.assertEqual(rt._regime_cooldown_suppressed_side, "A")
+
+                                rt._clear_expired_regime_cooldown(now=1701.0)
+
+        self.assertEqual(rt.slots[0].state.mode_source, "none")
+        self.assertEqual(rt._regime_tier2_last_downgrade_at, 0.0)
+        self.assertIsNone(rt._regime_cooldown_suppressed_side)
+
+    def test_cooldown_resets_metadata_on_expiry(self):
+        rt = bot.BotRuntime()
+        rt._regime_tier = 0
+        rt._regime_tier2_last_downgrade_at = 100.0
+        rt._regime_cooldown_suppressed_side = "B"
+
+        with mock.patch.object(config, "REGIME_TIER2_REENTRY_COOLDOWN_SEC", 600.0):
+            rt._clear_expired_regime_cooldown(now=1000.0)
+
+        self.assertEqual(rt._regime_tier2_last_downgrade_at, 0.0)
+        self.assertIsNone(rt._regime_cooldown_suppressed_side)
+
+    def test_bootstrap_respects_cooldown_suppression(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        rt.constraints = {
+            "price_decimals": 6,
+            "volume_decimals": 0,
+            "min_volume": 13.0,
+            "min_cost_usd": 0.0,
+        }
+        rt._regime_tier = 0
+        rt._regime_tier2_last_downgrade_at = bot._now() - 10.0
+        rt._regime_cooldown_suppressed_side = "B"
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(market_price=0.1, now=1000.0),
+            )
+        }
+
+        with mock.patch.object(rt, "_safe_balance", return_value={"ZUSD": "50.0", "XXDG": "1000.0"}):
+            with mock.patch.object(config, "REGIME_DIRECTIONAL_ENABLED", True):
+                with mock.patch.object(config, "REGIME_TIER2_REENTRY_COOLDOWN_SEC", 600.0):
+                    with mock.patch.object(rt, "_execute_actions") as exec_actions:
+                        rt._ensure_slot_bootstrapped(0)
+
+        entries = [o for o in rt.slots[0].state.orders if o.role == "entry"]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].side, "sell")
+        self.assertTrue(rt.slots[0].state.short_only)
+        self.assertFalse(rt.slots[0].state.long_only)
+        self.assertEqual(rt.slots[0].state.mode_source, "regime")
+        exec_actions.assert_called_once()
+        self.assertEqual(exec_actions.call_args.args[1][0].side, "sell")
+
+    def test_tier_history_buffer_max_20(self):
+        rt = bot.BotRuntime()
+        rt._hmm_state.update({
+            "available": True,
+            "trained": True,
+            "regime": "BULLISH",
+            "confidence": 0.95,
+            "bias_signal": 0.80,
+            "last_update_ts": 1000.0,
+        })
+
+        with mock.patch.object(config, "HMM_ENABLED", True):
+            with mock.patch.object(config, "REGIME_SHADOW_ENABLED", True):
+                with mock.patch.object(config, "REGIME_DIRECTIONAL_ENABLED", False):
+                    with mock.patch.object(config, "REGIME_EVAL_INTERVAL_SEC", 1.0):
+                        with mock.patch.object(config, "REGIME_MIN_DWELL_SEC", 0.0):
+                            with mock.patch.object(config, "REGIME_TIER2_REENTRY_COOLDOWN_SEC", 0.0):
+                                with mock.patch("bot.supabase_store.save_regime_tier_transition"):
+                                    for i in range(25):
+                                        if i % 2 == 0:
+                                            rt._hmm_state.update({
+                                                "regime": "BULLISH",
+                                                "confidence": 0.95,
+                                                "bias_signal": 0.80,
+                                                "last_update_ts": 1000.0 + i,
+                                            })
+                                        else:
+                                            rt._hmm_state.update({
+                                                "regime": "RANGING",
+                                                "confidence": 0.0,
+                                                "bias_signal": 0.0,
+                                                "last_update_ts": 1000.0 + i,
+                                            })
+                                        rt._update_regime_tier(now=1000.0 + i)
+
+        self.assertEqual(len(rt._regime_tier_history), 20)
+        self.assertAlmostEqual(float(rt._regime_tier_history[0]["time"]), 1005.0)
+        self.assertAlmostEqual(float(rt._regime_tier_history[-1]["time"]), 1024.0)
+
+    def test_regime_status_payload_includes_cooldown_and_history(self):
+        rt = bot.BotRuntime()
+        rt._regime_tier = 0
+        rt._regime_tier_entered_at = 900.0
+        rt._regime_tier2_last_downgrade_at = 1000.0
+        rt._regime_cooldown_suppressed_side = "B"
+        rt._regime_tier_history = [{
+            "time": 990.0,
+            "from_tier": 2,
+            "to_tier": 0,
+            "regime": "RANGING",
+            "confidence": 0.0,
+            "bias": 0.0,
+            "reason": "hmm_eval",
+        }]
+
+        with mock.patch.object(config, "REGIME_TIER2_REENTRY_COOLDOWN_SEC", 600.0):
+            payload = rt._regime_status_payload(now=1200.0)
+
+        self.assertIn("cooldown_remaining_sec", payload)
+        self.assertIn("cooldown_suppressed_side", payload)
+        self.assertIn("tier_history", payload)
+        self.assertAlmostEqual(float(payload["cooldown_remaining_sec"]), 400.0)
+        self.assertEqual(payload["cooldown_suppressed_side"], "B")
+        self.assertEqual(len(payload["tier_history"]), 1)
 
     def test_regime_flip_clears_old_suppression(self):
         rt = bot.BotRuntime()

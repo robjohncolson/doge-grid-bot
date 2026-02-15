@@ -57,6 +57,24 @@ DASHBOARD_HTML = """<!doctype html>
     .badge.ok { color: var(--good); border-color: rgba(46,160,67,.45); }
     .badge.pause { color: var(--warn); border-color: rgba(210,153,34,.45); }
     .badge.halt { color: var(--bad); border-color: rgba(248,81,73,.5); }
+    .status-chip {
+      display: inline-block;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 1px 8px;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: .04em;
+      margin-right: 6px;
+      color: var(--muted);
+      background: rgba(255,255,255,.02);
+      vertical-align: middle;
+    }
+    .status-chip.warn {
+      color: var(--warn);
+      border-color: rgba(210,153,34,.45);
+      background: rgba(210,153,34,.1);
+    }
 
     .grid {
       display: grid;
@@ -370,6 +388,19 @@ DASHBOARD_HTML = """<!doctype html>
         <div class=\"row\"><span class=\"k\">Data Window (1m)</span><span id=\"hmmWindow\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Data Window (15m)</span><span id=\"hmmWindowSecondary\" class=\"v\"></span></div>
         <div id=\"hmmHints\" class=\"tiny\"></div>
+
+        <h3 style=\"margin-top:14px\">Directional Regime</h3>
+        <div class=\"row\"><span class=\"k\">Tier</span><span id=\"regTier\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Suppressed</span><span id=\"regSuppressed\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Favored</span><span id=\"regFavored\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Gates</span><span id=\"regGates\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Grace</span><span id=\"regGrace\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Cooldown</span><span id=\"regCooldown\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Suppressed Slots</span><span id=\"regSuppressedSlots\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Dwell</span><span id=\"regDwell\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Last Eval</span><span id=\"regLastEval\" class=\"v\"></span></div>
+        <div id=\"regHints\" class=\"tiny\"></div>
+        <div id=\"regTransitions\" class=\"tiny\"></div>
 
         <h3 style=\"margin-top:14px\">Capacity &amp; Fill Health</h3>
         <div class=\"row\"><span class=\"k\">Status</span><span id=\"cfhBand\" class=\"v\"></span></div>
@@ -1122,6 +1153,7 @@ DASHBOARD_HTML = """<!doctype html>
     }
 
     function renderTop(s) {
+      const nowSec = Date.now() / 1000;
       const mode = document.getElementById('mode');
       mode.textContent = s.mode;
       mode.className = 'badge ' + (s.mode === 'RUNNING' ? 'ok' : s.mode === 'PAUSED' ? 'pause' : 'halt');
@@ -1354,6 +1386,95 @@ DASHBOARD_HTML = """<!doctype html>
       }
       document.getElementById('hmmHints').textContent =
         hmmHints.length ? `Hints: ${hmmHints.join(' | ')}` : '';
+
+      // --- Directional Regime ---
+      const reg = s.regime_directional || {};
+      const regEnabled = Boolean(reg.actuation_enabled);
+      const regTier = Number(reg.tier || 0);
+      const regLabel = String(reg.tier_label || 'symmetric');
+      const regSuppressed = reg.suppressed_side || null;
+      const regFavored = reg.favored_side || null;
+      const regGraceSec = Number(reg.grace_remaining_sec || 0);
+      const regCooldownSec = Number(reg.cooldown_remaining_sec || 0);
+      const regCooldownSuppressed = reg.cooldown_suppressed_side || null;
+      const regSuppressedSlots = Number(reg.regime_suppressed_slots || 0);
+      const regDwellSec = Number(reg.dwell_sec || 0);
+      const regReady = Boolean(reg.hmm_ready);
+      const regOkT1 = Boolean(reg.directional_ok_tier1);
+      const regOkT2 = Boolean(reg.directional_ok_tier2);
+      const regReason = String(reg.reason || '');
+      const regLastEval = Number(reg.last_eval_ts || 0);
+
+      const tierColors = { 0: '#888', 1: '#f5a623', 2: '#e74c3c' };
+      const tierColor = regEnabled
+        ? (regCooldownSec > 0 ? '#f5a623' : (tierColors[regTier] || '#888'))
+        : '#888';
+      const tierBadge = regEnabled
+        ? `<span style="color:${tierColor}">${regTier} - ${regLabel}</span>`
+        : '<span style="color:#888">OFF</span>';
+      document.getElementById('regTier').innerHTML = tierBadge;
+
+      const regSideLabel = { A: 'A (short)', B: 'B (long)' };
+      document.getElementById('regSuppressed').textContent =
+        regEnabled && regSuppressed ? regSideLabel[regSuppressed] || regSuppressed : '-';
+      document.getElementById('regFavored').textContent =
+        regEnabled && regFavored ? regSideLabel[regFavored] || regFavored : '-';
+
+      const gateT1 = regOkT1 ? '✓' : '✗';
+      const gateT2 = regOkT2 ? '✓' : '✗';
+      document.getElementById('regGates').innerHTML =
+        regEnabled
+          ? (`T1:${gateT1} T2:${gateT2}` + (regReady ? '' : ' <span style="color:#e74c3c">(HMM not ready)</span>'))
+          : '-';
+
+      document.getElementById('regGrace').textContent =
+        regTier === 2
+          ? (regGraceSec > 0 ? fmt(regGraceSec, 0) + 's remaining' : 'elapsed')
+          : '-';
+
+      const regCooldownEl = document.getElementById('regCooldown');
+      if (!regEnabled) {
+        regCooldownEl.textContent = '-';
+      } else if (regCooldownSec > 0) {
+        const cooldownDetail = `${fmt(regCooldownSec, 0)}s remaining`
+          + (regCooldownSuppressed ? ` (${regSideLabel[regCooldownSuppressed] || regCooldownSuppressed})` : '');
+        regCooldownEl.innerHTML = `<span class="status-chip warn">ACTIVE</span>${cooldownDetail}`;
+      } else {
+        regCooldownEl.innerHTML = '<span class="status-chip">IDLE</span>';
+      }
+
+      document.getElementById('regSuppressedSlots').textContent =
+        regEnabled ? String(regSuppressedSlots) : '-';
+
+      document.getElementById('regDwell').textContent =
+        regEnabled ? fmtAgeSeconds(regDwellSec) : '-';
+
+      document.getElementById('regLastEval').textContent =
+        regEnabled && regLastEval > 0
+          ? fmt((nowSec - regLastEval), 0) + 's ago'
+          : '-';
+
+      const regHints = [];
+      if (!regEnabled) regHints.push('actuation:off');
+      if (!regReady) regHints.push('hmm_not_ready');
+      if (regTier === 2 && regGraceSec > 0) regHints.push('grace_pending');
+      if (regCooldownSec > 0) regHints.push(`cooldown_active:${fmt(regCooldownSec, 0)}s`);
+      if (regTier === 0 && regEnabled && regReady) regHints.push('confidence_below_threshold');
+      if (regReason) regHints.push(regReason);
+      document.getElementById('regHints').textContent =
+        regHints.length ? `Hints: ${regHints.join(' | ')}` : '';
+
+      const regHistory = reg.tier_history || [];
+      const regTransitionsEl = document.getElementById('regTransitions');
+      if (regHistory.length > 0) {
+        const lines = regHistory.slice(-5).reverse().map(h => {
+          const ago = fmt(nowSec - Number(h.time || 0), 0);
+          return `${h.from_tier}→${h.to_tier} ${ago}s ago (${String(h.regime || '-')} ${fmt(Number(h.confidence || 0) * 100, 0)}%)`;
+        });
+        regTransitionsEl.textContent = 'Transitions: ' + lines.join(' | ');
+      } else {
+        regTransitionsEl.textContent = '';
+      }
 
       const softCloseBtn = document.getElementById('softCloseBtn');
       const cancelStaleBtn = document.getElementById('cancelStaleBtn');

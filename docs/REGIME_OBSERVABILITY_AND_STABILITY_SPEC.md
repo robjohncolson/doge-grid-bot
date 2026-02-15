@@ -1,6 +1,6 @@
 # Regime Observability & Stability — Implementation Spec
 
-Version: v0.1
+Version: v0.3
 Date: 2026-02-15
 Status: Implementation-ready
 Parent: TIER2_SIDE_SUPPRESSION_SPEC, DIRECTIONAL_REGIME_SPEC §6–7, MULTI_TIMEFRAME_HMM_SPEC §4
@@ -55,10 +55,12 @@ between lines 372 and 374).
 <div class="row"><span class="k">Favored</span><span id="regFavored" class="v"></span></div>
 <div class="row"><span class="k">Gates</span><span id="regGates" class="v"></span></div>
 <div class="row"><span class="k">Grace</span><span id="regGrace" class="v"></span></div>
+<div class="row"><span class="k">Cooldown</span><span id="regCooldown" class="v"></span></div>
 <div class="row"><span class="k">Suppressed Slots</span><span id="regSuppressedSlots" class="v"></span></div>
 <div class="row"><span class="k">Dwell</span><span id="regDwell" class="v"></span></div>
 <div class="row"><span class="k">Last Eval</span><span id="regLastEval" class="v"></span></div>
 <div id="regHints" class="tiny"></div>
+<div id="regTransitions" class="tiny"></div>
 ```
 
 **JavaScript rendering** (follows the HMM panel pattern at lines
@@ -73,6 +75,8 @@ const regLabel = String(reg.tier_label || 'symmetric');
 const regSuppressed = reg.suppressed_side || null;
 const regFavored = reg.favored_side || null;
 const regGraceSec = Number(reg.grace_remaining_sec || 0);
+const regCooldownSec = Number(reg.cooldown_remaining_sec || 0);
+const regCooldownSuppressed = reg.cooldown_suppressed_side || null;
 const regSuppressedSlots = Number(reg.regime_suppressed_slots || 0);
 const regDwellSec = Number(reg.dwell_sec || 0);
 const regReady = Boolean(reg.hmm_ready);
@@ -92,20 +96,29 @@ document.getElementById('regTier').innerHTML = tierBadge;
 // Suppressed/favored side
 const sideLabel = { A: 'A (short)', B: 'B (long)' };
 document.getElementById('regSuppressed').textContent =
-  regSuppressed ? sideLabel[regSuppressed] || regSuppressed : '—';
+  regEnabled && regSuppressed ? sideLabel[regSuppressed] || regSuppressed : '—';
 document.getElementById('regFavored').textContent =
-  regFavored ? sideLabel[regFavored] || regFavored : '—';
+  regEnabled && regFavored ? sideLabel[regFavored] || regFavored : '—';
 
 // Directional gates
 const gateT1 = regOkT1 ? '✓' : '✗';
 const gateT2 = regOkT2 ? '✓' : '✗';
 document.getElementById('regGates').innerHTML =
-  `T1:${gateT1} T2:${gateT2}` + (regReady ? '' : ' <span style="color:#e74c3c">(HMM not ready)</span>');
+  regEnabled
+    ? (`T1:${gateT1} T2:${gateT2}` + (regReady ? '' : ' <span style="color:#e74c3c">(HMM not ready)</span>'))
+    : '—';
 
 // Grace countdown
 document.getElementById('regGrace').textContent =
   regTier === 2
     ? (regGraceSec > 0 ? fmt(regGraceSec, 0) + 's remaining' : 'elapsed')
+    : '—';
+
+// Cooldown countdown (tier-2 re-entry lockout)
+document.getElementById('regCooldown').textContent =
+  regEnabled && regCooldownSec > 0
+    ? `${fmt(regCooldownSec, 0)}s remaining`
+      + (regCooldownSuppressed ? ` (${sideLabel[regCooldownSuppressed] || regCooldownSuppressed})` : '')
     : '—';
 
 // Suppressed slot count
@@ -114,24 +127,48 @@ document.getElementById('regSuppressedSlots').textContent =
 
 // Dwell time
 document.getElementById('regDwell').textContent =
-  fmtAgeSeconds(regDwellSec);
+  regEnabled ? fmtAgeSeconds(regDwellSec) : '—';
 
 // Last eval
 document.getElementById('regLastEval').textContent =
-  regLastEval > 0
+  regEnabled && regLastEval > 0
     ? fmt((nowSec - regLastEval), 0) + 's ago'
-    : 'never';
+    : '—';
 
 // Hints
 const regHints = [];
 if (!regEnabled) regHints.push('actuation:off');
 if (!regReady) regHints.push('hmm_not_ready');
 if (regTier === 2 && regGraceSec > 0) regHints.push('grace_pending');
+if (regCooldownSec > 0) regHints.push(`cooldown_active:${fmt(regCooldownSec, 0)}s`);
 if (regTier === 0 && regEnabled && regReady)
   regHints.push('confidence_below_threshold');
 if (regReason) regHints.push(regReason);
 document.getElementById('regHints').textContent =
   regHints.length ? 'Hints: ' + regHints.join(' | ') : '';
+```
+
+**Payload additions** (in `_regime_status_payload()`):
+
+```python
+cooldown_sec = max(0.0, float(
+    getattr(config, "REGIME_TIER2_REENTRY_COOLDOWN_SEC", 600.0)
+))
+cooldown_remaining = 0.0
+cooldown_side = None
+if (
+    cooldown_sec > 0
+    and int(self._regime_tier) < 2
+    and self._regime_tier2_last_downgrade_at > 0
+):
+    elapsed = max(0.0, now_ts - self._regime_tier2_last_downgrade_at)
+    if elapsed < cooldown_sec:
+        cooldown_remaining = cooldown_sec - elapsed
+        if self._regime_cooldown_suppressed_side in ("A", "B"):
+            cooldown_side = self._regime_cooldown_suppressed_side
+
+"cooldown_remaining_sec": float(cooldown_remaining),
+"cooldown_suppressed_side": cooldown_side,
 ```
 
 **Display rules:**
@@ -142,8 +179,8 @@ document.getElementById('regHints').textContent =
 | 1 | amber (#f5a623) | `1 — biased` |
 | 2 | red (#e74c3c) | `2 — directional` |
 
-When `actuation_enabled` is False, the entire section shows "OFF"
-with grayed-out fields.
+When `actuation_enabled` is False, Tier shows "OFF" and all other rows
+show `—`.
 
 ### 2.2 Flicker guard: tier-down cooldown
 
@@ -177,6 +214,7 @@ confidence and bias fully satisfy the thresholds.
 
 ```python
 self._regime_tier2_last_downgrade_at: float = 0.0
+self._regime_cooldown_suppressed_side: str | None = None
 ```
 
 **Implementation** (in `_update_regime_tier()`, after target_tier is
@@ -201,14 +239,15 @@ if changed and current_tier == 2 and int(target_tier) < 2:
     self._regime_tier2_last_downgrade_at = now
 ```
 
-**Persistence:** Add `regime_tier2_last_downgrade_at` to save/load
-alongside the other regime fields.
+**Persistence:** Add `regime_tier2_last_downgrade_at` and
+`regime_cooldown_suppressed_side` to save/load alongside the other
+regime fields.
 
 **Effect:** After a flicker drops the tier, the bot stays at tier 0
 or 1 for 10 minutes. During this time, Tier 1 spacing bias still
-applies (asymmetric entry_pct), but entries on both sides are placed.
-This trades some suboptimal entries for stability — better than the
-current pattern of rapid regime cycling that leaves 18 stranded exits.
+applies (asymmetric entry_pct). Sections §2.4–§2.5 preserve the last
+suppressed side during that window so against-trend bootstrap entries
+do not resume immediately.
 
 ### 2.3 Dashboard: tier transition log
 
@@ -251,21 +290,23 @@ Dashboard rendering (below the Directional Regime rows):
 
 ```javascript
 const regHistory = reg.tier_history || [];
+const regTransitionsEl = document.getElementById('regTransitions');
 if (regHistory.length > 0) {
   const lines = regHistory.slice(-5).reverse().map(h => {
     const ago = fmt(nowSec - h.time, 0);
     return `${h.from_tier}→${h.to_tier} ${ago}s ago `
       + `(${h.regime} ${fmt(h.confidence*100,0)}%)`;
   });
-  document.getElementById('regHints').textContent +=
-    (regHints.length ? ' | ' : '')
-    + 'transitions: ' + lines.join(', ');
+  regTransitionsEl.textContent = 'Transitions: ' + lines.join(' | ');
+} else {
+  regTransitionsEl.textContent = '';
 }
 ```
 
 This lets the operator see at a glance whether the tier is stable
-or oscillating. If they see `2→0→2→0→2→0` they know the 1m HMM is
-flickering and should enable consensus.
+or oscillating. With cooldown enabled, instability appears as repeated
+`2→0` events plus noisy `0↔1` churn. That is a signal to enable
+consensus.
 
 ### 2.4 Suppress-side persistence across tier flicker
 
@@ -274,9 +315,9 @@ flickering and should enable consensus.
 **Problem:** When tier drops from 2→0, the downgrade cleanup
 (bot.py:2367-2377) clears `mode_source="regime"` on all slots. This
 is correct — auto-repair should be able to restore sides when tier
-drops. But during a brief flicker (drop followed by re-promotion),
-the cleared slots get both-side entries placed before tier 2 can
-re-activate and cancel them.
+drops. But during the cooldown window after a flicker downgrade, the
+cleared slots can get both-side entries before tier 2 is allowed to
+re-activate.
 
 **Solution:** During the re-entry cooldown period (§2.2), keep
 `mode_source="regime"` on suppressed slots. Only clear regime
@@ -288,6 +329,9 @@ ownership when the cooldown expires (i.e., a sustained tier drop).
 # When tier drops from 2 to lower:
 if changed and current_tier == 2 and int(target_tier) < 2:
     self._regime_tier2_last_downgrade_at = now
+    self._regime_cooldown_suppressed_side = (
+        self._regime_side_suppressed if self._regime_side_suppressed in ("A", "B") else None
+    )
 
     cooldown_sec = max(0.0, float(
         getattr(config, "REGIME_TIER2_REENTRY_COOLDOWN_SEC", 600.0)
@@ -303,6 +347,7 @@ if changed and current_tier == 2 and int(target_tier) < 2:
                     "slot %s: cleared regime suppression (tier %d -> %d)",
                     sid, current_tier, int(target_tier),
                 )
+        self._regime_cooldown_suppressed_side = None
     else:
         # Cooldown active — defer clearing.
         # mode_source stays "regime", which blocks auto-repair from
@@ -324,7 +369,9 @@ self._clear_expired_regime_cooldown(loop_now)
 ```python
 def _clear_expired_regime_cooldown(self, now: float) -> None:
     if self._regime_tier == 2:
-        return  # Tier is back at 2, no clearing needed
+        self._regime_tier2_last_downgrade_at = 0.0
+        self._regime_cooldown_suppressed_side = None
+        return  # Tier is active again; normal tier-2 logic owns suppression
     if self._regime_tier2_last_downgrade_at <= 0:
         return
     cooldown_sec = max(0.0, float(
@@ -347,21 +394,21 @@ def _clear_expired_regime_cooldown(self, now: float) -> None:
             "cooldown expired (%.0fs): cleared regime ownership on %d slots",
             elapsed, cleared,
         )
-        self._regime_tier2_last_downgrade_at = 0.0
+    self._regime_tier2_last_downgrade_at = 0.0
+    self._regime_cooldown_suppressed_side = None
 ```
 
-**Effect:** During a brief flicker (2→0→2 within 10 min), the
-suppressed slots stay one-sided the entire time. No new against-trend
-entries are placed. When the tier returns to 2, the grace period is
-skipped because `mode_source="regime"` was never cleared.
+**Effect:** During the cooldown window after a 2→0 downgrade, suppressed
+slots stay one-sided the entire time. No new against-trend entries are
+placed.
 
 If the drop is sustained (>10 min), the cooldown expires, regime
 ownership is cleared, and auto-repair restores both sides — this is
 the correct behavior for a genuine regime change.
 
-### 2.5 Auto-repair blocks during cooldown
+### 2.5 Bootstrap respects cooldown suppression
 
-**File:** `bot.py`, `_auto_repair_degraded_slot()`
+**File:** `bot.py`, `_ensure_slot_bootstrapped()`
 
 **Problem:** Even with §2.4 preserving `mode_source="regime"` during
 cooldown, auto-repair already checks `mode_source=="regime"` and
@@ -374,21 +421,27 @@ bootstrap places both sides on new S0 slots.
 
 ```python
 # In _ensure_slot_bootstrapped(), replace existing suppressed check:
+now_ts = _now()
 suppressed = None
+cooldown_suppressed = (
+    self._regime_cooldown_suppressed_side
+    if self._regime_cooldown_suppressed_side in ("A", "B")
+    else None
+)
 if bool(getattr(config, "REGIME_DIRECTIONAL_ENABLED", False)):
-    if int(self._regime_tier) == 2 and self._regime_grace_elapsed(_now()):
+    if int(self._regime_tier) == 2 and self._regime_grace_elapsed(now_ts):
         if self._regime_side_suppressed in ("A", "B"):
             suppressed = self._regime_side_suppressed
     elif (
         self._regime_tier2_last_downgrade_at > 0
-        and self._regime_side_suppressed in ("A", "B")
+        and cooldown_suppressed in ("A", "B")
     ):
         cooldown_sec = max(0.0, float(
             getattr(config, "REGIME_TIER2_REENTRY_COOLDOWN_SEC", 600.0)
         ))
-        elapsed = _now() - self._regime_tier2_last_downgrade_at
+        elapsed = now_ts - self._regime_tier2_last_downgrade_at
         if elapsed < cooldown_sec:
-            suppressed = self._regime_side_suppressed
+            suppressed = cooldown_suppressed
 ```
 
 **Effect:** During cooldown, bootstrap respects the last known
@@ -415,6 +468,7 @@ No other config changes. Existing `REGIME_SUPPRESSION_GRACE_SEC`,
 
 ```python
 "regime_tier2_last_downgrade_at": float(self._regime_tier2_last_downgrade_at),
+"regime_cooldown_suppressed_side": self._regime_cooldown_suppressed_side,
 "regime_tier_history": list(self._regime_tier_history[-20:]),
 ```
 
@@ -424,6 +478,8 @@ No other config changes. Existing `REGIME_SUPPRESSION_GRACE_SEC`,
 self._regime_tier2_last_downgrade_at = float(
     snap.get("regime_tier2_last_downgrade_at", 0.0) or 0.0
 )
+raw_cooldown_side = snap.get("regime_cooldown_suppressed_side", None)
+self._regime_cooldown_suppressed_side = raw_cooldown_side if raw_cooldown_side in ("A", "B", None) else None
 raw_history = snap.get("regime_tier_history", [])
 if isinstance(raw_history, list):
     self._regime_tier_history = raw_history[-20:]
@@ -444,6 +500,10 @@ self._clear_expired_regime_cooldown(loop_now)  # NEW
 ---
 
 ## 6. Tests
+
+**Test location:** Add these to `tests/test_hardening_regressions.py`
+or create `tests/test_regime_observability_stability.py` if you want
+this feature isolated.
 
 ### 6.1 Re-entry cooldown blocks rapid re-promotion
 
@@ -471,14 +531,15 @@ def test_cooldown_preserves_mode_source_regime():
     # Assert: mode_source cleared to "none"
 ```
 
-### 6.3 Cooldown doesn't clear if tier returns to 2
+### 6.3 Cooldown metadata resets on expiry
 
 ```python
-def test_cooldown_noop_if_tier_returns():
-    # Set tier=2, transition to 0, slots keep mode_source="regime"
-    # Before cooldown expires, transition back to 2
+def test_cooldown_resets_metadata_on_expiry():
+    # Set tier=0, cooldown timestamp in the past, cooldown side set
+    # Ensure there are zero slots with mode_source="regime"
     # Call _clear_expired_regime_cooldown()
-    # Assert: no-op (tier is 2, regime ownership stays)
+    # Assert: _regime_tier2_last_downgrade_at reset to 0.0
+    # Assert: _regime_cooldown_suppressed_side reset to None
 ```
 
 ### 6.4 Bootstrap respects cooldown suppression
@@ -486,7 +547,7 @@ def test_cooldown_noop_if_tier_returns():
 ```python
 def test_bootstrap_respects_cooldown_suppression():
     # Set tier=0 but within cooldown window
-    # _regime_side_suppressed="B", _regime_tier2_last_downgrade_at=recent
+    # _regime_cooldown_suppressed_side="B", _regime_tier2_last_downgrade_at=recent
     # Call _ensure_slot_bootstrapped()
     # Assert: only A-side entry placed (suppressed="B" still honored)
 ```
@@ -509,6 +570,7 @@ def test_regime_status_payload_complete():
     # Assert: all expected keys present
     # Assert: tier_history included
     # Assert: grace_remaining_sec is correct
+    # Assert: cooldown_remaining_sec and cooldown_suppressed_side are correct
 ```
 
 ---
@@ -526,16 +588,19 @@ def test_regime_status_payload_complete():
    active tier 2 suppression to auto-repair — it won't restore the
    suppressed side in either case.
 
-4. The dashboard panel is purely observational. Removing it has zero
+4. Tier 2 grace is unchanged. After cooldown expires and tier 2 becomes
+   eligible again, normal `REGIME_SUPPRESSION_GRACE_SEC` timing applies.
+
+5. The dashboard panel is purely observational. Removing it has zero
    effect on bot behavior.
 
-5. Tier history is in-memory only (plus state.json). It does not
+6. Tier history is in-memory only (plus state.json). It does not
    accumulate unboundedly — capped at 20 entries.
 
-6. Exits are NEVER affected by cooldown logic. Only entries and
+7. Exits are NEVER affected by cooldown logic. Only entries and
    bootstrap are gated.
 
-7. If `REGIME_TIER2_REENTRY_COOLDOWN_SEC=0`, behavior is identical
+8. If `REGIME_TIER2_REENTRY_COOLDOWN_SEC=0`, behavior is identical
    to pre-spec (immediate clear on downgrade, no cooldown).
 
 ---
@@ -568,6 +633,6 @@ After this spec is implemented, the operator should:
 | File | Changes |
 |------|---------|
 | `config.py` | `REGIME_TIER2_REENTRY_COOLDOWN_SEC` |
-| `bot.py` | `_regime_tier2_last_downgrade_at` state, re-entry cooldown in `_update_regime_tier()`, `_clear_expired_regime_cooldown()`, deferred downgrade cleanup, bootstrap cooldown check, tier history buffer, persistence |
-| `dashboard.py` | Directional Regime HTML panel, JS rendering, tier transition hints |
+| `bot.py` | `_regime_tier2_last_downgrade_at` + `_regime_cooldown_suppressed_side` state, re-entry cooldown in `_update_regime_tier()`, `_clear_expired_regime_cooldown()`, deferred downgrade cleanup, bootstrap cooldown check, cooldown status payload fields, tier history buffer, persistence |
+| `dashboard.py` | Directional Regime HTML panel, JS rendering, cooldown row/hint, tier transition log split into dedicated `regTransitions` line |
 | `tests/` | 6 new tests (§6.1–6.6) |

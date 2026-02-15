@@ -324,6 +324,9 @@ class BotRuntime:
         self._regime_tier2_grace_start: float = 0.0
         self._regime_side_suppressed: str | None = None
         self._regime_last_eval_ts: float = 0.0
+        self._regime_tier2_last_downgrade_at: float = 0.0
+        self._regime_cooldown_suppressed_side: str | None = None
+        self._regime_tier_history: list[dict[str, Any]] = []
         self._regime_shadow_state: dict[str, Any] = {
             "enabled": False,
             "shadow_enabled": False,
@@ -1087,6 +1090,9 @@ class BotRuntime:
             "regime_tier2_grace_start": float(self._regime_tier2_grace_start),
             "regime_side_suppressed": self._regime_side_suppressed,
             "regime_last_eval_ts": float(self._regime_last_eval_ts),
+            "regime_tier2_last_downgrade_at": float(self._regime_tier2_last_downgrade_at),
+            "regime_cooldown_suppressed_side": self._regime_cooldown_suppressed_side,
+            "regime_tier_history": list(self._regime_tier_history[-20:]),
             "regime_shadow_state": dict(self._regime_shadow_state or {}),
             "entry_adds_deferred_total": self._entry_adds_deferred_total,
             "entry_adds_drained_total": self._entry_adds_drained_total,
@@ -1245,6 +1251,16 @@ class BotRuntime:
             raw_suppressed = snap.get("regime_side_suppressed", self._regime_side_suppressed)
             self._regime_side_suppressed = raw_suppressed if raw_suppressed in ("A", "B", None) else None
             self._regime_last_eval_ts = float(snap.get("regime_last_eval_ts", self._regime_last_eval_ts))
+            self._regime_tier2_last_downgrade_at = float(
+                snap.get("regime_tier2_last_downgrade_at", self._regime_tier2_last_downgrade_at) or 0.0
+            )
+            raw_cooldown_side = snap.get("regime_cooldown_suppressed_side", self._regime_cooldown_suppressed_side)
+            self._regime_cooldown_suppressed_side = (
+                raw_cooldown_side if raw_cooldown_side in ("A", "B", None) else None
+            )
+            raw_tier_history = snap.get("regime_tier_history", self._regime_tier_history)
+            if isinstance(raw_tier_history, list):
+                self._regime_tier_history = list(raw_tier_history[-20:])
             raw_regime_shadow_state = snap.get("regime_shadow_state", self._regime_shadow_state)
             if isinstance(raw_regime_shadow_state, dict):
                 self._regime_shadow_state = dict(raw_regime_shadow_state)
@@ -2348,6 +2364,14 @@ class BotRuntime:
             if target_tier != current_tier and dwell_elapsed < min_dwell_sec:
                 target_tier = current_tier
 
+            # Tier 2 re-entry cooldown: prevent rapid 2->0->2 oscillation.
+            if target_tier == 2 and current_tier < 2:
+                cooldown_sec = max(0.0, float(getattr(config, "REGIME_TIER2_REENTRY_COOLDOWN_SEC", 600.0)))
+                if cooldown_sec > 0 and self._regime_tier2_last_downgrade_at > 0:
+                    since_downgrade = now - self._regime_tier2_last_downgrade_at
+                    if since_downgrade < cooldown_sec:
+                        target_tier = 1 if directional_ok_tier1 else 0
+
             reason = "hmm_eval"
         elif enabled:
             reason = "hmm_not_ready"
@@ -2360,25 +2384,55 @@ class BotRuntime:
             self._regime_tier_entered_at = float(now)
             if int(target_tier) == 2:
                 self._regime_tier2_grace_start = float(now)
+                self._regime_tier2_last_downgrade_at = 0.0
+                self._regime_cooldown_suppressed_side = None
             else:
                 self._regime_tier2_grace_start = 0.0
 
         # Tier downgrade: clear regime ownership so balance-driven repair can restore both sides.
+        # During cooldown, defer clearing to avoid rapid suppression churn.
         if changed and current_tier == 2 and int(target_tier) < 2:
-            for sid in sorted(self.slots.keys()):
-                st = self.slots[sid].state
-                if str(getattr(st, "mode_source", "none")) == "regime":
-                    self.slots[sid].state = replace(st, mode_source="none")
-                    logger.info(
-                        "slot %s: cleared regime suppression (tier %d -> %d)",
-                        sid,
-                        int(current_tier),
-                        int(target_tier),
-                    )
+            self._regime_tier2_last_downgrade_at = float(now)
+            self._regime_cooldown_suppressed_side = (
+                self._regime_side_suppressed if self._regime_side_suppressed in ("A", "B") else None
+            )
+            cooldown_sec = max(0.0, float(getattr(config, "REGIME_TIER2_REENTRY_COOLDOWN_SEC", 600.0)))
+            if cooldown_sec <= 0:
+                for sid in sorted(self.slots.keys()):
+                    st = self.slots[sid].state
+                    if str(getattr(st, "mode_source", "none")) == "regime":
+                        self.slots[sid].state = replace(st, mode_source="none")
+                        logger.info(
+                            "slot %s: cleared regime suppression (tier %d -> %d)",
+                            sid,
+                            int(current_tier),
+                            int(target_tier),
+                        )
+                self._regime_cooldown_suppressed_side = None
+            else:
+                logger.info(
+                    "tier %d -> %d: deferring regime clear for %.0fs cooldown",
+                    int(current_tier),
+                    int(target_tier),
+                    cooldown_sec,
+                )
 
         if int(target_tier) == 2 and regime in ("BULLISH", "BEARISH"):
             suppressed_side = "A" if bias > 0 else "B"
         self._regime_side_suppressed = suppressed_side
+
+        if changed:
+            self._regime_tier_history.append({
+                "time": float(now),
+                "from_tier": int(current_tier),
+                "to_tier": int(target_tier),
+                "regime": str(regime),
+                "confidence": round(float(confidence), 3),
+                "bias": round(float(bias), 3),
+                "reason": str(reason),
+            })
+            if len(self._regime_tier_history) > 20:
+                self._regime_tier_history = self._regime_tier_history[-20:]
 
         if changed:
             tier_labels = {0: "symmetric", 1: "biased", 2: "directional"}
@@ -2504,6 +2558,34 @@ class BotRuntime:
                 float(self._hmm_consensus.get("confidence", 0.0)),
             )
 
+    def _clear_expired_regime_cooldown(self, now: float) -> None:
+        if int(self._regime_tier) == 2:
+            self._regime_tier2_last_downgrade_at = 0.0
+            self._regime_cooldown_suppressed_side = None
+            return
+        if self._regime_tier2_last_downgrade_at <= 0:
+            return
+        cooldown_sec = max(0.0, float(getattr(config, "REGIME_TIER2_REENTRY_COOLDOWN_SEC", 600.0)))
+        if cooldown_sec <= 0:
+            return
+        elapsed = now - self._regime_tier2_last_downgrade_at
+        if elapsed < cooldown_sec:
+            return
+        cleared = 0
+        for sid in sorted(self.slots.keys()):
+            st = self.slots[sid].state
+            if str(getattr(st, "mode_source", "none")) == "regime":
+                self.slots[sid].state = replace(st, mode_source="none")
+                cleared += 1
+        if cleared:
+            logger.info(
+                "cooldown expired (%.0fs): cleared regime ownership on %d slots",
+                elapsed,
+                cleared,
+            )
+        self._regime_tier2_last_downgrade_at = 0.0
+        self._regime_cooldown_suppressed_side = None
+
     def _regime_status_payload(self, now: float | None = None) -> dict[str, Any]:
         now_ts = float(now if now is not None else _now())
         state = dict(self._regime_shadow_state or {})
@@ -2523,6 +2605,19 @@ class BotRuntime:
         grace_sec = max(0.0, float(getattr(config, "REGIME_SUPPRESSION_GRACE_SEC", 0.0)))
         grace_start = float(self._regime_tier2_grace_start or self._regime_tier_entered_at or now_ts)
         grace_remaining = max(0.0, grace_sec - max(0.0, now_ts - grace_start)) if tier == 2 else 0.0
+        cooldown_sec = max(0.0, float(getattr(config, "REGIME_TIER2_REENTRY_COOLDOWN_SEC", 600.0)))
+        cooldown_remaining = 0.0
+        cooldown_side = None
+        if (
+            cooldown_sec > 0
+            and int(self._regime_tier) < 2
+            and self._regime_tier2_last_downgrade_at > 0
+        ):
+            elapsed = max(0.0, now_ts - self._regime_tier2_last_downgrade_at)
+            if elapsed < cooldown_sec:
+                cooldown_remaining = cooldown_sec - elapsed
+                if self._regime_cooldown_suppressed_side in ("A", "B"):
+                    cooldown_side = self._regime_cooldown_suppressed_side
         return {
             "enabled": bool(state.get("enabled", False)),
             "shadow_enabled": bool(state.get("shadow_enabled", False)),
@@ -2541,11 +2636,14 @@ class BotRuntime:
             "dwell_sec": float(dwell_sec),
             "hysteresis_buffer": float(getattr(config, "REGIME_HYSTERESIS", 0.05)),
             "grace_remaining_sec": float(grace_remaining),
+            "cooldown_remaining_sec": float(cooldown_remaining),
+            "cooldown_suppressed_side": cooldown_side,
             "regime_suppressed_slots": sum(
                 1
                 for slot in self.slots.values()
                 if str(getattr(slot.state, "mode_source", "none")) == "regime"
             ),
+            "tier_history": list(self._regime_tier_history[-20:]),
             "last_eval_ts": float(state.get("last_eval_ts", self._regime_last_eval_ts)),
             "reason": str(state.get("reason", "")),
         }
@@ -3452,14 +3550,25 @@ class BotRuntime:
 
         cfg = self._engine_cfg(slot)
 
+        now_ts = _now()
         suppressed = None
-        if (
-            bool(getattr(config, "REGIME_DIRECTIONAL_ENABLED", False))
-            and int(self._regime_tier) == 2
-            and self._regime_grace_elapsed(_now())
-        ):
-            if self._regime_side_suppressed in ("A", "B"):
-                suppressed = self._regime_side_suppressed
+        cooldown_suppressed = (
+            self._regime_cooldown_suppressed_side
+            if self._regime_cooldown_suppressed_side in ("A", "B")
+            else None
+        )
+        if bool(getattr(config, "REGIME_DIRECTIONAL_ENABLED", False)):
+            if int(self._regime_tier) == 2 and self._regime_grace_elapsed(now_ts):
+                if self._regime_side_suppressed in ("A", "B"):
+                    suppressed = self._regime_side_suppressed
+            elif (
+                self._regime_tier2_last_downgrade_at > 0
+                and cooldown_suppressed in ("A", "B")
+            ):
+                cooldown_sec = max(0.0, float(getattr(config, "REGIME_TIER2_REENTRY_COOLDOWN_SEC", 600.0)))
+                elapsed = now_ts - self._regime_tier2_last_downgrade_at
+                if elapsed < cooldown_sec:
+                    suppressed = cooldown_suppressed
 
         if suppressed == "A":
             if usd >= min_cost:
@@ -5302,6 +5411,7 @@ class BotRuntime:
             self._update_rebalancer(loop_now)
             self._update_regime_tier(loop_now)
             self._apply_tier2_suppression(loop_now)
+            self._clear_expired_regime_cooldown(loop_now)
             # Prioritize older deferred entries each loop, while avoiding stale placements
             # that the upcoming price tick is likely to refresh anyway.
             self._drain_pending_entry_orders("entry_scheduler_pre_tick", skip_stale=True)
