@@ -1,6 +1,6 @@
 # HMM Regime Detector — Integration with STATE_MACHINE v1
 
-Last updated: 2026-02-14
+Last updated: 2026-02-15
 
 ## 1. Architectural Fit
 
@@ -14,7 +14,7 @@ the existing rebalancer (§14) and trend detector (§15).
                     │              bot.py runtime               │
                     │                                          │
  Kraken OHLCV ──►  │  FeatureExtractor  ──►  RegimeDetector   │
- (price_history)    │       │                      │           │
+ (ohlcv_candles)    │       │                      │           │
                     │       │              RegimeState          │
                     │       │           (bias_signal,           │
                     │       │            confidence,            │
@@ -64,12 +64,16 @@ if "_hmm_regime_state" in snapshot:
     restore_from_snapshot(self._hmm, snapshot)
 ```
 
-### 2.2 Training (in startup, after price_history is available)
+### 2.2 Training (startup, after OHLCV sync/backfill)
 
 ```python
 # After FETCH INITIAL PRICE in lifecycle (§3)
-# Pull 5-min candles from Supabase price_history or Kraken OHLC endpoint
-closes, volumes = self._fetch_training_candles(count=2000)
+# Sync OHLCV, optionally backfill, then train from persisted candles
+self._sync_ohlcv_candles(_now())
+self._maybe_backfill_ohlcv_on_startup()
+closes, volumes = self._fetch_training_candles(
+    count=int(getattr(config, "HMM_TRAINING_CANDLES", 2000))
+)
 self._hmm.train(closes, volumes)
 ```
 
@@ -105,7 +109,9 @@ grid_bias = compute_grid_bias(regime_state)
 ```python
 # At the end of main loop, check if retrain is due
 if self._hmm.needs_retrain():
-    closes, volumes = self._fetch_training_candles(count=2000)
+    closes, volumes = self._fetch_training_candles(
+        count=int(getattr(config, "HMM_TRAINING_CANDLES", 2000))
+    )
     self._hmm.train(closes, volumes)
 ```
 
@@ -137,6 +143,19 @@ Add to `/api/status` response:
     "trained": self._hmm._trained,
     "observation_count": self._hmm.state.observation_count,
     "blend_factor": self._hmm.cfg["HMM_BLEND_WITH_TREND"],
+},
+
+"hmm_data_pipeline": {
+    "interval_min": int(getattr(config, "HMM_OHLCV_INTERVAL_MIN", 1)),
+    "sync_interval_sec": float(getattr(config, "HMM_OHLCV_SYNC_INTERVAL_SEC", 60.0)),
+    "samples": sample_count,
+    "coverage_pct": coverage_pct,
+    "freshness_sec": freshness_sec,
+    "freshness_limit_sec": freshness_limit_sec,  # max(180s, interval*3)
+    "freshness_ok": freshness_ok,
+    "backfill_last_at": self._hmm_backfill_last_at,
+    "backfill_last_rows": self._hmm_backfill_last_rows,
+    "backfill_last_message": self._hmm_backfill_last_message,
 }
 ```
 
@@ -153,11 +172,13 @@ Add to `/api/status` response:
 
 ### Modified (bot.py runtime only)
 - `_compute_dynamic_idle_target()` — blended formula
-- `_update_rebalancer()` — HMM update call added
-- `_slot_order_size_usd()` — optionally consumes grid_bias spacing mults
-- `save_state()` / `load_state()` — new snapshot keys
-- `status_payload()` — new telemetry block
-- Startup sequence — training step added
+- `_update_hmm()` / `_train_hmm()` — startup + periodic HMM lifecycle
+- `_sync_ohlcv_candles()` — incremental OHLCV persistence
+- `_maybe_backfill_ohlcv_on_startup()` + `backfill_ohlcv_history()` — one-time warmup
+- `/backfill_ohlcv [target_candles] [max_pages]` — operator-triggered backfill
+- `_hmm_data_readiness()` — readiness + freshness diagnostics
+- `save_state()` / `load_state()` — HMM + backfill snapshot keys
+- `status_payload()` / dashboard — `hmm_regime` + `hmm_data_pipeline` telemetry
 
 ### New files
 - `hmm_regime_detector.py` — self-contained module
@@ -227,19 +248,24 @@ trend_score-only idle target). This is guaranteed by:
 ## 6. Data Pipeline
 
 ```
-Kraken OHLC endpoint (5-min candles)
+Kraken OHLC endpoint (interval = HMM_OHLCV_INTERVAL_MIN, default 1m)
         │
         ▼
-Supabase price_history table
+Supabase ohlcv_candles table
         │
-        ├── _fetch_training_candles(2000) → train() on startup + daily
+        ├── _fetch_training_candles(HMM_TRAINING_CANDLES) → train() on startup + periodic retrain
         │
-        └── _fetch_recent_candles(100) → update() every REBALANCE_INTERVAL_SEC
+        └── _fetch_recent_candles(HMM_RECENT_CANDLES) → update() every REBALANCE_INTERVAL_SEC
 ```
 
-You likely already have price_history data from the existing trend
-detector. If not, add a simple candle aggregator that buckets
-price ticks into 5-min OHLCV rows.
+Startup sequence includes:
+1. `_sync_ohlcv_candles()` to ingest recent closed bars
+2. `_maybe_backfill_ohlcv_on_startup()` (best-effort history warmup)
+3. initial HMM train/update
+
+Readiness uses a freshness gate:
+- `freshness_limit_sec = max(180, interval_sec * 3)`
+- At 1m cadence, stale after ~3 minutes.
 
 
 ## 7. Config Summary
@@ -249,11 +275,21 @@ New env vars / config keys:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `HMM_ENABLED` | False | Master enable (start disabled) |
+| `HMM_OHLCV_ENABLED` | True | Master switch for OHLCV persistence |
+| `HMM_OHLCV_INTERVAL_MIN` | 1 | Candle interval in minutes |
+| `HMM_OHLCV_SYNC_INTERVAL_SEC` | 60.0 | OHLCV pull cadence |
+| `HMM_OHLCV_RETENTION_DAYS` | 14 | Supabase retention period |
+| `HMM_OHLCV_BACKFILL_ON_STARTUP` | True | Attempt warmup backfill at startup |
+| `HMM_OHLCV_BACKFILL_MAX_PAGES` | 40 | Max Kraken pages per backfill run |
+| `HMM_TRAINING_CANDLES` | 2000 | Target training window size |
+| `HMM_RECENT_CANDLES` | 100 | Inference fetch window |
+| `HMM_READINESS_CACHE_SEC` | 300.0 | Readiness cache TTL |
 | `HMM_N_STATES` | 3 | Number of hidden states |
+| `HMM_N_ITER` | 100 | Baum-Welch iterations |
 | `HMM_COVARIANCE_TYPE` | "diag" | Gaussian covariance structure |
 | `HMM_INFERENCE_WINDOW` | 50 | Observations used per inference |
 | `HMM_CONFIDENCE_THRESHOLD` | 0.15 | Min confidence for non-zero bias |
-| `HMM_RETRAIN_INTERVAL_SEC` | 86400 | Retrain period (1 day) |
+| `HMM_RETRAIN_INTERVAL_SEC` | 86400.0 | Retrain period (1 day) |
 | `HMM_MIN_TRAIN_SAMPLES` | 500 | Minimum candles for training |
 | `HMM_BIAS_GAIN` | 1.0 | Scales bias magnitude |
 | `HMM_BLEND_WITH_TREND` | 0.5 | Blend ratio (0=HMM, 1=trend) |

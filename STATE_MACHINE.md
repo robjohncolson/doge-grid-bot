@@ -1,6 +1,6 @@
 # DOGE State-Machine Bot v1
 
-Last updated: 2026-02-14
+Last updated: 2026-02-15
 Primary code references: `bot.py`, `state_machine.py`, `config.py`, `dashboard.py`, `supabase_store.py`, `hmm_regime_detector.py`
 
 ## 1. Scope
@@ -42,7 +42,7 @@ START
   -> LOAD SNAPSHOT (Supabase key __v1__, restore HMM state)
   -> FETCH CONSTRAINTS + FEES (Kraken)
   -> FETCH INITIAL PRICE (strict)
-  -> SYNC OHLCV + PRIME HMM (initial candle pull, first training attempt)
+  -> SYNC OHLCV + OPTIONAL BACKFILL + PRIME HMM (initial pull, warmup backfill, first train)
   -> RECONCILE TRACKED ORDERS
   -> REPLAY MISSED FILLS (trade history)
   -> ENSURE BOOTSTRAP PER SLOT
@@ -65,7 +65,7 @@ Per iteration in `bot.py`:
 1. `begin_loop()` enables private API budget accounting.
 2. `_refresh_price(strict=False)`.
 3. If price age exceeds `STALE_PRICE_MAX_AGE_SEC`, call `pause(...)`.
-4. **OHLCV sync** (`_sync_ohlcv_candles`): pull Kraken 5-min candles, queue upserts to Supabase (see §16).
+4. **OHLCV sync** (`_sync_ohlcv_candles`): pull Kraken OHLC candles (default 1m), queue upserts to Supabase (see §16).
 5. Compute volatility-adaptive runtime profit target.
 6. **Daily loss lock check** (`_update_daily_loss_lock`): auto-pauses if aggregate UTC-day loss exceeds `DAILY_LOSS_LIMIT`.
 7. **Entry scheduler pre-tick drain**: drain up to `MAX_ENTRY_ADDS_PER_LOOP` deferred entries.
@@ -404,14 +404,15 @@ Three stages in strict order:
 
 ## 16. OHLCV Data Pipeline
 
-Persists 5-minute OHLCV candles from Kraken into Supabase for HMM training and inference.
+Persists interval-based OHLCV candles from Kraken into Supabase for HMM training and inference (default interval: 1 minute).
 
 ### 16.1 Collection
 
-- `_sync_ohlcv_candles()`: called every main loop iteration, rate-limited to `HMM_OHLCV_SYNC_INTERVAL_SEC` (default 300s).
-- Pulls one page from Kraken's OHLC endpoint (`get_ohlc_page`), normalizes rows, filters out the still-forming candle.
-- Queues closed candles for upsert into `ohlcv_candles` table via `supabase_store.queue_ohlcv_candles()`.
-- Cursor (`_ohlcv_since_cursor`) persisted in snapshot for incremental fetches across restarts.
+- `_sync_ohlcv_candles()`: called every main loop iteration, rate-limited to `HMM_OHLCV_SYNC_INTERVAL_SEC` (default 60s).
+- Pulls one page from Kraken's OHLC endpoint (`get_ohlc_page`) using `HMM_OHLCV_INTERVAL_MIN` (default 1).
+- Normalizes rows, filters out the still-forming candle, and queues upserts to `ohlcv_candles` via `supabase_store.queue_ohlcv_candles()`.
+- Cursor (`_ohlcv_since_cursor`) is persisted in snapshot for incremental fetches across restarts.
+- Startup warmup: `_maybe_backfill_ohlcv_on_startup()` may call `backfill_ohlcv_history()` to queue additional historical candles when below target window.
 
 ### 16.2 Storage
 
@@ -433,7 +434,8 @@ Supabase table `ohlcv_candles`:
 
 - `samples`: current candle count in Supabase
 - `coverage_pct`: samples / training_target * 100
-- `freshness_ok`: newest candle within 3x interval
+- `freshness_limit_sec`: stale threshold = `max(180, interval_sec * 3)`
+- `freshness_ok`: newest candle age <= `freshness_limit_sec`
 - `volume_coverage_pct`: % of candles with non-zero volume
 - `ready_for_min_train`: samples >= `HMM_MIN_TRAIN_SAMPLES` and fresh
 - `ready_for_target_window`: samples >= `HMM_TRAINING_CANDLES` and fresh
@@ -444,9 +446,11 @@ Supabase table `ohlcv_candles`:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `HMM_OHLCV_ENABLED` | True | Master switch for candle collection |
-| `HMM_OHLCV_INTERVAL_MIN` | 5 | Candle interval in minutes |
-| `HMM_OHLCV_SYNC_INTERVAL_SEC` | 300.0 | How often to pull from Kraken |
+| `HMM_OHLCV_INTERVAL_MIN` | 1 | Candle interval in minutes |
+| `HMM_OHLCV_SYNC_INTERVAL_SEC` | 60.0 | How often to pull from Kraken |
 | `HMM_OHLCV_RETENTION_DAYS` | 14 | Supabase retention period |
+| `HMM_OHLCV_BACKFILL_ON_STARTUP` | True | Attempt warmup backfill on startup |
+| `HMM_OHLCV_BACKFILL_MAX_PAGES` | 40 | Max Kraken pages in one backfill run |
 | `HMM_TRAINING_CANDLES` | 2000 | Target training window size |
 | `HMM_RECENT_CANDLES` | 100 | Inference window size |
 | `HMM_MIN_TRAIN_SAMPLES` | 500 | Minimum candles for training |
@@ -577,6 +581,7 @@ Snapshot payload includes:
 - **daily loss lock state**: `_daily_loss_lock_active`, `_daily_loss_lock_utc_day`, `_daily_realized_loss_utc`
 - **capital layer state**: `target_layers`, `effective_layers`
 - **OHLCV pipeline state**: `ohlcv_since_cursor`, `ohlcv_last_sync_ts`, `ohlcv_last_candle_ts`
+- **HMM backfill state**: `hmm_backfill_last_at`, `hmm_backfill_last_rows`, `hmm_backfill_last_message`
 - **HMM regime state**: `_hmm_regime_state` (RegimeState dict), `_hmm_last_train_ts`, `_hmm_trained`
 
 Fields absent from old snapshots default to safe values (backward compatible).
@@ -649,8 +654,9 @@ Supported dashboard actions:
 
 - `enabled`, `source`, `interval_min`, `samples`, `coverage_pct`
 - `ready_for_min_train`, `ready_for_target_window`, `gaps`
-- `freshness_ok`, `volume_coverage_pct`, `span_hours`
+- `freshness_sec`, `freshness_limit_sec`, `freshness_ok`, `volume_coverage_pct`, `span_hours`
 - `sync_interval_sec`, `last_sync_ts`, `last_sync_rows_queued`, `sync_cursor`
+- `backfill_last_at`, `backfill_last_rows`, `backfill_last_message`
 
 **`hmm_regime`**: HMM regime detector state (§17):
 
@@ -674,6 +680,7 @@ Supported commands:
 - `/add_slot`
 - `/status`
 - `/help`
+- `/backfill_ohlcv [target_candles] [max_pages]`
 - `/soft_close [slot_id recovery_id]`
 - `/set_entry_pct <value>`
 - `/set_profit_pct <value>`
