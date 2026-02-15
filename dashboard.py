@@ -360,11 +360,13 @@ DASHBOARD_HTML = """<!doctype html>
 
         <h3 style=\"margin-top:14px\">HMM Regime</h3>
         <div class=\"row\"><span class=\"k\">Status</span><span id=\"hmmStatus\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Source</span><span id=\"hmmSource\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Regime</span><span id=\"hmmRegime\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Confidence</span><span id=\"hmmConfidence\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Bias Signal</span><span id=\"hmmBias\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Blend</span><span id=\"hmmBlend\" class=\"v\"></span></div>
-        <div class=\"row\"><span class=\"k\">Data Window</span><span id=\"hmmWindow\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Data Window (1m)</span><span id=\"hmmWindow\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Data Window (15m)</span><span id=\"hmmWindowSecondary\" class=\"v\"></span></div>
         <div id=\"hmmHints\" class=\"tiny\"></div>
 
         <h3 style=\"margin-top:14px\">Capacity &amp; Fill Health</h3>
@@ -1225,7 +1227,9 @@ DASHBOARD_HTML = """<!doctype html>
         releaseGateBlocked ? String(release.recon_hard_gate_reason || '') : '';
 
       const hmm = s.hmm_regime || {};
+      const hmmConsensus = s.hmm_consensus || {};
       const hmmPipe = s.hmm_data_pipeline || {};
+      const hmmPipeSecondary = s.hmm_data_pipeline_secondary || {};
       const hmmStatusEl = document.getElementById('hmmStatus');
       const hmmEnabled = Boolean(hmm.enabled);
       const hmmAvailable = Boolean(hmm.available);
@@ -1244,6 +1248,12 @@ DASHBOARD_HTML = """<!doctype html>
       }
       hmmStatusEl.textContent = hmmStatus;
       hmmStatusEl.style.color = hmmStatusColor;
+
+      const sourceModeRaw = hmmConsensus.source_mode || hmm.source_mode || 'primary';
+      const sourceMode = String(sourceModeRaw || 'primary').toLowerCase();
+      const agreement = hmmConsensus.agreement || hmm.agreement || (sourceMode === 'consensus' ? '-' : 'primary_only');
+      document.getElementById('hmmSource').textContent =
+        `${sourceMode.toUpperCase()}${agreement ? ` (${String(agreement)})` : ''}`;
 
       const regimeLabel = hmm.regime ? String(hmm.regime) : '-';
       const regimeId = hmm.regime_id;
@@ -1277,9 +1287,24 @@ DASHBOARD_HTML = """<!doctype html>
       }
       document.getElementById('hmmWindow').textContent = windowText;
 
+      const samples2 = Number(hmmPipeSecondary.samples || 0);
+      const target2 = Number(hmmPipeSecondary.training_target || 0);
+      const coverage2 = hmmPipeSecondary.coverage_pct;
+      const spanHours2 = hmmPipeSecondary.span_hours;
+      let windowText2 = '-';
+      if (target2 > 0 || samples2 > 0) {
+        const covText2 = coverage2 === null || coverage2 === undefined ? '' : ` (${fmt(Number(coverage2), 1)}%)`;
+        const spanText2 = spanHours2 === null || spanHours2 === undefined ? '' : `, ${fmt(Number(spanHours2), 1)}h`;
+        windowText2 = `${samples2}/${target2 || '-'}${covText2}${spanText2}`;
+      }
+      document.getElementById('hmmWindowSecondary').textContent = windowText2;
+
       const hmmHints = [];
       if (Array.isArray(hmmPipe.gaps) && hmmPipe.gaps.length) {
         hmmHints.push(...hmmPipe.gaps.map(x => String(x)));
+      }
+      if (Array.isArray(hmmPipeSecondary.gaps) && hmmPipeSecondary.gaps.length) {
+        hmmHints.push(...hmmPipeSecondary.gaps.map(x => `secondary:${String(x)}`));
       }
       if (hmm.error) {
         hmmHints.push(`error:${String(hmm.error)}`);
@@ -1287,13 +1312,24 @@ DASHBOARD_HTML = """<!doctype html>
       if (hmmPipe.backfill_last_message) {
         hmmHints.push(`backfill:${String(hmmPipe.backfill_last_message)}`);
       }
+      if (hmmPipeSecondary.backfill_last_message) {
+        hmmHints.push(`backfill_secondary:${String(hmmPipeSecondary.backfill_last_message)}`);
+      }
       if (hmmPipe.freshness_ok === false && freshnessSec !== null && freshnessSec !== undefined) {
         hmmHints.push(`stale:${Math.round(Number(freshnessSec))}s`);
+      }
+      if (hmmPipeSecondary.freshness_ok === false && hmmPipeSecondary.freshness_sec !== null && hmmPipeSecondary.freshness_sec !== undefined) {
+        hmmHints.push(`stale_secondary:${Math.round(Number(hmmPipeSecondary.freshness_sec))}s`);
       }
       if (hmmPipe.backfill_last_at) {
         const agoSec = (Date.now() / 1000) - Number(hmmPipe.backfill_last_at);
         const rows = Number(hmmPipe.backfill_last_rows || 0);
         hmmHints.push(`last_backfill:${rows} rows, ${fmtAgeSeconds(agoSec)} ago`);
+      }
+      if (hmmPipeSecondary.backfill_last_at) {
+        const agoSec2 = (Date.now() / 1000) - Number(hmmPipeSecondary.backfill_last_at);
+        const rows2 = Number(hmmPipeSecondary.backfill_last_rows || 0);
+        hmmHints.push(`last_backfill_secondary:${rows2} rows, ${fmtAgeSeconds(agoSec2)} ago`);
       }
       document.getElementById('hmmHints').textContent =
         hmmHints.length ? `Hints: ${hmmHints.join(' | ')}` : '';

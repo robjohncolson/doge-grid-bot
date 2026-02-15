@@ -289,16 +289,36 @@ class BotRuntime:
         self._ohlcv_last_sync_ts: float = 0.0
         self._ohlcv_last_candle_ts: float = 0.0
         self._ohlcv_last_rows_queued: int = 0
-        self._hmm_readiness_cache: dict[str, Any] | None = None
-        self._hmm_readiness_last_ts: float = 0.0
+        self._ohlcv_secondary_since_cursor: int | None = None
+        self._ohlcv_secondary_last_sync_ts: float = 0.0
+        self._ohlcv_secondary_last_candle_ts: float = 0.0
+        self._ohlcv_secondary_last_rows_queued: int = 0
+        self._hmm_readiness_cache: dict[str, dict[str, Any]] = {}
+        self._hmm_readiness_last_ts: dict[str, float] = {}
         self._hmm_detector: Any = None
+        self._hmm_detector_secondary: Any = None
         self._hmm_module: Any = None
         self._hmm_numpy: Any = None
         self._hmm_state: dict[str, Any] = self._hmm_default_state()
+        self._hmm_state_secondary: dict[str, Any] = self._hmm_default_state(
+            enabled=bool(getattr(config, "HMM_ENABLED", False))
+            and bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)),
+            interval_min=max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15))),
+        )
+        self._hmm_consensus: dict[str, Any] = dict(self._hmm_state)
+        self._hmm_consensus.update({
+            "agreement": "primary_only",
+            "source_mode": "primary",
+            "multi_timeframe": False,
+        })
         self._hmm_last_train_attempt_ts: float = 0.0
+        self._hmm_last_train_attempt_ts_secondary: float = 0.0
         self._hmm_backfill_last_at: float = 0.0
         self._hmm_backfill_last_rows: int = 0
         self._hmm_backfill_last_message: str = ""
+        self._hmm_backfill_last_at_secondary: float = 0.0
+        self._hmm_backfill_last_rows_secondary: int = 0
+        self._hmm_backfill_last_message_secondary: str = ""
         self._regime_tier: int = 0
         self._regime_tier_entered_at: float = 0.0
         self._regime_side_suppressed: str | None = None
@@ -345,7 +365,8 @@ class BotRuntime:
             return 1.0, 1.0
 
         state = dict(self._regime_shadow_state or {})
-        regime = str(state.get("regime", self._hmm_state.get("regime", "RANGING"))).upper()
+        policy_regime, policy_confidence, policy_bias_signal, _, _ = self._policy_hmm_signal()
+        regime = str(state.get("regime", policy_regime)).upper()
         if regime not in {"BULLISH", "BEARISH"}:
             return 1.0, 1.0
 
@@ -353,8 +374,8 @@ class BotRuntime:
         if not hmm_mod or not hasattr(hmm_mod, "compute_grid_bias"):
             return 1.0, 1.0
 
-        confidence = float(state.get("confidence", self._hmm_state.get("confidence", 0.0) or 0.0))
-        bias_signal = float(state.get("bias_signal", self._hmm_state.get("bias_signal", 0.0) or 0.0))
+        confidence = float(state.get("confidence", policy_confidence))
+        bias_signal = float(state.get("bias_signal", policy_bias_signal))
         regime_stub = SimpleNamespace(confidence=confidence, bias_signal=bias_signal)
         try:
             bias = hmm_mod.compute_grid_bias(regime_stub)
@@ -1021,9 +1042,18 @@ class BotRuntime:
             "ohlcv_since_cursor": self._ohlcv_since_cursor,
             "ohlcv_last_sync_ts": self._ohlcv_last_sync_ts,
             "ohlcv_last_candle_ts": self._ohlcv_last_candle_ts,
+            "ohlcv_secondary_since_cursor": self._ohlcv_secondary_since_cursor,
+            "ohlcv_secondary_last_sync_ts": self._ohlcv_secondary_last_sync_ts,
+            "ohlcv_secondary_last_candle_ts": self._ohlcv_secondary_last_candle_ts,
+            "ohlcv_secondary_last_rows_queued": self._ohlcv_secondary_last_rows_queued,
+            "hmm_state_secondary": dict(self._hmm_state_secondary or {}),
+            "hmm_consensus": dict(self._hmm_consensus or {}),
             "hmm_backfill_last_at": self._hmm_backfill_last_at,
             "hmm_backfill_last_rows": self._hmm_backfill_last_rows,
             "hmm_backfill_last_message": self._hmm_backfill_last_message,
+            "hmm_backfill_last_at_secondary": self._hmm_backfill_last_at_secondary,
+            "hmm_backfill_last_rows_secondary": self._hmm_backfill_last_rows_secondary,
+            "hmm_backfill_last_message_secondary": self._hmm_backfill_last_message_secondary,
             "regime_tier": int(self._regime_tier),
             "regime_tier_entered_at": float(self._regime_tier_entered_at),
             "regime_side_suppressed": self._regime_side_suppressed,
@@ -1134,13 +1164,46 @@ class BotRuntime:
                 self._ohlcv_since_cursor = int(raw_cursor) if raw_cursor is not None else None
             except (TypeError, ValueError):
                 self._ohlcv_since_cursor = None
+            raw_secondary_cursor = snap.get("ohlcv_secondary_since_cursor", self._ohlcv_secondary_since_cursor)
+            try:
+                self._ohlcv_secondary_since_cursor = int(raw_secondary_cursor) if raw_secondary_cursor is not None else None
+            except (TypeError, ValueError):
+                self._ohlcv_secondary_since_cursor = None
             self._ohlcv_last_sync_ts = float(snap.get("ohlcv_last_sync_ts", self._ohlcv_last_sync_ts))
             self._ohlcv_last_candle_ts = float(snap.get("ohlcv_last_candle_ts", self._ohlcv_last_candle_ts))
+            self._ohlcv_secondary_last_sync_ts = float(
+                snap.get("ohlcv_secondary_last_sync_ts", self._ohlcv_secondary_last_sync_ts)
+            )
+            self._ohlcv_secondary_last_candle_ts = float(
+                snap.get("ohlcv_secondary_last_candle_ts", self._ohlcv_secondary_last_candle_ts)
+            )
+            self._ohlcv_secondary_last_rows_queued = int(
+                snap.get("ohlcv_secondary_last_rows_queued", self._ohlcv_secondary_last_rows_queued)
+            )
             self._hmm_backfill_last_at = float(snap.get("hmm_backfill_last_at", self._hmm_backfill_last_at))
             self._hmm_backfill_last_rows = int(snap.get("hmm_backfill_last_rows", self._hmm_backfill_last_rows))
             self._hmm_backfill_last_message = str(
                 snap.get("hmm_backfill_last_message", self._hmm_backfill_last_message) or ""
             )
+            self._hmm_backfill_last_at_secondary = float(
+                snap.get("hmm_backfill_last_at_secondary", self._hmm_backfill_last_at_secondary)
+            )
+            self._hmm_backfill_last_rows_secondary = int(
+                snap.get("hmm_backfill_last_rows_secondary", self._hmm_backfill_last_rows_secondary)
+            )
+            self._hmm_backfill_last_message_secondary = str(
+                snap.get(
+                    "hmm_backfill_last_message_secondary",
+                    self._hmm_backfill_last_message_secondary,
+                )
+                or ""
+            )
+            raw_hmm_state_secondary = snap.get("hmm_state_secondary", self._hmm_state_secondary)
+            if isinstance(raw_hmm_state_secondary, dict):
+                self._hmm_state_secondary = dict(raw_hmm_state_secondary)
+            raw_hmm_consensus = snap.get("hmm_consensus", self._hmm_consensus)
+            if isinstance(raw_hmm_consensus, dict):
+                self._hmm_consensus = dict(raw_hmm_consensus)
             self._regime_tier = int(snap.get("regime_tier", self._regime_tier))
             self._regime_tier = max(0, min(2, self._regime_tier))
             self._regime_tier_entered_at = float(snap.get("regime_tier_entered_at", self._regime_tier_entered_at))
@@ -1177,6 +1240,7 @@ class BotRuntime:
                         continue
             self._rebalancer_sign_flip_history = deque(sorted(cleaned_hist)[-20:])
             self._restore_hmm_snapshot(snap)
+            self._hmm_consensus = self._compute_hmm_consensus()
 
             self.slots = {}
             slot_aliases = snap.get("slot_aliases", {})
@@ -1354,8 +1418,8 @@ class BotRuntime:
         # Prime OHLCV + optional one-time backfill + HMM state before entering the loop.
         self._sync_ohlcv_candles(_now())
         self._maybe_backfill_ohlcv_on_startup()
-        self._hmm_readiness_cache = None
-        self._hmm_readiness_last_ts = 0.0
+        self._hmm_readiness_cache = {}
+        self._hmm_readiness_last_ts = {}
         startup_now = _now()
         self._update_hmm(startup_now)
         self._update_regime_tier(startup_now)
@@ -1450,12 +1514,27 @@ class BotRuntime:
             if self.consecutive_api_errors >= config.MAX_CONSECUTIVE_ERRORS:
                 self.pause(f"{self.consecutive_api_errors} consecutive API errors")
 
-    def _hmm_default_state(self) -> dict[str, Any]:
+    def _hmm_default_state(
+        self,
+        *,
+        enabled: bool | None = None,
+        interval_min: int | None = None,
+    ) -> dict[str, Any]:
         blend = max(0.0, min(1.0, float(getattr(config, "HMM_BLEND_WITH_TREND", 0.5))))
+        use_enabled = bool(getattr(config, "HMM_ENABLED", False)) if enabled is None else bool(enabled)
+        use_interval = max(
+            1,
+            int(
+                getattr(config, "HMM_OHLCV_INTERVAL_MIN", 1)
+                if interval_min is None
+                else interval_min
+            ),
+        )
         return {
-            "enabled": bool(getattr(config, "HMM_ENABLED", False)),
+            "enabled": use_enabled,
             "available": False,
             "trained": False,
+            "interval_min": use_interval,
             "regime": "RANGING",
             "regime_id": 1,
             "confidence": 0.0,
@@ -1469,10 +1548,52 @@ class BotRuntime:
             "blend_factor": blend,
             "last_update_ts": 0.0,
             "last_train_ts": 0.0,
+            "agreement": "single",
+            "source_mode": "primary",
+            "multi_timeframe": False,
             "error": "",
         }
 
-    def _hmm_runtime_config(self) -> dict[str, Any]:
+    def _hmm_source_mode(self) -> str:
+        raw = str(getattr(config, "HMM_MULTI_TIMEFRAME_SOURCE", "primary") or "primary").strip().lower()
+        mode = "consensus" if raw == "consensus" else "primary"
+        if mode == "consensus" and not bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)):
+            return "primary"
+        return mode
+
+    def _policy_hmm_source(self) -> dict[str, Any]:
+        primary = self._hmm_state if isinstance(self._hmm_state, dict) else self._hmm_default_state()
+        if not bool(getattr(config, "HMM_ENABLED", False)):
+            return primary
+        if not bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)):
+            return primary
+        if self._hmm_source_mode() != "consensus":
+            return primary
+        if isinstance(self._hmm_consensus, dict) and self._hmm_consensus:
+            return self._hmm_consensus
+        return primary
+
+    def _policy_hmm_signal(self) -> tuple[str, float, float, bool, dict[str, Any]]:
+        source = dict(self._policy_hmm_source() or {})
+        regime = str(source.get("regime", "RANGING") or "RANGING").upper()
+        confidence = max(0.0, min(1.0, float(source.get("confidence", 0.0) or 0.0)))
+        bias = float(source.get("bias_signal", 0.0) or 0.0)
+        ready = bool(
+            bool(getattr(config, "HMM_ENABLED", False))
+            and bool(source.get("available"))
+            and bool(source.get("trained"))
+        )
+        return regime, confidence, bias, ready, source
+
+    def _hmm_runtime_config(self, *, min_train_samples: int | None = None) -> dict[str, Any]:
+        resolved_min_samples = max(
+            50,
+            int(
+                getattr(config, "HMM_MIN_TRAIN_SAMPLES", 500)
+                if min_train_samples is None
+                else min_train_samples
+            ),
+        )
         return {
             "HMM_N_STATES": max(2, int(getattr(config, "HMM_N_STATES", 3))),
             "HMM_N_ITER": max(10, int(getattr(config, "HMM_N_ITER", 100))),
@@ -1484,23 +1605,48 @@ class BotRuntime:
             "HMM_RETRAIN_INTERVAL_SEC": max(
                 300.0, float(getattr(config, "HMM_RETRAIN_INTERVAL_SEC", 86400.0))
             ),
-            "HMM_MIN_TRAIN_SAMPLES": max(50, int(getattr(config, "HMM_MIN_TRAIN_SAMPLES", 500))),
+            "HMM_MIN_TRAIN_SAMPLES": resolved_min_samples,
             "HMM_BIAS_GAIN": max(0.0, float(getattr(config, "HMM_BIAS_GAIN", 1.0))),
             "HMM_BLEND_WITH_TREND": max(
                 0.0, min(1.0, float(getattr(config, "HMM_BLEND_WITH_TREND", 0.5)))
             ),
         }
 
-    def _refresh_hmm_state_from_detector(self) -> None:
-        if not self._hmm_detector:
-            self._hmm_state["available"] = False
-            self._hmm_state["trained"] = False
-            self._hmm_state["blend_factor"] = max(
+    def _refresh_hmm_state_from_detector(self, *, secondary: bool = False) -> None:
+        detector = self._hmm_detector_secondary if secondary else self._hmm_detector
+        if secondary:
+            if not isinstance(self._hmm_state_secondary, dict):
+                self._hmm_state_secondary = self._hmm_default_state(
+                    enabled=bool(getattr(config, "HMM_ENABLED", False))
+                    and bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)),
+                    interval_min=max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15))),
+                )
+            state = self._hmm_state_secondary
+            enabled_flag = bool(getattr(config, "HMM_ENABLED", False)) and bool(
+                getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)
+            )
+            interval_min = max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15)))
+        else:
+            if not isinstance(self._hmm_state, dict):
+                self._hmm_state = self._hmm_default_state(
+                    enabled=bool(getattr(config, "HMM_ENABLED", False)),
+                    interval_min=max(1, int(getattr(config, "HMM_OHLCV_INTERVAL_MIN", 1))),
+                )
+            state = self._hmm_state
+            enabled_flag = bool(getattr(config, "HMM_ENABLED", False))
+            interval_min = max(1, int(getattr(config, "HMM_OHLCV_INTERVAL_MIN", 1)))
+
+        if not detector:
+            state["enabled"] = enabled_flag
+            state["available"] = False
+            state["trained"] = False
+            state["interval_min"] = interval_min
+            state["blend_factor"] = max(
                 0.0, min(1.0, float(getattr(config, "HMM_BLEND_WITH_TREND", 0.5)))
             )
             return
 
-        st = getattr(self._hmm_detector, "state", None)
+        st = getattr(detector, "state", None)
         probs = [0.0, 1.0, 0.0]
         if st is not None:
             raw_probs = list(getattr(st, "probabilities", []) or [])
@@ -1525,10 +1671,11 @@ class BotRuntime:
         except Exception:
             regime_name = "RANGING"
 
-        self._hmm_state.update({
-            "enabled": bool(getattr(config, "HMM_ENABLED", False)),
+        state.update({
+            "enabled": enabled_flag,
             "available": True,
-            "trained": bool(getattr(self._hmm_detector, "_trained", False)),
+            "trained": bool(getattr(detector, "_trained", False)),
+            "interval_min": interval_min,
             "regime": regime_name,
             "regime_id": regime_id,
             "confidence": float(getattr(st, "confidence", 0.0) if st is not None else 0.0),
@@ -1543,16 +1690,33 @@ class BotRuntime:
                 0.0, min(1.0, float(getattr(config, "HMM_BLEND_WITH_TREND", 0.5)))
             ),
             "last_update_ts": float(getattr(st, "last_update_ts", 0.0) if st is not None else 0.0),
-            "last_train_ts": float(getattr(self._hmm_detector, "_last_train_ts", 0.0) or 0.0),
+            "last_train_ts": float(getattr(detector, "_last_train_ts", 0.0) or 0.0),
         })
 
     def _init_hmm_runtime(self) -> None:
-        self._hmm_state = self._hmm_default_state()
+        primary_interval = max(1, int(getattr(config, "HMM_OHLCV_INTERVAL_MIN", 1)))
+        secondary_interval = max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15)))
+        hmm_enabled = bool(getattr(config, "HMM_ENABLED", False))
+        multi_enabled = bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False))
+
+        self._hmm_state = self._hmm_default_state(enabled=hmm_enabled, interval_min=primary_interval)
+        self._hmm_state_secondary = self._hmm_default_state(
+            enabled=bool(hmm_enabled and multi_enabled),
+            interval_min=secondary_interval,
+        )
+        self._hmm_consensus = dict(self._hmm_state)
+        self._hmm_consensus.update({
+            "agreement": "primary_only",
+            "source_mode": self._hmm_source_mode(),
+            "multi_timeframe": bool(multi_enabled),
+        })
         self._hmm_detector = None
+        self._hmm_detector_secondary = None
         self._hmm_module = None
         self._hmm_numpy = None
 
-        if not bool(getattr(config, "HMM_ENABLED", False)):
+        if not hmm_enabled:
+            self._hmm_consensus = self._compute_hmm_consensus()
             return
 
         try:
@@ -1561,43 +1725,94 @@ class BotRuntime:
 
             self._hmm_numpy = np
             self._hmm_module = hmm_mod
-            self._hmm_detector = hmm_mod.RegimeDetector(config=self._hmm_runtime_config())
+            self._hmm_detector = hmm_mod.RegimeDetector(
+                config=self._hmm_runtime_config(
+                    min_train_samples=max(1, int(getattr(config, "HMM_MIN_TRAIN_SAMPLES", 500))),
+                )
+            )
             self._hmm_state["available"] = True
             self._hmm_state["error"] = ""
             self._refresh_hmm_state_from_detector()
+            if multi_enabled:
+                try:
+                    self._hmm_detector_secondary = hmm_mod.RegimeDetector(
+                        config=self._hmm_runtime_config(
+                            min_train_samples=max(
+                                1,
+                                int(getattr(config, "HMM_SECONDARY_MIN_TRAIN_SAMPLES", 200)),
+                            ),
+                        )
+                    )
+                    self._hmm_state_secondary["available"] = True
+                    self._hmm_state_secondary["error"] = ""
+                    self._refresh_hmm_state_from_detector(secondary=True)
+                except Exception as e:
+                    self._hmm_state_secondary["available"] = False
+                    self._hmm_state_secondary["trained"] = False
+                    self._hmm_state_secondary["error"] = str(e)
+                    logger.warning(
+                        "Secondary HMM runtime unavailable, continuing with primary HMM only: %s",
+                        e,
+                    )
             logger.info("HMM runtime initialized (advisory mode enabled)")
         except Exception as e:
             self._hmm_state["available"] = False
             self._hmm_state["trained"] = False
             self._hmm_state["error"] = str(e)
+            self._hmm_state_secondary["available"] = False
+            self._hmm_state_secondary["trained"] = False
             logger.warning("HMM runtime unavailable, continuing with trend-only logic: %s", e)
+        self._hmm_consensus = self._compute_hmm_consensus()
 
     def _snapshot_hmm_state(self) -> dict[str, Any]:
-        if not self._hmm_detector or not self._hmm_module:
+        if not self._hmm_module:
             return {}
+        out: dict[str, Any] = {}
         try:
-            if hasattr(self._hmm_module, "serialize_for_snapshot"):
+            if self._hmm_detector and hasattr(self._hmm_module, "serialize_for_snapshot"):
                 snap = self._hmm_module.serialize_for_snapshot(self._hmm_detector)
                 if isinstance(snap, dict):
-                    return dict(snap)
+                    out.update(dict(snap))
+            if self._hmm_detector_secondary and hasattr(self._hmm_module, "serialize_for_snapshot"):
+                sec_snap = self._hmm_module.serialize_for_snapshot(self._hmm_detector_secondary)
+                if isinstance(sec_snap, dict):
+                    out["_hmm_secondary_regime_state"] = dict(
+                        sec_snap.get("_hmm_regime_state", {}) or {}
+                    )
+                    out["_hmm_secondary_last_train_ts"] = float(
+                        sec_snap.get("_hmm_last_train_ts", 0.0) or 0.0
+                    )
+                    out["_hmm_secondary_trained"] = bool(
+                        sec_snap.get("_hmm_trained", False)
+                    )
         except Exception as e:
             logger.warning("HMM snapshot serialization failed: %s", e)
-        return {}
+        return out
 
     def _restore_hmm_snapshot(self, snapshot: dict[str, Any]) -> None:
         if not isinstance(snapshot, dict):
             return
-        if not self._hmm_detector or not self._hmm_module:
-            return
-        if "_hmm_regime_state" not in snapshot:
+        if not self._hmm_module:
             return
         try:
-            if hasattr(self._hmm_module, "restore_from_snapshot"):
+            if self._hmm_detector and "_hmm_regime_state" in snapshot and hasattr(self._hmm_module, "restore_from_snapshot"):
                 self._hmm_module.restore_from_snapshot(self._hmm_detector, snapshot)
+            if (
+                self._hmm_detector_secondary
+                and "_hmm_secondary_regime_state" in snapshot
+                and hasattr(self._hmm_module, "restore_from_snapshot")
+            ):
+                sec_snap = {
+                    "_hmm_regime_state": snapshot.get("_hmm_secondary_regime_state", {}),
+                    "_hmm_last_train_ts": snapshot.get("_hmm_secondary_last_train_ts", 0.0),
+                    "_hmm_trained": snapshot.get("_hmm_secondary_trained", False),
+                }
+                self._hmm_module.restore_from_snapshot(self._hmm_detector_secondary, sec_snap)
         except Exception as e:
             logger.warning("HMM snapshot restore failed: %s", e)
         finally:
             self._refresh_hmm_state_from_detector()
+            self._refresh_hmm_state_from_detector(secondary=True)
 
     def _train_hmm(self, *, now: float | None = None, reason: str = "scheduled") -> bool:
         if not self._hmm_detector or self._hmm_numpy is None:
@@ -1610,8 +1825,10 @@ class BotRuntime:
             return False
 
         self._hmm_last_train_attempt_ts = now_ts
+        interval_min = max(1, int(getattr(config, "HMM_OHLCV_INTERVAL_MIN", 1)))
         closes, volumes = self._fetch_training_candles(
-            count=int(getattr(config, "HMM_TRAINING_CANDLES", 2000))
+            count=int(getattr(config, "HMM_TRAINING_CANDLES", 2000)),
+            interval_min=interval_min,
         )
         if not closes or not volumes:
             self._hmm_state["error"] = "no_training_candles"
@@ -1636,10 +1853,274 @@ class BotRuntime:
         self._refresh_hmm_state_from_detector()
         return ok
 
+    def _train_hmm_secondary(self, *, now: float | None = None, reason: str = "scheduled") -> bool:
+        if not self._hmm_detector_secondary or self._hmm_numpy is None:
+            return False
+
+        now_ts = float(now if now is not None else _now())
+        retry_sec = max(
+            60.0,
+            float(
+                getattr(
+                    config,
+                    "HMM_SECONDARY_SYNC_INTERVAL_SEC",
+                    getattr(config, "HMM_OHLCV_SYNC_INTERVAL_SEC", 300.0),
+                )
+            ),
+        )
+        is_trained = bool(getattr(self._hmm_detector_secondary, "_trained", False))
+        if (
+            (not is_trained)
+            and (now_ts - self._hmm_last_train_attempt_ts_secondary) < retry_sec
+            and reason != "startup"
+        ):
+            return False
+
+        self._hmm_last_train_attempt_ts_secondary = now_ts
+        interval_min = max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15)))
+        closes, volumes = self._fetch_training_candles(
+            count=int(getattr(config, "HMM_SECONDARY_TRAINING_CANDLES", 1000)),
+            interval_min=interval_min,
+        )
+        if not closes or not volumes:
+            self._hmm_state_secondary["error"] = "no_training_candles"
+            self._refresh_hmm_state_from_detector(secondary=True)
+            return False
+
+        try:
+            closes_arr = self._hmm_numpy.asarray(closes, dtype=float)
+            volumes_arr = self._hmm_numpy.asarray(volumes, dtype=float)
+            ok = bool(self._hmm_detector_secondary.train(closes_arr, volumes_arr))
+        except Exception as e:
+            logger.warning("Secondary HMM train failed (%s): %s", reason, e)
+            self._hmm_state_secondary["error"] = f"train_failed:{e}"
+            self._refresh_hmm_state_from_detector(secondary=True)
+            return False
+
+        if ok:
+            self._hmm_state_secondary["error"] = ""
+            logger.info("Secondary HMM trained (%s) with %d candles", reason, len(closes))
+        else:
+            self._hmm_state_secondary["error"] = "train_skipped_or_failed"
+        self._refresh_hmm_state_from_detector(secondary=True)
+        return ok
+
+    def _update_hmm_secondary(self, now: float) -> None:
+        if not bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)):
+            return
+        if not self._hmm_detector_secondary or self._hmm_numpy is None:
+            self._refresh_hmm_state_from_detector(secondary=True)
+            return
+
+        trained = bool(getattr(self._hmm_detector_secondary, "_trained", False))
+        if not trained:
+            self._train_hmm_secondary(now=now, reason="startup")
+            trained = bool(getattr(self._hmm_detector_secondary, "_trained", False))
+        else:
+            try:
+                if bool(self._hmm_detector_secondary.needs_retrain()):
+                    self._train_hmm_secondary(now=now, reason="periodic")
+            except Exception as e:
+                logger.debug("Secondary HMM retrain check failed: %s", e)
+
+        if not trained:
+            self._refresh_hmm_state_from_detector(secondary=True)
+            return
+
+        interval_min = max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15)))
+        closes, volumes = self._fetch_recent_candles(
+            count=int(getattr(config, "HMM_SECONDARY_RECENT_CANDLES", 50)),
+            interval_min=interval_min,
+        )
+        if not closes or not volumes:
+            self._refresh_hmm_state_from_detector(secondary=True)
+            return
+
+        try:
+            closes_arr = self._hmm_numpy.asarray(closes, dtype=float)
+            volumes_arr = self._hmm_numpy.asarray(volumes, dtype=float)
+            self._hmm_detector_secondary.update(closes_arr, volumes_arr)
+            self._hmm_state_secondary["error"] = ""
+        except Exception as e:
+            logger.warning("Secondary HMM inference failed: %s", e)
+            self._hmm_state_secondary["error"] = f"inference_failed:{e}"
+        finally:
+            self._refresh_hmm_state_from_detector(secondary=True)
+
+    @staticmethod
+    def _normalize_consensus_weights(w1_raw: Any, w15_raw: Any) -> tuple[float, float]:
+        try:
+            w1 = float(w1_raw)
+        except (TypeError, ValueError):
+            w1 = 0.0
+        try:
+            w15 = float(w15_raw)
+        except (TypeError, ValueError):
+            w15 = 0.0
+        if not isfinite(w1):
+            w1 = 0.0
+        if not isfinite(w15):
+            w15 = 0.0
+        w1 = max(0.0, w1)
+        w15 = max(0.0, w15)
+        total = w1 + w15
+        if total <= 1e-9:
+            return 0.3, 0.7
+        return w1 / total, w15 / total
+
+    def _compute_hmm_consensus(self) -> dict[str, Any]:
+        primary = dict(self._hmm_state or self._hmm_default_state())
+        secondary = dict(
+            self._hmm_state_secondary
+            or self._hmm_default_state(
+                enabled=bool(getattr(config, "HMM_ENABLED", False))
+                and bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)),
+                interval_min=max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15))),
+            )
+        )
+        multi_enabled = bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False))
+        source_mode = self._hmm_source_mode()
+        primary_ready = bool(primary.get("available")) and bool(primary.get("trained"))
+
+        if not primary_ready:
+            return {
+                "enabled": bool(getattr(config, "HMM_ENABLED", False)),
+                "available": bool(primary.get("available")),
+                "trained": False,
+                "interval_min": int(primary.get("interval_min", getattr(config, "HMM_OHLCV_INTERVAL_MIN", 1))),
+                "regime": "RANGING",
+                "regime_id": 1,
+                "confidence": 0.0,
+                "bias_signal": 0.0,
+                "effective_regime": "RANGING",
+                "effective_confidence": 0.0,
+                "effective_bias": 0.0,
+                "agreement": "primary_untrained",
+                "source_mode": source_mode,
+                "multi_timeframe": bool(multi_enabled),
+                "primary": primary,
+                "secondary": secondary,
+                "last_update_ts": float(primary.get("last_update_ts", 0.0) or 0.0),
+                "last_train_ts": float(primary.get("last_train_ts", 0.0) or 0.0),
+                "blend_factor": float(primary.get("blend_factor", getattr(config, "HMM_BLEND_WITH_TREND", 0.5))),
+                "error": str(primary.get("error", "")),
+            }
+
+        if not multi_enabled:
+            out = dict(primary)
+            out.update({
+                "agreement": "primary_only",
+                "source_mode": source_mode,
+                "multi_timeframe": False,
+                "primary": primary,
+                "secondary": secondary,
+                "effective_regime": str(out.get("regime", "RANGING") or "RANGING"),
+                "effective_confidence": float(out.get("confidence", 0.0) or 0.0),
+                "effective_bias": float(out.get("bias_signal", 0.0) or 0.0),
+            })
+            return out
+
+        if not bool(secondary.get("available")) or not bool(secondary.get("trained")):
+            out = dict(primary)
+            out.update({
+                "agreement": "primary_only",
+                "source_mode": source_mode,
+                "multi_timeframe": True,
+                "primary": primary,
+                "secondary": secondary,
+                "effective_regime": str(out.get("regime", "RANGING") or "RANGING"),
+                "effective_confidence": float(out.get("confidence", 0.0) or 0.0),
+                "effective_bias": float(out.get("bias_signal", 0.0) or 0.0),
+            })
+            return out
+
+        regime_1m = str(primary.get("regime", "RANGING") or "RANGING").upper()
+        regime_15m = str(secondary.get("regime", "RANGING") or "RANGING").upper()
+        valid_regimes = {"BULLISH", "BEARISH", "RANGING"}
+        if regime_1m not in valid_regimes:
+            regime_1m = "RANGING"
+        if regime_15m not in valid_regimes:
+            regime_15m = "RANGING"
+
+        conf_1m = max(0.0, min(1.0, float(primary.get("confidence", 0.0) or 0.0)))
+        conf_15m = max(0.0, min(1.0, float(secondary.get("confidence", 0.0) or 0.0)))
+        bias_1m = float(primary.get("bias_signal", 0.0) or 0.0)
+        bias_15m = float(secondary.get("bias_signal", 0.0) or 0.0)
+        dampen = max(0.0, min(1.0, float(getattr(config, "CONSENSUS_DAMPEN_FACTOR", 0.5))))
+        w1, w15 = self._normalize_consensus_weights(
+            getattr(config, "CONSENSUS_1M_WEIGHT", 0.3),
+            getattr(config, "CONSENSUS_15M_WEIGHT", 0.7),
+        )
+
+        agreement = "conflict"
+        if regime_1m == regime_15m:
+            effective_confidence = max(conf_1m, conf_15m)
+            agreement = "full"
+        elif regime_15m == "RANGING":
+            effective_confidence = 0.0
+            agreement = "15m_neutral"
+        elif regime_1m == "RANGING":
+            effective_confidence = conf_15m * dampen
+            agreement = "1m_cooling"
+        else:
+            effective_confidence = 0.0
+            agreement = "conflict"
+
+        if agreement == "full":
+            effective_bias = w1 * bias_1m + w15 * bias_15m
+        elif agreement == "1m_cooling":
+            effective_bias = bias_15m * dampen
+        else:
+            effective_bias = 0.0
+
+        effective_confidence = max(0.0, min(1.0, float(effective_confidence)))
+        effective_bias = max(-1.0, min(1.0, float(effective_bias)))
+        tier1_conf = max(0.0, min(1.0, float(getattr(config, "REGIME_TIER1_CONFIDENCE", 0.20))))
+        if effective_confidence < tier1_conf:
+            effective_regime = "RANGING"
+        elif effective_bias > 0:
+            effective_regime = "BULLISH"
+        elif effective_bias < 0:
+            effective_regime = "BEARISH"
+        else:
+            effective_regime = "RANGING"
+
+        return {
+            "enabled": bool(getattr(config, "HMM_ENABLED", False)),
+            "available": bool(primary.get("available")) and bool(secondary.get("available")),
+            "trained": bool(primary.get("trained")) and bool(secondary.get("trained")),
+            "interval_min": int(primary.get("interval_min", getattr(config, "HMM_OHLCV_INTERVAL_MIN", 1))),
+            "regime": effective_regime,
+            "regime_id": {"BEARISH": 0, "RANGING": 1, "BULLISH": 2}.get(effective_regime, 1),
+            "confidence": effective_confidence,
+            "bias_signal": effective_bias,
+            "effective_regime": effective_regime,
+            "effective_confidence": effective_confidence,
+            "effective_bias": effective_bias,
+            "agreement": agreement,
+            "weights": {"w1m": w1, "w15m": w15},
+            "source_mode": source_mode,
+            "multi_timeframe": True,
+            "primary": primary,
+            "secondary": secondary,
+            "last_update_ts": max(
+                float(primary.get("last_update_ts", 0.0) or 0.0),
+                float(secondary.get("last_update_ts", 0.0) or 0.0),
+            ),
+            "last_train_ts": max(
+                float(primary.get("last_train_ts", 0.0) or 0.0),
+                float(secondary.get("last_train_ts", 0.0) or 0.0),
+            ),
+            "blend_factor": float(primary.get("blend_factor", getattr(config, "HMM_BLEND_WITH_TREND", 0.5))),
+            "error": "",
+        }
+
     def _update_hmm(self, now: float) -> None:
         if not bool(getattr(config, "HMM_ENABLED", False)):
+            self._hmm_consensus = self._compute_hmm_consensus()
             return
         if not self._hmm_detector or self._hmm_numpy is None:
+            self._hmm_consensus = self._compute_hmm_consensus()
             return
 
         trained = bool(getattr(self._hmm_detector, "_trained", False))
@@ -1655,13 +2136,21 @@ class BotRuntime:
 
         if not trained:
             self._refresh_hmm_state_from_detector()
+            if bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)):
+                self._update_hmm_secondary(now)
+            self._hmm_consensus = self._compute_hmm_consensus()
             return
 
+        interval_min = max(1, int(getattr(config, "HMM_OHLCV_INTERVAL_MIN", 1)))
         closes, volumes = self._fetch_recent_candles(
-            count=int(getattr(config, "HMM_RECENT_CANDLES", 100))
+            count=int(getattr(config, "HMM_RECENT_CANDLES", 100)),
+            interval_min=interval_min,
         )
         if not closes or not volumes:
             self._refresh_hmm_state_from_detector()
+            if bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)):
+                self._update_hmm_secondary(now)
+            self._hmm_consensus = self._compute_hmm_consensus()
             return
 
         try:
@@ -1674,29 +2163,56 @@ class BotRuntime:
             self._hmm_state["error"] = f"inference_failed:{e}"
         finally:
             self._refresh_hmm_state_from_detector()
+            if bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)):
+                self._update_hmm_secondary(now)
+            self._hmm_consensus = self._compute_hmm_consensus()
 
     def _hmm_status_payload(self) -> dict[str, Any]:
-        state = dict(self._hmm_state or self._hmm_default_state())
-        raw_probs = state.get("probabilities")
+        primary = dict(
+            self._hmm_state
+            or self._hmm_default_state(
+                enabled=bool(getattr(config, "HMM_ENABLED", False)),
+                interval_min=max(1, int(getattr(config, "HMM_OHLCV_INTERVAL_MIN", 1))),
+            )
+        )
+        secondary = dict(
+            self._hmm_state_secondary
+            or self._hmm_default_state(
+                enabled=bool(getattr(config, "HMM_ENABLED", False))
+                and bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)),
+                interval_min=max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15))),
+            )
+        )
+        consensus = dict(self._hmm_consensus or self._compute_hmm_consensus())
+        source_mode = self._hmm_source_mode()
+        source = dict(self._policy_hmm_source() or primary)
+        raw_probs = source.get("probabilities", primary.get("probabilities"))
         probs = (
             dict(raw_probs)
             if isinstance(raw_probs, dict)
             else {"bearish": 0.0, "ranging": 1.0, "bullish": 0.0}
         )
         out = {
-            "enabled": bool(state.get("enabled", False)),
-            "available": bool(state.get("available", False)),
-            "trained": bool(state.get("trained", False)),
-            "regime": str(state.get("regime", "RANGING")),
-            "regime_id": int(state.get("regime_id", 1)),
-            "confidence": float(state.get("confidence", 0.0)),
-            "bias_signal": float(state.get("bias_signal", 0.0)),
+            "enabled": bool(source.get("enabled", False)),
+            "available": bool(source.get("available", False)),
+            "trained": bool(source.get("trained", False)),
+            "interval_min": int(source.get("interval_min", primary.get("interval_min", 1))),
+            "regime": str(source.get("regime", "RANGING")),
+            "regime_id": int(source.get("regime_id", 1)),
+            "confidence": float(source.get("confidence", 0.0)),
+            "bias_signal": float(source.get("bias_signal", 0.0)),
             "probabilities": probs,
-            "observation_count": int(state.get("observation_count", 0)),
-            "blend_factor": float(state.get("blend_factor", getattr(config, "HMM_BLEND_WITH_TREND", 0.5))),
-            "last_update_ts": float(state.get("last_update_ts", 0.0)),
-            "last_train_ts": float(state.get("last_train_ts", 0.0)),
-            "error": str(state.get("error", "")),
+            "observation_count": int(source.get("observation_count", 0)),
+            "blend_factor": float(primary.get("blend_factor", getattr(config, "HMM_BLEND_WITH_TREND", 0.5))),
+            "last_update_ts": float(source.get("last_update_ts", 0.0)),
+            "last_train_ts": float(source.get("last_train_ts", 0.0)),
+            "error": str(source.get("error", "")),
+            "source_mode": source_mode,
+            "multi_timeframe": bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)),
+            "agreement": str(consensus.get("agreement", "primary_only")),
+            "primary": primary,
+            "secondary": secondary,
+            "consensus": consensus,
         }
         return out
 
@@ -1718,18 +2234,12 @@ class BotRuntime:
         enabled = bool(actuation_enabled or shadow_enabled)
 
         if enabled:
-            last_hmm_update_ts = float(self._hmm_state.get("last_update_ts", 0.0) or 0.0)
+            _, _, _, _, pre_source = self._policy_hmm_signal()
+            last_hmm_update_ts = float(pre_source.get("last_update_ts", 0.0) or 0.0)
             if (now - last_hmm_update_ts) >= interval_sec:
                 self._update_hmm(now)
 
-        hmm_ready = (
-            bool(getattr(config, "HMM_ENABLED", False))
-            and bool(self._hmm_state.get("available"))
-            and bool(self._hmm_state.get("trained"))
-        )
-        regime = str(self._hmm_state.get("regime", "RANGING")).upper()
-        confidence = max(0.0, min(1.0, float(self._hmm_state.get("confidence", 0.0) or 0.0)))
-        bias = float(self._hmm_state.get("bias_signal", 0.0) or 0.0)
+        regime, confidence, bias, hmm_ready, _ = self._policy_hmm_signal()
         reason = "disabled"
 
         override, override_conf = self._manual_regime_override()
@@ -1863,6 +2373,7 @@ class BotRuntime:
     def _regime_status_payload(self, now: float | None = None) -> dict[str, Any]:
         now_ts = float(now if now is not None else _now())
         state = dict(self._regime_shadow_state or {})
+        regime_default, confidence_default, bias_default, _, _ = self._policy_hmm_signal()
         tier = int(state.get("tier", self._regime_tier))
         tier = max(0, min(2, tier))
         suppressed = state.get("suppressed_side", self._regime_side_suppressed)
@@ -1883,10 +2394,10 @@ class BotRuntime:
             "tier_label": tier_label,
             "suppressed_side": suppressed,
             "favored_side": favored,
-            "regime": str(state.get("regime", self._hmm_state.get("regime", "RANGING"))),
-            "confidence": float(state.get("confidence", self._hmm_state.get("confidence", 0.0) or 0.0)),
-            "bias_signal": float(state.get("bias_signal", self._hmm_state.get("bias_signal", 0.0) or 0.0)),
-            "abs_bias": float(state.get("abs_bias", abs(float(self._hmm_state.get("bias_signal", 0.0) or 0.0)))),
+            "regime": str(state.get("regime", regime_default)),
+            "confidence": float(state.get("confidence", confidence_default)),
+            "bias_signal": float(state.get("bias_signal", bias_default)),
+            "abs_bias": float(state.get("abs_bias", abs(float(bias_default)))),
             "directional_ok_tier1": bool(state.get("directional_ok_tier1", False)),
             "directional_ok_tier2": bool(state.get("directional_ok_tier2", False)),
             "hmm_ready": bool(state.get("hmm_ready", False)),
@@ -1962,59 +2473,130 @@ class BotRuntime:
             volumes.append(max(0.0, v))
         return closes, volumes
 
-    def _sync_ohlcv_candles(self, now: float | None = None) -> None:
+    def _sync_ohlcv_candles_for_interval(
+        self,
+        now: float,
+        *,
+        interval_min: int,
+        sync_interval_sec: float,
+        state_key: str,
+    ) -> None:
         """
-        Pull recent Kraken OHLCV and queue upserts to Supabase.
+        Pull recent Kraken OHLCV for one interval and queue upserts to Supabase.
         """
         if not bool(getattr(config, "HMM_OHLCV_ENABLED", True)):
             return
 
-        now_ts = float(now if now is not None else _now())
-        sync_interval = max(30.0, float(getattr(config, "HMM_OHLCV_SYNC_INTERVAL_SEC", 300.0)))
-        if self._ohlcv_last_sync_ts > 0 and (now_ts - self._ohlcv_last_sync_ts) < sync_interval:
+        interval = max(1, int(interval_min))
+        sync_interval = max(30.0, float(sync_interval_sec))
+        if state_key == "secondary":
+            last_sync_ts = float(self._ohlcv_secondary_last_sync_ts)
+            since_cursor = int(self._ohlcv_secondary_since_cursor) if self._ohlcv_secondary_since_cursor else None
+        else:
+            last_sync_ts = float(self._ohlcv_last_sync_ts)
+            since_cursor = int(self._ohlcv_since_cursor) if self._ohlcv_since_cursor else None
+
+        if last_sync_ts > 0 and (now - last_sync_ts) < sync_interval:
             return
 
-        self._ohlcv_last_sync_ts = now_ts
-        interval_min = max(1, int(getattr(config, "HMM_OHLCV_INTERVAL_MIN", 5)))
-        since_cursor = int(self._ohlcv_since_cursor) if self._ohlcv_since_cursor else None
+        if state_key == "secondary":
+            self._ohlcv_secondary_last_sync_ts = now
+        else:
+            self._ohlcv_last_sync_ts = now
 
         try:
             rows, last_cursor = kraken_client.get_ohlc_page(
                 pair=self.pair,
-                interval=interval_min,
+                interval=interval,
                 since=since_cursor,
             )
             candles = self._normalize_kraken_ohlcv_rows(
                 rows,
-                interval_min=interval_min,
-                now_ts=now_ts,
+                interval_min=interval,
+                now_ts=now,
             )
             if candles:
                 supabase_store.queue_ohlcv_candles(
                     candles,
                     pair=self.pair,
-                    interval_min=interval_min,
+                    interval_min=interval,
                 )
-                self._ohlcv_last_rows_queued = len(candles)
-                self._ohlcv_last_candle_ts = float(candles[-1]["time"])
+                self._hmm_readiness_cache.pop(state_key, None)
+                self._hmm_readiness_last_ts.pop(state_key, None)
+                if state_key == "secondary":
+                    self._ohlcv_secondary_last_rows_queued = len(candles)
+                    self._ohlcv_secondary_last_candle_ts = float(candles[-1]["time"])
+                else:
+                    self._ohlcv_last_rows_queued = len(candles)
+                    self._ohlcv_last_candle_ts = float(candles[-1]["time"])
             else:
-                self._ohlcv_last_rows_queued = 0
+                if state_key == "secondary":
+                    self._ohlcv_secondary_last_rows_queued = 0
+                else:
+                    self._ohlcv_last_rows_queued = 0
 
             if last_cursor is not None:
                 try:
-                    self._ohlcv_since_cursor = int(last_cursor)
+                    next_cursor = int(last_cursor)
+                    if state_key == "secondary":
+                        self._ohlcv_secondary_since_cursor = next_cursor
+                    else:
+                        self._ohlcv_since_cursor = next_cursor
                 except (TypeError, ValueError):
                     pass
             elif candles:
-                self._ohlcv_since_cursor = int(float(candles[-1]["time"]))
+                if state_key == "secondary":
+                    self._ohlcv_secondary_since_cursor = int(float(candles[-1]["time"]))
+                else:
+                    self._ohlcv_since_cursor = int(float(candles[-1]["time"]))
         except Exception as e:
-            logger.warning("OHLCV sync failed: %s", e)
+            logger.warning(
+                "OHLCV sync failed (%s interval=%dm): %s",
+                state_key,
+                interval,
+                e,
+            )
+
+    def _sync_ohlcv_candles(self, now: float | None = None) -> None:
+        """
+        Pull recent Kraken OHLCV and queue upserts to Supabase for active intervals.
+        """
+        now_ts = float(now if now is not None else _now())
+        self._sync_ohlcv_candles_for_interval(
+            now_ts,
+            interval_min=max(1, int(getattr(config, "HMM_OHLCV_INTERVAL_MIN", 5))),
+            sync_interval_sec=max(30.0, float(getattr(config, "HMM_OHLCV_SYNC_INTERVAL_SEC", 300.0))),
+            state_key="primary",
+        )
+
+        secondary_collect_enabled = bool(getattr(config, "HMM_SECONDARY_OHLCV_ENABLED", False)) or bool(
+            getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)
+        )
+        if secondary_collect_enabled:
+            self._sync_ohlcv_candles_for_interval(
+                now_ts,
+                interval_min=max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15))),
+                sync_interval_sec=max(
+                    30.0,
+                    float(
+                        getattr(
+                            config,
+                            "HMM_SECONDARY_SYNC_INTERVAL_SEC",
+                            getattr(config, "HMM_OHLCV_SYNC_INTERVAL_SEC", 300.0),
+                        )
+                    ),
+                ),
+                state_key="secondary",
+            )
 
 
     def backfill_ohlcv_history(
         self,
         target_candles: int | None = None,
         max_pages: int | None = None,
+        *,
+        interval_min: int | None = None,
+        state_key: str = "primary",
     ) -> tuple[bool, str]:
         """
         Best-effort historical OHLCV backfill for faster HMM warm-up.
@@ -2022,18 +2604,36 @@ class BotRuntime:
         """
         if not bool(getattr(config, "HMM_OHLCV_ENABLED", True)):
             msg = "ohlcv pipeline disabled"
-            self._hmm_backfill_last_message = msg
+            if state_key == "secondary":
+                self._hmm_backfill_last_message_secondary = msg
+            else:
+                self._hmm_backfill_last_message = msg
             return False, msg
 
-        target = max(1, int(target_candles if target_candles is not None else getattr(config, "HMM_TRAINING_CANDLES", 2000)))
+        default_target = (
+            int(getattr(config, "HMM_SECONDARY_TRAINING_CANDLES", 1000))
+            if state_key == "secondary"
+            else int(getattr(config, "HMM_TRAINING_CANDLES", 2000))
+        )
+        target = max(1, int(target_candles if target_candles is not None else default_target))
         pages = max(1, int(max_pages if max_pages is not None else getattr(config, "HMM_OHLCV_BACKFILL_MAX_PAGES", 40)))
-        interval_min = max(1, int(getattr(config, "HMM_OHLCV_INTERVAL_MIN", 5)))
-        interval_sec = interval_min * 60
+        if interval_min is None:
+            interval = max(
+                1,
+                int(
+                    getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15)
+                    if state_key == "secondary"
+                    else getattr(config, "HMM_OHLCV_INTERVAL_MIN", 5)
+                ),
+            )
+        else:
+            interval = max(1, int(interval_min))
+        interval_sec = interval * 60
 
         existing = supabase_store.load_ohlcv_candles(
             limit=target,
             pair=self.pair,
-            interval_min=interval_min,
+            interval_min=interval,
         )
         existing_ts: set[float] = set()
         for row in existing:
@@ -2043,9 +2643,14 @@ class BotRuntime:
                 continue
         existing_count = len(existing_ts)
         if existing_count >= target:
-            self._hmm_backfill_last_at = _now()
-            self._hmm_backfill_last_rows = 0
-            self._hmm_backfill_last_message = f"already_ready:{existing_count}/{target}"
+            if state_key == "secondary":
+                self._hmm_backfill_last_at_secondary = _now()
+                self._hmm_backfill_last_rows_secondary = 0
+                self._hmm_backfill_last_message_secondary = f"already_ready:{existing_count}/{target}"
+            else:
+                self._hmm_backfill_last_at = _now()
+                self._hmm_backfill_last_rows = 0
+                self._hmm_backfill_last_message = f"already_ready:{existing_count}/{target}"
             return True, f"OHLCV already sufficient: {existing_count}/{target}"
 
         missing = max(0, target - existing_count)
@@ -2060,16 +2665,19 @@ class BotRuntime:
             try:
                 rows, last_cursor = kraken_client.get_ohlc_page(
                     pair=self.pair,
-                    interval=interval_min,
+                    interval=interval,
                     since=cursor if cursor > 0 else None,
                 )
             except Exception as e:
-                self._hmm_backfill_last_message = f"fetch_failed:{e}"
+                if state_key == "secondary":
+                    self._hmm_backfill_last_message_secondary = f"fetch_failed:{e}"
+                else:
+                    self._hmm_backfill_last_message = f"fetch_failed:{e}"
                 break
 
             parsed = self._normalize_kraken_ohlcv_rows(
                 rows,
-                interval_min=interval_min,
+                interval_min=interval,
                 now_ts=_now(),
             )
             for row in parsed:
@@ -2092,56 +2700,110 @@ class BotRuntime:
             supabase_store.queue_ohlcv_candles(
                 payload,
                 pair=self.pair,
-                interval_min=interval_min,
+                interval_min=interval,
             )
             queued_rows = len(payload)
             new_unique = sum(1 for ts in fetched.keys() if ts not in existing_ts)
 
-        self._hmm_backfill_last_at = _now()
-        self._hmm_backfill_last_rows = int(queued_rows)
+        if state_key == "secondary":
+            self._hmm_backfill_last_at_secondary = _now()
+            self._hmm_backfill_last_rows_secondary = int(queued_rows)
+        else:
+            self._hmm_backfill_last_at = _now()
+            self._hmm_backfill_last_rows = int(queued_rows)
         est_total = existing_count + new_unique
-        self._hmm_backfill_last_message = (
-            f"queued={queued_rows} new={new_unique} est_total={est_total}/{target}"
-        )
-        self._hmm_readiness_cache = None
-        self._hmm_readiness_last_ts = 0.0
+        backfill_msg = f"queued={queued_rows} new={new_unique} est_total={est_total}/{target}"
+        if state_key == "secondary":
+            self._hmm_backfill_last_message_secondary = backfill_msg
+        else:
+            self._hmm_backfill_last_message = backfill_msg
+        self._hmm_readiness_cache.pop(state_key, None)
+        self._hmm_readiness_last_ts.pop(state_key, None)
 
         if queued_rows <= 0:
             return False, (
-                "OHLCV backfill queued no rows; "
+                "OHLCV backfill queued no rows "
+                f"({state_key}, interval={interval}m); "
                 f"existing={existing_count}/{target}, max_pages={pages}"
             )
 
         return True, (
-            f"OHLCV backfill queued {queued_rows} rows "
+            f"OHLCV backfill queued {queued_rows} rows ({state_key}, interval={interval}m) "
             f"({new_unique} new, est {est_total}/{target})"
         )
 
     def _maybe_backfill_ohlcv_on_startup(self) -> None:
         if not bool(getattr(config, "HMM_OHLCV_BACKFILL_ON_STARTUP", True)):
             return
-        readiness = self._hmm_data_readiness(_now())
+        now_ts = _now()
+        readiness = self._hmm_data_readiness(now_ts)
         if bool(readiness.get("ready_for_target_window", False)):
+            logger.info("OHLCV startup backfill skipped (primary already ready)")
+        else:
+            ok, msg = self.backfill_ohlcv_history(
+                target_candles=int(getattr(config, "HMM_TRAINING_CANDLES", 2000)),
+                max_pages=int(getattr(config, "HMM_OHLCV_BACKFILL_MAX_PAGES", 40)),
+                interval_min=max(1, int(getattr(config, "HMM_OHLCV_INTERVAL_MIN", 1))),
+                state_key="primary",
+            )
+            if ok:
+                logger.info("OHLCV startup backfill: %s", msg)
+            else:
+                logger.warning("OHLCV startup backfill: %s", msg)
+
+        secondary_collect_enabled = bool(getattr(config, "HMM_SECONDARY_OHLCV_ENABLED", False)) or bool(
+            getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)
+        )
+        if not secondary_collect_enabled:
             return
+
+        secondary_readiness = self._hmm_data_readiness(
+            now_ts,
+            interval_min=max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15))),
+            training_target=max(1, int(getattr(config, "HMM_SECONDARY_TRAINING_CANDLES", 1000))),
+            min_samples=max(1, int(getattr(config, "HMM_SECONDARY_MIN_TRAIN_SAMPLES", 200))),
+            sync_interval_sec=max(
+                30.0,
+                float(
+                    getattr(
+                        config,
+                        "HMM_SECONDARY_SYNC_INTERVAL_SEC",
+                        getattr(config, "HMM_OHLCV_SYNC_INTERVAL_SEC", 300.0),
+                    )
+                ),
+            ),
+            state_key="secondary",
+        )
+        if bool(secondary_readiness.get("ready_for_target_window", False)):
+            logger.info("OHLCV startup backfill skipped (secondary already ready)")
+            return
+
         ok, msg = self.backfill_ohlcv_history(
-            target_candles=int(getattr(config, "HMM_TRAINING_CANDLES", 2000)),
+            target_candles=int(getattr(config, "HMM_SECONDARY_TRAINING_CANDLES", 1000)),
             max_pages=int(getattr(config, "HMM_OHLCV_BACKFILL_MAX_PAGES", 40)),
+            interval_min=max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15))),
+            state_key="secondary",
         )
         if ok:
-            logger.info("OHLCV startup backfill: %s", msg)
+            logger.info("OHLCV startup backfill (secondary): %s", msg)
         else:
-            logger.warning("OHLCV startup backfill: %s", msg)
+            logger.warning("OHLCV startup backfill (secondary): %s", msg)
 
-    def _load_recent_ohlcv_rows(self, count: int) -> list[dict[str, float | int | None]]:
+    def _load_recent_ohlcv_rows(
+        self,
+        count: int,
+        *,
+        interval_min: int,
+    ) -> list[dict[str, float | int | None]]:
         """
         Load recent OHLCV candles, preferring Supabase and falling back to Kraken.
         """
         limit = max(1, int(count))
-        interval_min = max(1, int(getattr(config, "HMM_OHLCV_INTERVAL_MIN", 5)))
+        interval = max(1, int(interval_min))
         supa_rows = supabase_store.load_ohlcv_candles(
             limit=limit,
             pair=self.pair,
-            interval_min=interval_min,
+            interval_min=interval,
         )
 
         merged: dict[float, dict[str, float | int | None]] = {}
@@ -2155,10 +2817,10 @@ class BotRuntime:
         need_fallback = len(merged) < limit
         if need_fallback:
             try:
-                kr_rows = kraken_client.get_ohlc(pair=self.pair, interval=interval_min)
+                kr_rows = kraken_client.get_ohlc(pair=self.pair, interval=interval)
                 parsed = self._normalize_kraken_ohlcv_rows(
                     kr_rows,
-                    interval_min=interval_min,
+                    interval_min=interval,
                     now_ts=_now(),
                 )
                 for row in parsed:
@@ -2171,33 +2833,120 @@ class BotRuntime:
             out = out[-limit:]
         return out
 
-    def _fetch_training_candles(self, count: int | None = None) -> tuple[list[float], list[float]]:
+    def _fetch_training_candles(
+        self,
+        count: int | None = None,
+        *,
+        interval_min: int | None = None,
+    ) -> tuple[list[float], list[float]]:
+        interval = max(
+            1,
+            int(
+                getattr(config, "HMM_OHLCV_INTERVAL_MIN", 5)
+                if interval_min is None
+                else interval_min
+            ),
+        )
         target = max(1, int(count if count is not None else getattr(config, "HMM_TRAINING_CANDLES", 2000)))
-        rows = self._load_recent_ohlcv_rows(target)
+        rows = self._load_recent_ohlcv_rows(target, interval_min=interval)
         return self._extract_close_volume(rows)
 
-    def _fetch_recent_candles(self, count: int | None = None) -> tuple[list[float], list[float]]:
+    def _fetch_recent_candles(
+        self,
+        count: int | None = None,
+        *,
+        interval_min: int | None = None,
+    ) -> tuple[list[float], list[float]]:
+        interval = max(
+            1,
+            int(
+                getattr(config, "HMM_OHLCV_INTERVAL_MIN", 5)
+                if interval_min is None
+                else interval_min
+            ),
+        )
         target = max(1, int(count if count is not None else getattr(config, "HMM_RECENT_CANDLES", 100)))
-        rows = self._load_recent_ohlcv_rows(target)
+        rows = self._load_recent_ohlcv_rows(target, interval_min=interval)
         return self._extract_close_volume(rows)
 
-    def _hmm_data_readiness(self, now: float | None = None) -> dict[str, Any]:
+    def _hmm_data_readiness(
+        self,
+        now: float | None = None,
+        *,
+        interval_min: int | None = None,
+        training_target: int | None = None,
+        min_samples: int | None = None,
+        sync_interval_sec: float | None = None,
+        state_key: str = "primary",
+    ) -> dict[str, Any]:
         """
         Runtime readiness summary for HMM training data.
         """
         now_ts = float(now if now is not None else _now())
         ttl = max(5.0, float(getattr(config, "HMM_READINESS_CACHE_SEC", 300.0)))
-        if self._hmm_readiness_cache and (now_ts - self._hmm_readiness_last_ts) < ttl:
-            return dict(self._hmm_readiness_cache)
+        use_state_key = "secondary" if str(state_key).lower() == "secondary" else "primary"
+        if interval_min is None:
+            interval = max(
+                1,
+                int(
+                    getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15)
+                    if use_state_key == "secondary"
+                    else getattr(config, "HMM_OHLCV_INTERVAL_MIN", 5)
+                ),
+            )
+        else:
+            interval = max(1, int(interval_min))
+        if training_target is None:
+            target = max(
+                1,
+                int(
+                    getattr(config, "HMM_SECONDARY_TRAINING_CANDLES", 1000)
+                    if use_state_key == "secondary"
+                    else getattr(config, "HMM_TRAINING_CANDLES", 2000)
+                ),
+            )
+        else:
+            target = max(1, int(training_target))
+        if min_samples is None:
+            min_train = max(
+                1,
+                int(
+                    getattr(config, "HMM_SECONDARY_MIN_TRAIN_SAMPLES", 200)
+                    if use_state_key == "secondary"
+                    else getattr(config, "HMM_MIN_TRAIN_SAMPLES", 500)
+                ),
+            )
+        else:
+            min_train = max(1, int(min_samples))
+        if sync_interval_sec is None:
+            sync_interval = (
+                float(getattr(config, "HMM_SECONDARY_SYNC_INTERVAL_SEC", 300.0))
+                if use_state_key == "secondary"
+                else float(getattr(config, "HMM_OHLCV_SYNC_INTERVAL_SEC", 300.0))
+            )
+        else:
+            sync_interval = float(sync_interval_sec)
+
+        cached = self._hmm_readiness_cache.get(use_state_key)
+        last_cache_ts = float(self._hmm_readiness_last_ts.get(use_state_key, 0.0))
+        if cached and (now_ts - last_cache_ts) < ttl:
+            cached_interval = int(cached.get("interval_min", 0) or 0)
+            cached_target = int(cached.get("training_target", 0) or 0)
+            cached_min = int(cached.get("min_train_samples", 0) or 0)
+            if cached_interval == interval and cached_target == target and cached_min == min_train:
+                return dict(cached)
 
         try:
-            interval_min = max(1, int(getattr(config, "HMM_OHLCV_INTERVAL_MIN", 5)))
-            training_target = max(1, int(getattr(config, "HMM_TRAINING_CANDLES", 2000)))
-            min_samples = max(1, int(getattr(config, "HMM_MIN_TRAIN_SAMPLES", 500)))
+            secondary_collect_enabled = bool(getattr(config, "HMM_SECONDARY_OHLCV_ENABLED", False)) or bool(
+                getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)
+            )
+            enabled = bool(getattr(config, "HMM_OHLCV_ENABLED", True))
+            if use_state_key == "secondary":
+                enabled = bool(enabled and secondary_collect_enabled)
             rows = supabase_store.load_ohlcv_candles(
-                limit=training_target,
+                limit=target,
                 pair=self.pair,
-                interval_min=interval_min,
+                interval_min=interval,
             )
             source = "supabase" if rows else "none"
 
@@ -2215,19 +2964,21 @@ class BotRuntime:
                     span_sec = 0.0
 
             freshness_sec = (now_ts - last_candle_ts) if last_candle_ts is not None else None
-            interval_sec = interval_min * 60.0
+            interval_sec = interval * 60.0
             # Keep short-interval feeds honest (e.g., 1m should not tolerate 15m stale data).
             freshness_limit_sec = max(180.0, interval_sec * 3.0)
             freshness_ok = bool(freshness_sec is not None and freshness_sec <= freshness_limit_sec)
             volume_nonzero_count = sum(1 for v in volumes if v > 0)
             volume_coverage_pct = (volume_nonzero_count / sample_count * 100.0) if sample_count else 0.0
-            coverage_pct = sample_count / training_target * 100.0 if training_target > 0 else 0.0
+            coverage_pct = sample_count / target * 100.0 if target > 0 else 0.0
 
             gaps: list[str] = []
-            if sample_count < min_samples:
-                gaps.append(f"insufficient_samples:{sample_count}/{min_samples}")
-            if sample_count < training_target:
-                gaps.append(f"below_target_window:{sample_count}/{training_target}")
+            if not enabled:
+                gaps.append("pipeline_disabled")
+            if sample_count < min_train:
+                gaps.append(f"insufficient_samples:{sample_count}/{min_train}")
+            if sample_count < target:
+                gaps.append(f"below_target_window:{sample_count}/{target}")
             if not freshness_ok:
                 gaps.append("stale_candles")
             if volume_coverage_pct < 95.0:
@@ -2235,12 +2986,28 @@ class BotRuntime:
             if source != "supabase":
                 gaps.append("no_supabase_ohlcv")
 
+            if use_state_key == "secondary":
+                last_sync_ts = float(self._ohlcv_secondary_last_sync_ts)
+                last_sync_rows_queued = int(self._ohlcv_secondary_last_rows_queued)
+                sync_cursor = self._ohlcv_secondary_since_cursor
+                backfill_last_at = float(self._hmm_backfill_last_at_secondary)
+                backfill_last_rows = int(self._hmm_backfill_last_rows_secondary)
+                backfill_last_message = str(self._hmm_backfill_last_message_secondary or "")
+            else:
+                last_sync_ts = float(self._ohlcv_last_sync_ts)
+                last_sync_rows_queued = int(self._ohlcv_last_rows_queued)
+                sync_cursor = self._ohlcv_since_cursor
+                backfill_last_at = float(self._hmm_backfill_last_at)
+                backfill_last_rows = int(self._hmm_backfill_last_rows)
+                backfill_last_message = str(self._hmm_backfill_last_message or "")
+
             out = {
-                "enabled": bool(getattr(config, "HMM_OHLCV_ENABLED", True)),
+                "enabled": bool(enabled),
+                "state_key": use_state_key,
                 "source": source,
-                "interval_min": interval_min,
-                "training_target": training_target,
-                "min_train_samples": min_samples,
+                "interval_min": interval,
+                "training_target": target,
+                "min_train_samples": min_train,
                 "samples": sample_count,
                 "coverage_pct": round(coverage_pct, 2),
                 "span_hours": round(span_sec / 3600.0, 2),
@@ -2249,31 +3016,44 @@ class BotRuntime:
                 "freshness_limit_sec": freshness_limit_sec,
                 "freshness_ok": freshness_ok,
                 "volume_coverage_pct": round(volume_coverage_pct, 2),
-                "ready_for_min_train": sample_count >= min_samples and freshness_ok,
-                "ready_for_target_window": sample_count >= training_target and freshness_ok,
+                "ready_for_min_train": bool(enabled and sample_count >= min_train and freshness_ok),
+                "ready_for_target_window": bool(enabled and sample_count >= target and freshness_ok),
                 "gaps": gaps,
-                "sync_interval_sec": float(getattr(config, "HMM_OHLCV_SYNC_INTERVAL_SEC", 300.0)),
-                "last_sync_ts": float(self._ohlcv_last_sync_ts),
-                "last_sync_rows_queued": int(self._ohlcv_last_rows_queued),
-                "sync_cursor": self._ohlcv_since_cursor,
-                "backfill_last_at": float(self._hmm_backfill_last_at),
-                "backfill_last_rows": int(self._hmm_backfill_last_rows),
-                "backfill_last_message": str(self._hmm_backfill_last_message or ""),
+                "sync_interval_sec": float(sync_interval),
+                "last_sync_ts": last_sync_ts,
+                "last_sync_rows_queued": last_sync_rows_queued,
+                "sync_cursor": sync_cursor,
+                "backfill_last_at": backfill_last_at,
+                "backfill_last_rows": backfill_last_rows,
+                "backfill_last_message": backfill_last_message,
             }
         except Exception as e:
             out = {
                 "enabled": bool(getattr(config, "HMM_OHLCV_ENABLED", True)),
+                "state_key": use_state_key,
                 "error": str(e),
                 "ready_for_min_train": False,
                 "ready_for_target_window": False,
                 "gaps": ["readiness_check_failed"],
-                "backfill_last_at": float(self._hmm_backfill_last_at),
-                "backfill_last_rows": int(self._hmm_backfill_last_rows),
-                "backfill_last_message": str(self._hmm_backfill_last_message or ""),
+                "backfill_last_at": (
+                    float(self._hmm_backfill_last_at_secondary)
+                    if use_state_key == "secondary"
+                    else float(self._hmm_backfill_last_at)
+                ),
+                "backfill_last_rows": (
+                    int(self._hmm_backfill_last_rows_secondary)
+                    if use_state_key == "secondary"
+                    else int(self._hmm_backfill_last_rows)
+                ),
+                "backfill_last_message": (
+                    str(self._hmm_backfill_last_message_secondary or "")
+                    if use_state_key == "secondary"
+                    else str(self._hmm_backfill_last_message or "")
+                ),
             }
 
-        self._hmm_readiness_cache = dict(out)
-        self._hmm_readiness_last_ts = now_ts
+        self._hmm_readiness_cache[use_state_key] = dict(out)
+        self._hmm_readiness_last_ts[use_state_key] = now_ts
         return out
 
     def _price_age_sec(self) -> float:
@@ -2967,10 +3747,7 @@ class BotRuntime:
             )
             return
 
-        hmm_regime = self._hmm_status_payload()
-        regime_name = str(hmm_regime.get("regime", "RANGING") or "RANGING").upper()
-        regime_confidence = float(hmm_regime.get("confidence", 0.0) or 0.0)
-        regime_bias = float(hmm_regime.get("bias_signal", 0.0) or 0.0)
+        regime_name, regime_confidence, regime_bias, _, _ = self._policy_hmm_signal()
 
         against_trend = False
         if regime_name == "BULLISH":
@@ -4417,7 +5194,7 @@ class BotRuntime:
                     "/cancel_stale [min_distance_pct]\n"
                     "/reconcile_drift\n"
                     "/audit_pnl\n"
-                    "/backfill_ohlcv [target_candles] [max_pages]\n"
+                    "/backfill_ohlcv [target_candles] [max_pages] [interval_min]\n"
                     "/set_entry_pct <value>\n"
                     "/set_profit_pct <value>"
                 )
@@ -4489,18 +5266,36 @@ class BotRuntime:
             elif head == "/backfill_ohlcv":
                 target = None
                 pages = None
+                interval_min = None
                 if len(parts) >= 2:
                     try:
                         target = int(parts[1])
                     except ValueError:
-                        ok, msg = False, "usage: /backfill_ohlcv [target_candles] [max_pages]"
+                        ok, msg = False, "usage: /backfill_ohlcv [target_candles] [max_pages] [interval_min]"
                 if ok and len(parts) >= 3:
                     try:
                         pages = int(parts[2])
                     except ValueError:
-                        ok, msg = False, "usage: /backfill_ohlcv [target_candles] [max_pages]"
+                        ok, msg = False, "usage: /backfill_ohlcv [target_candles] [max_pages] [interval_min]"
+                if ok and len(parts) >= 4:
+                    try:
+                        interval_min = int(parts[3])
+                    except ValueError:
+                        ok, msg = False, "usage: /backfill_ohlcv [target_candles] [max_pages] [interval_min]"
                 if ok:
-                    ok, msg = self.backfill_ohlcv_history(target_candles=target, max_pages=pages)
+                    interval = (
+                        max(1, int(interval_min))
+                        if interval_min is not None
+                        else max(1, int(getattr(config, "HMM_OHLCV_INTERVAL_MIN", 1)))
+                    )
+                    secondary_interval = max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15)))
+                    state_key = "secondary" if interval == secondary_interval else "primary"
+                    ok, msg = self.backfill_ohlcv_history(
+                        target_candles=target,
+                        max_pages=pages,
+                        interval_min=interval,
+                        state_key=state_key,
+                    )
             else:
                 ok, msg = False, "unknown command"
 
@@ -4722,13 +5517,13 @@ class BotRuntime:
 
         signal_for_target = float(self._trend_score)
         hmm_enabled = bool(getattr(config, "HMM_ENABLED", False))
-        hmm_ready = bool(self._hmm_state.get("available")) and bool(self._hmm_state.get("trained"))
+        _, _, policy_bias, hmm_ready, _ = self._policy_hmm_signal()
         if hmm_enabled and hmm_ready:
             blend_factor = max(
                 0.0,
                 min(1.0, float(self._hmm_state.get("blend_factor", getattr(config, "HMM_BLEND_WITH_TREND", 0.5)))),
             )
-            hmm_bias = float(self._hmm_state.get("bias_signal", 0.0) or 0.0)
+            hmm_bias = float(policy_bias)
             signal_for_target = blend_factor * float(self._trend_score) + (1.0 - blend_factor) * hmm_bias
             self._hmm_state["blend_factor"] = blend_factor
         self._hmm_state["blended_signal"] = float(signal_for_target)
@@ -5065,7 +5860,39 @@ class BotRuntime:
             orders_at_funded_size = self._count_orders_at_funded_size()
             slot_vintage = self._slot_vintage_metrics_locked(now)
             hmm_data_pipeline = self._hmm_data_readiness(now)
+            secondary_collect_enabled = bool(getattr(config, "HMM_SECONDARY_OHLCV_ENABLED", False)) or bool(
+                getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)
+            )
+            if secondary_collect_enabled:
+                hmm_data_pipeline_secondary = self._hmm_data_readiness(
+                    now,
+                    interval_min=max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15))),
+                    training_target=max(1, int(getattr(config, "HMM_SECONDARY_TRAINING_CANDLES", 1000))),
+                    min_samples=max(1, int(getattr(config, "HMM_SECONDARY_MIN_TRAIN_SAMPLES", 200))),
+                    sync_interval_sec=max(
+                        30.0,
+                        float(
+                            getattr(
+                                config,
+                                "HMM_SECONDARY_SYNC_INTERVAL_SEC",
+                                getattr(config, "HMM_OHLCV_SYNC_INTERVAL_SEC", 300.0),
+                            )
+                        ),
+                    ),
+                    state_key="secondary",
+                )
+            else:
+                hmm_data_pipeline_secondary = {
+                    "enabled": False,
+                    "state_key": "secondary",
+                    "ready_for_min_train": False,
+                    "ready_for_target_window": False,
+                    "gaps": ["pipeline_disabled"],
+                }
             hmm_regime = self._hmm_status_payload()
+            hmm_consensus = dict(self._hmm_consensus or self._compute_hmm_consensus())
+            hmm_consensus["source_mode"] = self._hmm_source_mode()
+            hmm_consensus["multi_timeframe"] = bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False))
             regime_directional = self._regime_status_payload(now)
             oldest_exit_age_sec = float(slot_vintage.get("oldest_exit_age_sec", 0.0) or 0.0)
             stuck_capital_pct = float(slot_vintage.get("stuck_capital_pct", 0.0) or 0.0)
@@ -5178,7 +6005,9 @@ class BotRuntime:
                 },
                 "slot_vintage": slot_vintage,
                 "hmm_data_pipeline": hmm_data_pipeline,
+                "hmm_data_pipeline_secondary": hmm_data_pipeline_secondary,
                 "hmm_regime": hmm_regime,
+                "hmm_consensus": hmm_consensus,
                 "regime_directional": regime_directional,
                 "release_health": {
                     "sticky_release_total": int(self._sticky_release_total),

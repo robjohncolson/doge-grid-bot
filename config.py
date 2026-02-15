@@ -489,6 +489,19 @@ HMM_RETRAIN_INTERVAL_SEC: float = _env("HMM_RETRAIN_INTERVAL_SEC", 86400.0, floa
 HMM_BIAS_GAIN: float = _env("HMM_BIAS_GAIN", 1.0, float)
 HMM_BLEND_WITH_TREND: float = _env("HMM_BLEND_WITH_TREND", 0.5, float)
 
+# Multi-timeframe HMM (primary + secondary + consensus selector).
+HMM_MULTI_TIMEFRAME_ENABLED: bool = _env("HMM_MULTI_TIMEFRAME_ENABLED", False, bool)
+HMM_MULTI_TIMEFRAME_SOURCE: str = _env("HMM_MULTI_TIMEFRAME_SOURCE", "primary", str)
+HMM_SECONDARY_INTERVAL_MIN: int = _env("HMM_SECONDARY_INTERVAL_MIN", 15, int)
+HMM_SECONDARY_OHLCV_ENABLED: bool = _env("HMM_SECONDARY_OHLCV_ENABLED", False, bool)
+HMM_SECONDARY_SYNC_INTERVAL_SEC: float = _env("HMM_SECONDARY_SYNC_INTERVAL_SEC", 300.0, float)
+HMM_SECONDARY_TRAINING_CANDLES: int = _env("HMM_SECONDARY_TRAINING_CANDLES", 1000, int)
+HMM_SECONDARY_RECENT_CANDLES: int = _env("HMM_SECONDARY_RECENT_CANDLES", 50, int)
+HMM_SECONDARY_MIN_TRAIN_SAMPLES: int = _env("HMM_SECONDARY_MIN_TRAIN_SAMPLES", 200, int)
+CONSENSUS_1M_WEIGHT: float = _env("CONSENSUS_1M_WEIGHT", 0.3, float)
+CONSENSUS_15M_WEIGHT: float = _env("CONSENSUS_15M_WEIGHT", 0.7, float)
+CONSENSUS_DAMPEN_FACTOR: float = _env("CONSENSUS_DAMPEN_FACTOR", 0.5, float)
+
 # ---------------------------------------------------------------------------
 # Directional regime controls (Phase 0 shadow mode defaults)
 # ---------------------------------------------------------------------------
