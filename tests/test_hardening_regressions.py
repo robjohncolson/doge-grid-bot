@@ -1243,6 +1243,42 @@ class BotEventLogTests(unittest.TestCase):
         self.assertFalse(rt.slots[0].state.short_only)
         self.assertEqual(rt.slots[0].state.mode_source, "none")
 
+    def test_update_regime_tier_persists_transition_row(self):
+        rt = bot.BotRuntime()
+        rt._regime_tier = 0
+        rt._regime_tier_entered_at = 900.0
+        rt._hmm_state.update({
+            "available": True,
+            "trained": True,
+            "regime": "BULLISH",
+            "confidence": 0.80,
+            "bias_signal": 0.70,
+            "last_update_ts": 1000.0,
+        })
+
+        with mock.patch.object(config, "HMM_ENABLED", True):
+            with mock.patch.object(config, "REGIME_SHADOW_ENABLED", True):
+                with mock.patch.object(config, "REGIME_DIRECTIONAL_ENABLED", False):
+                    with mock.patch.object(config, "REGIME_TIER1_CONFIDENCE", 0.20):
+                        with mock.patch.object(config, "REGIME_TIER2_CONFIDENCE", 0.50):
+                            with mock.patch.object(config, "REGIME_MIN_DWELL_SEC", 0.0):
+                                with mock.patch("bot.supabase_store.save_regime_tier_transition") as save_transition:
+                                    rt._update_regime_tier(now=1000.0)
+
+        save_transition.assert_called_once()
+        row = save_transition.call_args.args[0]
+        self.assertEqual(row["pair"], rt.pair)
+        self.assertEqual(row["from_tier"], 0)
+        self.assertEqual(row["to_tier"], 2)
+        self.assertEqual(row["from_label"], "symmetric")
+        self.assertEqual(row["to_label"], "directional")
+        self.assertEqual(row["suppressed_side"], "A")
+        self.assertEqual(row["favored_side"], "B")
+        self.assertEqual(row["shadow_enabled"], True)
+        self.assertEqual(row["actuation_enabled"], False)
+        self.assertEqual(row["hmm_ready"], True)
+        self.assertAlmostEqual(float(row["dwell_sec"]), 100.0)
+
     def test_execute_actions_books_exit_outcome_row(self):
         rt = bot.BotRuntime()
         rt.last_price = 0.1

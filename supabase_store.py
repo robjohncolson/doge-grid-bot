@@ -43,7 +43,8 @@ logger = logging.getLogger(__name__)
 
 def _note_missing_column(err_body: str):
     """Detect missing columns from Supabase error responses."""
-    global _pair_column_supported, _identity_columns_supported, _ohlcv_table_supported, _exit_outcomes_table_supported
+    global _pair_column_supported, _identity_columns_supported
+    global _ohlcv_table_supported, _exit_outcomes_table_supported, _regime_tier_transitions_supported
     if "does not exist" in err_body:
         if "pair" in err_body and _pair_column_supported is not False:
             _pair_column_supported = False
@@ -53,6 +54,8 @@ def _note_missing_column(err_body: str):
             _ohlcv_table_supported = False
         if "exit_outcomes" in err_body:
             _exit_outcomes_table_supported = False
+        if "regime_tier_transitions" in err_body:
+            _regime_tier_transitions_supported = False
 
 
 def _strip_unsupported_columns(row: dict) -> dict:
@@ -86,6 +89,7 @@ _pair_column_supported = None        # auto-detect on first write; None = untest
 _identity_columns_supported = None  # trade_id, cycle columns
 _ohlcv_table_supported = None       # ohlcv_candles table availability
 _exit_outcomes_table_supported = None  # exit_outcomes table availability
+_regime_tier_transitions_supported = None  # regime_tier_transitions table availability
 
 # Writer thread state
 _writer_thread: threading.Thread = None
@@ -203,6 +207,19 @@ def save_exit_outcome(row: dict):
     if not isinstance(row, dict) or not row:
         return
     _write_queue.append(("exit_outcomes", dict(row)))
+
+
+def save_regime_tier_transition(row: dict):
+    """
+    Queue a directional regime tier transition row for dwell analytics.
+
+    Expected table: regime_tier_transitions.
+    """
+    if not _enabled() or _regime_tier_transitions_supported is False:
+        return
+    if not isinstance(row, dict) or not row:
+        return
+    _write_queue.append(("regime_tier_transitions", dict(row)))
 
 
 def save_trade(order, net_profit: float, fees: float, pair: str = "XDGUSD"):

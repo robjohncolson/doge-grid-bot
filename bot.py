@@ -1745,6 +1745,8 @@ class BotRuntime:
             reason = "hmm_not_ready"
 
         changed = target_tier != current_tier
+        prev_entered_at = float(self._regime_tier_entered_at)
+        prev_dwell_sec = max(0.0, now - prev_entered_at) if prev_entered_at > 0 else 0.0
         if changed:
             self._regime_tier = int(target_tier)
             self._regime_tier_entered_at = float(now)
@@ -1752,6 +1754,28 @@ class BotRuntime:
         if int(target_tier) == 2 and regime in ("BULLISH", "BEARISH"):
             suppressed_side = "A" if bias > 0 else "B"
         self._regime_side_suppressed = suppressed_side
+
+        if changed:
+            tier_labels = {0: "symmetric", 1: "biased", 2: "directional"}
+            supabase_store.save_regime_tier_transition({
+                "time": float(now),
+                "pair": str(self.pair),
+                "from_tier": int(current_tier),
+                "to_tier": int(target_tier),
+                "from_label": str(tier_labels.get(int(current_tier), "symmetric")),
+                "to_label": str(tier_labels.get(int(target_tier), "symmetric")),
+                "dwell_sec": float(prev_dwell_sec),
+                "regime": str(regime),
+                "confidence": float(confidence),
+                "bias_signal": float(bias),
+                "abs_bias": abs(float(bias)),
+                "suppressed_side": suppressed_side,
+                "favored_side": ("B" if suppressed_side == "A" else "A" if suppressed_side == "B" else None),
+                "reason": str(reason),
+                "shadow_enabled": bool(shadow_enabled),
+                "actuation_enabled": bool(actuation_enabled),
+                "hmm_ready": bool(hmm_ready),
+            })
 
         if changed:
             logger.info(
