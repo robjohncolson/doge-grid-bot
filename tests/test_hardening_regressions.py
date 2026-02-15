@@ -1279,6 +1279,60 @@ class BotEventLogTests(unittest.TestCase):
         self.assertEqual(row["hmm_ready"], True)
         self.assertAlmostEqual(float(row["dwell_sec"]), 100.0)
 
+    def test_update_regime_tier_directional_gate_beats_hysteresis(self):
+        rt = bot.BotRuntime()
+        rt._regime_tier = 2
+        rt._regime_tier_entered_at = 100.0
+        rt._hmm_state.update({
+            "available": True,
+            "trained": True,
+            "regime": "RANGING",
+            "confidence": 0.95,
+            "bias_signal": 0.02,
+            "last_update_ts": 1000.0,
+        })
+
+        with mock.patch.object(config, "HMM_ENABLED", True):
+            with mock.patch.object(config, "REGIME_SHADOW_ENABLED", True):
+                with mock.patch.object(config, "REGIME_DIRECTIONAL_ENABLED", False):
+                    with mock.patch.object(config, "REGIME_MIN_DWELL_SEC", 300.0):
+                        with mock.patch.object(config, "REGIME_EVAL_INTERVAL_SEC", 1.0):
+                            with mock.patch("bot.supabase_store.save_regime_tier_transition") as save_transition:
+                                rt._update_regime_tier(now=1000.0)
+
+        self.assertEqual(rt._regime_tier, 0)
+        self.assertFalse(bool(rt._regime_shadow_state.get("directional_ok_tier2")))
+        self.assertIsNone(rt._regime_side_suppressed)
+        save_transition.assert_called_once()
+        row = save_transition.call_args.args[0]
+        self.assertEqual(row["from_tier"], 2)
+        self.assertEqual(row["to_tier"], 0)
+
+    def test_update_regime_tier_dwell_blocks_gate_downgrade(self):
+        rt = bot.BotRuntime()
+        rt._regime_tier = 2
+        rt._regime_tier_entered_at = 950.0
+        rt._hmm_state.update({
+            "available": True,
+            "trained": True,
+            "regime": "RANGING",
+            "confidence": 0.95,
+            "bias_signal": 0.02,
+            "last_update_ts": 1000.0,
+        })
+
+        with mock.patch.object(config, "HMM_ENABLED", True):
+            with mock.patch.object(config, "REGIME_SHADOW_ENABLED", True):
+                with mock.patch.object(config, "REGIME_DIRECTIONAL_ENABLED", False):
+                    with mock.patch.object(config, "REGIME_MIN_DWELL_SEC", 300.0):
+                        with mock.patch.object(config, "REGIME_EVAL_INTERVAL_SEC", 1.0):
+                            with mock.patch("bot.supabase_store.save_regime_tier_transition") as save_transition:
+                                rt._update_regime_tier(now=1000.0)
+
+        self.assertEqual(rt._regime_tier, 2)
+        self.assertFalse(bool(rt._regime_shadow_state.get("directional_ok_tier2")))
+        save_transition.assert_not_called()
+
     def test_execute_actions_books_exit_outcome_row(self):
         rt = bot.BotRuntime()
         rt.last_price = 0.1
