@@ -37,6 +37,8 @@ class KellySizerTests(unittest.TestCase):
         self.assertEqual(out.f_fractional, 0.25)
         self.assertEqual(out.multiplier, 1.25)
         self.assertTrue(math.isinf(out.payoff_ratio))
+        payload = out.to_dict()
+        self.assertTrue(math.isfinite(float(payload["payoff_ratio"])))
 
     def test_partition_cycles_by_regime_normalizes_legacy_text(self):
         cycles = [

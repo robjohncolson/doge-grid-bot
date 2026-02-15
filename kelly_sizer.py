@@ -20,8 +20,8 @@ Usage in bot.py:
 
 from __future__ import annotations
 
-import math
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -202,19 +202,34 @@ class KellyResult:
     sufficient_data: bool
     reason: str             # "ok", "no_data", "no_edge", "all_wins", "insufficient_samples"
 
+    @staticmethod
+    def _safe_float(value: float, digits: int, *, inf_fallback: float | None = None) -> float | None:
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(num):
+            if inf_fallback is None:
+                return None
+            if math.isinf(num):
+                num = inf_fallback if num > 0 else -inf_fallback
+            else:
+                return None
+        return round(num, digits)
+
     def to_dict(self) -> dict:
         return {
-            "f_star": round(self.f_star, 6),
-            "f_fractional": round(self.f_fractional, 6),
-            "multiplier": round(self.multiplier, 4),
-            "win_rate": round(self.win_rate, 4),
-            "avg_win": round(self.avg_win, 6),
-            "avg_loss": round(self.avg_loss, 6),
-            "payoff_ratio": round(self.payoff_ratio, 4),
+            "f_star": self._safe_float(self.f_star, 6) or 0.0,
+            "f_fractional": self._safe_float(self.f_fractional, 6) or 0.0,
+            "multiplier": self._safe_float(self.multiplier, 4) or 1.0,
+            "win_rate": self._safe_float(self.win_rate, 4) or 0.0,
+            "avg_win": self._safe_float(self.avg_win, 6) or 0.0,
+            "avg_loss": self._safe_float(self.avg_loss, 6) or 0.0,
+            "payoff_ratio": self._safe_float(self.payoff_ratio, 4, inf_fallback=1.7976931348623157e308) or 0.0,
             "n_total": self.n_total,
             "n_wins": self.n_wins,
             "n_losses": self.n_losses,
-            "edge": round(self.edge, 6),
+            "edge": self._safe_float(self.edge, 6) or 0.0,
             "sufficient_data": self.sufficient_data,
             "reason": self.reason,
         }
