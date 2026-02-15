@@ -1,6 +1,7 @@
 import io
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import bot
@@ -431,6 +432,34 @@ class DogeV1StateMachineTests(unittest.TestCase):
         restored_bad = sm.from_dict(raw)
         self.assertEqual(restored_bad.mode_source, "none")
 
+    def test_add_entry_order_uses_side_specific_entry_pct(self):
+        st = sm.PairState(market_price=0.1, now=1000.0)
+        cfg = sm.EngineConfig(
+            entry_pct=0.2,
+            entry_pct_a=0.50,
+            entry_pct_b=0.10,
+            profit_pct=1.0,
+            refresh_pct=1.0,
+            order_size_usd=2.0,
+            price_decimals=6,
+            volume_decimals=0,
+            min_volume=13.0,
+            min_cost_usd=0.0,
+            maker_fee_pct=0.25,
+        )
+
+        st, a_sell = sm.add_entry_order(
+            st, cfg, side="sell", trade_id="A", cycle=st.cycle_a, order_size_usd=2.0, reason="unit_a"
+        )
+        st, a_buy = sm.add_entry_order(
+            st, cfg, side="buy", trade_id="B", cycle=st.cycle_b, order_size_usd=2.0, reason="unit_b"
+        )
+
+        self.assertIsNotNone(a_sell)
+        self.assertIsNotNone(a_buy)
+        self.assertAlmostEqual(float(a_sell.price), 0.1005, places=6)
+        self.assertAlmostEqual(float(a_buy.price), 0.0999, places=6)
+
 
 class BotEventLogTests(unittest.TestCase):
     @mock.patch("supabase_store.save_event")
@@ -504,6 +533,33 @@ class BotEventLogTests(unittest.TestCase):
         self.assertTrue(bool(o1 and o1.txid))
         self.assertTrue(bool(o2 and o2.txid))
         self.assertEqual(rt._entry_adds_drained_total, 1)
+
+    def test_engine_cfg_regime_spacing_bias_gated_by_actuation_toggle(self):
+        rt = bot.BotRuntime()
+        rt.entry_pct = 0.35
+        rt._regime_tier = 1
+        rt._regime_shadow_state.update({
+            "regime": "BULLISH",
+            "confidence": 0.90,
+            "bias_signal": 0.80,
+        })
+        rt._hmm_module = SimpleNamespace(
+            compute_grid_bias=lambda _state: {
+                "entry_spacing_mult_a": 1.5,
+                "entry_spacing_mult_b": 0.7,
+            }
+        )
+        slot = bot.SlotRuntime(slot_id=0, state=sm.PairState(market_price=0.1, now=1000.0))
+
+        with mock.patch.object(config, "REGIME_DIRECTIONAL_ENABLED", False):
+            cfg_shadow = rt._engine_cfg(slot)
+        self.assertAlmostEqual(float(cfg_shadow.entry_pct_a), 0.35)
+        self.assertAlmostEqual(float(cfg_shadow.entry_pct_b), 0.35)
+
+        with mock.patch.object(config, "REGIME_DIRECTIONAL_ENABLED", True):
+            cfg_active = rt._engine_cfg(slot)
+        self.assertAlmostEqual(float(cfg_active.entry_pct_a), 0.525)
+        self.assertAlmostEqual(float(cfg_active.entry_pct_b), 0.245)
 
     @mock.patch("supabase_store.save_fill")
     def test_replay_missed_fills_aggregates_and_applies_once(self, _save_fill):

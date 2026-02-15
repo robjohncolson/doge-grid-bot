@@ -26,6 +26,10 @@ PairPhase = Literal["S0", "S1a", "S1b", "S2"]
 @dataclass(frozen=True)
 class EngineConfig:
     entry_pct: float = 0.2
+    # Optional side-specific entry distances (percent). When unset/invalid,
+    # entry_pct is used for both sides.
+    entry_pct_a: float | None = None
+    entry_pct_b: float | None = None
     profit_pct: float = 1.0
     refresh_pct: float = 1.0
     order_size_usd: float = 2.0
@@ -262,6 +266,17 @@ def _entry_prices(market_price: float, entry_pct: float, cfg: EngineConfig) -> t
     return buy, sell
 
 
+def _entry_pct_for_trade(cfg: EngineConfig, trade_id: TradeId) -> float:
+    pct = cfg.entry_pct
+    if trade_id == "A" and cfg.entry_pct_a is not None and cfg.entry_pct_a > 0:
+        pct = float(cfg.entry_pct_a)
+    elif trade_id == "B" and cfg.entry_pct_b is not None and cfg.entry_pct_b > 0:
+        pct = float(cfg.entry_pct_b)
+    if pct <= 0:
+        return float(cfg.entry_pct)
+    return float(pct)
+
+
 def _exit_price(entry_fill: float, market_price: float, side: Side, cfg: EngineConfig, profit_pct: float) -> float:
     p = profit_pct / 100.0
     e = cfg.entry_pct / 100.0
@@ -346,13 +361,20 @@ def _new_entry_order(
     order_size_usd: float,
     reason: str,
 ) -> tuple[PairState, OrderState | None, PlaceOrderAction | None]:
-    buy_price, sell_price = _entry_prices(state.market_price, cfg.entry_pct, cfg)
+    base_entry_pct = _entry_pct_for_trade(cfg, trade_id)
+    buy_price, sell_price = _entry_prices(state.market_price, base_entry_pct, cfg)
     if side == "buy":
         loss_count = state.consecutive_losses_b if trade_id == "B" else state.consecutive_losses_a
-        price = _round_price(state.market_price * (1 - (cfg.entry_pct * entry_backoff_multiplier(loss_count, cfg)) / 100.0), cfg)
+        price = _round_price(
+            state.market_price * (1 - (base_entry_pct * entry_backoff_multiplier(loss_count, cfg)) / 100.0),
+            cfg,
+        )
     else:
         loss_count = state.consecutive_losses_a if trade_id == "A" else state.consecutive_losses_b
-        price = _round_price(state.market_price * (1 + (cfg.entry_pct * entry_backoff_multiplier(loss_count, cfg)) / 100.0), cfg)
+        price = _round_price(
+            state.market_price * (1 + (base_entry_pct * entry_backoff_multiplier(loss_count, cfg)) / 100.0),
+            cfg,
+        )
     # Fallback to standard rounded side price if backoff rounding produced 0.
     if price <= 0:
         price = buy_price if side == "buy" else sell_price

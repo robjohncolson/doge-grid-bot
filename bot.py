@@ -24,6 +24,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from math import ceil, exp, floor, isfinite
 from socketserver import ThreadingMixIn
 from statistics import median
+from types import SimpleNamespace
 from typing import Any
 
 import config
@@ -332,9 +333,51 @@ class BotRuntime:
 
     # ------------------ Config/State ------------------
 
+    def _regime_entry_spacing_multipliers(self) -> tuple[float, float]:
+        """
+        Runtime policy hook for Tier-1 asymmetric spacing.
+
+        Returns A/B entry spacing multipliers. Shadow mode must remain non-actuating.
+        """
+        if not bool(getattr(config, "REGIME_DIRECTIONAL_ENABLED", False)):
+            return 1.0, 1.0
+        if int(self._regime_tier) < 1:
+            return 1.0, 1.0
+
+        state = dict(self._regime_shadow_state or {})
+        regime = str(state.get("regime", self._hmm_state.get("regime", "RANGING"))).upper()
+        if regime not in {"BULLISH", "BEARISH"}:
+            return 1.0, 1.0
+
+        hmm_mod = self._hmm_module
+        if not hmm_mod or not hasattr(hmm_mod, "compute_grid_bias"):
+            return 1.0, 1.0
+
+        confidence = float(state.get("confidence", self._hmm_state.get("confidence", 0.0) or 0.0))
+        bias_signal = float(state.get("bias_signal", self._hmm_state.get("bias_signal", 0.0) or 0.0))
+        regime_stub = SimpleNamespace(confidence=confidence, bias_signal=bias_signal)
+        try:
+            bias = hmm_mod.compute_grid_bias(regime_stub)
+            mult_a = float(bias.get("entry_spacing_mult_a", 1.0) or 1.0)
+            mult_b = float(bias.get("entry_spacing_mult_b", 1.0) or 1.0)
+        except Exception as e:
+            logger.debug("Regime spacing bias unavailable: %s", e)
+            return 1.0, 1.0
+
+        if not isfinite(mult_a) or mult_a <= 0:
+            mult_a = 1.0
+        if not isfinite(mult_b) or mult_b <= 0:
+            mult_b = 1.0
+
+        return max(0.10, min(3.0, mult_a)), max(0.10, min(3.0, mult_b))
+
     def _engine_cfg(self, slot: SlotRuntime) -> sm.EngineConfig:
+        spacing_mult_a, spacing_mult_b = self._regime_entry_spacing_multipliers()
+        base_entry_pct = float(self.entry_pct)
         return sm.EngineConfig(
-            entry_pct=self.entry_pct,
+            entry_pct=base_entry_pct,
+            entry_pct_a=base_entry_pct * spacing_mult_a,
+            entry_pct_b=base_entry_pct * spacing_mult_b,
             profit_pct=self.profit_pct,
             refresh_pct=config.PAIR_REFRESH_PCT,
             order_size_usd=self._slot_order_size_usd(slot),
@@ -1730,11 +1773,22 @@ class BotRuntime:
             elif target_tier == 1 and not directional_ok_tier1:
                 target_tier = 0
 
-            # Hysteresis on downgrades only.
+            # Hysteresis on downgrades only — but never override the
+            # directional gate.  If the downgrade was caused by missing
+            # directional evidence (RANGING or weak bias), hysteresis
+            # must not re-promote back to the gated tier.
             if target_tier < current_tier:
-                threshold = [0.0, tier1_conf, tier2_conf][current_tier]
-                if confidence > (threshold - hysteresis):
-                    target_tier = current_tier
+                # Only apply hysteresis if the current tier's directional
+                # gate is still satisfied.
+                gate_ok_for_current = (
+                    (current_tier == 1 and directional_ok_tier1) or
+                    (current_tier == 2 and directional_ok_tier2) or
+                    current_tier == 0
+                )
+                if gate_ok_for_current:
+                    threshold = [0.0, tier1_conf, tier2_conf][current_tier]
+                    if confidence > (threshold - hysteresis):
+                        target_tier = current_tier
 
             # Minimum dwell between transitions.
             if target_tier != current_tier and dwell_elapsed < min_dwell_sec:
