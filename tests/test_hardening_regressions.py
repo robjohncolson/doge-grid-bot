@@ -534,6 +534,61 @@ class BotEventLogTests(unittest.TestCase):
         self.assertTrue(bool(o2 and o2.txid))
         self.assertEqual(rt._entry_adds_drained_total, 1)
 
+    def test_deferred_entries_purged_for_suppressed_side(self):
+        rt = bot.BotRuntime()
+        rt.mode = "RUNNING"
+        now = bot._now()
+        rt.last_price = 0.1
+        rt.last_price_ts = now
+        rt._regime_tier = 2
+        rt._regime_side_suppressed = "A"
+        rt._regime_tier2_grace_start = now - 120.0
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=now,
+                    orders=(
+                        sm.OrderState(
+                            local_id=1,
+                            side="sell",
+                            role="entry",
+                            price=0.1002,
+                            volume=13.0,
+                            trade_id="A",
+                            cycle=1,
+                            txid="",
+                            placed_at=now - 2.0,
+                        ),
+                        sm.OrderState(
+                            local_id=2,
+                            side="buy",
+                            role="entry",
+                            price=0.0998,
+                            volume=13.0,
+                            trade_id="B",
+                            cycle=1,
+                            txid="",
+                            placed_at=now - 1.0,
+                        ),
+                    ),
+                    next_order_id=3,
+                ),
+            )
+        }
+
+        with mock.patch.object(config, "REGIME_DIRECTIONAL_ENABLED", True):
+            with mock.patch.object(config, "REGIME_SUPPRESSION_GRACE_SEC", 60.0):
+                with mock.patch.object(rt, "_execute_actions") as exec_actions:
+                    rt._drain_pending_entry_orders("unit_test_regime_drain", skip_stale=False)
+
+        self.assertIsNone(sm.find_order(rt.slots[0].state, 1))
+        self.assertIsNotNone(sm.find_order(rt.slots[0].state, 2))
+        exec_actions.assert_called_once()
+        action = exec_actions.call_args.args[1][0]
+        self.assertEqual(action.side, "buy")
+
     def test_engine_cfg_regime_spacing_bias_gated_by_actuation_toggle(self):
         rt = bot.BotRuntime()
         rt.entry_pct = 0.35
@@ -890,6 +945,52 @@ class BotEventLogTests(unittest.TestCase):
         self.assertIn("sell", sides)
         self.assertFalse(rt.slots[0].state.long_only)
         self.assertFalse(rt.slots[0].state.short_only)
+
+    def test_auto_repair_skips_regime_mode_source(self):
+        rt = bot.BotRuntime()
+        rt.mode = "RUNNING"
+        rt.last_price = 0.1
+        rt.constraints = {
+            "price_decimals": 6,
+            "volume_decimals": 0,
+            "min_volume": 13.0,
+            "min_cost_usd": 0.0,
+        }
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    orders=(
+                        sm.OrderState(
+                            local_id=1,
+                            side="buy",
+                            role="entry",
+                            price=0.0998,
+                            volume=13.0,
+                            trade_id="B",
+                            cycle=1,
+                            txid="TX-B-ENTRY",
+                            placed_at=999.0,
+                        ),
+                    ),
+                    long_only=True,
+                    short_only=False,
+                    mode_source="regime",
+                    next_order_id=2,
+                ),
+            )
+        }
+
+        with mock.patch.object(rt, "_safe_balance") as safe_balance:
+            with mock.patch.object(rt, "_execute_actions") as exec_actions:
+                rt._auto_repair_degraded_slot(0)
+
+        safe_balance.assert_not_called()
+        exec_actions.assert_not_called()
+        self.assertTrue(rt.slots[0].state.long_only)
+        self.assertEqual(rt.slots[0].state.mode_source, "regime")
 
     def test_auto_repair_degraded_s1a_adds_missing_entry(self):
         rt = bot.BotRuntime()
@@ -1388,6 +1489,203 @@ class BotEventLogTests(unittest.TestCase):
         self.assertEqual(rt._regime_tier, 2)
         self.assertFalse(bool(rt._regime_shadow_state.get("directional_ok_tier2")))
         save_transition.assert_not_called()
+
+    def test_tier2_grace_period_delays_suppression(self):
+        rt = bot.BotRuntime()
+        rt._regime_tier = 2
+        rt._regime_side_suppressed = "A"
+        rt._regime_tier2_grace_start = 1000.0
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    orders=(
+                        sm.OrderState(
+                            local_id=1,
+                            side="sell",
+                            role="entry",
+                            price=0.1002,
+                            volume=13.0,
+                            trade_id="A",
+                            cycle=1,
+                            txid="TX-A-ENTRY",
+                            placed_at=999.0,
+                        ),
+                        sm.OrderState(
+                            local_id=2,
+                            side="buy",
+                            role="entry",
+                            price=0.0998,
+                            volume=13.0,
+                            trade_id="B",
+                            cycle=1,
+                            txid="TX-B-ENTRY",
+                            placed_at=999.0,
+                        ),
+                    ),
+                    next_order_id=3,
+                ),
+            )
+        }
+
+        with mock.patch.object(config, "REGIME_DIRECTIONAL_ENABLED", True):
+            with mock.patch.object(config, "REGIME_SUPPRESSION_GRACE_SEC", 60.0):
+                with mock.patch.object(rt, "_cancel_order", return_value=True) as cancel_mock:
+                    rt._apply_tier2_suppression(now=1030.0)
+                    self.assertIsNotNone(sm.find_order(rt.slots[0].state, 1))
+                    cancel_mock.assert_not_called()
+
+                    rt._apply_tier2_suppression(now=1061.0)
+
+        cancel_mock.assert_called_once_with("TX-A-ENTRY")
+        self.assertIsNone(sm.find_order(rt.slots[0].state, 1))
+        self.assertTrue(rt.slots[0].state.long_only)
+        self.assertEqual(rt.slots[0].state.mode_source, "regime")
+
+    def test_bootstrap_only_places_favored_side_during_tier2(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        rt.constraints = {
+            "price_decimals": 6,
+            "volume_decimals": 0,
+            "min_volume": 13.0,
+            "min_cost_usd": 0.0,
+        }
+        rt._regime_tier = 2
+        rt._regime_side_suppressed = "A"
+        rt._regime_tier2_grace_start = 900.0
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(market_price=0.1, now=1000.0),
+            )
+        }
+
+        with mock.patch.object(rt, "_safe_balance", return_value={"ZUSD": "50.0", "XXDG": "1000.0"}):
+            with mock.patch.object(config, "REGIME_DIRECTIONAL_ENABLED", True):
+                with mock.patch.object(config, "REGIME_SUPPRESSION_GRACE_SEC", 60.0):
+                    with mock.patch.object(rt, "_execute_actions") as exec_actions:
+                        rt._ensure_slot_bootstrapped(0)
+
+        entries = [o for o in rt.slots[0].state.orders if o.role == "entry"]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].side, "buy")
+        self.assertTrue(rt.slots[0].state.long_only)
+        self.assertFalse(rt.slots[0].state.short_only)
+        self.assertEqual(rt.slots[0].state.mode_source, "regime")
+        exec_actions.assert_called_once()
+        self.assertEqual(exec_actions.call_args.args[1][0].side, "buy")
+
+    def test_tier_downgrade_clears_mode_source_regime(self):
+        rt = bot.BotRuntime()
+        rt._regime_tier = 2
+        rt._regime_tier_entered_at = 900.0
+        rt._regime_tier2_grace_start = 900.0
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    long_only=True,
+                    short_only=False,
+                    mode_source="regime",
+                ),
+            ),
+            1: bot.SlotRuntime(
+                slot_id=1,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    long_only=False,
+                    short_only=True,
+                    mode_source="regime",
+                ),
+            ),
+        }
+        rt._hmm_state.update({
+            "available": True,
+            "trained": True,
+            "regime": "RANGING",
+            "confidence": 0.0,
+            "bias_signal": 0.0,
+            "last_update_ts": 1000.0,
+        })
+
+        with mock.patch.object(config, "HMM_ENABLED", True):
+            with mock.patch.object(config, "REGIME_SHADOW_ENABLED", True):
+                with mock.patch.object(config, "REGIME_DIRECTIONAL_ENABLED", True):
+                    with mock.patch.object(config, "REGIME_EVAL_INTERVAL_SEC", 1.0):
+                        with mock.patch.object(config, "REGIME_MIN_DWELL_SEC", 0.0):
+                            rt._update_regime_tier(now=1000.0)
+
+        self.assertEqual(rt._regime_tier, 0)
+        self.assertEqual(rt._regime_tier2_grace_start, 0.0)
+        self.assertEqual(rt.slots[0].state.mode_source, "none")
+        self.assertEqual(rt.slots[1].state.mode_source, "none")
+
+    def test_regime_flip_clears_old_suppression(self):
+        rt = bot.BotRuntime()
+        rt._regime_tier = 2
+        rt._regime_side_suppressed = "A"
+        rt._regime_tier2_grace_start = 900.0
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    short_only=True,
+                    mode_source="regime",
+                ),
+            ),
+            1: bot.SlotRuntime(
+                slot_id=1,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    orders=(
+                        sm.OrderState(
+                            local_id=1,
+                            side="sell",
+                            role="entry",
+                            price=0.1002,
+                            volume=13.0,
+                            trade_id="A",
+                            cycle=1,
+                            txid="TX-A-ENTRY",
+                            placed_at=999.0,
+                        ),
+                        sm.OrderState(
+                            local_id=2,
+                            side="buy",
+                            role="entry",
+                            price=0.0998,
+                            volume=13.0,
+                            trade_id="B",
+                            cycle=1,
+                            txid="TX-B-ENTRY",
+                            placed_at=999.0,
+                        ),
+                    ),
+                    next_order_id=3,
+                ),
+            ),
+        }
+
+        with mock.patch.object(config, "REGIME_DIRECTIONAL_ENABLED", True):
+            with mock.patch.object(config, "REGIME_SUPPRESSION_GRACE_SEC", 60.0):
+                with mock.patch.object(rt, "_cancel_order", return_value=True) as cancel_mock:
+                    rt._apply_tier2_suppression(now=1000.0)
+
+        self.assertEqual(rt.slots[0].state.mode_source, "none")
+        self.assertTrue(rt.slots[0].state.short_only)
+        self.assertIsNone(sm.find_order(rt.slots[1].state, 1))
+        self.assertTrue(rt.slots[1].state.long_only)
+        self.assertEqual(rt.slots[1].state.mode_source, "regime")
+        cancel_mock.assert_called_once_with("TX-A-ENTRY")
 
     def test_execute_actions_books_exit_outcome_row(self):
         rt = bot.BotRuntime()

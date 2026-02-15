@@ -321,6 +321,7 @@ class BotRuntime:
         self._hmm_backfill_last_message_secondary: str = ""
         self._regime_tier: int = 0
         self._regime_tier_entered_at: float = 0.0
+        self._regime_tier2_grace_start: float = 0.0
         self._regime_side_suppressed: str | None = None
         self._regime_last_eval_ts: float = 0.0
         self._regime_shadow_state: dict[str, Any] = {
@@ -838,6 +839,33 @@ class BotRuntime:
         if not pending:
             return
 
+        # Purge suppressed-side deferred entries during Tier 2 after grace.
+        if bool(getattr(config, "REGIME_DIRECTIONAL_ENABLED", False)) and self._regime_grace_elapsed(_now()):
+            suppressed = self._regime_side_suppressed
+            if suppressed in ("A", "B"):
+                suppressed_side = "sell" if suppressed == "A" else "buy"
+                purged = 0
+                kept: list[tuple[int, sm.OrderState]] = []
+                for sid, order in pending:
+                    if order.side == suppressed_side:
+                        slot = self.slots.get(sid)
+                        if slot is not None:
+                            current = sm.find_order(slot.state, order.local_id)
+                            if current is not None and current.role == "entry" and not current.txid:
+                                slot.state = sm.remove_order(slot.state, order.local_id)
+                        purged += 1
+                    else:
+                        kept.append((sid, order))
+                if purged > 0:
+                    logger.info(
+                        "entry_scheduler: purged %d suppressed-side (%s) deferred entries",
+                        purged,
+                        suppressed,
+                    )
+                pending = kept
+                if not pending:
+                    return
+
         drained = 0
         for sid, order in pending:
             if self.entry_adds_per_loop_used >= self.entry_adds_per_loop_cap:
@@ -1056,6 +1084,7 @@ class BotRuntime:
             "hmm_backfill_last_message_secondary": self._hmm_backfill_last_message_secondary,
             "regime_tier": int(self._regime_tier),
             "regime_tier_entered_at": float(self._regime_tier_entered_at),
+            "regime_tier2_grace_start": float(self._regime_tier2_grace_start),
             "regime_side_suppressed": self._regime_side_suppressed,
             "regime_last_eval_ts": float(self._regime_last_eval_ts),
             "regime_shadow_state": dict(self._regime_shadow_state or {}),
@@ -1207,6 +1236,12 @@ class BotRuntime:
             self._regime_tier = int(snap.get("regime_tier", self._regime_tier))
             self._regime_tier = max(0, min(2, self._regime_tier))
             self._regime_tier_entered_at = float(snap.get("regime_tier_entered_at", self._regime_tier_entered_at))
+            raw_grace_start = snap.get("regime_tier2_grace_start", self._regime_tier2_grace_start)
+            self._regime_tier2_grace_start = float(raw_grace_start or 0.0)
+            if self._regime_tier == 2 and self._regime_tier2_grace_start <= 0.0:
+                self._regime_tier2_grace_start = float(self._regime_tier_entered_at)
+            if self._regime_tier != 2:
+                self._regime_tier2_grace_start = 0.0
             raw_suppressed = snap.get("regime_side_suppressed", self._regime_side_suppressed)
             self._regime_side_suppressed = raw_suppressed if raw_suppressed in ("A", "B", None) else None
             self._regime_last_eval_ts = float(snap.get("regime_last_eval_ts", self._regime_last_eval_ts))
@@ -2223,6 +2258,15 @@ class BotRuntime:
             return raw, conf
         return None, 0.0
 
+    def _regime_grace_elapsed(self, now: float) -> bool:
+        if int(self._regime_tier) != 2:
+            return False
+        grace_sec = max(0.0, float(getattr(config, "REGIME_SUPPRESSION_GRACE_SEC", 0.0)))
+        if grace_sec <= 0.0:
+            return True
+        started_at = float(self._regime_tier2_grace_start or self._regime_tier_entered_at or now)
+        return (float(now) - started_at) >= grace_sec
+
     def _update_regime_tier(self, now: float) -> None:
         interval_sec = max(1.0, float(getattr(config, "REGIME_EVAL_INTERVAL_SEC", 300.0)))
         if self._regime_last_eval_ts > 0 and (now - self._regime_last_eval_ts) < interval_sec:
@@ -2314,6 +2358,23 @@ class BotRuntime:
         if changed:
             self._regime_tier = int(target_tier)
             self._regime_tier_entered_at = float(now)
+            if int(target_tier) == 2:
+                self._regime_tier2_grace_start = float(now)
+            else:
+                self._regime_tier2_grace_start = 0.0
+
+        # Tier downgrade: clear regime ownership so balance-driven repair can restore both sides.
+        if changed and current_tier == 2 and int(target_tier) < 2:
+            for sid in sorted(self.slots.keys()):
+                st = self.slots[sid].state
+                if str(getattr(st, "mode_source", "none")) == "regime":
+                    self.slots[sid].state = replace(st, mode_source="none")
+                    logger.info(
+                        "slot %s: cleared regime suppression (tier %d -> %d)",
+                        sid,
+                        int(current_tier),
+                        int(target_tier),
+                    )
 
         if int(target_tier) == 2 and regime in ("BULLISH", "BEARISH"):
             suppressed_side = "A" if bias > 0 else "B"
@@ -2370,6 +2431,79 @@ class BotRuntime:
             "reason": reason,
         }
 
+    def _apply_tier2_suppression(self, now: float) -> None:
+        if not bool(getattr(config, "REGIME_DIRECTIONAL_ENABLED", False)):
+            return
+        if int(self._regime_tier) != 2:
+            return
+        if not self._regime_grace_elapsed(now):
+            return
+        suppressed = self._regime_side_suppressed
+        if suppressed not in ("A", "B"):
+            return
+        suppressed_side = "sell" if suppressed == "A" else "buy"
+
+        # Regime can flip while still in Tier 2; release old-side regime ownership.
+        for sid in sorted(self.slots.keys()):
+            st = self.slots[sid].state
+            if str(getattr(st, "mode_source", "none")) != "regime":
+                continue
+            if suppressed == "A" and st.short_only:
+                self.slots[sid].state = replace(st, mode_source="none")
+            elif suppressed == "B" and st.long_only:
+                self.slots[sid].state = replace(st, mode_source="none")
+
+        for sid in sorted(self.slots.keys()):
+            st = self.slots[sid].state
+
+            if suppressed == "A" and st.long_only and str(getattr(st, "mode_source", "none")) == "regime":
+                continue
+            if suppressed == "B" and st.short_only and str(getattr(st, "mode_source", "none")) == "regime":
+                continue
+
+            if sm.derive_phase(st) != "S0":
+                continue
+
+            target_order = next(
+                (
+                    o
+                    for o in st.orders
+                    if o.role == "entry" and o.side == suppressed_side
+                ),
+                None,
+            )
+
+            # Preserve favored one-sided slots by tagging regime ownership.
+            if target_order is None:
+                if suppressed == "A" and st.long_only and not st.short_only and str(getattr(st, "mode_source", "none")) != "regime":
+                    self.slots[sid].state = replace(st, mode_source="regime")
+                elif suppressed == "B" and st.short_only and not st.long_only and str(getattr(st, "mode_source", "none")) != "regime":
+                    self.slots[sid].state = replace(st, mode_source="regime")
+                continue
+
+            if target_order.txid:
+                try:
+                    if not self._cancel_order(target_order.txid):
+                        logger.warning("slot %s tier2 cancel %s failed", sid, target_order.txid)
+                        continue
+                except Exception as e:
+                    logger.warning("slot %s tier2 cancel %s failed: %s", sid, target_order.txid, e)
+                    continue
+
+            new_st = sm.remove_order(st, target_order.local_id)
+            if suppressed == "A":
+                new_st = replace(new_st, long_only=True, short_only=False, mode_source="regime")
+            else:
+                new_st = replace(new_st, short_only=True, long_only=False, mode_source="regime")
+            self.slots[sid].state = new_st
+            logger.info(
+                "slot %s: tier2 suppressed %s entry (regime=%s, conf=%.3f)",
+                sid,
+                suppressed,
+                self._hmm_consensus.get("regime", ""),
+                float(self._hmm_consensus.get("confidence", 0.0)),
+            )
+
     def _regime_status_payload(self, now: float | None = None) -> dict[str, Any]:
         now_ts = float(now if now is not None else _now())
         state = dict(self._regime_shadow_state or {})
@@ -2386,6 +2520,9 @@ class BotRuntime:
             favored = None
         tier_label = {0: "symmetric", 1: "biased", 2: "directional"}[tier]
         dwell_sec = max(0.0, now_ts - float(self._regime_tier_entered_at or now_ts))
+        grace_sec = max(0.0, float(getattr(config, "REGIME_SUPPRESSION_GRACE_SEC", 0.0)))
+        grace_start = float(self._regime_tier2_grace_start or self._regime_tier_entered_at or now_ts)
+        grace_remaining = max(0.0, grace_sec - max(0.0, now_ts - grace_start)) if tier == 2 else 0.0
         return {
             "enabled": bool(state.get("enabled", False)),
             "shadow_enabled": bool(state.get("shadow_enabled", False)),
@@ -2403,7 +2540,12 @@ class BotRuntime:
             "hmm_ready": bool(state.get("hmm_ready", False)),
             "dwell_sec": float(dwell_sec),
             "hysteresis_buffer": float(getattr(config, "REGIME_HYSTERESIS", 0.05)),
-            "grace_remaining_sec": 0.0,
+            "grace_remaining_sec": float(grace_remaining),
+            "regime_suppressed_slots": sum(
+                1
+                for slot in self.slots.values()
+                if str(getattr(slot.state, "mode_source", "none")) == "regime"
+            ),
             "last_eval_ts": float(state.get("last_eval_ts", self._regime_last_eval_ts)),
             "reason": str(state.get("reason", "")),
         }
@@ -3310,6 +3452,63 @@ class BotRuntime:
 
         cfg = self._engine_cfg(slot)
 
+        suppressed = None
+        if (
+            bool(getattr(config, "REGIME_DIRECTIONAL_ENABLED", False))
+            and int(self._regime_tier) == 2
+            and self._regime_grace_elapsed(_now())
+        ):
+            if self._regime_side_suppressed in ("A", "B"):
+                suppressed = self._regime_side_suppressed
+
+        if suppressed == "A":
+            if usd >= min_cost:
+                st = replace(slot.state, long_only=True, short_only=False, mode_source="regime")
+                st, action = sm.add_entry_order(
+                    st,
+                    cfg,
+                    side="buy",
+                    trade_id="B",
+                    cycle=st.cycle_b,
+                    order_size_usd=self._slot_order_size_usd(slot),
+                    reason="bootstrap_regime_long_only",
+                )
+                self.slots[slot_id].state = st
+                if action:
+                    self._execute_actions(slot_id, [action], "bootstrap_regime")
+                else:
+                    logger.info("slot %s bootstrap_regime waiting: buy entry below minimum", slot_id)
+            else:
+                logger.info(
+                    "slot %s bootstrap waiting: regime suppresses A, insufficient USD for B",
+                    slot_id,
+                )
+            return
+
+        if suppressed == "B":
+            if doge >= min_vol:
+                st = replace(slot.state, short_only=True, long_only=False, mode_source="regime")
+                st, action = sm.add_entry_order(
+                    st,
+                    cfg,
+                    side="sell",
+                    trade_id="A",
+                    cycle=st.cycle_a,
+                    order_size_usd=self._slot_order_size_usd(slot),
+                    reason="bootstrap_regime_short_only",
+                )
+                self.slots[slot_id].state = st
+                if action:
+                    self._execute_actions(slot_id, [action], "bootstrap_regime")
+                else:
+                    logger.info("slot %s bootstrap_regime waiting: sell entry below minimum", slot_id)
+            else:
+                logger.info(
+                    "slot %s bootstrap waiting: regime suppresses B, insufficient DOGE for A",
+                    slot_id,
+                )
+            return
+
         # Normal bootstrap: both sides available.
         if doge >= min_vol and usd >= min_cost:
             st = slot.state
@@ -3401,6 +3600,9 @@ class BotRuntime:
         slot = self.slots[slot_id]
         st = slot.state
         if not (st.long_only or st.short_only):
+            return
+
+        if str(getattr(st, "mode_source", "none")) == "regime":
             return
 
         phase = sm.derive_phase(st)
@@ -5099,6 +5301,7 @@ class BotRuntime:
             self._update_daily_loss_lock(loop_now)
             self._update_rebalancer(loop_now)
             self._update_regime_tier(loop_now)
+            self._apply_tier2_suppression(loop_now)
             # Prioritize older deferred entries each loop, while avoiding stale placements
             # that the upcoming price tick is likely to refresh anyway.
             self._drain_pending_entry_orders("entry_scheduler_pre_tick", skip_stale=True)
