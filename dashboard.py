@@ -358,6 +358,15 @@ DASHBOARD_HTML = """<!doctype html>
         <div class=\"row\"><span class=\"k\">Releases</span><span id=\"releaseTotals\" class=\"v\"></span></div>
         <div id=\"releaseGateReason\" class=\"tiny\"></div>
 
+        <h3 style=\"margin-top:14px\">HMM Regime</h3>
+        <div class=\"row\"><span class=\"k\">Status</span><span id=\"hmmStatus\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Regime</span><span id=\"hmmRegime\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Confidence</span><span id=\"hmmConfidence\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Bias Signal</span><span id=\"hmmBias\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Blend</span><span id=\"hmmBlend\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Data Window</span><span id=\"hmmWindow\" class=\"v\"></span></div>
+        <div id=\"hmmHints\" class=\"tiny\"></div>
+
         <h3 style=\"margin-top:14px\">Capacity &amp; Fill Health</h3>
         <div class=\"row\"><span class=\"k\">Status</span><span id=\"cfhBand\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Open Orders</span><span id=\"cfhOpenOrders\" class=\"v\"></span></div>
@@ -1214,6 +1223,80 @@ DASHBOARD_HTML = """<!doctype html>
           : `${Number(release.sticky_release_total || 0)} total`;
       document.getElementById('releaseGateReason').textContent =
         releaseGateBlocked ? String(release.recon_hard_gate_reason || '') : '';
+
+      const hmm = s.hmm_regime || {};
+      const hmmPipe = s.hmm_data_pipeline || {};
+      const hmmStatusEl = document.getElementById('hmmStatus');
+      const hmmEnabled = Boolean(hmm.enabled);
+      const hmmAvailable = Boolean(hmm.available);
+      const hmmTrained = Boolean(hmm.trained);
+      let hmmStatus = 'OFF';
+      let hmmStatusColor = '';
+      if (hmmEnabled && hmmAvailable && hmmTrained) {
+        hmmStatus = 'ACTIVE';
+        hmmStatusColor = 'var(--good)';
+      } else if (hmmEnabled && hmmAvailable && !hmmTrained) {
+        hmmStatus = 'WARMING';
+        hmmStatusColor = 'var(--warn)';
+      } else if (hmmEnabled && !hmmAvailable) {
+        hmmStatus = 'UNAVAILABLE';
+        hmmStatusColor = 'var(--warn)';
+      }
+      hmmStatusEl.textContent = hmmStatus;
+      hmmStatusEl.style.color = hmmStatusColor;
+
+      const regimeLabel = hmm.regime ? String(hmm.regime) : '-';
+      const regimeId = hmm.regime_id;
+      document.getElementById('hmmRegime').textContent =
+        regimeId === null || regimeId === undefined ? regimeLabel : `${regimeLabel} (id ${regimeId})`;
+
+      const confidence = hmm.confidence;
+      document.getElementById('hmmConfidence').textContent =
+        confidence === null || confidence === undefined ? '-' : `${fmt(Number(confidence) * 100, 1)}%`;
+
+      const biasSignal = hmm.bias_signal;
+      document.getElementById('hmmBias').textContent =
+        biasSignal === null || biasSignal === undefined
+          ? '-'
+          : `${Number(biasSignal) >= 0 ? '+' : ''}${fmt(Number(biasSignal) * 100, 2)}%`;
+
+      const blendFactor = hmm.blend_factor;
+      document.getElementById('hmmBlend').textContent =
+        blendFactor === null || blendFactor === undefined ? '-' : fmt(Number(blendFactor), 2);
+
+      const samples = Number(hmmPipe.samples || 0);
+      const target = Number(hmmPipe.training_target || 0);
+      const coverage = hmmPipe.coverage_pct;
+      const spanHours = hmmPipe.span_hours;
+      const freshnessSec = hmmPipe.freshness_sec;
+      let windowText = '-';
+      if (target > 0 || samples > 0) {
+        const covText = coverage === null || coverage === undefined ? '' : ` (${fmt(Number(coverage), 1)}%)`;
+        const spanText = spanHours === null || spanHours === undefined ? '' : `, ${fmt(Number(spanHours), 1)}h`;
+        windowText = `${samples}/${target || '-'}${covText}${spanText}`;
+      }
+      document.getElementById('hmmWindow').textContent = windowText;
+
+      const hmmHints = [];
+      if (Array.isArray(hmmPipe.gaps) && hmmPipe.gaps.length) {
+        hmmHints.push(...hmmPipe.gaps.map(x => String(x)));
+      }
+      if (hmm.error) {
+        hmmHints.push(`error:${String(hmm.error)}`);
+      }
+      if (hmmPipe.backfill_last_message) {
+        hmmHints.push(`backfill:${String(hmmPipe.backfill_last_message)}`);
+      }
+      if (hmmPipe.freshness_ok === false && freshnessSec !== null && freshnessSec !== undefined) {
+        hmmHints.push(`stale:${Math.round(Number(freshnessSec))}s`);
+      }
+      if (hmmPipe.backfill_last_at) {
+        const agoSec = (Date.now() / 1000) - Number(hmmPipe.backfill_last_at);
+        const rows = Number(hmmPipe.backfill_last_rows || 0);
+        hmmHints.push(`last_backfill:${rows} rows, ${fmtAgeSeconds(agoSec)} ago`);
+      }
+      document.getElementById('hmmHints').textContent =
+        hmmHints.length ? `Hints: ${hmmHints.join(' | ')}` : '';
 
       const softCloseBtn = document.getElementById('softCloseBtn');
       const cancelStaleBtn = document.getElementById('cancelStaleBtn');

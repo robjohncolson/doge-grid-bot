@@ -468,6 +468,9 @@ HMM_OHLCV_INTERVAL_MIN: int = _env("HMM_OHLCV_INTERVAL_MIN", 5, int)
 HMM_OHLCV_SYNC_INTERVAL_SEC: float = _env("HMM_OHLCV_SYNC_INTERVAL_SEC", 300.0, float)
 # Retention for persisted candles (days). 14 days ~= 4032 5m candles.
 HMM_OHLCV_RETENTION_DAYS: int = _env("HMM_OHLCV_RETENTION_DAYS", 14, int)
+# One-time startup backfill to accelerate first HMM training window.
+HMM_OHLCV_BACKFILL_ON_STARTUP: bool = _env("HMM_OHLCV_BACKFILL_ON_STARTUP", True, bool)
+HMM_OHLCV_BACKFILL_MAX_PAGES: int = _env("HMM_OHLCV_BACKFILL_MAX_PAGES", 40, int)
 
 # Readiness targets for HMM training/inference windows.
 HMM_TRAINING_CANDLES: int = _env("HMM_TRAINING_CANDLES", 2000, int)

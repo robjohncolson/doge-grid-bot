@@ -295,6 +295,9 @@ class BotRuntime:
         self._hmm_numpy: Any = None
         self._hmm_state: dict[str, Any] = self._hmm_default_state()
         self._hmm_last_train_attempt_ts: float = 0.0
+        self._hmm_backfill_last_at: float = 0.0
+        self._hmm_backfill_last_rows: int = 0
+        self._hmm_backfill_last_message: str = ""
 
         # Daily loss lock (aggregate bot-level, UTC day).
         self._daily_loss_lock_active: bool = False
@@ -954,6 +957,9 @@ class BotRuntime:
             "ohlcv_since_cursor": self._ohlcv_since_cursor,
             "ohlcv_last_sync_ts": self._ohlcv_last_sync_ts,
             "ohlcv_last_candle_ts": self._ohlcv_last_candle_ts,
+            "hmm_backfill_last_at": self._hmm_backfill_last_at,
+            "hmm_backfill_last_rows": self._hmm_backfill_last_rows,
+            "hmm_backfill_last_message": self._hmm_backfill_last_message,
             "entry_adds_deferred_total": self._entry_adds_deferred_total,
             "entry_adds_drained_total": self._entry_adds_drained_total,
             "entry_adds_last_deferred_at": self._entry_adds_last_deferred_at,
@@ -1061,6 +1067,11 @@ class BotRuntime:
                 self._ohlcv_since_cursor = None
             self._ohlcv_last_sync_ts = float(snap.get("ohlcv_last_sync_ts", self._ohlcv_last_sync_ts))
             self._ohlcv_last_candle_ts = float(snap.get("ohlcv_last_candle_ts", self._ohlcv_last_candle_ts))
+            self._hmm_backfill_last_at = float(snap.get("hmm_backfill_last_at", self._hmm_backfill_last_at))
+            self._hmm_backfill_last_rows = int(snap.get("hmm_backfill_last_rows", self._hmm_backfill_last_rows))
+            self._hmm_backfill_last_message = str(
+                snap.get("hmm_backfill_last_message", self._hmm_backfill_last_message) or ""
+            )
             self._entry_adds_deferred_total = int(snap.get("entry_adds_deferred_total", self._entry_adds_deferred_total))
             self._entry_adds_drained_total = int(snap.get("entry_adds_drained_total", self._entry_adds_drained_total))
             self._entry_adds_last_deferred_at = float(
@@ -1262,8 +1273,11 @@ class BotRuntime:
 
         # Get initial market price.
         self._refresh_price(strict=True)
-        # Prime OHLCV + HMM state before entering the loop.
+        # Prime OHLCV + optional one-time backfill + HMM state before entering the loop.
         self._sync_ohlcv_candles(_now())
+        self._maybe_backfill_ohlcv_on_startup()
+        self._hmm_readiness_cache = None
+        self._hmm_readiness_last_ts = 0.0
         self._update_hmm(_now())
 
         # Push price into all slots.
@@ -1719,6 +1733,128 @@ class BotRuntime:
         except Exception as e:
             logger.warning("OHLCV sync failed: %s", e)
 
+
+    def backfill_ohlcv_history(
+        self,
+        target_candles: int | None = None,
+        max_pages: int | None = None,
+    ) -> tuple[bool, str]:
+        """
+        Best-effort historical OHLCV backfill for faster HMM warm-up.
+        Queues rows into Supabase writer; ingestion is asynchronous.
+        """
+        if not bool(getattr(config, "HMM_OHLCV_ENABLED", True)):
+            msg = "ohlcv pipeline disabled"
+            self._hmm_backfill_last_message = msg
+            return False, msg
+
+        target = max(1, int(target_candles if target_candles is not None else getattr(config, "HMM_TRAINING_CANDLES", 2000)))
+        pages = max(1, int(max_pages if max_pages is not None else getattr(config, "HMM_OHLCV_BACKFILL_MAX_PAGES", 40)))
+        interval_min = max(1, int(getattr(config, "HMM_OHLCV_INTERVAL_MIN", 5)))
+        interval_sec = interval_min * 60
+
+        existing = supabase_store.load_ohlcv_candles(
+            limit=target,
+            pair=self.pair,
+            interval_min=interval_min,
+        )
+        existing_ts: set[float] = set()
+        for row in existing:
+            try:
+                existing_ts.add(float(row.get("time")))
+            except Exception:
+                continue
+        existing_count = len(existing_ts)
+        if existing_count >= target:
+            self._hmm_backfill_last_at = _now()
+            self._hmm_backfill_last_rows = 0
+            self._hmm_backfill_last_message = f"already_ready:{existing_count}/{target}"
+            return True, f"OHLCV already sufficient: {existing_count}/{target}"
+
+        missing = max(0, target - existing_count)
+        oldest_ts = min(existing_ts) if existing_ts else 0.0
+        if oldest_ts > 0:
+            cursor = max(0, int(oldest_ts - (missing + 24) * interval_sec))
+        else:
+            cursor = 0
+
+        fetched: dict[float, dict[str, float | int | None]] = {}
+        for _ in range(pages):
+            try:
+                rows, last_cursor = kraken_client.get_ohlc_page(
+                    pair=self.pair,
+                    interval=interval_min,
+                    since=cursor if cursor > 0 else None,
+                )
+            except Exception as e:
+                self._hmm_backfill_last_message = f"fetch_failed:{e}"
+                break
+
+            parsed = self._normalize_kraken_ohlcv_rows(
+                rows,
+                interval_min=interval_min,
+                now_ts=_now(),
+            )
+            for row in parsed:
+                fetched[float(row["time"])] = row
+
+            if last_cursor is None:
+                break
+            try:
+                next_cursor = int(last_cursor)
+            except (TypeError, ValueError):
+                break
+            if next_cursor <= cursor:
+                break
+            cursor = next_cursor
+
+        queued_rows = 0
+        new_unique = 0
+        if fetched:
+            payload = [fetched[k] for k in sorted(fetched.keys())]
+            supabase_store.queue_ohlcv_candles(
+                payload,
+                pair=self.pair,
+                interval_min=interval_min,
+            )
+            queued_rows = len(payload)
+            new_unique = sum(1 for ts in fetched.keys() if ts not in existing_ts)
+
+        self._hmm_backfill_last_at = _now()
+        self._hmm_backfill_last_rows = int(queued_rows)
+        est_total = existing_count + new_unique
+        self._hmm_backfill_last_message = (
+            f"queued={queued_rows} new={new_unique} est_total={est_total}/{target}"
+        )
+        self._hmm_readiness_cache = None
+        self._hmm_readiness_last_ts = 0.0
+
+        if queued_rows <= 0:
+            return False, (
+                "OHLCV backfill queued no rows; "
+                f"existing={existing_count}/{target}, max_pages={pages}"
+            )
+
+        return True, (
+            f"OHLCV backfill queued {queued_rows} rows "
+            f"({new_unique} new, est {est_total}/{target})"
+        )
+
+    def _maybe_backfill_ohlcv_on_startup(self) -> None:
+        if not bool(getattr(config, "HMM_OHLCV_BACKFILL_ON_STARTUP", True)):
+            return
+        readiness = self._hmm_data_readiness(_now())
+        if bool(readiness.get("ready_for_target_window", False)):
+            return
+        ok, msg = self.backfill_ohlcv_history(
+            target_candles=int(getattr(config, "HMM_TRAINING_CANDLES", 2000)),
+            max_pages=int(getattr(config, "HMM_OHLCV_BACKFILL_MAX_PAGES", 40)),
+        )
+        if ok:
+            logger.info("OHLCV startup backfill: %s", msg)
+        else:
+            logger.warning("OHLCV startup backfill: %s", msg)
+
     def _load_recent_ohlcv_rows(self, count: int) -> list[dict[str, float | int | None]]:
         """
         Load recent OHLCV candles, preferring Supabase and falling back to Kraken.
@@ -1840,6 +1976,9 @@ class BotRuntime:
                 "last_sync_ts": float(self._ohlcv_last_sync_ts),
                 "last_sync_rows_queued": int(self._ohlcv_last_rows_queued),
                 "sync_cursor": self._ohlcv_since_cursor,
+                "backfill_last_at": float(self._hmm_backfill_last_at),
+                "backfill_last_rows": int(self._hmm_backfill_last_rows),
+                "backfill_last_message": str(self._hmm_backfill_last_message or ""),
             }
         except Exception as e:
             out = {
@@ -1848,6 +1987,9 @@ class BotRuntime:
                 "ready_for_min_train": False,
                 "ready_for_target_window": False,
                 "gaps": ["readiness_check_failed"],
+                "backfill_last_at": float(self._hmm_backfill_last_at),
+                "backfill_last_rows": int(self._hmm_backfill_last_rows),
+                "backfill_last_message": str(self._hmm_backfill_last_message or ""),
             }
 
         self._hmm_readiness_cache = dict(out)
@@ -3922,6 +4064,7 @@ class BotRuntime:
                     "/cancel_stale [min_distance_pct]\n"
                     "/reconcile_drift\n"
                     "/audit_pnl\n"
+                    "/backfill_ohlcv [target_candles] [max_pages]\n"
                     "/set_entry_pct <value>\n"
                     "/set_profit_pct <value>"
                 )
@@ -3990,6 +4133,21 @@ class BotRuntime:
                 ok, msg = self.reconcile_drift()
             elif head == "/audit_pnl":
                 ok, msg = self.audit_pnl()
+            elif head == "/backfill_ohlcv":
+                target = None
+                pages = None
+                if len(parts) >= 2:
+                    try:
+                        target = int(parts[1])
+                    except ValueError:
+                        ok, msg = False, "usage: /backfill_ohlcv [target_candles] [max_pages]"
+                if ok and len(parts) >= 3:
+                    try:
+                        pages = int(parts[2])
+                    except ValueError:
+                        ok, msg = False, "usage: /backfill_ohlcv [target_candles] [max_pages]"
+                if ok:
+                    ok, msg = self.backfill_ohlcv_history(target_candles=target, max_pages=pages)
             else:
                 ok, msg = False, "unknown command"
 
