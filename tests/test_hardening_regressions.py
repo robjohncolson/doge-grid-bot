@@ -608,6 +608,86 @@ class BotEventLogTests(unittest.TestCase):
         self.assertTrue(bool(o2 and o2.txid))
         self.assertEqual(rt._entry_adds_drained_total, 1)
 
+    def test_execute_actions_bootstrap_bypasses_entry_scheduler_cap(self):
+        rt = bot.BotRuntime()
+        rt.mode = "RUNNING"
+        now = bot._now()
+        rt.last_price = 0.1
+        rt.last_price_ts = now
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=now,
+                ),
+            )
+        }
+        cfg = rt._engine_cfg(rt.slots[0])
+        st = rt.slots[0].state
+        st, a1 = sm.add_entry_order(st, cfg, side="sell", trade_id="A", cycle=st.cycle_a, order_size_usd=2.0, reason="t1")
+        st, a2 = sm.add_entry_order(st, cfg, side="buy", trade_id="B", cycle=st.cycle_b, order_size_usd=2.0, reason="t2")
+        rt.slots[0].state = st
+        self.assertIsNotNone(a1)
+        self.assertIsNotNone(a2)
+
+        rt.entry_adds_per_loop_cap = 1
+        rt.entry_adds_per_loop_used = 0
+        rt._loop_available_usd = 100.0
+        rt._loop_available_doge = 1000.0
+
+        with mock.patch.object(rt, "_place_order", side_effect=["TX-A", "TX-B"]) as place_order:
+            rt._execute_actions(0, [a1, a2], "bootstrap")
+
+        o1 = sm.find_order(rt.slots[0].state, a1.local_id)
+        o2 = sm.find_order(rt.slots[0].state, a2.local_id)
+        self.assertTrue(bool(o1 and o1.txid))
+        self.assertTrue(bool(o2 and o2.txid))
+        self.assertEqual(place_order.call_count, 2)
+        self.assertEqual(rt.entry_adds_per_loop_used, 2)
+        self.assertEqual(rt._entry_adds_deferred_total, 0)
+
+    def test_execute_actions_non_bootstrap_respects_scheduler_cap(self):
+        rt = bot.BotRuntime()
+        rt.mode = "RUNNING"
+        now = bot._now()
+        rt.last_price = 0.1
+        rt.last_price_ts = now
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=now,
+                ),
+            )
+        }
+        cfg = rt._engine_cfg(rt.slots[0])
+        st = rt.slots[0].state
+        st, a1 = sm.add_entry_order(st, cfg, side="sell", trade_id="A", cycle=st.cycle_a, order_size_usd=2.0, reason="t1")
+        st, a2 = sm.add_entry_order(st, cfg, side="buy", trade_id="B", cycle=st.cycle_b, order_size_usd=2.0, reason="t2")
+        rt.slots[0].state = st
+        self.assertIsNotNone(a1)
+        self.assertIsNotNone(a2)
+
+        rt.entry_adds_per_loop_cap = 1
+        rt.entry_adds_per_loop_used = 0
+        rt._loop_available_usd = 100.0
+        rt._loop_available_doge = 1000.0
+
+        with mock.patch.object(rt, "_place_order", side_effect=["TX-A", "TX-B"]) as place_order:
+            rt._execute_actions(0, [a1, a2], "unit_test")
+
+        o1 = sm.find_order(rt.slots[0].state, a1.local_id)
+        o2 = sm.find_order(rt.slots[0].state, a2.local_id)
+        self.assertIsNotNone(o1)
+        self.assertIsNotNone(o2)
+        self.assertTrue(bool(o1.txid) ^ bool(o2.txid))
+        self.assertEqual(place_order.call_count, 1)
+        self.assertEqual(rt.entry_adds_per_loop_used, 1)
+        self.assertEqual(rt._entry_adds_deferred_total, 1)
+        self.assertEqual(len(rt._pending_entry_orders()), 1)
+
     def test_deferred_entries_purged_for_suppressed_side(self):
         rt = bot.BotRuntime()
         rt.mode = "RUNNING"
@@ -1043,7 +1123,8 @@ class BotEventLogTests(unittest.TestCase):
         self.assertFalse(rt.slots[0].state.long_only)
         self.assertFalse(rt.slots[0].state.short_only)
 
-    def test_auto_repair_skips_regime_mode_source(self):
+    def test_auto_repair_skips_regime_mode_source_while_suppressed(self):
+        """Repair is skipped when regime suppression is still active (Tier 2)."""
         rt = bot.BotRuntime()
         rt.mode = "RUNNING"
         rt.last_price = 0.1
@@ -1053,6 +1134,10 @@ class BotEventLogTests(unittest.TestCase):
             "min_volume": 13.0,
             "min_cost_usd": 0.0,
         }
+        rt._regime_tier = 2
+        rt._regime_side_suppressed = "A"
+        rt._regime_tier2_grace_start = 1.0  # old timestamp so grace has elapsed
+        rt._regime_tier_entered_at = 1.0
         rt.slots = {
             0: bot.SlotRuntime(
                 slot_id=0,
@@ -1080,9 +1165,117 @@ class BotEventLogTests(unittest.TestCase):
             )
         }
 
-        with mock.patch.object(rt, "_safe_balance") as safe_balance:
+        saved = config.REGIME_DIRECTIONAL_ENABLED
+        try:
+            config.REGIME_DIRECTIONAL_ENABLED = True
+            with mock.patch.object(rt, "_safe_balance") as safe_balance:
+                with mock.patch.object(rt, "_execute_actions") as exec_actions:
+                    rt._auto_repair_degraded_slot(0)
+
+            safe_balance.assert_not_called()
+            exec_actions.assert_not_called()
+            self.assertTrue(rt.slots[0].state.long_only)
+            self.assertEqual(rt.slots[0].state.mode_source, "regime")
+        finally:
+            config.REGIME_DIRECTIONAL_ENABLED = saved
+
+    def test_auto_repair_restores_regime_slot_when_suppression_lapsed(self):
+        """Repair proceeds when regime drops back to tier 0 (no suppression)."""
+        rt = bot.BotRuntime()
+        rt.mode = "RUNNING"
+        rt.last_price = 0.1
+        rt.constraints = {
+            "price_decimals": 6,
+            "volume_decimals": 0,
+            "min_volume": 13.0,
+            "min_cost_usd": 0.0,
+        }
+        rt._regime_tier = 0
+        rt._regime_side_suppressed = None
+        rt._regime_tier2_last_downgrade_at = 0.0
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    orders=(
+                        sm.OrderState(
+                            local_id=1,
+                            side="buy",
+                            role="entry",
+                            price=0.0998,
+                            volume=13.0,
+                            trade_id="B",
+                            cycle=1,
+                            txid="TX-B-ENTRY",
+                            placed_at=999.0,
+                        ),
+                    ),
+                    long_only=True,
+                    short_only=False,
+                    mode_source="regime",
+                    next_order_id=2,
+                ),
+            )
+        }
+
+        with mock.patch.object(rt, "_safe_balance", return_value={"ZUSD": "50.0", "XXDG": "1000.0"}):
             with mock.patch.object(rt, "_execute_actions") as exec_actions:
                 rt._auto_repair_degraded_slot(0)
+                exec_actions.assert_called_once()
+
+        sides = [o.side for o in rt.slots[0].state.orders if o.role == "entry"]
+        self.assertIn("sell", sides)
+        self.assertFalse(rt.slots[0].state.long_only)
+
+    def test_auto_repair_skips_during_cooldown(self):
+        """Repair remains blocked while Tier2 re-entry cooldown is active."""
+        rt = bot.BotRuntime()
+        rt.mode = "RUNNING"
+        rt.last_price = 0.1
+        rt.constraints = {
+            "price_decimals": 6,
+            "volume_decimals": 0,
+            "min_volume": 13.0,
+            "min_cost_usd": 0.0,
+        }
+        rt._regime_tier = 0
+        rt._regime_tier2_last_downgrade_at = 900.0
+        rt._regime_cooldown_suppressed_side = "A"
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    orders=(
+                        sm.OrderState(
+                            local_id=1,
+                            side="buy",
+                            role="entry",
+                            price=0.0998,
+                            volume=13.0,
+                            trade_id="B",
+                            cycle=1,
+                            txid="TX-B-ENTRY",
+                            placed_at=999.0,
+                        ),
+                    ),
+                    long_only=True,
+                    short_only=False,
+                    mode_source="regime",
+                    next_order_id=2,
+                ),
+            )
+        }
+
+        with mock.patch.object(config, "REGIME_DIRECTIONAL_ENABLED", True):
+            with mock.patch.object(config, "REGIME_TIER2_REENTRY_COOLDOWN_SEC", 600.0):
+                with mock.patch("bot._now", return_value=1000.0):
+                    with mock.patch.object(rt, "_safe_balance") as safe_balance:
+                        with mock.patch.object(rt, "_execute_actions") as exec_actions:
+                            rt._auto_repair_degraded_slot(0)
 
         safe_balance.assert_not_called()
         exec_actions.assert_not_called()

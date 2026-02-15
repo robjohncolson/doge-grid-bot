@@ -3819,7 +3819,27 @@ class BotRuntime:
             return
 
         if str(getattr(st, "mode_source", "none")) == "regime":
-            return
+            # Check if the regime still requires suppression.
+            # If suppression has lapsed (tier dropped, cooldown expired),
+            # clear mode_source and fall through to attempt normal repair.
+            still_suppressed = False
+            if bool(getattr(config, "REGIME_DIRECTIONAL_ENABLED", False)):
+                now_ts = _now()
+                if int(self._regime_tier) == 2 and self._regime_grace_elapsed(now_ts):
+                    if self._regime_side_suppressed in ("A", "B"):
+                        still_suppressed = True
+                elif self._regime_tier2_last_downgrade_at > 0:
+                    cd_side = (
+                        self._regime_cooldown_suppressed_side
+                        if self._regime_cooldown_suppressed_side in ("A", "B")
+                        else None
+                    )
+                    if cd_side:
+                        cd_sec = max(0.0, float(getattr(config, "REGIME_TIER2_REENTRY_COOLDOWN_SEC", 600.0)))
+                        if now_ts - self._regime_tier2_last_downgrade_at < cd_sec:
+                            still_suppressed = True
+            if still_suppressed:
+                return
 
         phase = sm.derive_phase(st)
         entries = [o for o in st.orders if o.role == "entry"]
@@ -4052,8 +4072,11 @@ class BotRuntime:
                     continue
 
                 if action.role == "entry" and self.entry_adds_per_loop_used >= self.entry_adds_per_loop_cap:
-                    self._defer_entry_due_scheduler(slot_id, action, source)
-                    continue
+                    # Bootstrap and auto-repair entries bypass the scheduler cap so
+                    # both sides of a slot are placed atomically.
+                    if source not in ("bootstrap", "bootstrap_regime", "auto_repair"):
+                        self._defer_entry_due_scheduler(slot_id, action, source)
+                        continue
 
                 reserved_locally = self._try_reserve_loop_funds(
                     side=action.side,
