@@ -24,7 +24,7 @@ def _env(name, default, cast=str):
     Read an environment variable and cast it to the right type.
     If the var is missing or empty, return *default* (already the right type).
     """
-    raw = os.environ.get(name, "")
+    raw = os.environ.get(name, "").strip()
     if not raw:
         return default
     try:
