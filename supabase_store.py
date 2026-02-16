@@ -472,32 +472,45 @@ def load_ohlcv_candles(
     """
     Load recent OHLCV candles from Supabase.
 
-    Returns rows sorted oldest -> newest.
+    Paginates automatically to work around PostgREST max_rows server limit
+    (default 1000). Returns rows sorted oldest -> newest.
     """
     if not _enabled() or _ohlcv_table_supported is False:
         return []
 
-    params = {
-        "select": "time,open,high,low,close,volume,trade_count",
-        "order": "time.desc",
-        "limit": str(max(1, int(limit))),
-        "pair": f"eq.{str(pair or 'XDGUSD').upper()}",
-        "interval_min": f"eq.{max(1, int(interval_min))}",
-    }
-    if since is not None:
-        try:
-            params["time"] = f"gt.{float(since)}"
-        except (TypeError, ValueError):
-            pass
+    target = max(1, int(limit))
+    norm_pair = str(pair or "XDGUSD").upper()
+    norm_interval = max(1, int(interval_min))
+    page_size = 1000  # Safe default under most PostgREST max_rows configs
 
-    result = _request("GET", "/rest/v1/ohlcv_candles", params=params)
-    if result is None:
-        return []
-    if not isinstance(result, list):
-        return []
+    collected: list[dict] = []
+    max_pages = max(1, (target + page_size - 1) // page_size)
+
+    for page in range(max_pages):
+        params = {
+            "select": "time,open,high,low,close,volume,trade_count",
+            "order": "time.desc",
+            "limit": str(min(page_size, target - len(collected))),
+            "offset": str(page * page_size),
+            "pair": f"eq.{norm_pair}",
+            "interval_min": f"eq.{norm_interval}",
+        }
+        if since is not None:
+            try:
+                params["time"] = f"gt.{float(since)}"
+            except (TypeError, ValueError):
+                pass
+
+        result = _request("GET", "/rest/v1/ohlcv_candles", params=params)
+        if result is None or not isinstance(result, list):
+            break
+
+        collected.extend(result)
+        if len(result) < page_size:
+            break  # No more rows available
 
     out: list[dict] = []
-    for row in reversed(result):
+    for row in reversed(collected):
         try:
             out.append({
                 "time": float(row.get("time")),
