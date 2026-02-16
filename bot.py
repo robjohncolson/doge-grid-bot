@@ -7768,6 +7768,7 @@ class BotRuntime:
                 "capital_layers": {
                     "target_layers": int(layer_metrics.get("target_layers", 0) or 0),
                     "effective_layers": int(layer_metrics.get("effective_layers", 0) or 0),
+                    "max_target_layers": max(1, int(getattr(config, "CAPITAL_LAYER_MAX_TARGET_LAYERS", 20))),
                     "doge_per_order_per_layer": float(layer_metrics.get("doge_per_order_per_layer", 0.0) or 0.0),
                     "layer_order_budget": int(layer_metrics.get("layer_order_budget", 0) or 0),
                     "layer_step_doge_eq": float(layer_metrics.get("layer_step_doge_eq", 0.0) or 0.0),

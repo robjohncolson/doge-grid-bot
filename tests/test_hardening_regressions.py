@@ -7,6 +7,7 @@ from unittest import mock
 
 import bot
 import config
+import dashboard
 import kraken_client
 import state_machine as sm
 
@@ -3837,7 +3838,32 @@ class BotEventLogTests(unittest.TestCase):
         layers = payload["capital_layers"]
         self.assertIn("target_layers", layers)
         self.assertIn("effective_layers", layers)
+        self.assertIn("max_target_layers", layers)
         self.assertIn("layer_step_doge_eq", layers)
+
+    def test_status_payload_exposes_capital_layer_max_target_override(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(market_price=0.1, now=1000.0),
+            )
+        }
+
+        with mock.patch.object(config, "CAPITAL_LAYER_MAX_TARGET_LAYERS", 17):
+            payload = rt.status_payload()
+
+        self.assertEqual(payload["capital_layers"]["max_target_layers"], 17)
+
+    def test_dashboard_layer_source_not_synced_from_backend_default(self):
+        self.assertNotIn("layerSourceSelect.value = sourceDefault", dashboard.DASHBOARD_HTML)
+
+    def test_dashboard_layers_hardening_markup_and_disable_states_present(self):
+        self.assertIn('id="layerTelemetryRows"', dashboard.DASHBOARD_HTML)
+        self.assertIn('id="layerNoLayers"', dashboard.DASHBOARD_HTML)
+        self.assertIn("addLayerBtn.disabled = (targetLayers >= maxTargetLayers);", dashboard.DASHBOARD_HTML)
+        self.assertIn("removeLayerBtn.disabled = (targetLayers <= 0);", dashboard.DASHBOARD_HTML)
 
     def test_auto_drain_recovery_backlog_prefers_furthest_then_oldest(self):
         rt = bot.BotRuntime()
@@ -3941,6 +3967,330 @@ class BotEventLogTests(unittest.TestCase):
         self.assertIn("layer added", msg)
         self.assertEqual(rt.target_layers, 1)
         self.assertEqual(rt.layer_last_add_event["source"], "AUTO")
+
+    def test_add_layer_doge_source_success(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+
+        with mock.patch.object(rt, "_safe_balance", return_value={"USD": 1.0, "DOGE": 230.0}):
+            ok, msg = rt.add_layer("DOGE")
+
+        self.assertTrue(ok)
+        self.assertIn("layer added", msg)
+        self.assertEqual(rt.target_layers, 1)
+        self.assertEqual(rt.layer_last_add_event["source"], "DOGE")
+
+    def test_add_layer_usd_source_success(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+
+        with mock.patch.object(rt, "_safe_balance", return_value={"USD": 30.0, "DOGE": 0.0}):
+            ok, msg = rt.add_layer("USD")
+
+        self.assertTrue(ok)
+        self.assertIn("layer added", msg)
+        self.assertEqual(rt.target_layers, 1)
+        self.assertEqual(rt.layer_last_add_event["source"], "USD")
+
+    def test_add_layer_rejects_underfunded_doge(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+
+        with mock.patch.object(rt, "_safe_balance", return_value={"USD": 1000.0, "DOGE": 10.0}):
+            ok, msg = rt.add_layer("DOGE")
+
+        self.assertFalse(ok)
+        self.assertIn("need 225 DOGE", msg)
+        self.assertEqual(rt.target_layers, 0)
+
+    def test_add_layer_rejects_underfunded_usd(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+
+        with mock.patch.object(rt, "_safe_balance", return_value={"USD": 1.0, "DOGE": 1000.0}):
+            ok, msg = rt.add_layer("USD")
+
+        self.assertFalse(ok)
+        self.assertIn("need $22.5000", msg)
+        self.assertEqual(rt.target_layers, 0)
+
+    def test_add_layer_rejects_underfunded_auto(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+
+        with mock.patch.object(rt, "_safe_balance", return_value={"USD": 10.0, "DOGE": 100.0}):
+            ok, msg = rt.add_layer("AUTO")
+
+        self.assertFalse(ok)
+        self.assertIn("need 225 DOGE-eq", msg)
+        self.assertEqual(rt.target_layers, 0)
+
+    def test_effective_layers_never_exceeds_target(self):
+        rt = bot.BotRuntime()
+        cases = [
+            {"target": 0, "usd": 0.0, "doge": 0.0, "sells": 0, "buys": 0, "price": 0.1},
+            {"target": 1, "usd": 1000.0, "doge": 1000.0, "sells": 1, "buys": 1, "price": 0.1},
+            {"target": 5, "usd": 10.0, "doge": 10.0, "sells": 3, "buys": 3, "price": 0.2},
+            {"target": 8, "usd": 0.0, "doge": 500.0, "sells": 2, "buys": 2, "price": 0.1},
+            {"target": 8, "usd": 500.0, "doge": 0.0, "sells": 2, "buys": 2, "price": 0.1},
+        ]
+        for row in cases:
+            rt.target_layers = row["target"]
+            with mock.patch.object(rt, "_available_free_balances", return_value=(row["usd"], row["doge"])):
+                with mock.patch.object(rt, "_active_order_side_counts", return_value=(row["sells"], row["buys"], 0)):
+                    metrics = rt._recompute_effective_layers(mark_price=row["price"])
+
+            self.assertLessEqual(int(metrics["effective_layers"]), int(row["target"]))
+            self.assertGreaterEqual(int(metrics["effective_layers"]), 0)
+            self.assertEqual(int(rt.effective_layers), int(metrics["effective_layers"]))
+
+    def test_alias_fallback_format_after_pool_exhaustion(self):
+        rt = bot.BotRuntime()
+        rt.slot_alias_pool = ("wow", "such")
+        alias_1 = rt._allocate_slot_alias(used_aliases={"wow", "such"})
+        alias_2 = rt._allocate_slot_alias(used_aliases={"wow", "such", "doge-01"})
+
+        self.assertEqual(alias_1, "doge-01")
+        self.assertEqual(alias_2, "doge-02")
+
+    def test_gap_fields_non_negative_when_underfunded(self):
+        rt = bot.BotRuntime()
+        rt.target_layers = 5
+
+        with mock.patch.object(rt, "_available_free_balances", return_value=(0.0, 0.0)):
+            with mock.patch.object(rt, "_active_order_side_counts", return_value=(4, 3, 7)):
+                metrics = rt._recompute_effective_layers(mark_price=0.1)
+
+        self.assertGreaterEqual(int(metrics["gap_layers"]), 0)
+        self.assertGreaterEqual(float(metrics["gap_doge_now"]), 0.0)
+        self.assertGreaterEqual(float(metrics["gap_usd_now"]), 0.0)
+        self.assertGreater(int(metrics["gap_layers"]), 0)
+
+    def test_drip_sizing_existing_orders_unchanged(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        slot = bot.SlotRuntime(
+            slot_id=0,
+            state=sm.PairState(
+                market_price=0.1,
+                now=1000.0,
+                orders=(
+                    sm.OrderState(
+                        local_id=1,
+                        side="sell",
+                        role="entry",
+                        price=0.101,
+                        volume=13.0,
+                        trade_id="A",
+                        cycle=1,
+                        txid="TX-A-ENTRY",
+                        placed_at=999.0,
+                    ),
+                    sm.OrderState(
+                        local_id=2,
+                        side="buy",
+                        role="entry",
+                        price=0.099,
+                        volume=21.0,
+                        trade_id="B",
+                        cycle=1,
+                        txid="TX-B-ENTRY",
+                        placed_at=999.0,
+                    ),
+                ),
+                recovery_orders=(
+                    sm.RecoveryOrder(
+                        recovery_id=1,
+                        side="sell",
+                        price=0.102,
+                        volume=34.0,
+                        trade_id="B",
+                        cycle=1,
+                        entry_price=0.1,
+                        orphaned_at=900.0,
+                        txid="TX-B-REC",
+                    ),
+                ),
+            ),
+        )
+        rt.slots = {0: slot}
+        before_orders = tuple(rt.slots[0].state.orders)
+        before_recovery_orders = tuple(rt.slots[0].state.recovery_orders)
+
+        with mock.patch.object(rt, "_safe_balance", return_value={"USD": 500.0, "DOGE": 500.0}):
+            with mock.patch.object(rt, "_save_snapshot", return_value=None):
+                ok, _msg = rt.add_layer("AUTO")
+
+        self.assertTrue(ok)
+        self.assertEqual(before_orders, tuple(rt.slots[0].state.orders))
+        self.assertEqual(before_recovery_orders, tuple(rt.slots[0].state.recovery_orders))
+
+    def test_layer_snapshot_round_trip(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        rt.last_price_ts = 1000.0
+        rt.target_layers = 2
+        rt.effective_layers = 2
+        rt.layer_last_add_event = {
+            "timestamp": 1000.0,
+            "source": "AUTO",
+            "price_at_commit": 0.1,
+            "usd_equiv_at_commit": 22.5,
+        }
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                alias="wow",
+                state=sm.PairState(market_price=0.1, now=1000.0),
+            )
+        }
+        snap = rt._global_snapshot()
+
+        restored = bot.BotRuntime()
+        restored._last_balance_snapshot = {"USD": 500.0, "DOGE": 500.0}
+        restored._last_balance_ts = 1000.0
+        with mock.patch("supabase_store.load_state", return_value=snap):
+            with mock.patch("supabase_store.load_max_event_id", return_value=0):
+                restored._load_snapshot()
+
+        self.assertEqual(restored.target_layers, 2)
+        self.assertEqual(restored.effective_layers, 2)
+        self.assertEqual(restored.layer_last_add_event, rt.layer_last_add_event)
+        self.assertEqual(restored.slots[0].alias, "wow")
+
+    def test_zero_slots_effective_layers_safe(self):
+        rt = bot.BotRuntime()
+        rt.slots = {}
+        rt.target_layers = 3
+        rt.last_price = 0.1
+        with mock.patch.object(rt, "_available_free_balances", return_value=(100.0, 1000.0)):
+            metrics = rt._recompute_effective_layers(mark_price=0.1)
+
+        self.assertEqual(int(metrics["active_sell_orders"]), 0)
+        self.assertEqual(int(metrics["active_buy_orders"]), 0)
+        self.assertEqual(int(metrics["open_orders_total"]), 0)
+        self.assertGreaterEqual(int(metrics["effective_layers"]), 0)
+        self.assertLessEqual(int(metrics["effective_layers"]), int(rt.target_layers))
+
+    def test_slot_order_size_uses_loop_effective_layers_cache(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.2
+        slot = bot.SlotRuntime(slot_id=0, state=sm.PairState(market_price=0.2, now=1000.0))
+        rt.slots = {0: slot}
+        rt._loop_effective_layers = {"effective_layers": 1}
+
+        with mock.patch.object(rt, "_recompute_effective_layers") as recompute_mock:
+            size_1 = rt._slot_order_size_usd(slot)
+            size_2 = rt._slot_order_size_usd(slot)
+
+        recompute_mock.assert_not_called()
+        self.assertAlmostEqual(size_1, size_2, places=8)
+
+    def test_slot_order_size_uses_price_override_for_layer_usd(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.2
+        slot = bot.SlotRuntime(slot_id=0, state=sm.PairState(market_price=0.2, now=1000.0))
+        rt.slots = {0: slot}
+        rt._loop_effective_layers = {"effective_layers": 1}
+
+        with mock.patch.object(config, "ORDER_SIZE_USD", 2.0):
+            with mock.patch.object(config, "CAPITAL_LAYER_DOGE_PER_ORDER", 1.0):
+                with_override = rt._slot_order_size_usd(slot, price_override=0.1)
+                without_override = rt._slot_order_size_usd(slot)
+
+        self.assertAlmostEqual(with_override, 2.1, places=8)
+        self.assertAlmostEqual(without_override, 2.2, places=8)
+
+    def test_count_orders_at_funded_size_uses_order_price_override(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.2
+        slot = bot.SlotRuntime(
+            slot_id=0,
+            state=sm.PairState(
+                market_price=0.2,
+                now=1000.0,
+                orders=(
+                    sm.OrderState(
+                        local_id=1,
+                        side="sell",
+                        role="entry",
+                        price=0.11,
+                        volume=13.0,
+                        trade_id="A",
+                        cycle=1,
+                        txid="TX-A-ENTRY",
+                        placed_at=999.0,
+                    ),
+                ),
+                recovery_orders=(
+                    sm.RecoveryOrder(
+                        recovery_id=1,
+                        side="buy",
+                        price=0.09,
+                        volume=13.0,
+                        trade_id="B",
+                        cycle=1,
+                        entry_price=0.1,
+                        orphaned_at=950.0,
+                        txid="TX-B-REC",
+                    ),
+                ),
+            ),
+        )
+        rt.slots = {0: slot}
+
+        observed_overrides: list[float | None] = []
+
+        def _fake_size(_slot, trade_id=None, price_override=None):
+            observed_overrides.append(price_override)
+            return 2.0
+
+        with mock.patch.object(rt, "_slot_order_size_usd", side_effect=_fake_size):
+            with mock.patch("bot.sm.compute_order_volume", return_value=13.0):
+                matched = rt._count_orders_at_funded_size()
+
+        self.assertEqual(matched, 2)
+        self.assertIn(0.11, observed_overrides)
+        self.assertIn(0.09, observed_overrides)
+
+    def test_add_layer_rejects_at_max_target_layers(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        rt._last_balance_snapshot = {"USD": 1000.0, "DOGE": 1000.0}
+        rt._last_balance_ts = 1000.0
+
+        with mock.patch.object(config, "CAPITAL_LAYER_MAX_TARGET_LAYERS", 1):
+            ok1, _msg1 = rt.add_layer("AUTO")
+            ok2, msg2 = rt.add_layer("AUTO")
+
+        self.assertTrue(ok1)
+        self.assertFalse(ok2)
+        self.assertIn("target limit 1 reached", msg2)
+        self.assertEqual(rt.target_layers, 1)
+
+    def test_layer_action_in_flight_guard_rejects_parallel_action(self):
+        rt = bot.BotRuntime()
+        rt._layer_action_in_flight = True
+        ok_add, msg_add = rt.add_layer("AUTO")
+        self.assertFalse(ok_add)
+        self.assertIn("already in progress", msg_add)
+
+        rt._layer_action_in_flight = True
+        ok_remove, msg_remove = rt.remove_layer()
+        self.assertFalse(ok_remove)
+        self.assertIn("already in progress", msg_remove)
+
+    def test_remove_layer_message_uses_doge_per_order_multiplier(self):
+        rt = bot.BotRuntime()
+        rt.target_layers = 3
+
+        with mock.patch.object(config, "CAPITAL_LAYER_DOGE_PER_ORDER", 2.5):
+            with mock.patch.object(rt, "_recompute_effective_layers", return_value={"effective_layers": 0}):
+                ok, msg = rt.remove_layer()
+
+        self.assertTrue(ok)
+        self.assertIn("target=2", msg)
+        self.assertIn("(+5.000 DOGE/order)", msg)
 
     def test_remove_layer_rejects_zero_target(self):
         rt = bot.BotRuntime()

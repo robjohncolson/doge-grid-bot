@@ -149,6 +149,8 @@ Capacity bounds:
 2. `max_layers_from_usd = floor(free_usd / (B * P_now * LAYER_BALANCE_BUFFER))`
 3. `effective_layers = max(0, min(target_layers, max_layers_from_doge, max_layers_from_usd))`
 
+Errata (2026-02-16): generalized form includes `DOGE_PER_ORDER` in both denominators (`S * DOGE_PER_ORDER * LAYER_BALANCE_BUFFER` and `B * DOGE_PER_ORDER * P_now * LAYER_BALANCE_BUFFER`); formulas above are the `DOGE_PER_ORDER = 1.0` simplification.
+
 ### 6.3 Order Size Rule
 
 For each new order:

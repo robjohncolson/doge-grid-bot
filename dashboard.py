@@ -122,6 +122,11 @@ DASHBOARD_HTML = """<!doctype html>
       font-weight: 600;
     }
     button:hover { border-color: var(--accent); }
+    button:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+    button:disabled:hover { border-color: var(--line); }
     button.wide { width: 100%; }
 
     .slots { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
@@ -399,12 +404,15 @@ DASHBOARD_HTML = """<!doctype html>
         <div style=\"display:flex;gap:8px\">
           <button id=\"removeLayerBtn\" class=\"wide\">Remove Layer</button>
         </div>
-        <div class=\"row\"><span class=\"k\">Target Size</span><span id=\"layerTarget\" class=\"v\"></span></div>
-        <div class=\"row\"><span class=\"k\">Funded Now</span><span id=\"layerFunded\" class=\"v\"></span></div>
-        <div class=\"row\"><span class=\"k\">Step Size</span><span id=\"layerStep\" class=\"v\"></span></div>
-        <div class=\"row\"><span class=\"k\">USD Equiv Now</span><span id=\"layerUsdNow\" class=\"v\"></span></div>
-        <div class=\"row\"><span class=\"k\">Propagation</span><span id=\"layerPropagation\" class=\"v\"></span></div>
-        <div class=\"row\"><span class=\"k\">Funding Gap</span><span id=\"layerGap\" class=\"v\"></span></div>
+        <div id=\"layerTelemetryRows\">
+          <div class=\"row\"><span class=\"k\">Target Size</span><span id=\"layerTarget\" class=\"v\"></span></div>
+          <div class=\"row\"><span class=\"k\">Funded Now</span><span id=\"layerFunded\" class=\"v\"></span></div>
+          <div class=\"row\"><span class=\"k\">Step Size</span><span id=\"layerStep\" class=\"v\"></span></div>
+          <div class=\"row\"><span class=\"k\">USD Equiv Now</span><span id=\"layerUsdNow\" class=\"v\"></span></div>
+          <div class=\"row\"><span class=\"k\">Propagation</span><span id=\"layerPropagation\" class=\"v\"></span></div>
+          <div class=\"row\"><span class=\"k\">Funding Gap</span><span id=\"layerGap\" class=\"v\"></span></div>
+        </div>
+        <div id=\"layerNoLayers\" class=\"tiny\" style=\"display:none\">No layers active</div>
         <div id=\"layerHint\" class=\"tiny\"></div>
 
         <div style=\"height:10px\"></div>
@@ -1869,23 +1877,46 @@ DASHBOARD_HTML = """<!doctype html>
       const gapLayers = Number(layers.gap_layers || 0);
       const gapDoge = Number(layers.gap_doge_now || 0);
       const gapUsd = Number(layers.gap_usd_now || 0);
-      const sourceDefault = String(layers.funding_source_default || 'AUTO').toUpperCase();
+      const maxTargetLayers = Math.max(1, Number(layers.max_target_layers || 20));
+      const hasActiveLayers = targetLayers > 0;
 
       document.getElementById('layerTarget').textContent = `+${fmt(targetLayers * dogePerLayer, 3)} DOGE/order`;
       document.getElementById('layerFunded').textContent = `+${fmt(effectiveLayers * dogePerLayer, 3)} DOGE/order`;
       document.getElementById('layerStep').textContent = `${fmt(layerStep, 3)} DOGE-eq`;
       document.getElementById('layerUsdNow').textContent = Number.isFinite(usdNow) ? `$${fmt(usdNow, 4)}` : '-';
       document.getElementById('layerPropagation').textContent = `${ordersFunded}/${ordersTotal}`;
-      document.getElementById('layerGap').textContent = `short ${fmt(gapDoge, 3)} DOGE and $${fmt(gapUsd, 4)}`;
-      document.getElementById('layerHint').textContent =
-        gapLayers > 0
+      const layerGapEl = document.getElementById('layerGap');
+      if (gapLayers <= 0) {
+        layerGapEl.textContent = 'fully funded';
+        layerGapEl.style.color = 'var(--good)';
+      } else {
+        layerGapEl.textContent = `short ${fmt(gapDoge, 3)} DOGE and $${fmt(gapUsd, 4)}`;
+        layerGapEl.style.color = 'var(--warn)';
+      }
+
+      const layerTelemetryRows = document.getElementById('layerTelemetryRows');
+      const layerNoLayers = document.getElementById('layerNoLayers');
+      if (layerTelemetryRows) layerTelemetryRows.style.display = hasActiveLayers ? '' : 'none';
+      if (layerNoLayers) {
+        layerNoLayers.style.display = hasActiveLayers ? 'none' : '';
+        layerNoLayers.textContent = hasActiveLayers ? '' : 'No layers active';
+      }
+
+      const layerHintEl = document.getElementById('layerHint');
+      if (hasActiveLayers) {
+        layerHintEl.style.display = '';
+        layerHintEl.textContent = gapLayers > 0
           ? 'Orders resize gradually as they recycle. No mass cancel/replace.'
           : 'Orders resize gradually as they recycle.';
-
-      const layerSourceSelect = document.getElementById('layerSourceSelect');
-      if (layerSourceSelect && document.activeElement !== layerSourceSelect) {
-        layerSourceSelect.value = sourceDefault;
+      } else {
+        layerHintEl.textContent = '';
+        layerHintEl.style.display = 'none';
       }
+
+      const addLayerBtn = document.getElementById('addLayerBtn');
+      const removeLayerBtn = document.getElementById('removeLayerBtn');
+      if (addLayerBtn) addLayerBtn.disabled = (targetLayers >= maxTargetLayers);
+      if (removeLayerBtn) removeLayerBtn.disabled = (targetLayers <= 0);
 
       // Balance Reconciliation card
       const recon = s.balance_recon;
