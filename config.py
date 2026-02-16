@@ -135,6 +135,9 @@ CAPITAL_LAYER_ORDER_BUDGET: int = _env("CAPITAL_LAYER_ORDER_BUDGET", 225, int)
 # Safety haircut for layer affordability checks.
 CAPITAL_LAYER_BALANCE_BUFFER: float = _env("CAPITAL_LAYER_BALANCE_BUFFER", 1.03, float)
 
+# Hard upper bound for manual layer target increments.
+CAPITAL_LAYER_MAX_TARGET_LAYERS: int = _env("CAPITAL_LAYER_MAX_TARGET_LAYERS", 20, int)
+
 # Default funding source for add-layer action.
 _CAPITAL_LAYER_DEFAULT_SOURCE_RAW: str = _env("CAPITAL_LAYER_DEFAULT_SOURCE", "AUTO", str)
 CAPITAL_LAYER_DEFAULT_SOURCE: str = str(_CAPITAL_LAYER_DEFAULT_SOURCE_RAW).strip().upper()
@@ -254,6 +257,7 @@ AI_REGIME_ADVISOR_ENABLED: bool = _env("AI_REGIME_ADVISOR_ENABLED", False, bool)
 AI_REGIME_INTERVAL_SEC: float = _env("AI_REGIME_INTERVAL_SEC", 300.0, float)
 AI_REGIME_DEBOUNCE_SEC: float = _env("AI_REGIME_DEBOUNCE_SEC", 60.0, float)
 AI_OVERRIDE_TTL_SEC: int = _env("AI_OVERRIDE_TTL_SEC", 1800, int)
+AI_OVERRIDE_MIN_TTL_SEC: int = _env("AI_OVERRIDE_MIN_TTL_SEC", 300, int)  # 5 min floor
 AI_OVERRIDE_MAX_TTL_SEC: int = _env("AI_OVERRIDE_MAX_TTL_SEC", 3600, int)
 AI_OVERRIDE_MIN_CONVICTION: int = _env("AI_OVERRIDE_MIN_CONVICTION", 50, int)
 AI_REGIME_HISTORY_SIZE: int = _env("AI_REGIME_HISTORY_SIZE", 12, int)

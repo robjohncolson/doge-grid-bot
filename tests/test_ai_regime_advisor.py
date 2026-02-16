@@ -614,5 +614,49 @@ class AIRegimeAdvisorP0Tests(unittest.TestCase):
         )
 
 
+    def test_parse_regime_opinion_suggested_ttl_present(self):
+        response = (
+            '{"recommended_tier": 1, "recommended_direction": "long_bias", '
+            '"conviction": 72, "rationale": "Trend.", "watch_for": "Decay.", '
+            '"suggested_ttl_minutes": 25}'
+        )
+        parsed, err = ai_advisor._parse_regime_opinion(response)
+        self.assertEqual(err, "")
+        self.assertEqual(parsed["suggested_ttl_minutes"], 25)
+
+    def test_parse_regime_opinion_suggested_ttl_missing(self):
+        response = (
+            '{"recommended_tier": 0, "recommended_direction": "symmetric", '
+            '"conviction": 61, "rationale": "Balanced.", "watch_for": "Bias."}'
+        )
+        parsed, err = ai_advisor._parse_regime_opinion(response)
+        self.assertEqual(err, "")
+        self.assertEqual(parsed["suggested_ttl_minutes"], 0)
+
+    def test_parse_regime_opinion_suggested_ttl_clamped(self):
+        response = (
+            '{"recommended_tier": 0, "recommended_direction": "symmetric", '
+            '"conviction": 50, "rationale": "ok", "watch_for": "x", '
+            '"suggested_ttl_minutes": 120}'
+        )
+        parsed, err = ai_advisor._parse_regime_opinion(response)
+        self.assertEqual(err, "")
+        self.assertEqual(parsed["suggested_ttl_minutes"], 60)
+
+        response_neg = (
+            '{"recommended_tier": 0, "recommended_direction": "symmetric", '
+            '"conviction": 50, "rationale": "ok", "watch_for": "x", '
+            '"suggested_ttl_minutes": -5}'
+        )
+        parsed_neg, err_neg = ai_advisor._parse_regime_opinion(response_neg)
+        self.assertEqual(err_neg, "")
+        self.assertEqual(parsed_neg["suggested_ttl_minutes"], 0)
+
+    def test_default_regime_opinion_has_suggested_ttl(self):
+        default = ai_advisor._default_regime_opinion()
+        self.assertIn("suggested_ttl_minutes", default)
+        self.assertEqual(default["suggested_ttl_minutes"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

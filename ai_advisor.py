@@ -109,7 +109,11 @@ _REGIME_SYSTEM_PROMPT = (
     "Even Tier 0 can have high conviction when signals clearly confirm "
     'ranging. 0 means "I cannot read these signals at all."\n'
     '- "rationale": brief explanation (1-2 sentences)\n'
-    '- "watch_for": what would change your mind (1 sentence)'
+    '- "watch_for": what would change your mind (1 sentence)\n'
+    '- "suggested_ttl_minutes": 10-60, how long you expect this regime to persist. '
+    'Consider: timeframe agreement (both align = longer), transition matrix stickiness '
+    '(high self-transition = longer), conviction trend (rising = longer), and signal '
+    'noise. 15 means "short-lived or uncertain signal", 45+ means "strong convergent trend".'
 )
 
 
@@ -354,6 +358,7 @@ def _default_regime_opinion(error: str = "") -> dict:
         "conviction": 0,
         "rationale": "",
         "watch_for": "",
+        "suggested_ttl_minutes": 0,
         "panelist": "",
         "error": _clip_text(error, 200),
     }
@@ -730,6 +735,7 @@ def _parse_regime_opinion(response: str) -> tuple:
         "conviction": _safe_int(parsed.get("conviction"), 0, 0, 100),
         "rationale": _clip_text(parsed.get("rationale"), 500),
         "watch_for": _clip_text(parsed.get("watch_for"), 200),
+        "suggested_ttl_minutes": _safe_int(parsed.get("suggested_ttl_minutes"), 0, 0, 60),
     }
     return (opinion, "")
 

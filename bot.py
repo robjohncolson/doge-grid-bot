@@ -218,6 +218,7 @@ class BotRuntime:
         self.target_layers = 0
         self.effective_layers = 0
         self.layer_last_add_event: dict | None = None
+        self._layer_action_in_flight: bool = False
 
         self.next_event_id = 1
         self.seen_fill_txids: set[str] = set()
@@ -239,6 +240,7 @@ class BotRuntime:
         self._loop_available_usd: float | None = None
         self._loop_available_doge: float | None = None
         self._loop_dust_dividend: float | None = None
+        self._loop_effective_layers: dict[str, float | int | None] | None = None
         self._dust_sweep_enabled: bool = bool(getattr(config, "DUST_SWEEP_ENABLED", True))
         self._dust_min_threshold_usd: float = max(0.0, float(getattr(config, "DUST_MIN_THRESHOLD", 0.50)))
         self._dust_max_bump_pct: float = max(0.0, float(getattr(config, "DUST_MAX_BUMP_PCT", 25.0)))
@@ -666,6 +668,12 @@ class BotRuntime:
             "free_doge": free_doge,
         }
 
+    def _current_layer_metrics(self, mark_price: float | None = None) -> dict[str, float | int | None]:
+        if self._loop_effective_layers is not None:
+            return self._loop_effective_layers
+        self._loop_effective_layers = self._recompute_effective_layers(mark_price=mark_price)
+        return self._loop_effective_layers
+
     def _count_orders_at_funded_size(self) -> int:
         matched = 0
         for slot in self.slots.values():
@@ -680,7 +688,7 @@ class BotRuntime:
                 if not o.txid:
                     continue
                 trade = o.trade_id if o.trade_id in ("A", "B") else None
-                target_usd = self._slot_order_size_usd(slot, trade_id=trade)
+                target_usd = self._slot_order_size_usd(slot, trade_id=trade, price_override=float(o.price))
                 expected_vol = sm.compute_order_volume(float(o.price), cfg, float(target_usd))
                 if expected_vol is None:
                     continue
@@ -691,7 +699,7 @@ class BotRuntime:
                 if not r.txid:
                     continue
                 trade = r.trade_id if r.trade_id in ("A", "B") else None
-                target_usd = self._slot_order_size_usd(slot, trade_id=trade)
+                target_usd = self._slot_order_size_usd(slot, trade_id=trade, price_override=float(r.price))
                 expected_vol = sm.compute_order_volume(float(r.price), cfg, float(target_usd))
                 if expected_vol is None:
                     continue
@@ -765,7 +773,12 @@ class BotRuntime:
             return 0.0
         return min(dividend, max_bump)
 
-    def _slot_order_size_usd(self, slot: SlotRuntime, trade_id: str | None = None) -> float:
+    def _slot_order_size_usd(
+        self,
+        slot: SlotRuntime,
+        trade_id: str | None = None,
+        price_override: float | None = None,
+    ) -> float:
         base_order = float(config.ORDER_SIZE_USD)
         compound_mode = str(getattr(config, "STICKY_COMPOUNDING_MODE", "legacy_profit")).strip().lower()
         if bool(config.STICKY_MODE_ENABLED) and compound_mode == "fixed":
@@ -773,10 +786,12 @@ class BotRuntime:
         else:
             # Independent compounding per slot.
             base = max(base_order, base_order + slot.state.total_profit)
-        layer_metrics = self._recompute_effective_layers(mark_price=self._layer_mark_price(slot))
+        layer_metrics = self._current_layer_metrics(mark_price=self._layer_mark_price(slot))
         effective_layers = int(layer_metrics.get("effective_layers", 0))
         layer_usd = 0.0
-        layer_price = self._layer_mark_price(slot)
+        layer_price = float(price_override) if price_override is not None else self._layer_mark_price(slot)
+        if layer_price <= 0:
+            layer_price = self._layer_mark_price(slot)
         if layer_price > 0:
             layer_usd = effective_layers * max(0.0, float(config.CAPITAL_LAYER_DOGE_PER_ORDER)) * layer_price
         base_with_layers = max(base, base + layer_usd)
@@ -1582,12 +1597,15 @@ class BotRuntime:
         self._loop_available_usd = None
         self._loop_available_doge = None
         self._loop_dust_dividend = None
+        self._loop_effective_layers = None
         # Sync capital ledger with fresh Kraken balance
         bal = self._safe_balance()
         if bal:
             self.ledger.sync(bal, self.slots)
             self._loop_available_usd = self.ledger.available_usd
             self._loop_available_doge = self.ledger.available_doge
+        # Prime the effective-layer snapshot once per loop.
+        self._loop_effective_layers = self._recompute_effective_layers()
 
     def end_loop(self) -> None:
         self.enforce_loop_budget = False
@@ -1596,6 +1614,7 @@ class BotRuntime:
         self._loop_available_usd = None
         self._loop_available_doge = None
         self._loop_dust_dividend = None
+        self._loop_effective_layers = None
         self.ledger.clear()
 
     def _consume_private_budget(self, units: int, reason: str) -> bool:
@@ -3053,7 +3072,8 @@ class BotRuntime:
                 use_ttl = int(ttl_sec)
             except (TypeError, ValueError):
                 use_ttl = default_ttl
-        use_ttl = max(1, min(use_ttl, max_ttl))
+        min_ttl = max(1, int(getattr(config, "AI_OVERRIDE_MIN_TTL_SEC", 300)))
+        use_ttl = max(min_ttl, min(use_ttl, max_ttl))
 
         now_ts = _now()
         self._ai_override_tier = int(applied_tier)
@@ -3194,6 +3214,7 @@ class BotRuntime:
         conviction = max(0, min(100, int(opinion.get("conviction", 0) or 0)))
         rationale = str(opinion.get("rationale", "") or "")[:500]
         watch_for = str(opinion.get("watch_for", "") or "")[:200]
+        suggested_ttl_minutes = max(0, min(60, int(opinion.get("suggested_ttl_minutes", 0) or 0)))
         panelist = str(opinion.get("panelist", "") or "")
         error = str(opinion.get("error", "") or "")
 
@@ -3223,6 +3244,7 @@ class BotRuntime:
             "conviction": int(conviction),
             "rationale": rationale,
             "watch_for": watch_for,
+            "suggested_ttl_minutes": int(suggested_ttl_minutes),
             "panelist": panelist,
             "error": error,
             "agreement": agreement,
@@ -3848,6 +3870,7 @@ class BotRuntime:
             "conviction": int(conviction),
             "rationale": str(opinion.get("rationale", "") or ""),
             "watch_for": str(opinion.get("watch_for", "") or ""),
+            "suggested_ttl_minutes": int(opinion.get("suggested_ttl_minutes", 0) or 0),
             "panelist": str(opinion.get("panelist", "") or ""),
             "agreement": agreement,
             "error": str(opinion.get("error", "") or ""),
@@ -3859,12 +3882,22 @@ class BotRuntime:
             ),
         }
 
+        default_ttl = int(max(1, int(getattr(config, "AI_OVERRIDE_TTL_SEC", 1800))))
+        max_ttl = int(max(1, int(getattr(config, "AI_OVERRIDE_MAX_TTL_SEC", 3600))))
+        ai_ttl_min = int(opinion_payload.get("suggested_ttl_minutes", 0) or 0)
+        if ai_ttl_min > 0:
+            min_ttl = max(1, int(getattr(config, "AI_OVERRIDE_MIN_TTL_SEC", 300)))
+            suggested_ttl_sec = max(min_ttl, min(max_ttl, ai_ttl_min * 60))
+        else:
+            suggested_ttl_sec = default_ttl
+
         return {
             "enabled": enabled,
             "thread_alive": bool(self._ai_regime_thread_alive),
             "dismissed": bool(self._ai_regime_dismissed),
-            "default_ttl_sec": int(max(1, int(getattr(config, "AI_OVERRIDE_TTL_SEC", 1800)))),
-            "max_ttl_sec": int(max(1, int(getattr(config, "AI_OVERRIDE_MAX_TTL_SEC", 3600)))),
+            "default_ttl_sec": default_ttl,
+            "max_ttl_sec": max_ttl,
+            "suggested_ttl_sec": int(suggested_ttl_sec),
             "min_conviction": int(max(0, min(100, int(getattr(config, "AI_OVERRIDE_MIN_CONVICTION", 50))))),
             "last_run_ts": (last_run_ts if last_run_ts > 0.0 else None),
             "last_run_age_sec": (float(last_run_age) if last_run_age is not None else None),
@@ -5684,62 +5717,82 @@ class BotRuntime:
         return True, f"slot {sid} ({alias}) added"
 
     def add_layer(self, source: str | None = None) -> tuple[bool, str]:
-        src = str(source or config.CAPITAL_LAYER_DEFAULT_SOURCE).strip().upper()
-        if src not in {"AUTO", "DOGE", "USD"}:
-            return False, f"invalid layer funding source: {src}"
+        if self._layer_action_in_flight:
+            return False, "layer action already in progress"
+        self._layer_action_in_flight = True
+        try:
+            src = str(source or config.CAPITAL_LAYER_DEFAULT_SOURCE).strip().upper()
+            if src not in {"AUTO", "DOGE", "USD"}:
+                return False, f"invalid layer funding source: {src}"
 
-        step_doge_eq = self._capital_layer_step_doge_eq()
-        if step_doge_eq <= 0:
-            return False, "layer add rejected: invalid layer step"
+            max_target_layers = max(1, int(getattr(config, "CAPITAL_LAYER_MAX_TARGET_LAYERS", 20)))
+            current_target_layers = max(0, int(self.target_layers))
+            if current_target_layers >= max_target_layers:
+                return False, f"layer add rejected: target limit {max_target_layers} reached"
 
-        price = self._layer_mark_price()
-        if price <= 0:
-            return False, "layer add rejected: market price unavailable"
+            step_doge_eq = self._capital_layer_step_doge_eq()
+            if step_doge_eq <= 0:
+                return False, "layer add rejected: invalid layer step"
 
-        free_usd, free_doge = self._available_free_balances(prefer_fresh=True)
-        required_usd = step_doge_eq * price
-        available_doge_eq = free_doge + (free_usd / price)
+            price = self._layer_mark_price()
+            if price <= 0:
+                return False, "layer add rejected: market price unavailable"
 
-        ok = False
-        if src == "DOGE":
-            ok = free_doge + 1e-12 >= step_doge_eq
-        elif src == "USD":
-            ok = free_usd + 1e-12 >= required_usd
-        else:
-            ok = available_doge_eq + 1e-12 >= step_doge_eq
+            free_usd, free_doge = self._available_free_balances(prefer_fresh=True)
+            required_usd = step_doge_eq * price
+            available_doge_eq = free_doge + (free_usd / price)
 
-        if not ok:
+            ok = False
             if src == "DOGE":
-                return False, f"layer add rejected: need {step_doge_eq:.0f} DOGE, available {free_doge:.4f} DOGE"
-            if src == "USD":
-                return False, f"layer add rejected: need ${required_usd:.4f}, available ${free_usd:.4f}"
-            return (
-                False,
-                f"layer add rejected: need {step_doge_eq:.0f} DOGE-eq, available {available_doge_eq:.4f} DOGE-eq",
-            )
+                ok = free_doge + 1e-12 >= step_doge_eq
+            elif src == "USD":
+                ok = free_usd + 1e-12 >= required_usd
+            else:
+                ok = available_doge_eq + 1e-12 >= step_doge_eq
 
-        self.target_layers = max(0, int(self.target_layers)) + 1
-        self.layer_last_add_event = {
-            "timestamp": _now(),
-            "source": src,
-            "price_at_commit": float(price),
-            "usd_equiv_at_commit": float(required_usd),
-        }
-        self._recompute_effective_layers(mark_price=price)
-        self._save_snapshot()
-        return (
-            True,
-            f"layer added: target={self.target_layers} (+{config.CAPITAL_LAYER_DOGE_PER_ORDER:.0f} DOGE/order), "
-            f"commit step {step_doge_eq:.0f} DOGE-eq @ ${price:.4f}",
-        )
+            if not ok:
+                if src == "DOGE":
+                    return False, f"layer add rejected: need {step_doge_eq:.0f} DOGE, available {free_doge:.4f} DOGE"
+                if src == "USD":
+                    return False, f"layer add rejected: need ${required_usd:.4f}, available ${free_usd:.4f}"
+                return (
+                    False,
+                    f"layer add rejected: need {step_doge_eq:.0f} DOGE-eq, available {available_doge_eq:.4f} DOGE-eq",
+                )
+
+            self.target_layers = current_target_layers + 1
+            self.layer_last_add_event = {
+                "timestamp": _now(),
+                "source": src,
+                "price_at_commit": float(price),
+                "usd_equiv_at_commit": float(required_usd),
+            }
+            self._recompute_effective_layers(mark_price=price)
+            self._loop_effective_layers = None
+            self._save_snapshot()
+            return (
+                True,
+                f"layer added: target={self.target_layers} (+{config.CAPITAL_LAYER_DOGE_PER_ORDER:.0f} DOGE/order), "
+                f"commit step {step_doge_eq:.0f} DOGE-eq @ ${price:.4f}",
+            )
+        finally:
+            self._layer_action_in_flight = False
 
     def remove_layer(self) -> tuple[bool, str]:
-        if int(self.target_layers) <= 0:
-            return False, "layer remove rejected: target already zero"
-        self.target_layers = int(self.target_layers) - 1
-        self._recompute_effective_layers()
-        self._save_snapshot()
-        return True, f"layer removed: target={self.target_layers} (+{self.target_layers:.0f} DOGE/order)"
+        if self._layer_action_in_flight:
+            return False, "layer action already in progress"
+        self._layer_action_in_flight = True
+        try:
+            if int(self.target_layers) <= 0:
+                return False, "layer remove rejected: target already zero"
+            self.target_layers = int(self.target_layers) - 1
+            self._recompute_effective_layers()
+            self._loop_effective_layers = None
+            self._save_snapshot()
+            target_doge_per_order = float(self.target_layers) * max(0.0, float(config.CAPITAL_LAYER_DOGE_PER_ORDER))
+            return True, f"layer removed: target={self.target_layers} (+{target_doge_per_order:.3f} DOGE/order)"
+        finally:
+            self._layer_action_in_flight = False
 
     def set_entry_pct(self, value: float) -> tuple[bool, str]:
         if value < 0.05:
@@ -7479,7 +7532,7 @@ class BotRuntime:
             total_profit_doge = total_profit / pnl_ref_price if pnl_ref_price > 0 else 0.0
             total_unrealized_doge = total_unrealized_profit / pnl_ref_price if pnl_ref_price > 0 else 0.0
             pnl_audit = self._pnl_audit_summary()
-            layer_metrics = self._recompute_effective_layers(mark_price=pnl_ref_price)
+            layer_metrics = self._current_layer_metrics(mark_price=pnl_ref_price)
             orders_at_funded_size = self._count_orders_at_funded_size()
             slot_vintage = self._slot_vintage_metrics_locked(now)
             hmm_data_pipeline = self._hmm_data_readiness(now)

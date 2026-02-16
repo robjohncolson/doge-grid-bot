@@ -1675,7 +1675,8 @@ DASHBOARD_HTML = """<!doctype html>
         }
       }
 
-      aiApplyBtn.textContent = `Apply Override (${fmtAgeSeconds(defaultTtlSec)})`;
+      const suggestedTtl = ai.suggested_ttl_sec || defaultTtlSec;
+      aiApplyBtn.textContent = `Apply Override (${fmtAgeSeconds(suggestedTtl)})`;
 
       const kelly = s.kelly || { enabled: false };
       const kellyStatusEl = document.getElementById('kellyStatus');
@@ -2377,7 +2378,7 @@ DASHBOARD_HTML = """<!doctype html>
     };
     document.getElementById('aiApplyOverrideBtn').onclick = () => {
       const ai = state && state.ai_regime_advisor ? state.ai_regime_advisor : {};
-      const ttl = Number(ai.default_ttl_sec || 1800);
+      const ttl = Number(ai.suggested_ttl_sec || ai.default_ttl_sec || 1800);
       requestAiRegimeOverride(ttl);
     };
     document.getElementById('aiDismissBtn').onclick = () => requestAiRegimeDismiss();
