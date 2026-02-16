@@ -7498,12 +7498,17 @@ class BotRuntime:
             slot_vintage["vintage_critical"] = stuck_capital_pct > float(config.RELEASE_MAX_STUCK_PCT)
             slot_vintage["release_recon_gate_blocked"] = bool(self._release_recon_blocked)
             slot_vintage["release_recon_gate_reason"] = str(self._release_recon_blocked_reason or "")
-            dust_dividend_usd = float(self._compute_dust_dividend())
+            # Prefer live computation if loop data is still available,
+            # otherwise use cached value from last loop.
+            _live_dust = self._compute_dust_dividend()
+            dust_dividend_usd = float(_live_dust if _live_dust > 0 else self._dust_last_dividend_usd)
             dust_available_usd: float | None = None
             if self._loop_available_usd is not None:
                 dust_available_usd = float(self._loop_available_usd)
             elif self.ledger._synced:
                 dust_available_usd = float(self.ledger.available_usd)
+            elif self._last_balance_snapshot:
+                dust_available_usd = float(_usd_balance(self._last_balance_snapshot))
 
             return {
                 "mode": self.mode,
