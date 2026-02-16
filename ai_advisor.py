@@ -13,7 +13,7 @@ HOW THIS WORKS:
   problem where one model fixates on the same recommendation).
 
 SUPPORTED PROVIDERS:
-  - Groq (free tier): Llama 3.3 70B + Llama 3.1 8B
+  - Groq (free tier): GPT-OSS-120B + Llama 3.3 70B + Llama 3.1 8B
   - NVIDIA build.nvidia.com (free tier): Kimi K2.5
   - Any OpenAI-compatible endpoint (legacy single-model fallback)
 
@@ -49,6 +49,7 @@ NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
 # Each tuple: (display_name, model_id, is_reasoning_model)
 GROQ_PANELISTS = [
+    ("GPT-OSS-120B", "openai/gpt-oss-120b", False),
     ("Llama-70B", "llama-3.3-70b-versatile", False),
     ("Llama-8B", "llama-3.1-8b-instant", False),
 ]
@@ -59,7 +60,7 @@ NVIDIA_PANELISTS = [
 
 # Reasoning models need more tokens (chain-of-thought + answer)
 _REASONING_MAX_TOKENS = 2048
-_INSTRUCT_MAX_TOKENS = 200
+_INSTRUCT_MAX_TOKENS = 400
 
 # Panelist timeout skip tracking
 _panelist_consecutive_fails: dict = {}   # name -> int
@@ -82,10 +83,19 @@ _REGIME_SYSTEM_PROMPT = (
     "- Tier 1 (Asymmetric): Favor one side with spacing bias.\n"
     "- Tier 2 (Aggressive): Suppress the against-trend side entirely.\n\n"
     "Recommend a tier and direction using ALL signals. Consider timeframe "
-    "agreement/convergence, transition matrix stickiness, operational "
-    "signals, and whether confidence is rising/falling over recent history. "
-    "Be conservative. Tier 2 is rare. When uncertain, recommend Tier 0 "
-    "(symmetric). Return JSON only."
+    "agreement/convergence, transition matrix stickiness, consensus "
+    "probabilities, operational signals, and whether confidence is "
+    "rising/falling over recent history. Be conservative. Tier 2 is rare. "
+    "When uncertain, recommend Tier 0 (symmetric).\n\n"
+    "Return ONLY a JSON object with these fields:\n"
+    '- "recommended_tier": 0, 1, or 2\n'
+    '- "recommended_direction": "symmetric", "long_bias", or "short_bias"\n'
+    '- "conviction": 0-100, your confidence in the ASSESSMENT (not urgency '
+    'to change). 80 means "I\'m quite sure this is the right posture." '
+    "Even Tier 0 can have high conviction when signals clearly confirm "
+    'ranging. 0 means "I cannot read these signals at all."\n'
+    '- "rationale": brief explanation (1-2 sentences)\n'
+    '- "watch_for": what would change your mind (1 sentence)'
 )
 
 
@@ -94,9 +104,9 @@ def _build_panel() -> list:
     Build the AI council based on available API keys.
 
     Returns a list of panelist dicts.  Auto-configures:
-      - GROQ_API_KEY  -> Llama 3.3 70B + Llama 3.1 8B
+      - GROQ_API_KEY  -> GPT-OSS-120B + Llama 3.3 70B + Llama 3.1 8B
       - NVIDIA_API_KEY -> Kimi K2.5
-      - Both keys     -> all three (best diversity)
+      - Both keys     -> all four (best diversity)
       - Neither       -> legacy fallback to AI_API_KEY
     """
     panel = []
@@ -354,6 +364,12 @@ def _normalize_direction(value) -> str:
 
 
 def _sanitize_probabilities(values) -> list:
+    if isinstance(values, dict):
+        values = [
+            values.get("bearish"),
+            values.get("ranging"),
+            values.get("bullish"),
+        ]
     if not isinstance(values, (list, tuple)):
         return [0.0, 1.0, 0.0]
     probs = []
@@ -508,6 +524,9 @@ def _build_regime_context(payload: dict) -> dict:
                     _safe_float(consensus.get("effective_bias"), 0.0, -1.0, 1.0),
                     4,
                 ),
+                "consensus_probabilities": _sanitize_probabilities(
+                    consensus.get("consensus_probabilities"),
+                ),
             },
             "transition_matrix_1m": _sanitize_transition_matrix(transition_matrix),
             "training_quality": training_quality,
@@ -551,9 +570,9 @@ def _ordered_regime_panel(panel: list) -> list:
 
     prefer_reasoning = bool(getattr(config, "AI_REGIME_PREFER_REASONING", True))
     if prefer_reasoning:
-        priority = {"Kimi-K2.5": 0, "Llama-70B": 1, "Llama-8B": 2}
+        priority = {"Kimi-K2.5": 0, "GPT-OSS-120B": 1, "Llama-70B": 2, "Llama-8B": 3}
     else:
-        priority = {"Llama-70B": 0, "Llama-8B": 1, "Kimi-K2.5": 2}
+        priority = {"GPT-OSS-120B": 0, "Llama-70B": 1, "Llama-8B": 2, "Kimi-K2.5": 3}
 
     with_index = list(enumerate(panel))
     with_index.sort(
@@ -857,9 +876,10 @@ def get_regime_opinion(context: dict) -> dict:
     Query a single preferred panelist for regime interpretation.
 
     Fallback order:
-      1) Kimi-K2.5 (reasoning), when enabled and available
-      2) Llama-70B
-      3) Llama-8B
+      1) Kimi-K2.5 (reasoning), when enabled and preferred
+      2) GPT-OSS-120B
+      3) Llama-70B
+      4) Llama-8B
 
     Returns a validated dict and never raises.
     """

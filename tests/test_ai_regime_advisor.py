@@ -10,6 +10,49 @@ except ModuleNotFoundError:
 
 
 class AIRegimeAdvisorP0Tests(unittest.TestCase):
+    def test_groq_panelists_includes_gpt_oss(self):
+        self.assertGreaterEqual(len(ai_advisor.GROQ_PANELISTS), 3)
+        self.assertEqual(ai_advisor.GROQ_PANELISTS[0][0], "GPT-OSS-120B")
+        self.assertEqual(ai_advisor.GROQ_PANELISTS[0][1], "openai/gpt-oss-120b")
+        self.assertFalse(bool(ai_advisor.GROQ_PANELISTS[0][2]))
+
+    def test_ordered_panel_prefer_reasoning(self):
+        panel = [
+            {"name": "Llama-70B"},
+            {"name": "Llama-8B"},
+            {"name": "GPT-OSS-120B"},
+            {"name": "Kimi-K2.5"},
+        ]
+        with mock.patch.object(ai_advisor.config, "AI_REGIME_PREFER_REASONING", True):
+            ordered = ai_advisor._ordered_regime_panel(panel)
+        self.assertEqual(
+            [p["name"] for p in ordered],
+            ["Kimi-K2.5", "GPT-OSS-120B", "Llama-70B", "Llama-8B"],
+        )
+
+    def test_ordered_panel_prefer_instruct(self):
+        panel = [
+            {"name": "Llama-70B"},
+            {"name": "Llama-8B"},
+            {"name": "GPT-OSS-120B"},
+            {"name": "Kimi-K2.5"},
+        ]
+        with mock.patch.object(ai_advisor.config, "AI_REGIME_PREFER_REASONING", False):
+            ordered = ai_advisor._ordered_regime_panel(panel)
+        self.assertEqual(
+            [p["name"] for p in ordered],
+            ["GPT-OSS-120B", "Llama-70B", "Llama-8B", "Kimi-K2.5"],
+        )
+
+    def test_instruct_max_tokens_400(self):
+        self.assertEqual(ai_advisor._INSTRUCT_MAX_TOKENS, 400)
+
+    def test_regime_prompt_conviction_definition(self):
+        prompt = ai_advisor._REGIME_SYSTEM_PROMPT
+        self.assertIn("confidence in the ASSESSMENT", prompt)
+        self.assertIn("Even Tier 0 can have high conviction", prompt)
+        self.assertIn("Return ONLY a JSON object", prompt)
+
     def test_parse_regime_opinion_validates_defaults_and_clamps(self):
         response = (
             "```json\n"
@@ -49,6 +92,11 @@ class AIRegimeAdvisorP0Tests(unittest.TestCase):
                 "effective_regime": "RANGING",
                 "effective_confidence": 0.08,
                 "effective_bias": 0.03,
+                "consensus_probabilities": {
+                    "bearish": 0.013,
+                    "ranging": 0.984,
+                    "bullish": 0.003,
+                },
             },
             "transition_matrix_1m": [
                 [0.95, 0.03, 0.02],
@@ -85,9 +133,29 @@ class AIRegimeAdvisorP0Tests(unittest.TestCase):
         self.assertEqual(payload["hmm"]["training_quality"], "deep")
         self.assertAlmostEqual(float(payload["hmm"]["confidence_modifier"]), 0.95)
         self.assertEqual(len(payload["hmm"]["transition_matrix_1m"]), 3)
+        self.assertEqual(payload["hmm"]["consensus"]["consensus_probabilities"], [0.013, 0.984, 0.003])
         self.assertEqual(len(payload["regime_history_30m"]), 2)
         self.assertEqual(payload["mechanical_tier"]["current"], 0)
         self.assertEqual(payload["mechanical_tier"]["direction"], "symmetric")
+
+    def test_consensus_probs_missing_defaults(self):
+        payload = ai_advisor._build_regime_context({
+            "hmm_consensus": {
+                "agreement": "full",
+                "effective_regime": "RANGING",
+                "effective_confidence": 0.9,
+                "effective_bias": 0.0,
+            },
+        })
+        self.assertEqual(payload["hmm"]["consensus"]["consensus_probabilities"], [0.0, 1.0, 0.0])
+
+    def test_consensus_probs_dict_format_supported(self):
+        out = ai_advisor._sanitize_probabilities({
+            "bearish": "0.12",
+            "ranging": 0.83,
+            "bullish": 0.05,
+        })
+        self.assertEqual(out, [0.12, 0.83, 0.05])
 
     def test_get_regime_opinion_prefers_reasoning_then_fallback(self):
         panel = [
