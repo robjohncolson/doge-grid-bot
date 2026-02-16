@@ -420,6 +420,8 @@ DASHBOARD_HTML = """<!doctype html>
         <div class=\"row\"><span class=\"k\">P&amp;L Audit</span><span id=\"pnlAudit\" class=\"v\"></span></div>
         <div id=\"pnlAuditDetails\" class=\"tiny\"></div>
         <div class=\"row\"><span id=\"orphansLabel\" class=\"k\">Waiting Exits</span><span id=\"orphans\" class=\"v\"></span></div>
+        <div id=\"dustSweepRow\" class=\"row\" style=\"display:none\"><span class=\"k\">Dust Sweep</span><span id=\"dustSweep\" class=\"v\"></span></div>
+        <div id=\"dustSweepDetails\" class=\"tiny\" style=\"display:none\"></div>
 
         <h3 style=\"margin-top:14px\">Sticky Vintage</h3>
         <div class=\"row\"><span class=\"k\">Sticky Mode</span><span id=\"stickyModeStatus\" class=\"v\"></span></div>
@@ -1261,8 +1263,10 @@ DASHBOARD_HTML = """<!doctype html>
       mode.className = 'badge ' + (s.mode === 'RUNNING' ? 'ok' : s.mode === 'PAUSED' ? 'pause' : 'halt');
 
       const phase = document.getElementById('phase');
-      phase.textContent = `PHASE ${s.top_phase}`;
-      phase.className = 'badge';
+      const phaseSymbols = {S0: '\u25CF', S1a: '\u25BC', S1b: '\u25B2', S2: '\u25A0'};
+      const sym = phaseSymbols[s.top_phase] || '';
+      phase.textContent = sym ? `${sym} ${s.top_phase}` : `PHASE ${s.top_phase}`;
+      phase.className = 'badge ' + (s.top_phase || '');
 
       const age = document.getElementById('priceAge');
       age.textContent = `PRICE AGE ${Math.round(s.price_age_sec)}s`;
@@ -1306,6 +1310,23 @@ DASHBOARD_HTML = """<!doctype html>
 
       document.getElementById('orphansLabel').textContent = 'Waiting Exits';
       document.getElementById('orphans').textContent = stickyEnabled ? waitingTotal : (waitingTotal || s.total_orphans);
+      const dust = s.dust_sweep || {};
+      const dustRowEl = document.getElementById('dustSweepRow');
+      const dustValueEl = document.getElementById('dustSweep');
+      const dustDetailsEl = document.getElementById('dustSweepDetails');
+      const dustDividend = Number(dust.current_dividend_usd || 0);
+      const dustLifetime = Number(dust.lifetime_absorbed_usd || 0);
+      if (dustDividend > 0) {
+        dustRowEl.style.display = '';
+        dustDetailsEl.style.display = '';
+        dustValueEl.textContent = `$${fmt(dustDividend, 2)}/slot available`;
+        dustDetailsEl.textContent = `$${fmt(dustLifetime, 2)} lifetime absorbed`;
+      } else {
+        dustRowEl.style.display = 'none';
+        dustDetailsEl.style.display = 'none';
+        dustValueEl.textContent = '';
+        dustDetailsEl.textContent = '';
+      }
       document.getElementById('stickyModeStatus').textContent = stickyEnabled
         ? `ON (${String(sticky.compounding_mode || 'legacy_profit')})`
         : 'OFF';

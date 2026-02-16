@@ -238,6 +238,12 @@ class BotRuntime:
         self._loop_balance_cache: dict | None = None
         self._loop_available_usd: float | None = None
         self._loop_available_doge: float | None = None
+        self._loop_dust_dividend: float | None = None
+        self._dust_sweep_enabled: bool = bool(getattr(config, "DUST_SWEEP_ENABLED", True))
+        self._dust_min_threshold_usd: float = max(0.0, float(getattr(config, "DUST_MIN_THRESHOLD", 0.50)))
+        self._dust_max_bump_pct: float = max(0.0, float(getattr(config, "DUST_MAX_BUMP_PCT", 25.0)))
+        self._dust_last_absorbed_usd: float = 0.0
+        self._dust_last_dividend_usd: float = 0.0
         self._last_balance_snapshot: dict | None = None
         self._last_balance_ts = 0.0
 
@@ -693,6 +699,72 @@ class BotRuntime:
                     matched += 1
         return matched
 
+    def _slot_wants_buy_entry(self, slot: SlotRuntime) -> bool:
+        """Conservative buy-entry intent gate for dust reservation."""
+        phase = sm.derive_phase(slot.state)
+        return phase in ("S0", "S1a")
+
+    def _compute_dust_dividend(self) -> float:
+        """Per-slot USD surplus that can be folded into B-side sizing."""
+        if self._loop_dust_dividend is not None:
+            return max(0.0, float(self._loop_dust_dividend))
+
+        available = 0.0
+        if self._loop_available_usd is not None:
+            available = max(0.0, float(self._loop_available_usd))
+        elif self.ledger._synced:
+            available = max(0.0, float(self.ledger.available_usd))
+        else:
+            self._loop_dust_dividend = 0.0
+            self._dust_last_dividend_usd = 0.0
+            return 0.0
+
+        if available <= 0.0:
+            self._loop_dust_dividend = 0.0
+            self._dust_last_dividend_usd = 0.0
+            return 0.0
+
+        reserved = 0.0
+        buy_count = 0
+        for slot in self.slots.values():
+            if not self._slot_wants_buy_entry(slot):
+                continue
+            buy_count += 1
+            # trade_id=None returns the baseline (no dust, no rebalancer skew).
+            reserved += max(0.0, float(self._slot_order_size_usd(slot, trade_id=None)))
+
+        surplus = available - reserved
+        if buy_count <= 0 or surplus < float(self._dust_min_threshold_usd):
+            self._loop_dust_dividend = 0.0
+            self._dust_last_dividend_usd = 0.0
+            return 0.0
+
+        dividend = max(0.0, surplus / buy_count)
+        if not isfinite(dividend):
+            dividend = 0.0
+        self._loop_dust_dividend = dividend
+        self._dust_last_dividend_usd = dividend
+        return dividend
+
+    def _dust_bump_usd(self, slot: SlotRuntime, trade_id: str | None) -> float:
+        if trade_id != "B" or not self._dust_sweep_enabled:
+            return 0.0
+        if not self.ledger._synced and self._loop_available_usd is None:
+            return 0.0
+
+        base_no_dust = max(0.0, float(self._slot_order_size_usd(slot, trade_id=None)))
+        if base_no_dust <= 0.0:
+            return 0.0
+
+        dividend = max(0.0, float(self._compute_dust_dividend()))
+        if dividend <= 0.0:
+            return 0.0
+
+        max_bump = base_no_dust * (max(0.0, float(self._dust_max_bump_pct)) / 100.0)
+        if max_bump <= 0.0:
+            return 0.0
+        return min(dividend, max_bump)
+
     def _slot_order_size_usd(self, slot: SlotRuntime, trade_id: str | None = None) -> float:
         base_order = float(config.ORDER_SIZE_USD)
         compound_mode = str(getattr(config, "STICKY_COMPOUNDING_MODE", "legacy_profit")).strip().lower()
@@ -714,6 +786,8 @@ class BotRuntime:
                 regime_label=self._kelly_regime_label(self._current_regime_id()),
             )
             base_with_layers = max(0.0, float(kelly_usd))
+        dust_bump = self._dust_bump_usd(slot, trade_id=trade_id)
+        base_with_layers = max(0.0, base_with_layers + dust_bump)
         if trade_id is None or not bool(config.REBALANCE_ENABLED):
             return base_with_layers
 
@@ -1180,6 +1254,8 @@ class BotRuntime:
             "sticky_release_last_at": float(self._sticky_release_last_at),
             "release_recon_blocked": bool(self._release_recon_blocked),
             "release_recon_blocked_reason": str(self._release_recon_blocked_reason or ""),
+            "dust_last_absorbed_usd": float(self._dust_last_absorbed_usd),
+            "dust_last_dividend_usd": float(self._dust_last_dividend_usd),
         }
         if self._kelly is not None:
             snap["kelly_state"] = self._kelly.snapshot_state()
@@ -1432,6 +1508,14 @@ class BotRuntime:
             self._release_recon_blocked_reason = str(
                 snap.get("release_recon_blocked_reason", self._release_recon_blocked_reason) or ""
             )
+            self._dust_last_absorbed_usd = max(
+                0.0,
+                float(snap.get("dust_last_absorbed_usd", self._dust_last_absorbed_usd)),
+            )
+            self._dust_last_dividend_usd = max(
+                0.0,
+                float(snap.get("dust_last_dividend_usd", self._dust_last_dividend_usd)),
+            )
             hist = snap.get("rebalancer_sign_flip_history", [])
             cleaned_hist: list[float] = []
             if isinstance(hist, list):
@@ -1497,6 +1581,7 @@ class BotRuntime:
         self._loop_balance_cache = None
         self._loop_available_usd = None
         self._loop_available_doge = None
+        self._loop_dust_dividend = None
         # Sync capital ledger with fresh Kraken balance
         bal = self._safe_balance()
         if bal:
@@ -1510,6 +1595,7 @@ class BotRuntime:
         self._loop_balance_cache = None
         self._loop_available_usd = None
         self._loop_available_doge = None
+        self._loop_dust_dividend = None
         self.ledger.clear()
 
     def _consume_private_budget(self, units: int, reason: str) -> bool:
@@ -4732,7 +4818,7 @@ class BotRuntime:
                     side="buy",
                     trade_id="B",
                     cycle=st.cycle_b,
-                    order_size_usd=self._slot_order_size_usd(slot),
+                    order_size_usd=self._slot_order_size_usd(slot, trade_id="B"),
                     reason="bootstrap_regime_long_only",
                 )
                 self.slots[slot_id].state = st
@@ -4778,7 +4864,7 @@ class BotRuntime:
             st, a1 = sm.add_entry_order(st, cfg, side="sell", trade_id="A", cycle=st.cycle_a, order_size_usd=self._slot_order_size_usd(slot), reason="bootstrap_A")
             if a1:
                 actions.append(a1)
-            st, a2 = sm.add_entry_order(st, cfg, side="buy", trade_id="B", cycle=st.cycle_b, order_size_usd=self._slot_order_size_usd(slot), reason="bootstrap_B")
+            st, a2 = sm.add_entry_order(st, cfg, side="buy", trade_id="B", cycle=st.cycle_b, order_size_usd=self._slot_order_size_usd(slot, trade_id="B"), reason="bootstrap_B")
             if a2:
                 actions.append(a2)
             self.slots[slot_id].state = replace(st, long_only=False, short_only=False, mode_source="none")
@@ -4906,7 +4992,6 @@ class BotRuntime:
         usd = self.ledger.available_usd if self.ledger._synced else _usd_balance(balance)
         doge = self.ledger.available_doge if self.ledger._synced else _doge_balance(balance)
         cfg = self._engine_cfg(slot)
-        order_size = self._slot_order_size_usd(slot)
 
         repaired_state = st
         actions: list[sm.PlaceOrderAction] = []
@@ -4924,7 +5009,10 @@ class BotRuntime:
                 side=side,
                 trade_id=trade_id,
                 cycle=cycle,
-                order_size_usd=order_size,
+                order_size_usd=self._slot_order_size_usd(
+                    slot,
+                    trade_id=trade_id if trade_id in ("A", "B") else None,
+                ),
                 reason=reason,
             )
             if action:
@@ -5177,6 +5265,16 @@ class BotRuntime:
                     self.ledger.commit_order(action.side, action.price, action.volume)
                     if action.role == "entry":
                         self.entry_adds_per_loop_used += 1
+                        if action.side == "buy" and action.trade_id == "B":
+                            dust_bump = self._dust_bump_usd(slot, trade_id="B")
+                            if dust_bump > 0.0:
+                                self._dust_last_absorbed_usd += dust_bump
+                                logger.info(
+                                    "DUST ABSORBED: $%.4f into slot %d B-entry (lifetime: $%.4f)",
+                                    dust_bump,
+                                    slot_id,
+                                    self._dust_last_absorbed_usd,
+                                )
                     _internal_order_count += 1
                 except Exception as e:
                     self._release_loop_reservation(
@@ -7400,6 +7498,12 @@ class BotRuntime:
             slot_vintage["vintage_critical"] = stuck_capital_pct > float(config.RELEASE_MAX_STUCK_PCT)
             slot_vintage["release_recon_gate_blocked"] = bool(self._release_recon_blocked)
             slot_vintage["release_recon_gate_reason"] = str(self._release_recon_blocked_reason or "")
+            dust_dividend_usd = float(self._compute_dust_dividend())
+            dust_available_usd: float | None = None
+            if self._loop_available_usd is not None:
+                dust_available_usd = float(self._loop_available_usd)
+            elif self.ledger._synced:
+                dust_available_usd = float(self.ledger.available_usd)
 
             return {
                 "mode": self.mode,
@@ -7510,6 +7614,12 @@ class BotRuntime:
                 "hmm_consensus": hmm_consensus,
                 "regime_history_30m": list(self._regime_history_30m),
                 "kelly": (self._kelly.status_payload() if self._kelly is not None else {"enabled": False}),
+                "dust_sweep": {
+                    "enabled": bool(self._dust_sweep_enabled),
+                    "current_dividend_usd": dust_dividend_usd,
+                    "lifetime_absorbed_usd": float(self._dust_last_absorbed_usd),
+                    "available_usd": dust_available_usd,
+                },
                 "regime_directional": regime_directional,
                 "ai_regime_advisor": ai_regime_advisor,
                 "release_health": {

@@ -794,6 +794,185 @@ class BotEventLogTests(unittest.TestCase):
         self.assertAlmostEqual(out, 3.5)
         rt._kelly.size_for_slot.assert_called_once_with(2.0, regime_label="bullish")
 
+    def test_dust_dividend_zero_when_no_surplus(self):
+        rt = bot.BotRuntime()
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(market_price=0.1, now=1000.0, total_profit=0.0),
+            )
+        }
+        rt._loop_available_usd = 2.0
+        rt._loop_dust_dividend = None
+
+        with mock.patch.object(config, "ORDER_SIZE_USD", 2.0):
+            with mock.patch.object(rt, "_recompute_effective_layers", return_value={"effective_layers": 0}):
+                with mock.patch.object(rt, "_layer_mark_price", return_value=0.1):
+                    out = rt._compute_dust_dividend()
+
+        self.assertAlmostEqual(out, 0.0)
+        self.assertAlmostEqual(rt._dust_last_dividend_usd, 0.0)
+
+    def test_dust_dividend_splits_across_slots(self):
+        rt = bot.BotRuntime()
+        rt.slots = {
+            sid: bot.SlotRuntime(
+                slot_id=sid,
+                state=sm.PairState(market_price=0.1, now=1000.0, total_profit=0.0),
+            )
+            for sid in range(4)
+        }
+        rt._loop_available_usd = 10.0
+        rt._loop_dust_dividend = None
+
+        with mock.patch.object(config, "ORDER_SIZE_USD", 2.0):
+            with mock.patch.object(rt, "_recompute_effective_layers", return_value={"effective_layers": 0}):
+                with mock.patch.object(rt, "_layer_mark_price", return_value=0.1):
+                    out = rt._compute_dust_dividend()
+
+        self.assertAlmostEqual(out, 0.5, places=8)
+
+    def test_dust_bump_capped(self):
+        rt = bot.BotRuntime()
+        slot = bot.SlotRuntime(
+            slot_id=0,
+            state=sm.PairState(market_price=0.1, now=1000.0, total_profit=0.0),
+        )
+        rt.slots = {0: slot}
+        rt._loop_available_usd = 7.0
+        rt._loop_dust_dividend = None
+        rt._dust_sweep_enabled = True
+        rt._dust_max_bump_pct = 25.0
+
+        with mock.patch.object(config, "ORDER_SIZE_USD", 2.0):
+            with mock.patch.object(config, "REBALANCE_ENABLED", False):
+                with mock.patch.object(rt, "_recompute_effective_layers", return_value={"effective_layers": 0}):
+                    with mock.patch.object(rt, "_layer_mark_price", return_value=0.1):
+                        out = rt._slot_order_size_usd(slot, trade_id="B")
+
+        self.assertAlmostEqual(out, 2.5, places=8)
+
+    def test_dust_disabled(self):
+        rt = bot.BotRuntime()
+        slot = bot.SlotRuntime(
+            slot_id=0,
+            state=sm.PairState(market_price=0.1, now=1000.0, total_profit=0.0),
+        )
+        rt.slots = {0: slot}
+        rt._loop_available_usd = 7.0
+        rt._loop_dust_dividend = None
+        rt._dust_sweep_enabled = False
+
+        with mock.patch.object(config, "ORDER_SIZE_USD", 2.0):
+            with mock.patch.object(config, "REBALANCE_ENABLED", False):
+                with mock.patch.object(rt, "_recompute_effective_layers", return_value={"effective_layers": 0}):
+                    with mock.patch.object(rt, "_layer_mark_price", return_value=0.1):
+                        out = rt._slot_order_size_usd(slot, trade_id="B")
+                        dividend = rt._compute_dust_dividend()
+
+        self.assertAlmostEqual(out, 2.0, places=8)
+        self.assertGreater(dividend, 0.0)
+
+    def test_dust_below_threshold(self):
+        rt = bot.BotRuntime()
+        slot = bot.SlotRuntime(
+            slot_id=0,
+            state=sm.PairState(market_price=0.1, now=1000.0, total_profit=0.0),
+        )
+        rt.slots = {0: slot}
+        rt._loop_available_usd = 2.3
+        rt._loop_dust_dividend = None
+        rt._dust_sweep_enabled = True
+        rt._dust_min_threshold_usd = 0.50
+
+        with mock.patch.object(config, "ORDER_SIZE_USD", 2.0):
+            with mock.patch.object(config, "REBALANCE_ENABLED", False):
+                with mock.patch.object(rt, "_recompute_effective_layers", return_value={"effective_layers": 0}):
+                    with mock.patch.object(rt, "_layer_mark_price", return_value=0.1):
+                        out = rt._slot_order_size_usd(slot, trade_id="B")
+                        dividend = rt._compute_dust_dividend()
+
+        self.assertAlmostEqual(dividend, 0.0, places=8)
+        self.assertAlmostEqual(out, 2.0, places=8)
+
+    def test_dust_no_buy_slots(self):
+        rt = bot.BotRuntime()
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    orders=(
+                        sm.OrderState(
+                            local_id=1,
+                            side="sell",
+                            role="exit",
+                            price=0.1010,
+                            volume=13.0,
+                            trade_id="A",
+                            cycle=1,
+                        ),
+                    ),
+                ),
+            )
+        }
+        rt._loop_available_usd = 50.0
+        rt._loop_dust_dividend = None
+
+        with mock.patch.object(config, "ORDER_SIZE_USD", 2.0):
+            with mock.patch.object(rt, "_recompute_effective_layers", return_value={"effective_layers": 0}):
+                with mock.patch.object(rt, "_layer_mark_price", return_value=0.1):
+                    out = rt._compute_dust_dividend()
+
+        self.assertAlmostEqual(out, 0.0, places=8)
+
+    def test_dust_interacts_with_kelly(self):
+        rt = bot.BotRuntime()
+        rt._kelly = mock.Mock()
+        rt._kelly.size_for_slot.return_value = (4.0, "kelly_aggregate")
+        slot = bot.SlotRuntime(
+            slot_id=0,
+            state=sm.PairState(market_price=0.1, now=1000.0, total_profit=0.0),
+        )
+        rt.slots = {0: slot}
+        rt._loop_available_usd = 10.0
+        rt._loop_dust_dividend = None
+        rt._dust_sweep_enabled = True
+        rt._dust_max_bump_pct = 25.0
+
+        with mock.patch.object(config, "ORDER_SIZE_USD", 2.0):
+            with mock.patch.object(config, "REBALANCE_ENABLED", False):
+                with mock.patch.object(rt, "_recompute_effective_layers", return_value={"effective_layers": 0}):
+                    with mock.patch.object(rt, "_layer_mark_price", return_value=0.1):
+                        with mock.patch.object(rt, "_current_regime_id", return_value=2):
+                            out = rt._slot_order_size_usd(slot, trade_id="B")
+
+        self.assertAlmostEqual(out, 5.0, places=8)
+
+    def test_dust_fund_guard_clamp(self):
+        rt = bot.BotRuntime()
+        slot = bot.SlotRuntime(
+            slot_id=0,
+            state=sm.PairState(market_price=0.1, now=1000.0, total_profit=0.0),
+        )
+        rt.slots = {0: slot}
+        rt._loop_available_usd = 3.0
+        rt._loop_dust_dividend = None
+        rt._dust_sweep_enabled = True
+        rt._dust_max_bump_pct = 25.0
+        rt._rebalancer_current_skew = 0.5
+
+        with mock.patch.object(config, "ORDER_SIZE_USD", 2.0):
+            with mock.patch.object(config, "REBALANCE_ENABLED", True):
+                with mock.patch.object(config, "REBALANCE_SIZE_SENSITIVITY", 1.0):
+                    with mock.patch.object(config, "REBALANCE_MAX_SIZE_MULT", 2.0):
+                        with mock.patch.object(rt, "_recompute_effective_layers", return_value={"effective_layers": 0}):
+                            with mock.patch.object(rt, "_layer_mark_price", return_value=0.1):
+                                out = rt._slot_order_size_usd(slot, trade_id="B")
+
+        self.assertAlmostEqual(out, 2.5, places=8)
+
     @mock.patch("supabase_store.save_fill")
     def test_replay_missed_fills_aggregates_and_applies_once(self, _save_fill):
         rt = bot.BotRuntime()
@@ -2952,6 +3131,30 @@ class BotEventLogTests(unittest.TestCase):
         self.assertTrue(trend["hysteresis_active"])
         self.assertEqual(trend["hysteresis_expires_in_sec"], 50)
 
+    def test_status_payload_exposes_dust_sweep_block(self):
+        rt = bot.BotRuntime()
+        slot = bot.SlotRuntime(
+            slot_id=0,
+            state=sm.PairState(market_price=0.1, now=1000.0, total_profit=0.0),
+        )
+        rt.slots = {0: slot}
+        rt.last_price = 0.1
+        rt._loop_available_usd = 7.0
+        rt._loop_dust_dividend = None
+        rt._dust_sweep_enabled = False
+        rt._dust_last_absorbed_usd = 1.23
+
+        with mock.patch.object(config, "ORDER_SIZE_USD", 2.0):
+            with mock.patch.object(rt, "_recompute_effective_layers", return_value={"effective_layers": 0}):
+                with mock.patch.object(rt, "_layer_mark_price", return_value=0.1):
+                    payload = rt.status_payload()
+
+        dust = payload.get("dust_sweep", {})
+        self.assertFalse(bool(dust.get("enabled")))
+        self.assertGreater(float(dust.get("current_dividend_usd") or 0.0), 0.0)
+        self.assertAlmostEqual(float(dust.get("lifetime_absorbed_usd") or 0.0), 1.23, places=8)
+        self.assertAlmostEqual(float(dust.get("available_usd") or 0.0), 7.0, places=8)
+
     def test_global_snapshot_persists_trend_fields(self):
         rt = bot.BotRuntime()
         rt._trend_fast_ema = 0.101
@@ -2971,6 +3174,31 @@ class BotEventLogTests(unittest.TestCase):
         self.assertAlmostEqual(snap["trend_smoothed_target"], 0.34)
         self.assertAlmostEqual(snap["trend_target_locked_until"], 2222.0)
         self.assertAlmostEqual(snap["trend_last_update_ts"], 1234.0)
+
+    def test_global_snapshot_persists_dust_fields(self):
+        rt = bot.BotRuntime()
+        rt._dust_last_absorbed_usd = 4.56
+        rt._dust_last_dividend_usd = 0.12
+
+        snap = rt._global_snapshot()
+
+        self.assertAlmostEqual(float(snap["dust_last_absorbed_usd"]), 4.56, places=8)
+        self.assertAlmostEqual(float(snap["dust_last_dividend_usd"]), 0.12, places=8)
+
+    def test_load_snapshot_restores_dust_fields(self):
+        rt = bot.BotRuntime()
+        snap = rt._global_snapshot()
+        snap["dust_last_absorbed_usd"] = 7.89
+        snap["dust_last_dividend_usd"] = 0.34
+        rt._dust_last_absorbed_usd = 0.0
+        rt._dust_last_dividend_usd = 0.0
+
+        with mock.patch("supabase_store.load_state", return_value=snap):
+            with mock.patch("supabase_store.load_max_event_id", return_value=0):
+                rt._load_snapshot()
+
+        self.assertAlmostEqual(rt._dust_last_absorbed_usd, 7.89, places=8)
+        self.assertAlmostEqual(rt._dust_last_dividend_usd, 0.34, places=8)
 
     def test_load_snapshot_backward_compatible_without_trend_fields(self):
         rt = bot.BotRuntime()
