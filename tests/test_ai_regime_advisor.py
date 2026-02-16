@@ -1,4 +1,6 @@
 import unittest
+import json
+import time
 from unittest import mock
 
 import ai_advisor
@@ -10,16 +12,73 @@ except ModuleNotFoundError:
 
 
 class AIRegimeAdvisorP0Tests(unittest.TestCase):
-    def test_groq_panelists_includes_gpt_oss(self):
-        self.assertGreaterEqual(len(ai_advisor.GROQ_PANELISTS), 3)
-        self.assertEqual(ai_advisor.GROQ_PANELISTS[0][0], "GPT-OSS-120B")
-        self.assertEqual(ai_advisor.GROQ_PANELISTS[0][1], "openai/gpt-oss-120b")
-        self.assertFalse(bool(ai_advisor.GROQ_PANELISTS[0][2]))
+    def setUp(self):
+        ai_advisor._panelist_consecutive_fails.clear()
+        ai_advisor._panelist_skip_until.clear()
 
-    def test_ordered_panel_prefer_reasoning(self):
+    def test_sambanova_panelists_defined(self):
+        self.assertEqual(
+            ai_advisor.SAMBANOVA_PANELISTS,
+            [
+                ("DeepSeek-R1", "DeepSeek-R1-0528", True),
+                ("DeepSeek-V3.1", "DeepSeek-V3.1", False),
+            ],
+        )
+
+    def test_cerebras_panelists_defined(self):
+        self.assertEqual(
+            ai_advisor.CEREBRAS_PANELISTS,
+            [
+                ("Qwen3-235B", "qwen-3-235b-a22b-instruct-2507", False),
+                ("GPT-OSS-120B", "gpt-oss-120b", False),
+            ],
+        )
+
+    def test_groq_panelists_excludes_gpt_oss(self):
+        self.assertEqual(
+            ai_advisor.GROQ_PANELISTS,
+            [
+                ("Llama-70B", "llama-3.3-70b-versatile", False),
+                ("Llama-8B", "llama-3.1-8b-instant", False),
+            ],
+        )
+
+    def test_build_panel_all_providers(self):
+        with mock.patch.object(ai_advisor.config, "SAMBANOVA_API_KEY", "s-key"):
+            with mock.patch.object(ai_advisor.config, "CEREBRAS_API_KEY", "c-key"):
+                with mock.patch.object(ai_advisor.config, "GROQ_API_KEY", "g-key"):
+                    with mock.patch.object(ai_advisor.config, "NVIDIA_API_KEY", "n-key"):
+                        with mock.patch.object(ai_advisor.config, "AI_API_KEY", ""):
+                            panel = ai_advisor._build_panel()
+
+        self.assertEqual(len(panel), 7)
+        names = [p["name"] for p in panel]
+        self.assertIn("DeepSeek-R1", names)
+        self.assertIn("DeepSeek-V3.1", names)
+        self.assertIn("Qwen3-235B", names)
+        self.assertIn("GPT-OSS-120B", names)
+        self.assertIn("Llama-70B", names)
+        self.assertIn("Llama-8B", names)
+        self.assertIn("Kimi-K2.5", names)
+        self.assertTrue(all(bool(p.get("panelist_id")) for p in panel))
+
+    def test_build_panel_partial_keys(self):
+        with mock.patch.object(ai_advisor.config, "SAMBANOVA_API_KEY", ""):
+            with mock.patch.object(ai_advisor.config, "CEREBRAS_API_KEY", ""):
+                with mock.patch.object(ai_advisor.config, "GROQ_API_KEY", "g-key"):
+                    with mock.patch.object(ai_advisor.config, "NVIDIA_API_KEY", ""):
+                        with mock.patch.object(ai_advisor.config, "AI_API_KEY", ""):
+                            panel = ai_advisor._build_panel()
+        self.assertEqual(len(panel), 2)
+        self.assertEqual([p["name"] for p in panel], ["Llama-70B", "Llama-8B"])
+
+    def test_ordered_panel_full_reasoning_chain(self):
         panel = [
-            {"name": "Llama-70B"},
+            {"name": "DeepSeek-V3.1"},
             {"name": "Llama-8B"},
+            {"name": "Qwen3-235B"},
+            {"name": "DeepSeek-R1"},
+            {"name": "Llama-70B"},
             {"name": "GPT-OSS-120B"},
             {"name": "Kimi-K2.5"},
         ]
@@ -27,25 +86,108 @@ class AIRegimeAdvisorP0Tests(unittest.TestCase):
             ordered = ai_advisor._ordered_regime_panel(panel)
         self.assertEqual(
             [p["name"] for p in ordered],
-            ["Kimi-K2.5", "GPT-OSS-120B", "Llama-70B", "Llama-8B"],
+            [
+                "DeepSeek-R1",
+                "Kimi-K2.5",
+                "DeepSeek-V3.1",
+                "Qwen3-235B",
+                "GPT-OSS-120B",
+                "Llama-70B",
+                "Llama-8B",
+            ],
         )
 
-    def test_ordered_panel_prefer_instruct(self):
+    def test_ordered_panel_full_instruct_chain(self):
         panel = [
+            {"name": "DeepSeek-R1"},
             {"name": "Llama-70B"},
             {"name": "Llama-8B"},
+            {"name": "DeepSeek-V3.1"},
             {"name": "GPT-OSS-120B"},
             {"name": "Kimi-K2.5"},
+            {"name": "Qwen3-235B"},
         ]
         with mock.patch.object(ai_advisor.config, "AI_REGIME_PREFER_REASONING", False):
             ordered = ai_advisor._ordered_regime_panel(panel)
         self.assertEqual(
             [p["name"] for p in ordered],
-            ["GPT-OSS-120B", "Llama-70B", "Llama-8B", "Kimi-K2.5"],
+            [
+                "DeepSeek-V3.1",
+                "Qwen3-235B",
+                "GPT-OSS-120B",
+                "Llama-70B",
+                "Llama-8B",
+                "DeepSeek-R1",
+                "Kimi-K2.5",
+            ],
         )
 
     def test_instruct_max_tokens_400(self):
         self.assertEqual(ai_advisor._INSTRUCT_MAX_TOKENS, 400)
+
+    def test_reasoning_token_cap_not_clipped(self):
+        captured_payload = {}
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b'{"choices":[{"message":{"content":"{}"}}]}'
+
+        def _fake_urlopen(req, timeout=0):
+            captured_payload["payload"] = json.loads(req.data.decode("utf-8"))
+            return _Resp()
+
+        panelist = {
+            "name": "DeepSeek-R1",
+            "url": "https://api.sambanova.ai/v1/chat/completions",
+            "model": "DeepSeek-R1-0528",
+            "key": "k",
+            "reasoning": True,
+            "max_tokens": 2048,
+        }
+        with mock.patch("ai_advisor.urllib.request.urlopen", side_effect=_fake_urlopen):
+            response, err = ai_advisor._call_panelist_messages([{"role": "user", "content": "x"}], panelist)
+
+        self.assertEqual(err, "")
+        self.assertEqual(response, "{}")
+        self.assertEqual(int(captured_payload["payload"]["max_tokens"]), 2048)
+
+    def test_instruct_token_cap_preserved(self):
+        captured_payload = {}
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b'{"choices":[{"message":{"content":"{}"}}]}'
+
+        def _fake_urlopen(req, timeout=0):
+            captured_payload["payload"] = json.loads(req.data.decode("utf-8"))
+            return _Resp()
+
+        panelist = {
+            "name": "Llama-70B",
+            "url": "https://api.groq.com/openai/v1/chat/completions",
+            "model": "llama-3.3-70b-versatile",
+            "key": "k",
+            "reasoning": False,
+            "max_tokens": 9999,
+        }
+        with mock.patch("ai_advisor.urllib.request.urlopen", side_effect=_fake_urlopen):
+            response, err = ai_advisor._call_panelist_messages([{"role": "user", "content": "x"}], panelist)
+
+        self.assertEqual(err, "")
+        self.assertEqual(response, "{}")
+        self.assertEqual(int(captured_payload["payload"]["max_tokens"]), 512)
 
     def test_regime_prompt_conviction_definition(self):
         prompt = ai_advisor._REGIME_SYSTEM_PROMPT
@@ -156,6 +298,152 @@ class AIRegimeAdvisorP0Tests(unittest.TestCase):
             "bullish": 0.05,
         })
         self.assertEqual(out, [0.12, 0.83, 0.05])
+
+    def test_think_tag_stripping(self):
+        response = (
+            "<think>Let me reason about {json: true} and fields.</think>\n"
+            '{"recommended_tier": 1, "recommended_direction": "long_bias", '
+            '"conviction": 76, "rationale": "Trend is strengthening.", '
+            '"watch_for": "15m confidence decay."}'
+        )
+        parsed, err = ai_advisor._parse_regime_opinion(response)
+        self.assertEqual(err, "")
+        self.assertEqual(parsed["recommended_tier"], 1)
+        self.assertEqual(parsed["recommended_direction"], "long_bias")
+        self.assertEqual(parsed["conviction"], 76)
+
+    def test_think_tag_absent(self):
+        response = (
+            '{"recommended_tier": 0, "recommended_direction": "symmetric", '
+            '"conviction": 61, "rationale": "Market is balanced.", '
+            '"watch_for": "Bias expansion."}'
+        )
+        parsed, err = ai_advisor._parse_regime_opinion(response)
+        self.assertEqual(err, "")
+        self.assertEqual(parsed["recommended_tier"], 0)
+        self.assertEqual(parsed["recommended_direction"], "symmetric")
+        self.assertEqual(parsed["conviction"], 61)
+
+    def test_reasoning_content_fallback(self):
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return (
+                    b'{"choices":[{"message":{"content":"","reasoning_content":"'
+                    b'{\\"recommended_tier\\":0,\\"recommended_direction\\":\\"symmetric\\",'
+                    b'\\"conviction\\":55,\\"rationale\\":\\"ok\\",\\"watch_for\\":\\"x\\"}"}}]}'
+                )
+
+        panelist = {
+            "name": "DeepSeek-R1",
+            "url": "https://api.sambanova.ai/v1/chat/completions",
+            "model": "DeepSeek-R1-0528",
+            "key": "k",
+            "reasoning": True,
+            "max_tokens": 2048,
+        }
+        with mock.patch("ai_advisor.urllib.request.urlopen", return_value=_Resp()):
+            response, err = ai_advisor._call_panelist_messages([{"role": "user", "content": "x"}], panelist)
+
+        self.assertEqual(err, "")
+        self.assertIn('"recommended_tier":0', response.replace(" ", ""))
+
+    def test_panelist_skip_tracking_uses_unique_identity_key(self):
+        panel = [
+            {
+                "name": "GPT-OSS-120B",
+                "url": "https://api.groq.com/openai/v1/chat/completions",
+                "model": "openai/gpt-oss-120b",
+                "key": "k",
+                "reasoning": False,
+                "max_tokens": 400,
+                "panelist_id": "https://api.groq.com/openai/v1/chat/completions|openai/gpt-oss-120b",
+            },
+            {
+                "name": "GPT-OSS-120B",
+                "url": "https://api.cerebras.ai/v1/chat/completions",
+                "model": "gpt-oss-120b",
+                "key": "k",
+                "reasoning": False,
+                "max_tokens": 400,
+                "panelist_id": "https://api.cerebras.ai/v1/chat/completions|gpt-oss-120b",
+            },
+        ]
+
+        def _fake_call(messages, panelist):
+            if panelist["panelist_id"].startswith("https://api.groq.com"):
+                return ("", "http_429")
+            return (
+                '{"recommended_tier": 0, "recommended_direction": "symmetric", '
+                '"conviction": 64, "rationale": "Range is stable.", '
+                '"watch_for": "Bias expansion."}',
+                "",
+            )
+
+        with mock.patch.object(ai_advisor.config, "AI_REGIME_ADVISOR_ENABLED", True):
+            with mock.patch("ai_advisor._build_panel", return_value=panel):
+                with mock.patch("ai_advisor._call_panelist_messages", side_effect=_fake_call):
+                    result = ai_advisor.get_regime_opinion({})
+
+        self.assertEqual(result["panelist"], "GPT-OSS-120B")
+        self.assertEqual(
+            ai_advisor._panelist_consecutive_fails.get(
+                "https://api.groq.com/openai/v1/chat/completions|openai/gpt-oss-120b",
+            ),
+            1,
+        )
+        self.assertNotIn("GPT-OSS-120B", ai_advisor._panelist_consecutive_fails)
+
+    def test_get_regime_opinion_honors_panelist_cooldown(self):
+        panel = [
+            {
+                "name": "DeepSeek-R1",
+                "url": "https://api.sambanova.ai/v1/chat/completions",
+                "model": "DeepSeek-R1-0528",
+                "key": "k",
+                "reasoning": True,
+                "max_tokens": 2048,
+                "panelist_id": "https://api.sambanova.ai/v1/chat/completions|DeepSeek-R1-0528",
+            },
+            {
+                "name": "DeepSeek-V3.1",
+                "url": "https://api.sambanova.ai/v1/chat/completions",
+                "model": "DeepSeek-V3.1",
+                "key": "k",
+                "reasoning": False,
+                "max_tokens": 400,
+                "panelist_id": "https://api.sambanova.ai/v1/chat/completions|DeepSeek-V3.1",
+            },
+        ]
+        now = time.time()
+        ai_advisor._panelist_skip_until["https://api.sambanova.ai/v1/chat/completions|DeepSeek-R1-0528"] = now + 60.0
+        calls = []
+
+        def _fake_call(messages, panelist):
+            calls.append(panelist["panelist_id"])
+            return (
+                '{"recommended_tier": 0, "recommended_direction": "symmetric", '
+                '"conviction": 70, "rationale": "Range is stable.", '
+                '"watch_for": "Bias expansion."}',
+                "",
+            )
+
+        with mock.patch.object(ai_advisor.config, "AI_REGIME_ADVISOR_ENABLED", True):
+            with mock.patch("ai_advisor._build_panel", return_value=panel):
+                with mock.patch("ai_advisor._call_panelist_messages", side_effect=_fake_call):
+                    with mock.patch("ai_advisor.time.time", return_value=now):
+                        result = ai_advisor.get_regime_opinion({})
+
+        self.assertEqual(result["panelist"], "DeepSeek-V3.1")
+        self.assertEqual(
+            calls,
+            ["https://api.sambanova.ai/v1/chat/completions|DeepSeek-V3.1"],
+        )
 
     def test_get_regime_opinion_prefers_reasoning_then_fallback(self):
         panel = [

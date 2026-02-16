@@ -13,11 +13,14 @@ HOW THIS WORKS:
   problem where one model fixates on the same recommendation).
 
 SUPPORTED PROVIDERS:
-  - Groq (free tier): GPT-OSS-120B + Llama 3.3 70B + Llama 3.1 8B
+  - SambaNova (free tier): DeepSeek R1 + DeepSeek V3.1
+  - Cerebras (free tier): Qwen3-235B + GPT-OSS-120B
+  - Groq (free tier): Llama 3.3 70B + Llama 3.1 8B
   - NVIDIA build.nvidia.com (free tier): Kimi K2.5
   - Any OpenAI-compatible endpoint (legacy single-model fallback)
 
-  Set GROQ_API_KEY and/or NVIDIA_API_KEY to enable panelists.
+  Set SAMBANOVA_API_KEY, CEREBRAS_API_KEY, GROQ_API_KEY,
+  and/or NVIDIA_API_KEY to enable panelists.
   Panel auto-configures based on which keys are available.
 
 ZERO DEPENDENCIES:
@@ -46,12 +49,23 @@ logger = logging.getLogger(__name__)
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+SAMBANOVA_URL = "https://api.sambanova.ai/v1/chat/completions"
+CEREBRAS_URL = "https://api.cerebras.ai/v1/chat/completions"
 
 # Each tuple: (display_name, model_id, is_reasoning_model)
 GROQ_PANELISTS = [
-    ("GPT-OSS-120B", "openai/gpt-oss-120b", False),
     ("Llama-70B", "llama-3.3-70b-versatile", False),
     ("Llama-8B", "llama-3.1-8b-instant", False),
+]
+
+SAMBANOVA_PANELISTS = [
+    ("DeepSeek-R1", "DeepSeek-R1-0528", True),
+    ("DeepSeek-V3.1", "DeepSeek-V3.1", False),
+]
+
+CEREBRAS_PANELISTS = [
+    ("Qwen3-235B", "qwen-3-235b-a22b-instruct-2507", False),
+    ("GPT-OSS-120B", "gpt-oss-120b", False),
 ]
 
 NVIDIA_PANELISTS = [
@@ -63,8 +77,8 @@ _REASONING_MAX_TOKENS = 2048
 _INSTRUCT_MAX_TOKENS = 400
 
 # Panelist timeout skip tracking
-_panelist_consecutive_fails: dict = {}   # name -> int
-_panelist_skip_until: dict = {}          # name -> timestamp
+_panelist_consecutive_fails: dict = {}   # panelist_id -> int
+_panelist_skip_until: dict = {}          # panelist_id -> timestamp
 SKIP_THRESHOLD = 3        # consecutive failures before skipping
 SKIP_COOLDOWN = 3600      # seconds to skip a panelist (1 hour)
 
@@ -104,12 +118,26 @@ def _build_panel() -> list:
     Build the AI council based on available API keys.
 
     Returns a list of panelist dicts.  Auto-configures:
-      - GROQ_API_KEY  -> GPT-OSS-120B + Llama 3.3 70B + Llama 3.1 8B
+      - SAMBANOVA_API_KEY -> DeepSeek-R1 + DeepSeek-V3.1
+      - CEREBRAS_API_KEY -> Qwen3-235B + GPT-OSS-120B
+      - GROQ_API_KEY  -> Llama 3.3 70B + Llama 3.1 8B
       - NVIDIA_API_KEY -> Kimi K2.5
-      - Both keys     -> all four (best diversity)
+      - Any subset    -> all models for configured providers
       - Neither       -> legacy fallback to AI_API_KEY
     """
     panel = []
+
+    if config.SAMBANOVA_API_KEY:
+        for name, model, reasoning in SAMBANOVA_PANELISTS:
+            panel.append({
+                "name": name,
+                "url": SAMBANOVA_URL,
+                "model": model,
+                "key": config.SAMBANOVA_API_KEY,
+                "reasoning": reasoning,
+                "max_tokens": _REASONING_MAX_TOKENS if reasoning else _INSTRUCT_MAX_TOKENS,
+                "panelist_id": f"{SAMBANOVA_URL}|{model}",
+            })
 
     if config.GROQ_API_KEY:
         for name, model, reasoning in GROQ_PANELISTS:
@@ -120,6 +148,7 @@ def _build_panel() -> list:
                 "key": config.GROQ_API_KEY,
                 "reasoning": reasoning,
                 "max_tokens": _REASONING_MAX_TOKENS if reasoning else _INSTRUCT_MAX_TOKENS,
+                "panelist_id": f"{GROQ_URL}|{model}",
             })
 
     if config.NVIDIA_API_KEY:
@@ -131,6 +160,19 @@ def _build_panel() -> list:
                 "key": config.NVIDIA_API_KEY,
                 "reasoning": reasoning,
                 "max_tokens": _REASONING_MAX_TOKENS if reasoning else _INSTRUCT_MAX_TOKENS,
+                "panelist_id": f"{NVIDIA_URL}|{model}",
+            })
+
+    if config.CEREBRAS_API_KEY:
+        for name, model, reasoning in CEREBRAS_PANELISTS:
+            panel.append({
+                "name": name,
+                "url": CEREBRAS_URL,
+                "model": model,
+                "key": config.CEREBRAS_API_KEY,
+                "reasoning": reasoning,
+                "max_tokens": _REASONING_MAX_TOKENS if reasoning else _INSTRUCT_MAX_TOKENS,
+                "panelist_id": f"{CEREBRAS_URL}|{model}",
             })
 
     # Legacy fallback: single model from AI_API_KEY + AI_API_URL
@@ -142,6 +184,7 @@ def _build_panel() -> list:
             "key": config.AI_API_KEY,
             "reasoning": False,
             "max_tokens": _INSTRUCT_MAX_TOKENS,
+            "panelist_id": f"{config.AI_API_URL}|{config.AI_MODEL}",
         })
 
     return panel
@@ -570,9 +613,25 @@ def _ordered_regime_panel(panel: list) -> list:
 
     prefer_reasoning = bool(getattr(config, "AI_REGIME_PREFER_REASONING", True))
     if prefer_reasoning:
-        priority = {"Kimi-K2.5": 0, "GPT-OSS-120B": 1, "Llama-70B": 2, "Llama-8B": 3}
+        priority = {
+            "DeepSeek-R1": 0,
+            "Kimi-K2.5": 1,
+            "DeepSeek-V3.1": 2,
+            "Qwen3-235B": 3,
+            "GPT-OSS-120B": 4,
+            "Llama-70B": 5,
+            "Llama-8B": 6,
+        }
     else:
-        priority = {"GPT-OSS-120B": 0, "Llama-70B": 1, "Llama-8B": 2, "Kimi-K2.5": 3}
+        priority = {
+            "DeepSeek-V3.1": 0,
+            "Qwen3-235B": 1,
+            "GPT-OSS-120B": 2,
+            "Llama-70B": 3,
+            "Llama-8B": 4,
+            "DeepSeek-R1": 5,
+            "Kimi-K2.5": 6,
+        }
 
     with_index = list(enumerate(panel))
     with_index.sort(
@@ -586,7 +645,8 @@ def _ordered_regime_panel(panel: list) -> list:
 
 def _call_panelist_messages(messages: list, panelist: dict) -> tuple:
     timeout = 30 if panelist.get("reasoning") else 15
-    max_tokens = min(int(panelist.get("max_tokens", _INSTRUCT_MAX_TOKENS)), 512)
+    cap = _REASONING_MAX_TOKENS if panelist.get("reasoning") else 512
+    max_tokens = min(int(panelist.get("max_tokens", _INSTRUCT_MAX_TOKENS)), cap)
 
     payload = json.dumps({
         "model": panelist["model"],
@@ -627,6 +687,9 @@ def _parse_regime_opinion(response: str) -> tuple:
         return ({}, "empty_response")
 
     stripped = response.strip()
+    think_end = stripped.rfind("</think>")
+    if think_end >= 0:
+        stripped = stripped[think_end + len("</think>"):].strip()
     json_start = stripped.find("{")
     json_end = stripped.rfind("}")
     if json_start < 0 or json_end <= json_start:
@@ -875,11 +938,14 @@ def get_regime_opinion(context: dict) -> dict:
     """
     Query a single preferred panelist for regime interpretation.
 
-    Fallback order:
-      1) Kimi-K2.5 (reasoning), when enabled and preferred
-      2) GPT-OSS-120B
-      3) Llama-70B
-      4) Llama-8B
+    Fallback order (when AI_REGIME_PREFER_REASONING=True):
+      1) DeepSeek-R1 (SambaNova, reasoning)
+      2) Kimi-K2.5 (NVIDIA, reasoning)
+      3) DeepSeek-V3.1 (SambaNova, instruct)
+      4) Qwen3-235B (Cerebras, instruct)
+      5) GPT-OSS-120B (Cerebras, instruct)
+      6) Llama-70B (Groq, instruct)
+      7) Llama-8B (Groq, instruct)
 
     Returns a validated dict and never raises.
     """
@@ -900,12 +966,37 @@ def get_regime_opinion(context: dict) -> dict:
         last_error = "all_panelists_failed"
         for panelist in panel:
             name = str(panelist.get("name", "")).strip() or "unknown"
+            panel_key = str(
+                panelist.get("panelist_id")
+                or f"{panelist.get('url', '')}|{panelist.get('model', '')}"
+                or name
+            )
+            now = time.time()
+            skip_until = float(_panelist_skip_until.get(panel_key, 0) or 0)
+            if now < skip_until:
+                remaining = int(skip_until - now)
+                logger.info(
+                    "AI regime advisor: panelist %s skipped (cooldown, %ds remaining)",
+                    name,
+                    remaining,
+                )
+                continue
             logger.info("AI regime advisor: querying %s...", name)
 
             response, err = _call_panelist_messages(messages, panelist)
             if not response:
                 reason = _clip_text(err or "empty_response", 120)
                 last_error = f"{name}:{reason}"
+                fails = int(_panelist_consecutive_fails.get(panel_key, 0) or 0) + 1
+                _panelist_consecutive_fails[panel_key] = fails
+                if fails >= SKIP_THRESHOLD:
+                    _panelist_skip_until[panel_key] = now + SKIP_COOLDOWN
+                    logger.warning(
+                        "AI regime advisor: panelist %s hit %d consecutive failures -- skipping for %ds",
+                        name,
+                        fails,
+                        SKIP_COOLDOWN,
+                    )
                 logger.warning(
                     "AI regime advisor: panelist %s failed (%s), trying next",
                     name,
@@ -916,6 +1007,16 @@ def get_regime_opinion(context: dict) -> dict:
             parsed, parse_err = _parse_regime_opinion(response)
             if parse_err:
                 last_error = f"{name}:{parse_err}"
+                fails = int(_panelist_consecutive_fails.get(panel_key, 0) or 0) + 1
+                _panelist_consecutive_fails[panel_key] = fails
+                if fails >= SKIP_THRESHOLD:
+                    _panelist_skip_until[panel_key] = now + SKIP_COOLDOWN
+                    logger.warning(
+                        "AI regime advisor: panelist %s hit %d consecutive failures -- skipping for %ds",
+                        name,
+                        fails,
+                        SKIP_COOLDOWN,
+                    )
                 logger.warning(
                     "AI regime advisor: panelist %s returned invalid JSON (%s), trying next",
                     name,
@@ -923,6 +1024,7 @@ def get_regime_opinion(context: dict) -> dict:
                 )
                 continue
 
+            _panelist_consecutive_fails[panel_key] = 0
             result = _default_regime_opinion("")
             result.update(parsed)
             result["panelist"] = name
@@ -985,9 +1087,14 @@ def get_recommendation(market_data: dict, stats_context: str = "") -> dict:
 
     for i, panelist in enumerate(panel):
         name = panelist["name"]
+        panel_key = str(
+            panelist.get("panelist_id")
+            or f"{panelist.get('url', '')}|{panelist.get('model', '')}"
+            or name
+        )
 
         # Check if this panelist is in cooldown from consecutive failures
-        skip_until = _panelist_skip_until.get(name, 0)
+        skip_until = _panelist_skip_until.get(panel_key, 0)
         if now < skip_until:
             remaining = int(skip_until - now)
             votes.append({
@@ -1012,7 +1119,7 @@ def get_recommendation(market_data: dict, stats_context: str = "") -> dict:
                     parsed["action"], parsed["reason"],
                 )
                 # Reset consecutive fail counter on success
-                _panelist_consecutive_fails[name] = 0
+                _panelist_consecutive_fails[panel_key] = 0
             else:
                 error_reason = err or "No response"
                 votes.append({
@@ -1024,10 +1131,10 @@ def get_recommendation(market_data: dict, stats_context: str = "") -> dict:
                 })
                 logger.warning("  %s: %s", name, error_reason)
                 # Track consecutive failure
-                fails = _panelist_consecutive_fails.get(name, 0) + 1
-                _panelist_consecutive_fails[name] = fails
+                fails = _panelist_consecutive_fails.get(panel_key, 0) + 1
+                _panelist_consecutive_fails[panel_key] = fails
                 if fails >= SKIP_THRESHOLD:
-                    _panelist_skip_until[name] = now + SKIP_COOLDOWN
+                    _panelist_skip_until[panel_key] = now + SKIP_COOLDOWN
                     logger.warning(
                         "  %s: %d consecutive failures -- skipping for %ds",
                         name, fails, SKIP_COOLDOWN,
@@ -1042,10 +1149,10 @@ def get_recommendation(market_data: dict, stats_context: str = "") -> dict:
                 "raw": "",
             })
             logger.warning("  %s: error -- %s", name, e)
-            fails = _panelist_consecutive_fails.get(name, 0) + 1
-            _panelist_consecutive_fails[name] = fails
+            fails = _panelist_consecutive_fails.get(panel_key, 0) + 1
+            _panelist_consecutive_fails[panel_key] = fails
             if fails >= SKIP_THRESHOLD:
-                _panelist_skip_until[name] = now + SKIP_COOLDOWN
+                _panelist_skip_until[panel_key] = now + SKIP_COOLDOWN
 
         # Brief pause between panelists to respect rate limits
         if i < len(panel) - 1:
@@ -1131,7 +1238,12 @@ def analyze_trade(cycle_data: dict) -> dict:
     # Try panelists in order until one succeeds
     for panelist in panel:
         now = time.time()
-        skip_until = _panelist_skip_until.get(panelist["name"], 0)
+        panel_key = str(
+            panelist.get("panelist_id")
+            or f"{panelist.get('url', '')}|{panelist.get('model', '')}"
+            or panelist["name"]
+        )
+        skip_until = _panelist_skip_until.get(panel_key, 0)
         if now < skip_until:
             continue
 

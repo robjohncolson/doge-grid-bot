@@ -50,14 +50,21 @@ KRAKEN_API_KEY: str = _env("KRAKEN_API_KEY", "")
 # Your Kraken private (secret) key -- base64-encoded by Kraken.
 KRAKEN_API_SECRET: str = _env("KRAKEN_API_SECRET", "")
 
-# AI Council API keys.  Set one or both for multi-model voting.
+# AI Council API keys. Set any subset for multi-provider fallback.
+# SambaNova (free tier): DeepSeek R1 + DeepSeek V3.1
+# Cerebras (free tier): Qwen3-235B + GPT-OSS-120B
 # Groq (free tier): Llama 3.3 70B + Llama 3.1 8B
 # NVIDIA build.nvidia.com (free tier): Kimi K2.5
+SAMBANOVA_API_KEY: str = _env("SAMBANOVA_API_KEY", "")
+CEREBRAS_API_KEY: str = _env("CEREBRAS_API_KEY", "")
 GROQ_API_KEY: str = _env("GROQ_API_KEY", "")
 NVIDIA_API_KEY: str = _env("NVIDIA_API_KEY", "")
 
-# Legacy fallback -- used only if neither GROQ nor NVIDIA key is set.
-AI_API_KEY: str = _env("AI_API_KEY", GROQ_API_KEY or NVIDIA_API_KEY)
+# Legacy fallback -- used only if no provider key is set.
+AI_API_KEY: str = _env(
+    "AI_API_KEY",
+    SAMBANOVA_API_KEY or CEREBRAS_API_KEY or GROQ_API_KEY or NVIDIA_API_KEY,
+)
 
 # Telegram bot token (from @BotFather) and your chat ID (from @userinfobot).
 TELEGRAM_BOT_TOKEN: str = _env("TELEGRAM_BOT_TOKEN", "")
@@ -377,7 +384,8 @@ BALANCE_RECON_DRIFT_PCT: float = _env("BALANCE_RECON_DRIFT_PCT", 2.0, float)
 # ---------------------------------------------------------------------------
 
 # The council queries multiple models and uses majority vote.
-# Panel is auto-configured from GROQ_API_KEY / NVIDIA_API_KEY.
+# Panel is auto-configured from SAMBANOVA_API_KEY / CEREBRAS_API_KEY /
+# GROQ_API_KEY / NVIDIA_API_KEY.
 # These legacy settings are only used as single-model fallback
 # when neither panel key is set.
 AI_API_URL: str = _env("AI_API_URL", "https://integrate.api.nvidia.com/v1/chat/completions")
@@ -908,9 +916,14 @@ def print_banner():
         f"  Health port:     {HEALTH_PORT}",
         f"  Log level:       {LOG_LEVEL}",
         f"  Kraken key:      {'configured' if KRAKEN_API_KEY else 'NOT SET'}",
+        f"  SambaNova key:   {'configured' if SAMBANOVA_API_KEY else 'NOT SET'}",
+        f"  Cerebras key:    {'configured' if CEREBRAS_API_KEY else 'NOT SET'}",
         f"  Groq key:        {'configured' if GROQ_API_KEY else 'NOT SET'}",
         f"  NVIDIA key:      {'configured' if NVIDIA_API_KEY else 'NOT SET'}",
-        f"  AI fallback:     {'configured' if AI_API_KEY and not GROQ_API_KEY and not NVIDIA_API_KEY else 'N/A'}",
+        (
+            "  AI fallback:     "
+            f"{'configured' if AI_API_KEY and not SAMBANOVA_API_KEY and not CEREBRAS_API_KEY and not GROQ_API_KEY and not NVIDIA_API_KEY else 'N/A'}"
+        ),
         f"  Telegram:        {'configured' if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID else 'NOT SET'}",
         f"  Supabase:        {'configured' if SUPABASE_URL and SUPABASE_KEY else 'NOT SET'}",
         "=" * 60,
