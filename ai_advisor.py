@@ -291,15 +291,18 @@ def _call_panelist(prompt: str, panelist: dict, pair_display: str = "DOGE/USD") 
             "only recommend grid parameter adjustments."
         )
 
-    payload = json.dumps({
+    body = {
         "model": panelist["model"],
         "messages": [
             {"role": "system", "content": system_content},
             {"role": "user", "content": prompt},
         ],
-        "temperature": 0.3,
         "max_tokens": panelist["max_tokens"],
-    }).encode("utf-8")
+    }
+    # Reasoning models (e.g. DeepSeek-R1) reject the temperature parameter
+    if not panelist.get("reasoning"):
+        body["temperature"] = 0.3
+    payload = json.dumps(body).encode("utf-8")
 
     headers = {
         "Content-Type": "application/json",
@@ -644,16 +647,21 @@ def _ordered_regime_panel(panel: list) -> list:
 
 
 def _call_panelist_messages(messages: list, panelist: dict) -> tuple:
-    timeout = 30 if panelist.get("reasoning") else 15
-    cap = _REASONING_MAX_TOKENS if panelist.get("reasoning") else 512
+    is_reasoning = bool(panelist.get("reasoning"))
+    timeout = 30 if is_reasoning else 20
+    cap = _REASONING_MAX_TOKENS if is_reasoning else 512
     max_tokens = min(int(panelist.get("max_tokens", _INSTRUCT_MAX_TOKENS)), cap)
 
-    payload = json.dumps({
+    body = {
         "model": panelist["model"],
         "messages": messages,
-        "temperature": 0.2,
         "max_tokens": max_tokens,
-    }).encode("utf-8")
+    }
+    # Reasoning models (e.g. DeepSeek-R1) reject the temperature parameter
+    if not is_reasoning:
+        body["temperature"] = 0.2
+
+    payload = json.dumps(body).encode("utf-8")
 
     headers = {
         "Content-Type": "application/json",
@@ -675,7 +683,15 @@ def _call_panelist_messages(messages: list, panelist: dict) -> tuple:
                 return (content.strip(), "") if content else ("", "empty_response")
             return ("", "no_choices")
     except urllib.error.HTTPError as e:
-        return ("", f"http_{e.code}")
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", errors="replace")[:300]
+        except Exception:
+            pass
+        err_msg = f"http_{e.code}"
+        if detail:
+            logger.debug("HTTP %d from %s: %s", e.code, panelist.get("name", "?"), detail)
+        return ("", err_msg)
     except urllib.error.URLError as e:
         return ("", f"connection_error:{e.reason}")
     except Exception as e:

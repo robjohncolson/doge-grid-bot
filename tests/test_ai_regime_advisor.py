@@ -492,6 +492,100 @@ class AIRegimeAdvisorP0Tests(unittest.TestCase):
         self.assertEqual(result["conviction"], 0)
         self.assertIn("boom", result["error"])
 
+    def test_reasoning_model_omits_temperature(self):
+        """DeepSeek-R1 rejects the temperature parameter (HTTP 400)."""
+        captured = {}
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b'{"choices":[{"message":{"content":"{}"}}]}'
+
+        def _fake_urlopen(req, timeout=0):
+            captured["payload"] = json.loads(req.data.decode("utf-8"))
+            return _Resp()
+
+        panelist = {
+            "name": "DeepSeek-R1",
+            "url": "https://api.sambanova.ai/v1/chat/completions",
+            "model": "DeepSeek-R1-0528",
+            "key": "k",
+            "reasoning": True,
+            "max_tokens": 2048,
+        }
+        with mock.patch("ai_advisor.urllib.request.urlopen", side_effect=_fake_urlopen):
+            ai_advisor._call_panelist_messages([{"role": "user", "content": "x"}], panelist)
+
+        self.assertNotIn("temperature", captured["payload"])
+
+    def test_instruct_model_includes_temperature(self):
+        """Instruct models should still get temperature=0.2."""
+        captured = {}
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b'{"choices":[{"message":{"content":"{}"}}]}'
+
+        def _fake_urlopen(req, timeout=0):
+            captured["payload"] = json.loads(req.data.decode("utf-8"))
+            return _Resp()
+
+        panelist = {
+            "name": "Llama-70B",
+            "url": "https://api.groq.com/openai/v1/chat/completions",
+            "model": "llama-3.3-70b-versatile",
+            "key": "k",
+            "reasoning": False,
+            "max_tokens": 400,
+        }
+        with mock.patch("ai_advisor.urllib.request.urlopen", side_effect=_fake_urlopen):
+            ai_advisor._call_panelist_messages([{"role": "user", "content": "x"}], panelist)
+
+        self.assertIn("temperature", captured["payload"])
+        self.assertAlmostEqual(captured["payload"]["temperature"], 0.2)
+
+    def test_council_call_omits_temperature_for_reasoning(self):
+        """_call_panelist (council path) also omits temperature for reasoning models."""
+        captured = {}
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b'{"choices":[{"message":{"content":"ok"}}]}'
+
+        def _fake_urlopen(req, timeout=0):
+            captured["payload"] = json.loads(req.data.decode("utf-8"))
+            return _Resp()
+
+        panelist = {
+            "name": "DeepSeek-R1",
+            "url": "https://api.sambanova.ai/v1/chat/completions",
+            "model": "DeepSeek-R1-0528",
+            "key": "k",
+            "reasoning": True,
+            "max_tokens": 2048,
+        }
+        with mock.patch("ai_advisor.urllib.request.urlopen", side_effect=_fake_urlopen):
+            ai_advisor._call_panelist("test prompt", panelist)
+
+        self.assertNotIn("temperature", captured["payload"])
+
     def test_regime_detector_transmat_getter(self):
         if hrd is None:
             self.skipTest("numpy/hmm dependencies not available in test env")
