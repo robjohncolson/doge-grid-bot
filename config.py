@@ -263,6 +263,23 @@ AI_OVERRIDE_MIN_CONVICTION: int = _env("AI_OVERRIDE_MIN_CONVICTION", 50, int)
 AI_REGIME_HISTORY_SIZE: int = _env("AI_REGIME_HISTORY_SIZE", 12, int)
 AI_REGIME_PREFER_REASONING: bool = _env("AI_REGIME_PREFER_REASONING", True, bool)
 
+# DeepSeek regime-advisor provider settings (strategic capital deployment).
+DEEPSEEK_API_KEY: str = _env("DEEPSEEK_API_KEY", "")
+DEEPSEEK_MODEL: str = _env("DEEPSEEK_MODEL", "deepseek-chat", str)
+DEEPSEEK_TIMEOUT_SEC: int = _env("DEEPSEEK_TIMEOUT_SEC", 30, int)
+AI_REGIME_PREFER_DEEPSEEK_R1: bool = _env("AI_REGIME_PREFER_DEEPSEEK_R1", False, bool)
+
+# Strategic accumulation engine (AI + 1h HMM gated).
+ACCUM_ENABLED: bool = _env("ACCUM_ENABLED", False, bool)
+ACCUM_MIN_CONVICTION: int = _env("ACCUM_MIN_CONVICTION", 60, int)
+ACCUM_RESERVE_USD: float = _env("ACCUM_RESERVE_USD", 50.0, float)
+ACCUM_MAX_BUDGET_USD: float = _env("ACCUM_MAX_BUDGET_USD", 50.0, float)
+ACCUM_CHUNK_USD: float = _env("ACCUM_CHUNK_USD", 2.0, float)
+ACCUM_INTERVAL_SEC: float = _env("ACCUM_INTERVAL_SEC", 120.0, float)
+ACCUM_MAX_DRAWDOWN_PCT: float = _env("ACCUM_MAX_DRAWDOWN_PCT", 3.0, float)
+ACCUM_COOLDOWN_SEC: float = _env("ACCUM_COOLDOWN_SEC", 3600.0, float)
+ACCUM_CONFIRMATION_CANDLES: int = _env("ACCUM_CONFIRMATION_CANDLES", 2, int)
+
 # Hour (UTC) to send daily P&L summary via Telegram.
 # 0 = midnight UTC.
 DAILY_SUMMARY_HOUR_UTC: int = _env("DAILY_SUMMARY_HOUR_UTC", 0, int)
@@ -401,6 +418,9 @@ AI_MODEL: str = _env("AI_MODEL", "meta/llama-3.1-8b-instruct")
 
 # Enable/disable the exit lifecycle system. When disabled, exits stay as-is.
 RECOVERY_ENABLED: bool = _env("RECOVERY_ENABLED", True, bool)
+# Recovery-order creation/management toggle for strategic-capital rollout.
+# Compatibility: if unset, it inherits RECOVERY_ENABLED.
+RECOVERY_ORDERS_ENABLED: bool = _env("RECOVERY_ORDERS_ENABLED", RECOVERY_ENABLED, bool)
 
 # Max orphaned exits kept on Kraken book per pair.
 MAX_RECOVERY_SLOTS: int = _env("MAX_RECOVERY_SLOTS", 2, int)
@@ -527,8 +547,16 @@ HMM_SECONDARY_SYNC_INTERVAL_SEC: float = _env("HMM_SECONDARY_SYNC_INTERVAL_SEC",
 HMM_SECONDARY_TRAINING_CANDLES: int = _env("HMM_SECONDARY_TRAINING_CANDLES", 1440, int)
 HMM_SECONDARY_RECENT_CANDLES: int = _env("HMM_SECONDARY_RECENT_CANDLES", 50, int)
 HMM_SECONDARY_MIN_TRAIN_SAMPLES: int = _env("HMM_SECONDARY_MIN_TRAIN_SAMPLES", 200, int)
+# Tertiary (1h) HMM for strategic transition sensing.
+HMM_TERTIARY_ENABLED: bool = _env("HMM_TERTIARY_ENABLED", False, bool)
+HMM_TERTIARY_INTERVAL_MIN: int = _env("HMM_TERTIARY_INTERVAL_MIN", 60, int)
+HMM_TERTIARY_TRAINING_CANDLES: int = _env("HMM_TERTIARY_TRAINING_CANDLES", 500, int)
+HMM_TERTIARY_RECENT_CANDLES: int = _env("HMM_TERTIARY_RECENT_CANDLES", 30, int)
+HMM_TERTIARY_MIN_TRAIN_SAMPLES: int = _env("HMM_TERTIARY_MIN_TRAIN_SAMPLES", 150, int)
+HMM_TERTIARY_SYNC_INTERVAL_SEC: float = _env("HMM_TERTIARY_SYNC_INTERVAL_SEC", 3600.0, float)
 CONSENSUS_1M_WEIGHT: float = _env("CONSENSUS_1M_WEIGHT", 0.3, float)
 CONSENSUS_15M_WEIGHT: float = _env("CONSENSUS_15M_WEIGHT", 0.7, float)
+CONSENSUS_1H_WEIGHT: float = _env("CONSENSUS_1H_WEIGHT", 0.30, float)
 CONSENSUS_DAMPEN_FACTOR: float = _env("CONSENSUS_DAMPEN_FACTOR", 0.5, float)
 
 # ---------------------------------------------------------------------------
@@ -930,6 +958,7 @@ def print_banner():
         f"  Health port:     {HEALTH_PORT}",
         f"  Log level:       {LOG_LEVEL}",
         f"  Kraken key:      {'configured' if KRAKEN_API_KEY else 'NOT SET'}",
+        f"  DeepSeek key:    {'configured' if DEEPSEEK_API_KEY else 'NOT SET'}",
         f"  SambaNova key:   {'configured' if SAMBANOVA_API_KEY else 'NOT SET'}",
         f"  Cerebras key:    {'configured' if CEREBRAS_API_KEY else 'NOT SET'}",
         f"  Groq key:        {'configured' if GROQ_API_KEY else 'NOT SET'}",

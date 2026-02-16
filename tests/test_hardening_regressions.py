@@ -1881,22 +1881,125 @@ class BotEventLogTests(unittest.TestCase):
         rt = bot.BotRuntime()
         rt._hmm_backfill_stall_count = 4
         rt._hmm_backfill_stall_count_secondary = 6
+        rt._hmm_backfill_stall_count_tertiary = 8
 
         with mock.patch.object(config, "HMM_OHLCV_INTERVAL_MIN", 1):
             with mock.patch.object(config, "HMM_SECONDARY_INTERVAL_MIN", 15):
-                with mock.patch("notifier._send_message"):
-                    with mock.patch.object(rt, "backfill_ohlcv_history", return_value=(True, "queued")):
-                        with mock.patch("notifier.poll_updates", return_value=([], [{"text": "/backfill_ohlcv 10 1 1"}])):
-                            rt.poll_telegram()
-                        self.assertEqual(rt._hmm_backfill_stall_count, 0)
-                        self.assertEqual(rt._hmm_backfill_stall_count_secondary, 6)
+                with mock.patch.object(config, "HMM_TERTIARY_INTERVAL_MIN", 60):
+                    with mock.patch("notifier._send_message"):
+                        with mock.patch.object(rt, "backfill_ohlcv_history", return_value=(True, "queued")):
+                            with mock.patch("notifier.poll_updates", return_value=([], [{"text": "/backfill_ohlcv 10 1 1"}])):
+                                rt.poll_telegram()
+                            self.assertEqual(rt._hmm_backfill_stall_count, 0)
+                            self.assertEqual(rt._hmm_backfill_stall_count_secondary, 6)
+                            self.assertEqual(rt._hmm_backfill_stall_count_tertiary, 8)
 
-                        rt._hmm_backfill_stall_count = 5
-                        rt._hmm_backfill_stall_count_secondary = 7
-                        with mock.patch("notifier.poll_updates", return_value=([], [{"text": "/backfill_ohlcv 10 1 15"}])):
-                            rt.poll_telegram()
-                        self.assertEqual(rt._hmm_backfill_stall_count, 5)
-                        self.assertEqual(rt._hmm_backfill_stall_count_secondary, 0)
+                            rt._hmm_backfill_stall_count = 5
+                            rt._hmm_backfill_stall_count_secondary = 7
+                            with mock.patch("notifier.poll_updates", return_value=([], [{"text": "/backfill_ohlcv 10 1 15"}])):
+                                rt.poll_telegram()
+                            self.assertEqual(rt._hmm_backfill_stall_count, 5)
+                            self.assertEqual(rt._hmm_backfill_stall_count_secondary, 0)
+                            self.assertEqual(rt._hmm_backfill_stall_count_tertiary, 8)
+
+                            rt._hmm_backfill_stall_count = 9
+                            rt._hmm_backfill_stall_count_secondary = 10
+                            rt._hmm_backfill_stall_count_tertiary = 11
+                            with mock.patch("notifier.poll_updates", return_value=([], [{"text": "/backfill_ohlcv 10 1 60"}])):
+                                rt.poll_telegram()
+                            self.assertEqual(rt._hmm_backfill_stall_count, 9)
+                            self.assertEqual(rt._hmm_backfill_stall_count_secondary, 10)
+                            self.assertEqual(rt._hmm_backfill_stall_count_tertiary, 0)
+
+    def test_startup_backfill_runs_tertiary_even_when_secondary_disabled(self):
+        rt = bot.BotRuntime()
+        readiness_calls: list[str] = []
+        backfill_calls: list[str] = []
+
+        def _readiness(*_args, **kwargs):
+            key = str(kwargs.get("state_key", "primary") or "primary")
+            readiness_calls.append(key)
+            return {"state_key": key, "ready_for_target_window": False}
+
+        def _backfill(*_args, **kwargs):
+            key = str(kwargs.get("state_key", "primary") or "primary")
+            backfill_calls.append(key)
+            return True, "queued"
+
+        with mock.patch.object(config, "HMM_OHLCV_BACKFILL_ON_STARTUP", True):
+            with mock.patch.object(config, "HMM_SECONDARY_OHLCV_ENABLED", False):
+                with mock.patch.object(config, "HMM_MULTI_TIMEFRAME_ENABLED", False):
+                    with mock.patch.object(config, "HMM_TERTIARY_ENABLED", True):
+                        with mock.patch.object(rt, "_hmm_data_readiness", side_effect=_readiness):
+                            with mock.patch.object(rt, "backfill_ohlcv_history", side_effect=_backfill):
+                                rt._maybe_backfill_ohlcv_on_startup()
+
+        self.assertEqual(readiness_calls, ["primary", "tertiary"])
+        self.assertEqual(backfill_calls, ["primary", "tertiary"])
+
+    def test_resample_candles_from_lower_interval_aggregates_contiguous_groups(self):
+        rows = [
+            {"time": 900.0, "open": 1.00, "high": 1.20, "low": 0.95, "close": 1.10, "volume": 10.0},
+            {"time": 1800.0, "open": 1.10, "high": 1.25, "low": 1.00, "close": 1.20, "volume": 11.0},
+            {"time": 2700.0, "open": 1.20, "high": 1.30, "low": 1.10, "close": 1.15, "volume": 12.0},
+            {"time": 3600.0, "open": 1.15, "high": 1.22, "low": 1.05, "close": 1.18, "volume": 13.0},
+            {"time": 5400.0, "open": 1.18, "high": 1.24, "low": 1.16, "close": 1.22, "volume": 9.0},
+            {"time": 6300.0, "open": 1.22, "high": 1.28, "low": 1.20, "close": 1.26, "volume": 8.0},
+            {"time": 7200.0, "open": 1.26, "high": 1.29, "low": 1.21, "close": 1.23, "volume": 7.0},
+            {"time": 8100.0, "open": 1.23, "high": 1.27, "low": 1.19, "close": 1.25, "volume": 6.0},
+        ]
+
+        out = bot.BotRuntime._resample_candles_from_lower_interval(
+            rows,
+            group_size=4,
+            base_interval_sec=900.0,
+        )
+
+        self.assertEqual(len(out), 2)
+        self.assertAlmostEqual(float(out[0]["time"]), 900.0)
+        self.assertAlmostEqual(float(out[0]["open"]), 1.00)
+        self.assertAlmostEqual(float(out[0]["high"]), 1.30)
+        self.assertAlmostEqual(float(out[0]["low"]), 0.95)
+        self.assertAlmostEqual(float(out[0]["close"]), 1.18)
+        self.assertAlmostEqual(float(out[0]["volume"]), 46.0)
+        self.assertIsNone(out[0]["trade_count"])
+        self.assertAlmostEqual(float(out[1]["time"]), 5400.0)
+        self.assertAlmostEqual(float(out[1]["open"]), 1.18)
+        self.assertAlmostEqual(float(out[1]["high"]), 1.29)
+        self.assertAlmostEqual(float(out[1]["low"]), 1.16)
+        self.assertAlmostEqual(float(out[1]["close"]), 1.25)
+        self.assertAlmostEqual(float(out[1]["volume"]), 30.0)
+
+    def test_update_hmm_tertiary_transition_requires_confirmation_candles(self):
+        rt = bot.BotRuntime()
+        rt._hmm_state_tertiary.update({
+            "enabled": True,
+            "available": True,
+            "trained": True,
+            "regime": "RANGING",
+            "confidence": 0.55,
+            "last_update_ts": 1000.0,
+        })
+
+        with mock.patch.object(config, "HMM_TERTIARY_INTERVAL_MIN", 1):
+            with mock.patch.object(config, "ACCUM_CONFIRMATION_CANDLES", 2):
+                rt._update_hmm_tertiary_transition(1000.0)
+                rt._hmm_state_tertiary.update({
+                    "regime": "BULLISH",
+                    "last_update_ts": 1100.0,
+                })
+                rt._update_hmm_tertiary_transition(1100.0)
+                first = dict(rt._hmm_tertiary_transition)
+                rt._update_hmm_tertiary_transition(1165.0)
+                second = dict(rt._hmm_tertiary_transition)
+
+        self.assertEqual(first["from_regime"], "RANGING")
+        self.assertEqual(first["to_regime"], "BULLISH")
+        self.assertEqual(int(first["confirmation_count"]), 1)
+        self.assertFalse(bool(first["confirmed"]))
+        self.assertEqual(float(first["changed_at"]), 1100.0)
+        self.assertGreaterEqual(int(second["confirmation_count"]), 2)
+        self.assertTrue(bool(second["confirmed"]))
 
     def test_fetch_training_candles_prefers_supabase_ohlcv(self):
         rt = bot.BotRuntime()
@@ -2225,6 +2328,38 @@ class BotEventLogTests(unittest.TestCase):
         self.assertIn("bias_signal", payload["hmm_regime"])
         self.assertIn("probabilities", payload["hmm_regime"])
 
+    def test_status_payload_exposes_hmm_tertiary_pipeline_block(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(market_price=0.1, now=1000.0),
+            )
+        }
+
+        def _readiness(*_args, **kwargs):
+            state_key = str(kwargs.get("state_key", "primary") or "primary")
+            return {
+                "enabled": True,
+                "state_key": state_key,
+                "ready_for_min_train": state_key == "tertiary",
+                "ready_for_target_window": False,
+                "gaps": [],
+            }
+
+        with mock.patch.object(config, "HMM_TERTIARY_ENABLED", True):
+            with mock.patch.object(config, "HMM_MULTI_TIMEFRAME_ENABLED", False):
+                with mock.patch.object(config, "HMM_SECONDARY_OHLCV_ENABLED", False):
+                    with mock.patch.object(rt, "_hmm_data_readiness", side_effect=_readiness):
+                        payload = rt.status_payload()
+
+        self.assertIn("hmm_data_pipeline_tertiary", payload)
+        self.assertEqual(payload["hmm_data_pipeline_tertiary"]["state_key"], "tertiary")
+        self.assertTrue(payload["hmm_data_pipeline_tertiary"]["ready_for_min_train"])
+        self.assertIn("tertiary", payload["hmm_regime"])
+        self.assertIn("tertiary_transition", payload["hmm_regime"])
+
     def test_status_payload_exposes_regime_directional_shadow_block(self):
         rt = bot.BotRuntime()
         rt.last_price = 0.1
@@ -2373,9 +2508,13 @@ class BotEventLogTests(unittest.TestCase):
             "recommended_tier": 1,
             "recommended_direction": "long_bias",
             "conviction": 72,
+            "accumulation_signal": "accumulate_doge",
+            "accumulation_conviction": 78,
             "rationale": "Momentum building.",
             "watch_for": "15m confidence > 0.20.",
             "panelist": "Llama-70B",
+            "provider": "groq",
+            "model": "llama-3.3-70b-versatile",
             "agreement": "ai_upgrade",
             "error": "",
             "ts": 905.0,
@@ -2412,9 +2551,188 @@ class BotEventLogTests(unittest.TestCase):
         self.assertEqual(block["opinion"]["recommended_tier"], 1)
         self.assertEqual(block["opinion"]["recommended_direction"], "long_bias")
         self.assertEqual(block["opinion"]["agreement"], "ai_upgrade")
+        self.assertEqual(block["opinion"]["accumulation_signal"], "accumulate_doge")
+        self.assertEqual(block["opinion"]["accumulation_conviction"], 78)
+        self.assertEqual(block["opinion"]["provider"], "groq")
+        self.assertEqual(block["opinion"]["model"], "llama-3.3-70b-versatile")
         self.assertTrue(block["override"]["active"])
         self.assertEqual(block["override"]["tier"], 1)
         self.assertEqual(len(block["history"]), 1)
+
+    def test_build_ai_regime_context_exposes_capital_and_accumulation_blocks(self):
+        rt = bot.BotRuntime()
+        rt._ai_regime_opinion = {
+            "accumulation_signal": "accumulate_doge",
+            "accumulation_conviction": 66,
+        }
+        rt._hmm_state.update({
+            "available": True,
+            "trained": True,
+            "regime": "RANGING",
+            "confidence": 0.5,
+            "bias_signal": 0.0,
+            "probabilities": {"bearish": 0.2, "ranging": 0.6, "bullish": 0.2},
+        })
+
+        with mock.patch.object(rt, "_available_free_balances", return_value=(120.0, 1800.0)):
+            with mock.patch.object(rt, "_compute_doge_bias_scoreboard", return_value={"idle_usd": 45.0, "idle_usd_pct": 37.5}):
+                with mock.patch.object(config, "ACCUM_ENABLED", True):
+                    context = rt._build_ai_regime_context(now=1000.0)
+
+        self.assertIn("capital", context)
+        self.assertAlmostEqual(float(context["capital"]["free_usd"]), 120.0)
+        self.assertAlmostEqual(float(context["capital"]["idle_usd"]), 45.0)
+        self.assertAlmostEqual(float(context["capital"]["idle_usd_pct"]), 37.5)
+        self.assertAlmostEqual(float(context["capital"]["free_doge"]), 1800.0)
+        self.assertIn("accumulation", context)
+        self.assertTrue(bool(context["accumulation"]["enabled"]))
+        self.assertEqual(context["accumulation"]["signal"], "accumulate_doge")
+        self.assertEqual(int(context["accumulation"]["conviction"]), 66)
+
+    def test_update_accumulation_arms_on_confirmed_tertiary_transition(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        rt._hmm_tertiary_transition = {
+            "from_regime": "BEARISH",
+            "to_regime": "RANGING",
+            "confirmed": True,
+        }
+        rt._ai_regime_opinion = {
+            "accumulation_signal": "hold",
+            "accumulation_conviction": 0,
+        }
+
+        with mock.patch.object(config, "ACCUM_ENABLED", True):
+            with mock.patch.object(config, "ACCUM_RESERVE_USD", 50.0):
+                with mock.patch.object(config, "ACCUM_MAX_BUDGET_USD", 50.0):
+                    with mock.patch.object(rt, "_compute_capacity_health", return_value={"status_band": "normal"}):
+                        with mock.patch.object(rt, "_compute_doge_bias_scoreboard", return_value={"idle_usd": 74.0}):
+                            with mock.patch.object(rt, "_available_free_balances", return_value=(120.0, 1000.0)):
+                                rt._update_accumulation(now=1000.0)
+
+        self.assertEqual(rt._accum_state, "ARMED")
+        self.assertEqual(rt._accum_trigger_from_regime, "BEARISH")
+        self.assertEqual(rt._accum_trigger_to_regime, "RANGING")
+        self.assertAlmostEqual(float(rt._accum_budget_usd), 24.0, places=6)
+        self.assertAlmostEqual(float(rt._accum_armed_at), 1000.0, places=6)
+
+    def test_update_accumulation_active_places_market_buy(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        rt._accum_state = "ARMED"
+        rt._accum_direction = "doge"
+        rt._accum_trigger_from_regime = "BEARISH"
+        rt._accum_trigger_to_regime = "RANGING"
+        rt._accum_budget_usd = 6.0
+        rt._accum_armed_at = 900.0
+        rt._hmm_tertiary_transition = {
+            "from_regime": "BEARISH",
+            "to_regime": "RANGING",
+            "confirmed": True,
+        }
+        rt._hmm_state_tertiary.update({
+            "regime": "RANGING",
+        })
+        rt._ai_regime_opinion = {
+            "accumulation_signal": "accumulate_doge",
+            "accumulation_conviction": 80,
+        }
+
+        with mock.patch.object(config, "ACCUM_ENABLED", True):
+            with mock.patch.object(config, "ACCUM_MIN_CONVICTION", 60):
+                with mock.patch.object(config, "ACCUM_RESERVE_USD", 20.0):
+                    with mock.patch.object(config, "ACCUM_MAX_BUDGET_USD", 50.0):
+                        with mock.patch.object(config, "ACCUM_CHUNK_USD", 2.0):
+                            with mock.patch.object(config, "ACCUM_INTERVAL_SEC", 120.0):
+                                with mock.patch.object(rt, "_compute_capacity_health", return_value={"status_band": "normal"}):
+                                    with mock.patch.object(rt, "_compute_doge_bias_scoreboard", return_value={"idle_usd": 80.0}):
+                                        with mock.patch.object(rt, "_available_free_balances", return_value=(120.0, 1000.0)):
+                                            with mock.patch.object(rt, "_try_reserve_loop_funds", return_value=True):
+                                                with mock.patch.object(rt, "_consume_private_budget", return_value=True):
+                                                    with mock.patch("bot.kraken_client.place_order", return_value="TX-ACC-1") as place_mock:
+                                                        rt._update_accumulation(now=1000.0)
+
+        self.assertEqual(rt._accum_state, "ACTIVE")
+        self.assertEqual(rt._accum_n_buys, 1)
+        self.assertAlmostEqual(float(rt._accum_spent_usd), 2.0, places=6)
+        self.assertAlmostEqual(float(rt._accum_acquired_doge), 20.0, places=6)
+        self.assertAlmostEqual(float(rt._accum_last_buy_ts), 1000.0, places=6)
+        place_mock.assert_called_once()
+        self.assertEqual(place_mock.call_args.kwargs["ordertype"], "market")
+        self.assertEqual(place_mock.call_args.kwargs["side"], "buy")
+
+    def test_update_accumulation_active_stops_on_drawdown_breach(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.095
+        rt._accum_state = "ACTIVE"
+        rt._accum_direction = "doge"
+        rt._accum_trigger_from_regime = "BEARISH"
+        rt._accum_trigger_to_regime = "RANGING"
+        rt._accum_start_ts = 1000.0
+        rt._accum_start_price = 0.1
+        rt._accum_budget_usd = 12.0
+        rt._accum_spent_usd = 4.0
+        rt._accum_acquired_doge = 40.0
+        rt._accum_n_buys = 2
+        rt._hmm_state_tertiary.update({
+            "regime": "RANGING",
+        })
+        rt._hmm_tertiary_transition = {
+            "from_regime": "BEARISH",
+            "to_regime": "RANGING",
+            "confirmed": True,
+        }
+        rt._ai_regime_opinion = {
+            "accumulation_signal": "accumulate_doge",
+            "accumulation_conviction": 90,
+        }
+
+        with mock.patch.object(config, "ACCUM_ENABLED", True):
+            with mock.patch.object(config, "ACCUM_MAX_DRAWDOWN_PCT", 3.0):
+                with mock.patch.object(config, "ACCUM_COOLDOWN_SEC", 3600.0):
+                    with mock.patch.object(rt, "_compute_capacity_health", return_value={"status_band": "normal"}):
+                        with mock.patch.object(rt, "_compute_doge_bias_scoreboard", return_value={"idle_usd": 60.0}):
+                            with mock.patch.object(rt, "_available_free_balances", return_value=(120.0, 1000.0)):
+                                rt._update_accumulation(now=1100.0)
+
+        self.assertEqual(rt._accum_state, "STOPPED")
+        self.assertIn("reason", rt._accum_last_session_summary)
+        self.assertEqual(rt._accum_last_session_summary["reason"], "drawdown_breach")
+        self.assertGreaterEqual(int(rt._accum_cooldown_remaining_sec), 3599)
+
+    def test_status_payload_includes_accumulation_block(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(market_price=0.1, now=1000.0),
+            )
+        }
+        rt._accum_state = "ACTIVE"
+        rt._accum_direction = "doge"
+        rt._accum_budget_usd = 10.0
+        rt._accum_spent_usd = 4.0
+        rt._accum_acquired_doge = 40.0
+        rt._accum_n_buys = 2
+        rt._accum_start_ts = 1000.0
+        rt._accum_start_price = 0.1
+        rt._accum_trigger_from_regime = "BEARISH"
+        rt._accum_trigger_to_regime = "RANGING"
+        rt._ai_regime_opinion = {
+            "accumulation_signal": "accumulate_doge",
+            "accumulation_conviction": 77,
+        }
+
+        payload = rt.status_payload()
+
+        self.assertIn("accumulation", payload)
+        block = payload["accumulation"]
+        self.assertEqual(block["state"], "ACTIVE")
+        self.assertEqual(block["direction"], "doge")
+        self.assertAlmostEqual(float(block["spent_usd"]), 4.0, places=6)
+        self.assertAlmostEqual(float(block["budget_remaining_usd"]), 6.0, places=6)
+        self.assertEqual(int(block["ai_accumulation_conviction"]), 77)
 
     def test_maybe_schedule_ai_regime_periodic_and_event_triggers(self):
         rt = bot.BotRuntime()
@@ -3832,6 +4150,22 @@ class BotEventLogTests(unittest.TestCase):
         self.assertIn("daily_loss_lock_active", payload)
         self.assertIn("daily_loss_lock_utc_day", payload)
 
+    def test_status_payload_exposes_recovery_orders_enabled_flag(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(market_price=0.1, now=1000.0),
+            )
+        }
+
+        with mock.patch.object(config, "RECOVERY_ORDERS_ENABLED", False):
+            payload = rt.status_payload()
+
+        self.assertIn("recovery_orders_enabled", payload)
+        self.assertFalse(payload["recovery_orders_enabled"])
+
     def test_status_payload_exposes_capital_layers_and_slot_alias(self):
         rt = bot.BotRuntime()
         rt.last_price = 0.1
@@ -3875,6 +4209,28 @@ class BotEventLogTests(unittest.TestCase):
         self.assertIn('id="layerNoLayers"', dashboard.DASHBOARD_HTML)
         self.assertIn("addLayerBtn.disabled = (targetLayers >= maxTargetLayers);", dashboard.DASHBOARD_HTML)
         self.assertIn("removeLayerBtn.disabled = (targetLayers <= 0);", dashboard.DASHBOARD_HTML)
+
+    def test_dashboard_throughput_age_pressure_p90_surface_present(self):
+        self.assertIn('id="throughputAgeLabel"', dashboard.DASHBOARD_HTML)
+        self.assertIn("Age Pressure (p90)", dashboard.DASHBOARD_HTML)
+        self.assertIn("age_pressure_ref_age_sec", dashboard.DASHBOARD_HTML)
+        self.assertIn(" (healthy)", dashboard.DASHBOARD_HTML)
+
+    def test_dashboard_hmm_card_includes_tertiary_rows(self):
+        self.assertIn('id="hmmRegime1hRow"', dashboard.DASHBOARD_HTML)
+        self.assertIn('id="hmmRegime1h"', dashboard.DASHBOARD_HTML)
+        self.assertIn('id="hmmWindowTertiary"', dashboard.DASHBOARD_HTML)
+        self.assertIn("hmmPipeTertiary", dashboard.DASHBOARD_HTML)
+
+    def test_dashboard_ai_and_accumulation_surface_present(self):
+        self.assertIn('id="aiRegimeProvider"', dashboard.DASHBOARD_HTML)
+        self.assertIn('id="aiRegimeAccumSignal"', dashboard.DASHBOARD_HTML)
+        self.assertIn('id="accumState"', dashboard.DASHBOARD_HTML)
+        self.assertIn('id="accumTrigger"', dashboard.DASHBOARD_HTML)
+        self.assertIn('id="accumBudget"', dashboard.DASHBOARD_HTML)
+        self.assertIn('id="accumDrawdown"', dashboard.DASHBOARD_HTML)
+        self.assertIn('id="accumAiSignal"', dashboard.DASHBOARD_HTML)
+        self.assertIn('id="accumLastSession"', dashboard.DASHBOARD_HTML)
 
     def test_auto_drain_recovery_backlog_prefers_furthest_then_oldest(self):
         rt = bot.BotRuntime()
@@ -4168,6 +4524,40 @@ class BotEventLogTests(unittest.TestCase):
         self.assertEqual(restored.effective_layers, 2)
         self.assertEqual(restored.layer_last_add_event, rt.layer_last_add_event)
         self.assertEqual(restored.slots[0].alias, "wow")
+
+    def test_accumulation_snapshot_round_trip(self):
+        rt = bot.BotRuntime()
+        rt._accum_state = "ACTIVE"
+        rt._accum_direction = "doge"
+        rt._accum_trigger_from_regime = "BEARISH"
+        rt._accum_trigger_to_regime = "RANGING"
+        rt._accum_start_ts = 1000.0
+        rt._accum_start_price = 0.1
+        rt._accum_spent_usd = 4.0
+        rt._accum_acquired_doge = 40.0
+        rt._accum_n_buys = 2
+        rt._accum_last_buy_ts = 1100.0
+        rt._accum_budget_usd = 12.0
+        rt._accum_armed_at = 950.0
+        rt._accum_hold_streak = 1
+        rt._accum_last_session_end_ts = 900.0
+        rt._accum_last_session_summary = {"state": "STOPPED", "reason": "manual_stop"}
+        rt._accum_manual_stop_requested = False
+        rt._accum_cooldown_remaining_sec = 1800
+        snap = rt._global_snapshot()
+
+        restored = bot.BotRuntime()
+        with mock.patch("supabase_store.load_state", return_value=snap):
+            with mock.patch("supabase_store.load_max_event_id", return_value=0):
+                restored._load_snapshot()
+
+        self.assertEqual(restored._accum_state, "ACTIVE")
+        self.assertEqual(restored._accum_direction, "doge")
+        self.assertEqual(restored._accum_trigger_from_regime, "BEARISH")
+        self.assertEqual(restored._accum_trigger_to_regime, "RANGING")
+        self.assertAlmostEqual(float(restored._accum_spent_usd), 4.0, places=6)
+        self.assertEqual(int(restored._accum_n_buys), 2)
+        self.assertEqual(int(restored._accum_cooldown_remaining_sec), 1800)
 
     def test_zero_slots_effective_layers_safe(self):
         rt = bot.BotRuntime()
@@ -4471,6 +4861,133 @@ class BotEventLogTests(unittest.TestCase):
         self.assertFalse(ok_stale)
         self.assertIn("disabled in sticky mode", msg_stale)
 
+    def test_recovery_actions_disabled_when_recovery_orders_disabled(self):
+        rt = bot.BotRuntime()
+        with mock.patch.object(config, "RECOVERY_ORDERS_ENABLED", False):
+            ok_close, msg_close = rt.soft_close(1, 1)
+            ok_next, msg_next = rt.soft_close_next()
+            ok_stale, msg_stale = rt.cancel_stale_recoveries()
+        self.assertFalse(ok_close)
+        self.assertIn("RECOVERY_ORDERS_ENABLED=false", msg_close)
+        self.assertFalse(ok_next)
+        self.assertIn("RECOVERY_ORDERS_ENABLED=false", msg_next)
+        self.assertFalse(ok_stale)
+        self.assertIn("RECOVERY_ORDERS_ENABLED=false", msg_stale)
+
+    def test_engine_cfg_disables_orphan_timers_when_recovery_orders_disabled(self):
+        rt = bot.BotRuntime()
+        slot = bot.SlotRuntime(slot_id=0, state=sm.PairState(market_price=0.1, now=1000.0))
+        with mock.patch.object(config, "RECOVERY_ORDERS_ENABLED", False):
+            cfg = rt._engine_cfg(slot)
+        self.assertEqual(cfg.s1_orphan_after_sec, float("inf"))
+        self.assertEqual(cfg.s2_orphan_after_sec, float("inf"))
+
+    def test_collect_open_exits_excludes_recoveries_when_recovery_orders_disabled(self):
+        rt = bot.BotRuntime()
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    orders=(
+                        sm.OrderState(
+                            local_id=1,
+                            side="sell",
+                            role="exit",
+                            price=0.101,
+                            volume=13.0,
+                            trade_id="A",
+                            cycle=1,
+                            entry_filled_at=900.0,
+                        ),
+                    ),
+                    recovery_orders=(
+                        sm.RecoveryOrder(
+                            recovery_id=1,
+                            side="buy",
+                            price=0.099,
+                            volume=13.0,
+                            trade_id="B",
+                            cycle=1,
+                            entry_price=0.1,
+                            entry_filled_at=850.0,
+                            orphaned_at=910.0,
+                        ),
+                    ),
+                ),
+            )
+        }
+        with mock.patch.object(config, "RECOVERY_ORDERS_ENABLED", False):
+            rows = rt._collect_open_exits(now_ts=1000.0)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["trade_id"], "A")
+
+    def test_cleanup_recovery_orders_on_startup_cancels_and_clears_orders(self):
+        rt = bot.BotRuntime()
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    recovery_orders=(
+                        sm.RecoveryOrder(
+                            recovery_id=1,
+                            side="buy",
+                            price=0.099,
+                            volume=13.0,
+                            trade_id="B",
+                            cycle=1,
+                            entry_price=0.1,
+                            orphaned_at=900.0,
+                            txid="TX-REC-1",
+                        ),
+                        sm.RecoveryOrder(
+                            recovery_id=2,
+                            side="sell",
+                            price=0.101,
+                            volume=13.0,
+                            trade_id="A",
+                            cycle=1,
+                            entry_price=0.1,
+                            orphaned_at=920.0,
+                        ),
+                    ),
+                ),
+            ),
+            1: bot.SlotRuntime(
+                slot_id=1,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    recovery_orders=(
+                        sm.RecoveryOrder(
+                            recovery_id=1,
+                            side="buy",
+                            price=0.098,
+                            volume=13.0,
+                            trade_id="B",
+                            cycle=1,
+                            entry_price=0.1,
+                            orphaned_at=930.0,
+                            txid="TX-REC-2",
+                        ),
+                    ),
+                ),
+            ),
+        }
+        with mock.patch.object(config, "RECOVERY_ORDERS_ENABLED", False):
+            with mock.patch.object(rt, "_cancel_order", side_effect=[True, False]) as cancel_mock:
+                cleared, cancelled, failed = rt._cleanup_recovery_orders_on_startup()
+
+        self.assertEqual(cleared, 3)
+        self.assertEqual(cancelled, 1)
+        self.assertEqual(failed, 1)
+        self.assertEqual(cancel_mock.call_count, 2)
+        self.assertEqual(len(rt.slots[0].state.recovery_orders), 0)
+        self.assertEqual(len(rt.slots[1].state.recovery_orders), 0)
+
     def test_release_oldest_eligible_selects_oldest_gate_passing_exit(self):
         rt = bot.BotRuntime()
         rt.slots = {
@@ -4540,6 +5057,7 @@ class DashboardApiHardeningTests(unittest.TestCase):
             self.ai_override_calls = []
             self.ai_revert_calls = 0
             self.ai_dismiss_calls = 0
+            self.accum_stop_calls = 0
 
         def pause(self, _reason):
             if self.raise_on_pause:
@@ -4591,6 +5109,10 @@ class DashboardApiHardeningTests(unittest.TestCase):
         def dismiss_ai_regime_opinion(self):
             self.ai_dismiss_calls += 1
             return True, "ai disagreement dismissed"
+
+        def stop_accumulation(self):
+            self.accum_stop_calls += 1
+            return True, "accumulation stopped"
 
         def _save_snapshot(self):
             return None
@@ -4756,6 +5278,19 @@ class DashboardApiHardeningTests(unittest.TestCase):
         self.assertIsInstance(payload, dict)
         self.assertTrue(payload.get("ok"))
 
+    def test_api_action_accum_stop_routes_ok(self):
+        runtime = self._RuntimeStub()
+        bot._RUNTIME = runtime
+        handler = self._HandlerStub({"action": "accum_stop"})
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(runtime.accum_stop_calls, 1)
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 200)
+        self.assertEqual(payload, {"ok": True, "message": "accumulation stopped"})
+
     def test_api_action_release_slot_routes_ok(self):
         runtime = self._RuntimeStub()
         bot._RUNTIME = runtime
@@ -4804,6 +5339,20 @@ class DashboardApiHardeningTests(unittest.TestCase):
         self.assertEqual(code, 400)
         self.assertEqual(payload, {"ok": False, "message": "soft_close disabled in sticky mode; use release_slot"})
 
+    def test_api_action_soft_close_rejected_when_recovery_orders_disabled(self):
+        bot._RUNTIME = self._RuntimeStub()
+        handler = self._HandlerStub({"action": "soft_close", "slot_id": 1, "recovery_id": 1})
+        with mock.patch.object(config, "RECOVERY_ORDERS_ENABLED", False):
+            bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 400)
+        self.assertEqual(
+            payload,
+            {"ok": False, "message": "soft_close disabled when RECOVERY_ORDERS_ENABLED=false"},
+        )
+
     def test_api_action_cancel_stale_rejected_when_sticky_enabled(self):
         bot._RUNTIME = self._RuntimeStub()
         handler = self._HandlerStub({"action": "cancel_stale_recoveries"})
@@ -4816,6 +5365,20 @@ class DashboardApiHardeningTests(unittest.TestCase):
         self.assertEqual(
             payload,
             {"ok": False, "message": "cancel_stale_recoveries disabled in sticky mode; use release_slot"},
+        )
+
+    def test_api_action_cancel_stale_rejected_when_recovery_orders_disabled(self):
+        bot._RUNTIME = self._RuntimeStub()
+        handler = self._HandlerStub({"action": "cancel_stale_recoveries"})
+        with mock.patch.object(config, "RECOVERY_ORDERS_ENABLED", False):
+            bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 400)
+        self.assertEqual(
+            payload,
+            {"ok": False, "message": "cancel_stale_recoveries disabled when RECOVERY_ORDERS_ENABLED=false"},
         )
 
     def test_api_action_resume_failure_returns_json_400(self):

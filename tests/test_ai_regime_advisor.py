@@ -194,12 +194,15 @@ class AIRegimeAdvisorP0Tests(unittest.TestCase):
         self.assertIn("confidence in the ASSESSMENT", prompt)
         self.assertIn("Even Tier 0 can have high conviction", prompt)
         self.assertIn("Return ONLY a JSON object", prompt)
+        self.assertIn('"accumulation_signal"', prompt)
+        self.assertIn('"accumulation_conviction"', prompt)
 
     def test_parse_regime_opinion_validates_defaults_and_clamps(self):
         response = (
             "```json\n"
             "{\"recommended_tier\": 9, \"recommended_direction\": \"UP\", "
-            "\"conviction\": 140, \"rationale\": \""
+            "\"conviction\": 140, \"accumulation_signal\": \"BUY_MORE\", "
+            "\"accumulation_conviction\": 300, \"rationale\": \""
             + ("x" * 600)
             + "\", \"watch_for\": \""
             + ("y" * 300)
@@ -212,6 +215,8 @@ class AIRegimeAdvisorP0Tests(unittest.TestCase):
         self.assertEqual(parsed["recommended_tier"], 0)
         self.assertEqual(parsed["recommended_direction"], "symmetric")
         self.assertEqual(parsed["conviction"], 100)
+        self.assertEqual(parsed["accumulation_signal"], "hold")
+        self.assertEqual(parsed["accumulation_conviction"], 100)
         self.assertEqual(len(parsed["rationale"]), 500)
         self.assertEqual(len(parsed["watch_for"]), 200)
 
@@ -240,13 +245,34 @@ class AIRegimeAdvisorP0Tests(unittest.TestCase):
                     "bullish": 0.003,
                 },
             },
+            "hmm_tertiary": {
+                "regime": "BULLISH",
+                "confidence": 0.66,
+                "bias_signal": 0.41,
+                "probabilities": [0.05, 0.21, 0.74],
+                "transition": {
+                    "from_regime": "RANGING",
+                    "to_regime": "BULLISH",
+                    "transition_age_sec": 7200,
+                    "confidence": 0.66,
+                    "confirmed": True,
+                    "confirmation_count": 3,
+                },
+            },
             "transition_matrix_1m": [
                 [0.95, 0.03, 0.02],
                 [0.04, 0.91, 0.05],
                 [0.02, 0.03, 0.95],
             ],
+            "transition_matrix_1h": [
+                [0.92, 0.05, 0.03],
+                [0.06, 0.88, 0.06],
+                [0.03, 0.04, 0.93],
+            ],
             "training_quality": "deep",
+            "training_quality_1h": "baseline",
             "confidence_modifier": "0.95",
+            "consensus_1h_weight": 0.30,
             "regime_history_30m": [
                 {"ts": 1739616000, "regime": "RANGING", "conf": "0.12"},
                 {"ts": 1739616300, "regime": "BULLISH", "conf": 0.42},
@@ -267,18 +293,44 @@ class AIRegimeAdvisorP0Tests(unittest.TestCase):
                 "kelly_edge_bearish": -0.008,
                 "kelly_edge_ranging": 0.015,
             },
+            "capital": {
+                "free_usd": 210.0,
+                "idle_usd": 70.0,
+                "idle_usd_pct": 33.3,
+                "free_doge": 1200.0,
+                "util_ratio": 0.667,
+            },
+            "accumulation": {
+                "enabled": True,
+                "state": "ARMED",
+                "active": False,
+                "signal": "accumulate_doge",
+                "conviction": 74,
+                "budget_used_usd": 8.0,
+                "budget_remaining_usd": 42.0,
+                "cooldown_remaining_sec": 0,
+            },
         }
 
         payload = ai_advisor._build_regime_context(raw)
         self.assertEqual(payload["hmm"]["primary_1m"]["regime"], "BULLISH")
         self.assertEqual(payload["hmm"]["secondary_15m"]["regime"], "RANGING")
+        self.assertEqual(payload["hmm"]["tertiary_1h"]["regime"], "BULLISH")
+        self.assertEqual(payload["hmm"]["tertiary_transition"]["to_regime"], "BULLISH")
+        self.assertTrue(payload["hmm"]["tertiary_transition"]["confirmed"])
         self.assertEqual(payload["hmm"]["training_quality"], "deep")
+        self.assertEqual(payload["hmm"]["training_quality_1h"], "baseline")
         self.assertAlmostEqual(float(payload["hmm"]["confidence_modifier"]), 0.95)
         self.assertEqual(len(payload["hmm"]["transition_matrix_1m"]), 3)
+        self.assertEqual(len(payload["hmm"]["transition_matrix_1h"]), 3)
         self.assertEqual(payload["hmm"]["consensus"]["consensus_probabilities"], [0.013, 0.984, 0.003])
         self.assertEqual(len(payload["regime_history_30m"]), 2)
         self.assertEqual(payload["mechanical_tier"]["current"], 0)
         self.assertEqual(payload["mechanical_tier"]["direction"], "symmetric")
+        self.assertAlmostEqual(float(payload["capital"]["idle_usd"]), 70.0)
+        self.assertEqual(payload["accumulation"]["state"], "ARMED")
+        self.assertEqual(payload["accumulation"]["signal"], "accumulate_doge")
+        self.assertEqual(payload["accumulation"]["conviction"], 74)
 
     def test_consensus_probs_missing_defaults(self):
         payload = ai_advisor._build_regime_context({
@@ -386,7 +438,7 @@ class AIRegimeAdvisorP0Tests(unittest.TestCase):
             )
 
         with mock.patch.object(ai_advisor.config, "AI_REGIME_ADVISOR_ENABLED", True):
-            with mock.patch("ai_advisor._build_panel", return_value=panel):
+            with mock.patch("ai_advisor._build_regime_provider_chain", return_value=panel):
                 with mock.patch("ai_advisor._call_panelist_messages", side_effect=_fake_call):
                     result = ai_advisor.get_regime_opinion({})
 
@@ -434,7 +486,7 @@ class AIRegimeAdvisorP0Tests(unittest.TestCase):
             )
 
         with mock.patch.object(ai_advisor.config, "AI_REGIME_ADVISOR_ENABLED", True):
-            with mock.patch("ai_advisor._build_panel", return_value=panel):
+            with mock.patch("ai_advisor._build_regime_provider_chain", return_value=panel):
                 with mock.patch("ai_advisor._call_panelist_messages", side_effect=_fake_call):
                     with mock.patch("ai_advisor.time.time", return_value=now):
                         result = ai_advisor.get_regime_opinion({})
@@ -445,51 +497,75 @@ class AIRegimeAdvisorP0Tests(unittest.TestCase):
             ["https://api.sambanova.ai/v1/chat/completions|DeepSeek-V3.1"],
         )
 
-    def test_get_regime_opinion_prefers_reasoning_then_fallback(self):
+    def test_get_regime_opinion_prefers_primary_then_fallback(self):
         panel = [
-            {"name": "Llama-8B", "url": "", "model": "", "key": "", "reasoning": False, "max_tokens": 200},
-            {"name": "Kimi-K2.5", "url": "", "model": "", "key": "", "reasoning": True, "max_tokens": 2048},
-            {"name": "Llama-70B", "url": "", "model": "", "key": "", "reasoning": False, "max_tokens": 200},
+            {"name": "DeepSeek-Chat", "provider": "deepseek", "url": "", "model": "deepseek-chat", "key": "", "reasoning": False, "max_tokens": 512},
+            {"name": "Llama-70B", "provider": "groq", "url": "", "model": "llama-3.3-70b-versatile", "key": "", "reasoning": False, "max_tokens": 512},
         ]
         call_order = []
 
         def _fake_call(messages, panelist):
             call_order.append(panelist["name"])
-            if panelist["name"] == "Kimi-K2.5":
+            if panelist["name"] == "DeepSeek-Chat":
                 return ("not-json", "")
-            if panelist["name"] == "Llama-70B":
-                return (
-                    '{"recommended_tier": 1, "recommended_direction": "long_bias", '
-                    '"conviction": 72, "rationale": "Momentum is improving.", '
-                    '"watch_for": "15m confidence > 0.20."}',
-                    "",
-                )
-            return ("", "not_used")
+            return (
+                '{"recommended_tier": 1, "recommended_direction": "long_bias", '
+                '"conviction": 72, "accumulation_signal": "accumulate_doge", '
+                '"accumulation_conviction": 78, "rationale": "Momentum is improving.", '
+                '"watch_for": "15m confidence > 0.20."}',
+                "",
+            )
 
         with mock.patch.object(ai_advisor.config, "AI_REGIME_ADVISOR_ENABLED", True):
-            with mock.patch.object(ai_advisor.config, "AI_REGIME_PREFER_REASONING", True):
-                with mock.patch("ai_advisor._build_panel", return_value=panel):
-                    with mock.patch("ai_advisor._call_panelist_messages", side_effect=_fake_call):
-                        result = ai_advisor.get_regime_opinion({})
+            with mock.patch("ai_advisor._build_regime_provider_chain", return_value=panel):
+                with mock.patch("ai_advisor._call_panelist_messages", side_effect=_fake_call):
+                    result = ai_advisor.get_regime_opinion({})
 
-        self.assertEqual(call_order, ["Kimi-K2.5", "Llama-70B"])
+        self.assertEqual(call_order, ["DeepSeek-Chat", "Llama-70B"])
         self.assertEqual(result["panelist"], "Llama-70B")
+        self.assertEqual(result["provider"], "groq")
+        self.assertEqual(result["model"], "llama-3.3-70b-versatile")
         self.assertEqual(result["recommended_tier"], 1)
         self.assertEqual(result["recommended_direction"], "long_bias")
         self.assertEqual(result["conviction"], 72)
+        self.assertEqual(result["accumulation_signal"], "accumulate_doge")
+        self.assertEqual(result["accumulation_conviction"], 78)
         self.assertEqual(result["error"], "")
+
+    def test_get_regime_opinion_double_failure_returns_safe_default(self):
+        panel = [
+            {"name": "DeepSeek-Chat", "provider": "deepseek", "url": "", "model": "deepseek-chat", "key": "", "reasoning": False, "max_tokens": 512},
+            {"name": "Llama-70B", "provider": "groq", "url": "", "model": "llama-3.3-70b-versatile", "key": "", "reasoning": False, "max_tokens": 512},
+        ]
+
+        def _fail(_messages, panelist):
+            return ("", f"{panelist['name']}:unavailable")
+
+        with mock.patch.object(ai_advisor.config, "AI_REGIME_ADVISOR_ENABLED", True):
+            with mock.patch("ai_advisor._build_regime_provider_chain", return_value=panel):
+                with mock.patch("ai_advisor._call_panelist_messages", side_effect=_fail):
+                    out = ai_advisor.get_regime_opinion({})
+
+        self.assertEqual(out["recommended_tier"], 0)
+        self.assertEqual(out["recommended_direction"], "symmetric")
+        self.assertEqual(out["conviction"], 0)
+        self.assertEqual(out["accumulation_signal"], "hold")
+        self.assertEqual(out["accumulation_conviction"], 0)
+        self.assertIn("Llama-70B", out["error"])
 
     def test_get_regime_opinion_never_raises(self):
         panel = [{"name": "Kimi-K2.5", "url": "", "model": "", "key": "", "reasoning": True, "max_tokens": 2048}]
 
         with mock.patch.object(ai_advisor.config, "AI_REGIME_ADVISOR_ENABLED", True):
-            with mock.patch("ai_advisor._build_panel", return_value=panel):
+            with mock.patch("ai_advisor._build_regime_provider_chain", return_value=panel):
                 with mock.patch("ai_advisor._build_regime_context", side_effect=RuntimeError("boom")):
                     result = ai_advisor.get_regime_opinion({})
 
         self.assertEqual(result["recommended_tier"], 0)
         self.assertEqual(result["recommended_direction"], "symmetric")
         self.assertEqual(result["conviction"], 0)
+        self.assertEqual(result["accumulation_signal"], "hold")
+        self.assertEqual(result["accumulation_conviction"], 0)
         self.assertIn("boom", result["error"])
 
     def test_reasoning_model_omits_temperature(self):
@@ -656,6 +732,34 @@ class AIRegimeAdvisorP0Tests(unittest.TestCase):
         default = ai_advisor._default_regime_opinion()
         self.assertIn("suggested_ttl_minutes", default)
         self.assertEqual(default["suggested_ttl_minutes"], 0)
+        self.assertEqual(default["accumulation_signal"], "hold")
+        self.assertEqual(default["accumulation_conviction"], 0)
+
+    def test_build_regime_provider_chain_prefers_deepseek_then_groq(self):
+        with mock.patch.object(ai_advisor.config, "DEEPSEEK_API_KEY", "d-key"):
+            with mock.patch.object(ai_advisor.config, "DEEPSEEK_MODEL", "deepseek-chat"):
+                with mock.patch.object(ai_advisor.config, "AI_REGIME_PREFER_DEEPSEEK_R1", False):
+                    with mock.patch.object(ai_advisor.config, "DEEPSEEK_TIMEOUT_SEC", 33):
+                        with mock.patch.object(ai_advisor.config, "GROQ_API_KEY", "g-key"):
+                            chain = ai_advisor._build_regime_provider_chain()
+
+        self.assertEqual(len(chain), 2)
+        self.assertEqual(chain[0]["provider"], "deepseek")
+        self.assertEqual(chain[0]["model"], "deepseek-chat")
+        self.assertEqual(chain[0]["timeout_sec"], 33)
+        self.assertEqual(chain[1]["provider"], "groq")
+        self.assertEqual(chain[1]["model"], "llama-3.3-70b-versatile")
+
+    def test_build_regime_provider_chain_r1_override(self):
+        with mock.patch.object(ai_advisor.config, "DEEPSEEK_API_KEY", "d-key"):
+            with mock.patch.object(ai_advisor.config, "DEEPSEEK_MODEL", "deepseek-chat"):
+                with mock.patch.object(ai_advisor.config, "AI_REGIME_PREFER_DEEPSEEK_R1", True):
+                    with mock.patch.object(ai_advisor.config, "GROQ_API_KEY", ""):
+                        chain = ai_advisor._build_regime_provider_chain()
+
+        self.assertEqual(len(chain), 1)
+        self.assertEqual(chain[0]["model"], "deepseek-reasoner")
+        self.assertTrue(chain[0]["reasoning"])
 
 
 if __name__ == "__main__":

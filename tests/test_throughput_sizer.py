@@ -150,6 +150,58 @@ class ThroughputSizerTests(unittest.TestCase):
         sized, _ = sizer.size_for_slot(100.0, regime_label="ranging", trade_id="A")
         self.assertAlmostEqual(sized, 30.0, delta=1.0)
 
+    def test_age_pressure_uses_p90_reference_ignoring_single_outlier(self):
+        sizer = ThroughputSizer(
+            self._cfg(
+                min_samples=3,
+                min_samples_per_bucket=1,
+                full_confidence_samples=1,
+                floor_mult=0.1,
+                age_pressure_trigger=1.0,
+                age_pressure_sensitivity=1.0,
+                age_pressure_floor=0.3,
+            )
+        )
+        cycles = [
+            _cycle(regime=1, trade_id="A", entry=0, exit_ts=100, duration=10, profit=1.0),
+            _cycle(regime=1, trade_id="B", entry=0, exit_ts=101, duration=10, profit=1.0),
+            _cycle(regime=2, trade_id="A", entry=0, exit_ts=102, duration=10, profit=1.0),
+        ]
+        open_exits = [{"regime_at_entry": 1, "trade_id": "A", "age_sec": 10.0, "volume": 10.0} for _ in range(10)]
+        open_exits.append({"regime_at_entry": 1, "trade_id": "B", "age_sec": 1000.0, "volume": 10.0})
+        sizer.update(cycles, open_exits=open_exits, regime_label="ranging", free_doge=100.0)
+        payload = sizer.status_payload()
+
+        self.assertEqual(payload["age_pressure_reference"], "p90")
+        self.assertAlmostEqual(float(payload["age_pressure_ref_age_sec"]), 10.0, delta=1e-6)
+        self.assertAlmostEqual(float(payload["oldest_open_exit_age_sec"]), 1000.0, delta=1e-6)
+        self.assertAlmostEqual(float(payload["age_pressure"]), 1.0, delta=1e-6)
+
+    def test_age_pressure_p90_small_open_set_degrades_toward_max(self):
+        sizer = ThroughputSizer(
+            self._cfg(
+                min_samples=3,
+                min_samples_per_bucket=1,
+                full_confidence_samples=1,
+                floor_mult=0.1,
+                age_pressure_trigger=1.0,
+                age_pressure_sensitivity=1.0,
+                age_pressure_floor=0.3,
+            )
+        )
+        cycles = [
+            _cycle(regime=1, trade_id="A", entry=0, exit_ts=100, duration=10, profit=1.0),
+            _cycle(regime=1, trade_id="B", entry=0, exit_ts=101, duration=10, profit=1.0),
+            _cycle(regime=2, trade_id="A", entry=0, exit_ts=102, duration=10, profit=1.0),
+        ]
+        open_exits = [{"regime_at_entry": 1, "trade_id": "A", "age_sec": 10.0, "volume": 10.0} for _ in range(8)]
+        open_exits.append({"regime_at_entry": 1, "trade_id": "B", "age_sec": 1000.0, "volume": 10.0})
+        sizer.update(cycles, open_exits=open_exits, regime_label="ranging", free_doge=100.0)
+        payload = sizer.status_payload()
+
+        self.assertAlmostEqual(float(payload["age_pressure_ref_age_sec"]), 1000.0, delta=1e-6)
+        self.assertAlmostEqual(float(payload["age_pressure"]), 0.3, delta=1e-6)
+
     def test_utilization_penalty_throttles_when_locked_is_high(self):
         sizer = ThroughputSizer(
             self._cfg(
@@ -238,6 +290,8 @@ class ThroughputSizerTests(unittest.TestCase):
         payload = restored.status_payload()
         self.assertEqual(payload["active_regime"], "bullish")
         self.assertEqual(payload["last_update_n"], 3)
+        self.assertEqual(payload["age_pressure_reference"], "p90")
+        self.assertIn("age_pressure_ref_age_sec", payload)
         self.assertIn("aggregate", payload)
         self.assertIn("ranging_A", payload)
 

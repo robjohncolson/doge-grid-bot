@@ -202,6 +202,7 @@ class ThroughputSizer:
         self._last_update_n = 0
         self._age_pressure = 1.0
         self._util_penalty = 1.0
+        self._age_pressure_ref_age_sec = 0.0
         self._oldest_open_exit_age_sec = 0.0
         self._util_ratio = 0.0
         self._bucket_stats: dict[str, BucketStats] = {}
@@ -287,6 +288,8 @@ class ThroughputSizer:
             "active_regime": str(self._active_regime),
             "last_update_n": int(self._last_update_n),
             "age_pressure": round(float(self._age_pressure), 6),
+            "age_pressure_reference": "p90",
+            "age_pressure_ref_age_sec": round(float(self._age_pressure_ref_age_sec), 6),
             "util_penalty": round(float(self._util_penalty), 6),
             "oldest_open_exit_age_sec": round(float(self._oldest_open_exit_age_sec), 6),
             "util_ratio": round(float(self._util_ratio), 6),
@@ -319,6 +322,8 @@ class ThroughputSizer:
             "active_regime": str(self._active_regime),
             "last_update_n": int(self._last_update_n),
             "age_pressure": float(self._age_pressure),
+            "age_pressure_reference": "p90",
+            "age_pressure_ref_age_sec": float(self._age_pressure_ref_age_sec),
             "util_penalty": float(self._util_penalty),
             "oldest_open_exit_age_sec": float(self._oldest_open_exit_age_sec),
             "util_ratio": float(self._util_ratio),
@@ -341,6 +346,13 @@ class ThroughputSizer:
             _safe_float(data.get("age_pressure"), 1.0),
             float(self.cfg.age_pressure_floor),
             1.0,
+        )
+        self._age_pressure_ref_age_sec = max(
+            0.0,
+            _safe_float(
+                data.get("age_pressure_ref_age_sec"),
+                _safe_float(data.get("oldest_open_exit_age_sec"), 0.0),
+            ),
         )
         self._util_penalty = _clamp(
             _safe_float(data.get("util_penalty"), 1.0),
@@ -414,6 +426,7 @@ class ThroughputSizer:
         self._bucket_n_censored = {name: 0 for name in _BUCKET_ORDER}
         self._age_pressure = 1.0
         self._util_penalty = 1.0
+        self._age_pressure_ref_age_sec = 0.0
         self._oldest_open_exit_age_sec = 0.0
         self._util_ratio = 0.0
 
@@ -582,10 +595,19 @@ class ThroughputSizer:
             self._bucket_multipliers[bucket_name] = final
 
     def _compute_age_pressure(self, open_aggregate: list[dict[str, float]], aggregate_ready: bool) -> None:
-        oldest = 0.0
+        ages: list[float] = []
         for row in open_aggregate:
-            oldest = max(oldest, max(0.0, _safe_float(row.get("age_sec"), 0.0)))
+            age = max(0.0, _safe_float(row.get("age_sec"), 0.0))
+            if age > 0.0:
+                ages.append(age)
+        oldest = max(ages) if ages else 0.0
         self._oldest_open_exit_age_sec = oldest
+        reference_age = 0.0
+        if ages:
+            ages_sorted = sorted(ages)
+            p90_index = min(int(len(ages_sorted) * 0.9), len(ages_sorted) - 1)
+            reference_age = float(ages_sorted[p90_index])
+        self._age_pressure_ref_age_sec = reference_age
         self._age_pressure = 1.0
 
         if not aggregate_ready:
@@ -596,10 +618,10 @@ class ThroughputSizer:
 
         trigger = max(0.0, float(self.cfg.age_pressure_trigger))
         threshold = aggregate.p75_fill_sec * trigger
-        if threshold <= 0.0 or oldest <= threshold:
+        if threshold <= 0.0 or reference_age <= threshold:
             return
 
-        excess_ratio = (oldest - threshold) / threshold
+        excess_ratio = (reference_age - threshold) / threshold
         pressured = 1.0 - excess_ratio * float(self.cfg.age_pressure_sensitivity)
         self._age_pressure = _clamp(pressured, float(self.cfg.age_pressure_floor), 1.0)
 
@@ -683,12 +705,12 @@ class ThroughputSizer:
             log.info("throughput: insufficient aggregate samples (n=%d)", self._last_update_n)
             return
         log.info(
-            "throughput: n=%d median=%.1fs p75=%.1fs age=%.3f util=%.3f util_ratio=%.3f",
+            "throughput: n=%d median=%.1fs p75=%.1fs age=%.3f ref_age=%.1fs util=%.3f util_ratio=%.3f",
             self._last_update_n,
             float(aggregate.median_fill_sec),
             float(aggregate.p75_fill_sec),
             float(self._age_pressure),
+            float(self._age_pressure_ref_age_sec),
             float(self._util_penalty),
             float(self._util_ratio),
         )
-

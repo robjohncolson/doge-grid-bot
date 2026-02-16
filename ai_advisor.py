@@ -51,6 +51,7 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 SAMBANOVA_URL = "https://api.sambanova.ai/v1/chat/completions"
 CEREBRAS_URL = "https://api.cerebras.ai/v1/chat/completions"
+DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 
 # Each tuple: (display_name, model_id, is_reasoning_model)
 GROQ_PANELISTS = [
@@ -85,22 +86,28 @@ SKIP_COOLDOWN = 3600      # seconds to skip a panelist (1 hour)
 _REGIME_DIRECTIONS = {"symmetric", "long_bias", "short_bias"}
 _REGIME_LABELS = {"BEARISH", "RANGING", "BULLISH"}
 _REGIME_QUALITY_TIERS = {"shallow", "baseline", "deep", "full"}
+_REGIME_ACCUM_SIGNALS = {"accumulate_doge", "hold", "accumulate_usd"}
 
 _REGIME_SYSTEM_PROMPT = (
     "You are a regime analyst for a DOGE/USD grid trading bot. You receive "
     "technical signals from a Hidden Markov Model (3-state: BEARISH, "
-    "RANGING, BULLISH) running on two timeframes (1-minute and 15-minute), "
-    "plus operational metrics. Your job is to interpret these signals "
-    "holistically and recommend a trading posture.\n\n"
+    "RANGING, BULLISH) running on three timeframes (1-minute, 15-minute, and "
+    "1-hour strategic), plus operational and capital metrics. Your job is to "
+    "interpret these signals holistically and recommend a trading posture.\n\n"
     "The bot uses a 3-tier system:\n"
     "- Tier 0 (Symmetric): Both sides trade equally. Default/safe.\n"
     "- Tier 1 (Asymmetric): Favor one side with spacing bias.\n"
     "- Tier 2 (Aggressive): Suppress the against-trend side entirely.\n\n"
-    "Recommend a tier and direction using ALL signals. Consider timeframe "
+    "Use 1m+15m as tactical input for tier/direction. Treat 1h as strategic "
+    "input for accumulation bias and persistence. Consider timeframe "
     "agreement/convergence, transition matrix stickiness, consensus "
-    "probabilities, operational signals, and whether confidence is "
-    "rising/falling over recent history. Be conservative. Tier 2 is rare. "
-    "When uncertain, recommend Tier 0 (symmetric).\n\n"
+    "probabilities, operational signals, capital utilization, and whether "
+    "confidence is rising/falling over recent history. Be conservative. "
+    "Tier 2 is rare. When uncertain, recommend Tier 0 (symmetric).\n\n"
+    "Also emit an accumulation stance:\n"
+    '- "accumulate_doge": deploy idle USD into DOGE via DCA\n'
+    '- "hold": no strategic accumulation change\n'
+    '- "accumulate_usd": preserve cash / avoid DOGE accumulation\n\n'
     "Return ONLY a JSON object with these fields:\n"
     '- "recommended_tier": 0, 1, or 2\n'
     '- "recommended_direction": "symmetric", "long_bias", or "short_bias"\n'
@@ -113,7 +120,9 @@ _REGIME_SYSTEM_PROMPT = (
     '- "suggested_ttl_minutes": 10-60, how long you expect this regime to persist. '
     'Consider: timeframe agreement (both align = longer), transition matrix stickiness '
     '(high self-transition = longer), conviction trend (rising = longer), and signal '
-    'noise. 15 means "short-lived or uncertain signal", 45+ means "strong convergent trend".'
+    'noise. 15 means "short-lived or uncertain signal", 45+ means "strong convergent trend".\n'
+    '- "accumulation_signal": "accumulate_doge", "hold", or "accumulate_usd"\n'
+    '- "accumulation_conviction": 0-100 confidence in the accumulation signal'
 )
 
 
@@ -356,10 +365,14 @@ def _default_regime_opinion(error: str = "") -> dict:
         "recommended_tier": 0,
         "recommended_direction": "symmetric",
         "conviction": 0,
+        "accumulation_signal": "hold",
+        "accumulation_conviction": 0,
         "rationale": "",
         "watch_for": "",
         "suggested_ttl_minutes": 0,
         "panelist": "",
+        "provider": "",
+        "model": "",
         "error": _clip_text(error, 200),
     }
 
@@ -412,6 +425,13 @@ def _normalize_direction(value) -> str:
     if direction not in _REGIME_DIRECTIONS:
         return "symmetric"
     return direction
+
+
+def _normalize_accumulation_signal(value) -> str:
+    signal = str(value or "hold").strip().lower()
+    if signal not in _REGIME_ACCUM_SIGNALS:
+        return "hold"
+    return signal
 
 
 def _sanitize_probabilities(values) -> list:
@@ -492,6 +512,14 @@ def _build_regime_context(payload: dict) -> dict:
     if not isinstance(secondary, dict):
         secondary = {}
 
+    tertiary = hmm.get("tertiary_1h")
+    if not isinstance(tertiary, dict):
+        tertiary = payload.get("hmm_tertiary")
+    if not isinstance(tertiary, dict):
+        tertiary = payload.get("tertiary_1h")
+    if not isinstance(tertiary, dict):
+        tertiary = {}
+
     consensus = hmm.get("consensus")
     if not isinstance(consensus, dict):
         consensus = payload.get("hmm_consensus")
@@ -504,17 +532,44 @@ def _build_regime_context(payload: dict) -> dict:
     if transition_matrix is None:
         transition_matrix = payload.get("transition_matrix_1m")
 
+    transition_matrix_1h = hmm.get("transition_matrix_1h")
+    if transition_matrix_1h is None:
+        transition_matrix_1h = payload.get("transition_matrix_1h")
+
+    tertiary_transition = hmm.get("tertiary_transition")
+    if not isinstance(tertiary_transition, dict):
+        tertiary_transition = tertiary.get("transition")
+    if not isinstance(tertiary_transition, dict):
+        tertiary_transition = payload.get("hmm_tertiary_transition")
+    if not isinstance(tertiary_transition, dict):
+        tertiary_transition = {}
+
     training_quality = str(
         hmm.get("training_quality", payload.get("training_quality", "shallow"))
     ).strip().lower()
     if training_quality not in _REGIME_QUALITY_TIERS:
         training_quality = "shallow"
 
+    training_quality_1h = str(
+        hmm.get("training_quality_1h", payload.get("training_quality_1h", "shallow"))
+    ).strip().lower()
+    if training_quality_1h not in _REGIME_QUALITY_TIERS:
+        training_quality_1h = "shallow"
+
     confidence_modifier = round(
         _safe_float(
             hmm.get("confidence_modifier", payload.get("confidence_modifier", 1.0)),
             1.0,
             0.5,
+            1.0,
+        ),
+        4,
+    )
+    consensus_1h_weight = round(
+        _safe_float(
+            hmm.get("consensus_1h_weight", payload.get("consensus_1h_weight", getattr(config, "CONSENSUS_1H_WEIGHT", 0.3))),
+            getattr(config, "CONSENSUS_1H_WEIGHT", 0.3),
+            0.0,
             1.0,
         ),
         4,
@@ -532,6 +587,10 @@ def _build_regime_context(payload: dict) -> dict:
             "regime": _normalize_regime(item.get("regime")),
             "conf": round(
                 _safe_float(item.get("conf", item.get("confidence")), 0.0, 0.0, 1.0),
+                4,
+            ),
+            "bias": round(
+                _safe_float(item.get("bias", item.get("bias_signal")), 0.0, -1.0, 1.0),
                 4,
             ),
         })
@@ -558,10 +617,58 @@ def _build_regime_context(payload: dict) -> dict:
     if not capacity_band:
         capacity_band = "normal"
 
+    capital = payload.get("capital")
+    if not isinstance(capital, dict):
+        capital = {}
+    free_usd = round(_safe_float(capital.get("free_usd"), 0.0, 0.0), 6)
+    idle_usd = round(_safe_float(capital.get("idle_usd"), 0.0, 0.0), 6)
+    idle_usd_pct = round(_safe_float(capital.get("idle_usd_pct"), 0.0, 0.0, 100.0), 4)
+    free_doge = round(_safe_float(capital.get("free_doge"), 0.0, 0.0), 6)
+    util_ratio = _safe_float(capital.get("util_ratio"), 0.0, 0.0, 1.0)
+    if util_ratio <= 0.0:
+        util_ratio = max(0.0, min(1.0, 1.0 - (idle_usd_pct / 100.0)))
+    util_ratio = round(util_ratio, 4)
+
+    accumulation = payload.get("accumulation")
+    if not isinstance(accumulation, dict):
+        accumulation = {}
+    accum_state = _clip_text(
+        str(accumulation.get("state", "IDLE")).strip().upper(),
+        24,
+    ) or "IDLE"
+    accum_signal = _normalize_accumulation_signal(
+        accumulation.get("signal", accumulation.get("accumulation_signal", "hold"))
+    )
+    accum_conviction = _safe_int(
+        accumulation.get("conviction", accumulation.get("accumulation_conviction", 0)),
+        0,
+        0,
+        100,
+    )
+
     return {
         "hmm": {
             "primary_1m": _sanitize_hmm_state(primary),
             "secondary_15m": _sanitize_hmm_state(secondary),
+            "tertiary_1h": _sanitize_hmm_state(tertiary),
+            "tertiary_transition": {
+                "from_regime": _normalize_regime(tertiary_transition.get("from_regime")),
+                "to_regime": _normalize_regime(tertiary_transition.get("to_regime")),
+                "transition_age_sec": round(
+                    _safe_float(tertiary_transition.get("transition_age_sec"), 0.0, 0.0),
+                    2,
+                ),
+                "confidence": round(
+                    _safe_float(tertiary_transition.get("confidence"), 0.0, 0.0, 1.0),
+                    4,
+                ),
+                "confirmed": bool(tertiary_transition.get("confirmed", False)),
+                "confirmation_count": _safe_int(
+                    tertiary_transition.get("confirmation_count"),
+                    0,
+                    0,
+                ),
+            },
             "consensus": {
                 "agreement": _clip_text(consensus.get("agreement", "unknown"), 40),
                 "effective_regime": _normalize_regime(
@@ -580,8 +687,11 @@ def _build_regime_context(payload: dict) -> dict:
                 ),
             },
             "transition_matrix_1m": _sanitize_transition_matrix(transition_matrix),
+            "transition_matrix_1h": _sanitize_transition_matrix(transition_matrix_1h),
             "training_quality": training_quality,
+            "training_quality_1h": training_quality_1h,
             "confidence_modifier": confidence_modifier,
+            "consensus_1h_weight": consensus_1h_weight,
         },
         "regime_history_30m": history,
         "mechanical_tier": {
@@ -612,7 +722,82 @@ def _build_regime_context(payload: dict) -> dict:
                 6,
             ),
         },
+        "capital": {
+            "free_usd": free_usd,
+            "idle_usd": idle_usd,
+            "idle_usd_pct": idle_usd_pct,
+            "free_doge": free_doge,
+            "util_ratio": util_ratio,
+        },
+        "accumulation": {
+            "enabled": bool(accumulation.get("enabled", False)),
+            "state": accum_state,
+            "active": bool(accumulation.get("active", False)),
+            "signal": accum_signal,
+            "conviction": int(accum_conviction),
+            "budget_used_usd": round(_safe_float(accumulation.get("budget_used_usd"), 0.0, 0.0), 6),
+            "budget_remaining_usd": round(
+                _safe_float(accumulation.get("budget_remaining_usd"), 0.0, 0.0),
+                6,
+            ),
+            "cooldown_remaining_sec": _safe_int(
+                accumulation.get("cooldown_remaining_sec"),
+                0,
+                0,
+            ),
+        },
     }
+
+
+def _build_regime_provider_chain() -> list:
+    """
+    Regime-only provider chain:
+      1) DeepSeek (primary)
+      2) Groq Llama-70B (fallback)
+
+    If neither is configured, fall back to legacy panel ordering so the
+    advisor can still operate in compatibility mode.
+    """
+    providers = []
+
+    deepseek_key = str(getattr(config, "DEEPSEEK_API_KEY", "") or "").strip()
+    deepseek_model_cfg = str(getattr(config, "DEEPSEEK_MODEL", "deepseek-chat") or "deepseek-chat").strip()
+    prefer_r1 = bool(getattr(config, "AI_REGIME_PREFER_DEEPSEEK_R1", False))
+    deepseek_model = "deepseek-reasoner" if prefer_r1 else (deepseek_model_cfg or "deepseek-chat")
+    deepseek_reasoning = "reasoner" in deepseek_model.lower() or "r1" in deepseek_model.lower()
+    deepseek_name = "DeepSeek-R1" if deepseek_reasoning else "DeepSeek-Chat"
+    deepseek_timeout = max(5, int(getattr(config, "DEEPSEEK_TIMEOUT_SEC", 30)))
+
+    if deepseek_key:
+        providers.append({
+            "name": deepseek_name,
+            "provider": "deepseek",
+            "url": DEEPSEEK_URL,
+            "model": deepseek_model,
+            "key": deepseek_key,
+            "reasoning": deepseek_reasoning,
+            "max_tokens": _REASONING_MAX_TOKENS if deepseek_reasoning else 512,
+            "timeout_sec": deepseek_timeout,
+            "panelist_id": f"{DEEPSEEK_URL}|{deepseek_model}",
+        })
+
+    groq_key = str(getattr(config, "GROQ_API_KEY", "") or "").strip()
+    if groq_key:
+        providers.append({
+            "name": "Llama-70B",
+            "provider": "groq",
+            "url": GROQ_URL,
+            "model": "llama-3.3-70b-versatile",
+            "key": groq_key,
+            "reasoning": False,
+            "max_tokens": 512,
+            "panelist_id": f"{GROQ_URL}|llama-3.3-70b-versatile",
+        })
+
+    if providers:
+        return providers
+
+    return _ordered_regime_panel(_build_panel())
 
 
 def _ordered_regime_panel(panel: list) -> list:
@@ -653,7 +838,10 @@ def _ordered_regime_panel(panel: list) -> list:
 
 def _call_panelist_messages(messages: list, panelist: dict) -> tuple:
     is_reasoning = bool(panelist.get("reasoning"))
-    timeout = 30 if is_reasoning else 20
+    timeout = max(
+        5,
+        int(panelist.get("timeout_sec", 30 if is_reasoning else 20)),
+    )
     cap = _REASONING_MAX_TOKENS if is_reasoning else 512
     max_tokens = min(int(panelist.get("max_tokens", _INSTRUCT_MAX_TOKENS)), cap)
 
@@ -733,6 +921,13 @@ def _parse_regime_opinion(response: str) -> tuple:
         "recommended_tier": tier,
         "recommended_direction": _normalize_direction(parsed.get("recommended_direction")),
         "conviction": _safe_int(parsed.get("conviction"), 0, 0, 100),
+        "accumulation_signal": _normalize_accumulation_signal(parsed.get("accumulation_signal")),
+        "accumulation_conviction": _safe_int(
+            parsed.get("accumulation_conviction"),
+            0,
+            0,
+            100,
+        ),
         "rationale": _clip_text(parsed.get("rationale"), 500),
         "watch_for": _clip_text(parsed.get("watch_for"), 200),
         "suggested_ttl_minutes": _safe_int(parsed.get("suggested_ttl_minutes"), 0, 0, 60),
@@ -958,16 +1153,11 @@ def log_approval_decision(action: str, decision: str):
 
 def get_regime_opinion(context: dict) -> dict:
     """
-    Query a single preferred panelist for regime interpretation.
+    Query regime advisor using strategic provider chain.
 
-    Fallback order (when AI_REGIME_PREFER_REASONING=True):
-      1) DeepSeek-R1 (SambaNova, reasoning)
-      2) Kimi-K2.5 (NVIDIA, reasoning)
-      3) DeepSeek-V3.1 (SambaNova, instruct)
-      4) Qwen3-235B (Cerebras, instruct)
-      5) GPT-OSS-120B (Cerebras, instruct)
-      6) Llama-70B (Groq, instruct)
-      7) Llama-8B (Groq, instruct)
+    Provider order:
+      1) DeepSeek (configured model or deepseek-reasoner)
+      2) Groq Llama-70B fallback
 
     Returns a validated dict and never raises.
     """
@@ -975,9 +1165,9 @@ def get_regime_opinion(context: dict) -> dict:
         return _default_regime_opinion("disabled")
 
     try:
-        panel = _ordered_regime_panel(_build_panel())
-        if not panel:
-            return _default_regime_opinion("no_panelists")
+        providers = _build_regime_provider_chain()
+        if not providers:
+            return _default_regime_opinion("no_regime_providers")
 
         prompt_context = _build_regime_context(context)
         messages = [
@@ -985,42 +1175,44 @@ def get_regime_opinion(context: dict) -> dict:
             {"role": "user", "content": json.dumps(prompt_context, default=str)},
         ]
 
-        last_error = "all_panelists_failed"
-        for panelist in panel:
-            name = str(panelist.get("name", "")).strip() or "unknown"
-            panel_key = str(
-                panelist.get("panelist_id")
-                or f"{panelist.get('url', '')}|{panelist.get('model', '')}"
+        last_error = "all_regime_providers_failed"
+        for provider in providers:
+            name = str(provider.get("name", "")).strip() or "unknown"
+            provider_name = str(provider.get("provider", "panel")).strip().lower() or "panel"
+            model_name = str(provider.get("model", "")).strip()
+            provider_key = str(
+                provider.get("panelist_id")
+                or f"{provider.get('url', '')}|{provider.get('model', '')}"
                 or name
             )
             now = time.time()
-            skip_until = float(_panelist_skip_until.get(panel_key, 0) or 0)
+            skip_until = float(_panelist_skip_until.get(provider_key, 0) or 0)
             if now < skip_until:
                 remaining = int(skip_until - now)
                 logger.info(
-                    "AI regime advisor: panelist %s skipped (cooldown, %ds remaining)",
+                    "AI regime advisor: provider %s skipped (cooldown, %ds remaining)",
                     name,
                     remaining,
                 )
                 continue
-            logger.info("AI regime advisor: querying %s...", name)
+            logger.info("AI regime advisor: querying %s/%s...", provider_name, model_name or name)
 
-            response, err = _call_panelist_messages(messages, panelist)
+            response, err = _call_panelist_messages(messages, provider)
             if not response:
                 reason = _clip_text(err or "empty_response", 120)
                 last_error = f"{name}:{reason}"
-                fails = int(_panelist_consecutive_fails.get(panel_key, 0) or 0) + 1
-                _panelist_consecutive_fails[panel_key] = fails
+                fails = int(_panelist_consecutive_fails.get(provider_key, 0) or 0) + 1
+                _panelist_consecutive_fails[provider_key] = fails
                 if fails >= SKIP_THRESHOLD:
-                    _panelist_skip_until[panel_key] = now + SKIP_COOLDOWN
+                    _panelist_skip_until[provider_key] = now + SKIP_COOLDOWN
                     logger.warning(
-                        "AI regime advisor: panelist %s hit %d consecutive failures -- skipping for %ds",
+                        "AI regime advisor: provider %s hit %d consecutive failures -- skipping for %ds",
                         name,
                         fails,
                         SKIP_COOLDOWN,
                     )
                 logger.warning(
-                    "AI regime advisor: panelist %s failed (%s), trying next",
+                    "AI regime advisor: provider %s failed (%s), trying next",
                     name,
                     reason,
                 )
@@ -1029,33 +1221,38 @@ def get_regime_opinion(context: dict) -> dict:
             parsed, parse_err = _parse_regime_opinion(response)
             if parse_err:
                 last_error = f"{name}:{parse_err}"
-                fails = int(_panelist_consecutive_fails.get(panel_key, 0) or 0) + 1
-                _panelist_consecutive_fails[panel_key] = fails
+                fails = int(_panelist_consecutive_fails.get(provider_key, 0) or 0) + 1
+                _panelist_consecutive_fails[provider_key] = fails
                 if fails >= SKIP_THRESHOLD:
-                    _panelist_skip_until[panel_key] = now + SKIP_COOLDOWN
+                    _panelist_skip_until[provider_key] = now + SKIP_COOLDOWN
                     logger.warning(
-                        "AI regime advisor: panelist %s hit %d consecutive failures -- skipping for %ds",
+                        "AI regime advisor: provider %s hit %d consecutive failures -- skipping for %ds",
                         name,
                         fails,
                         SKIP_COOLDOWN,
                     )
                 logger.warning(
-                    "AI regime advisor: panelist %s returned invalid JSON (%s), trying next",
+                    "AI regime advisor: provider %s returned invalid JSON (%s), trying next",
                     name,
                     parse_err,
                 )
                 continue
 
-            _panelist_consecutive_fails[panel_key] = 0
+            _panelist_consecutive_fails[provider_key] = 0
             result = _default_regime_opinion("")
             result.update(parsed)
             result["panelist"] = name
+            result["provider"] = provider_name
+            result["model"] = model_name
             logger.info(
-                "AI regime advisor: %s -> tier %d %s (%d%% conviction)",
-                name,
+                "AI regime advisor: %s/%s -> tier %d %s (%d%% conviction, accum=%s %d%%)",
+                provider_name,
+                model_name or name,
                 result["recommended_tier"],
                 result["recommended_direction"],
                 result["conviction"],
+                result["accumulation_signal"],
+                result["accumulation_conviction"],
             )
             return result
 

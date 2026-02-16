@@ -41,6 +41,20 @@ logger = logging.getLogger(__name__)
 _BOT_RUNTIME_STATE_FILE = os.path.join(config.LOG_DIR, "bot_runtime.json")
 
 
+def _recovery_orders_enabled_flag() -> bool:
+    return bool(
+        getattr(
+            config,
+            "RECOVERY_ORDERS_ENABLED",
+            getattr(config, "RECOVERY_ENABLED", True),
+        )
+    )
+
+
+def _recovery_disabled_message(action: str) -> str:
+    return f"{action} disabled when RECOVERY_ORDERS_ENABLED=false"
+
+
 def setup_logging() -> None:
     level = getattr(logging, config.LOG_LEVEL.upper(), logging.INFO)
     logging.basicConfig(
@@ -304,10 +318,15 @@ class BotRuntime:
         self._ohlcv_secondary_last_sync_ts: float = 0.0
         self._ohlcv_secondary_last_candle_ts: float = 0.0
         self._ohlcv_secondary_last_rows_queued: int = 0
+        self._ohlcv_tertiary_since_cursor: int | None = None
+        self._ohlcv_tertiary_last_sync_ts: float = 0.0
+        self._ohlcv_tertiary_last_candle_ts: float = 0.0
+        self._ohlcv_tertiary_last_rows_queued: int = 0
         self._hmm_readiness_cache: dict[str, dict[str, Any]] = {}
         self._hmm_readiness_last_ts: dict[str, float] = {}
         self._hmm_detector: Any = None
         self._hmm_detector_secondary: Any = None
+        self._hmm_detector_tertiary: Any = None
         self._hmm_module: Any = None
         self._hmm_numpy: Any = None
         self._regime_history_30m: deque[dict[str, Any]] = deque()
@@ -317,6 +336,11 @@ class BotRuntime:
             enabled=bool(getattr(config, "HMM_ENABLED", False))
             and bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)),
             interval_min=max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15))),
+        )
+        self._hmm_state_tertiary: dict[str, Any] = self._hmm_default_state(
+            enabled=bool(getattr(config, "HMM_ENABLED", False))
+            and bool(getattr(config, "HMM_TERTIARY_ENABLED", False)),
+            interval_min=max(1, int(getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60))),
         )
         self._hmm_consensus: dict[str, Any] = dict(self._hmm_state)
         self._hmm_consensus.update({
@@ -330,8 +354,12 @@ class BotRuntime:
         self._hmm_training_depth_secondary: dict[str, Any] = self._hmm_training_depth_default(
             state_key="secondary"
         )
+        self._hmm_training_depth_tertiary: dict[str, Any] = self._hmm_training_depth_default(
+            state_key="tertiary"
+        )
         self._hmm_last_train_attempt_ts: float = 0.0
         self._hmm_last_train_attempt_ts_secondary: float = 0.0
+        self._hmm_last_train_attempt_ts_tertiary: float = 0.0
         self._hmm_backfill_last_at: float = 0.0
         self._hmm_backfill_last_rows: int = 0
         self._hmm_backfill_last_message: str = ""
@@ -340,6 +368,19 @@ class BotRuntime:
         self._hmm_backfill_last_rows_secondary: int = 0
         self._hmm_backfill_last_message_secondary: str = ""
         self._hmm_backfill_stall_count_secondary: int = 0
+        self._hmm_backfill_last_at_tertiary: float = 0.0
+        self._hmm_backfill_last_rows_tertiary: int = 0
+        self._hmm_backfill_last_message_tertiary: str = ""
+        self._hmm_backfill_stall_count_tertiary: int = 0
+        self._hmm_tertiary_transition: dict[str, Any] = {
+            "from_regime": "RANGING",
+            "to_regime": "RANGING",
+            "transition_age_sec": 0.0,
+            "confidence": 0.0,
+            "confirmed": False,
+            "confirmation_count": 0,
+            "changed_at": 0.0,
+        }
         self._regime_tier: int = 0
         self._regime_tier_entered_at: float = 0.0
         self._regime_tier2_grace_start: float = 0.0
@@ -368,6 +409,24 @@ class BotRuntime:
         self._ai_override_until: float | None = None
         self._ai_override_applied_at: float | None = None
         self._ai_override_source_conviction: int | None = None
+        # Strategic accumulation engine runtime state.
+        self._accum_state: str = "IDLE"  # IDLE | ARMED | ACTIVE | COMPLETED | STOPPED
+        self._accum_direction: str | None = None
+        self._accum_trigger_from_regime: str = "RANGING"
+        self._accum_trigger_to_regime: str = "RANGING"
+        self._accum_start_ts: float = 0.0
+        self._accum_start_price: float = 0.0
+        self._accum_spent_usd: float = 0.0
+        self._accum_acquired_doge: float = 0.0
+        self._accum_n_buys: int = 0
+        self._accum_last_buy_ts: float = 0.0
+        self._accum_budget_usd: float = 0.0
+        self._accum_armed_at: float = 0.0
+        self._accum_hold_streak: int = 0
+        self._accum_last_session_end_ts: float = 0.0
+        self._accum_last_session_summary: dict[str, Any] = {}
+        self._accum_manual_stop_requested: bool = False
+        self._accum_cooldown_remaining_sec: int = 0
         self._regime_shadow_state: dict[str, Any] = {
             "enabled": False,
             "shadow_enabled": False,
@@ -466,9 +525,23 @@ class BotRuntime:
 
         return max(0.10, min(3.0, mult_a)), max(0.10, min(3.0, mult_b))
 
+    def _recovery_orders_enabled(self) -> bool:
+        return _recovery_orders_enabled_flag()
+
     def _engine_cfg(self, slot: SlotRuntime) -> sm.EngineConfig:
         spacing_mult_a, spacing_mult_b = self._regime_entry_spacing_multipliers()
         base_entry_pct = float(self.entry_pct)
+        recovery_orders_enabled = self._recovery_orders_enabled()
+        s1_orphan_after_sec = (
+            float(config.S1_ORPHAN_AFTER_SEC)
+            if recovery_orders_enabled
+            else float("inf")
+        )
+        s2_orphan_after_sec = (
+            float(config.S2_ORPHAN_AFTER_SEC)
+            if recovery_orders_enabled
+            else float("inf")
+        )
         return sm.EngineConfig(
             entry_pct=base_entry_pct,
             entry_pct_a=base_entry_pct * spacing_mult_a,
@@ -482,8 +555,8 @@ class BotRuntime:
             min_cost_usd=float(self.constraints.get("min_cost_usd", 0.0)),
             maker_fee_pct=float(self.maker_fee_pct),
             stale_price_max_age_sec=float(config.STALE_PRICE_MAX_AGE_SEC),
-            s1_orphan_after_sec=float(config.S1_ORPHAN_AFTER_SEC),
-            s2_orphan_after_sec=float(config.S2_ORPHAN_AFTER_SEC),
+            s1_orphan_after_sec=s1_orphan_after_sec,
+            s2_orphan_after_sec=s2_orphan_after_sec,
             loss_backoff_start=int(config.LOSS_BACKOFF_START),
             loss_cooldown_start=int(config.LOSS_COOLDOWN_START),
             loss_cooldown_sec=float(config.LOSS_COOLDOWN_SEC),
@@ -1265,7 +1338,12 @@ class BotRuntime:
             "ohlcv_secondary_last_sync_ts": self._ohlcv_secondary_last_sync_ts,
             "ohlcv_secondary_last_candle_ts": self._ohlcv_secondary_last_candle_ts,
             "ohlcv_secondary_last_rows_queued": self._ohlcv_secondary_last_rows_queued,
+            "ohlcv_tertiary_since_cursor": self._ohlcv_tertiary_since_cursor,
+            "ohlcv_tertiary_last_sync_ts": self._ohlcv_tertiary_last_sync_ts,
+            "ohlcv_tertiary_last_candle_ts": self._ohlcv_tertiary_last_candle_ts,
+            "ohlcv_tertiary_last_rows_queued": self._ohlcv_tertiary_last_rows_queued,
             "hmm_state_secondary": dict(self._hmm_state_secondary or {}),
+            "hmm_state_tertiary": dict(self._hmm_state_tertiary or {}),
             "hmm_consensus": dict(self._hmm_consensus or {}),
             "hmm_backfill_last_at": self._hmm_backfill_last_at,
             "hmm_backfill_last_rows": self._hmm_backfill_last_rows,
@@ -1275,6 +1353,11 @@ class BotRuntime:
             "hmm_backfill_last_rows_secondary": self._hmm_backfill_last_rows_secondary,
             "hmm_backfill_last_message_secondary": self._hmm_backfill_last_message_secondary,
             "hmm_backfill_stall_count_secondary": self._hmm_backfill_stall_count_secondary,
+            "hmm_backfill_last_at_tertiary": self._hmm_backfill_last_at_tertiary,
+            "hmm_backfill_last_rows_tertiary": self._hmm_backfill_last_rows_tertiary,
+            "hmm_backfill_last_message_tertiary": self._hmm_backfill_last_message_tertiary,
+            "hmm_backfill_stall_count_tertiary": self._hmm_backfill_stall_count_tertiary,
+            "hmm_tertiary_transition": dict(self._hmm_tertiary_transition or {}),
             "regime_tier": int(self._regime_tier),
             "regime_tier_entered_at": float(self._regime_tier_entered_at),
             "regime_tier2_grace_start": float(self._regime_tier2_grace_start),
@@ -1296,6 +1379,23 @@ class BotRuntime:
             "ai_override_until": self._ai_override_until,
             "ai_override_applied_at": self._ai_override_applied_at,
             "ai_override_source_conviction": self._ai_override_source_conviction,
+            "accum_state": str(self._accum_state),
+            "accum_direction": self._accum_direction,
+            "accum_trigger_from_regime": str(self._accum_trigger_from_regime),
+            "accum_trigger_to_regime": str(self._accum_trigger_to_regime),
+            "accum_start_ts": float(self._accum_start_ts),
+            "accum_start_price": float(self._accum_start_price),
+            "accum_spent_usd": float(self._accum_spent_usd),
+            "accum_acquired_doge": float(self._accum_acquired_doge),
+            "accum_n_buys": int(self._accum_n_buys),
+            "accum_last_buy_ts": float(self._accum_last_buy_ts),
+            "accum_budget_usd": float(self._accum_budget_usd),
+            "accum_armed_at": float(self._accum_armed_at),
+            "accum_hold_streak": int(self._accum_hold_streak),
+            "accum_last_session_end_ts": float(self._accum_last_session_end_ts),
+            "accum_last_session_summary": dict(self._accum_last_session_summary or {}),
+            "accum_manual_stop_requested": bool(self._accum_manual_stop_requested),
+            "accum_cooldown_remaining_sec": int(self._accum_cooldown_remaining_sec),
             "entry_adds_deferred_total": self._entry_adds_deferred_total,
             "entry_adds_drained_total": self._entry_adds_drained_total,
             "entry_adds_last_deferred_at": self._entry_adds_last_deferred_at,
@@ -1410,6 +1510,11 @@ class BotRuntime:
                 self._ohlcv_secondary_since_cursor = int(raw_secondary_cursor) if raw_secondary_cursor is not None else None
             except (TypeError, ValueError):
                 self._ohlcv_secondary_since_cursor = None
+            raw_tertiary_cursor = snap.get("ohlcv_tertiary_since_cursor", self._ohlcv_tertiary_since_cursor)
+            try:
+                self._ohlcv_tertiary_since_cursor = int(raw_tertiary_cursor) if raw_tertiary_cursor is not None else None
+            except (TypeError, ValueError):
+                self._ohlcv_tertiary_since_cursor = None
             self._ohlcv_last_sync_ts = float(snap.get("ohlcv_last_sync_ts", self._ohlcv_last_sync_ts))
             self._ohlcv_last_candle_ts = float(snap.get("ohlcv_last_candle_ts", self._ohlcv_last_candle_ts))
             self._ohlcv_secondary_last_sync_ts = float(
@@ -1420,6 +1525,15 @@ class BotRuntime:
             )
             self._ohlcv_secondary_last_rows_queued = int(
                 snap.get("ohlcv_secondary_last_rows_queued", self._ohlcv_secondary_last_rows_queued)
+            )
+            self._ohlcv_tertiary_last_sync_ts = float(
+                snap.get("ohlcv_tertiary_last_sync_ts", self._ohlcv_tertiary_last_sync_ts)
+            )
+            self._ohlcv_tertiary_last_candle_ts = float(
+                snap.get("ohlcv_tertiary_last_candle_ts", self._ohlcv_tertiary_last_candle_ts)
+            )
+            self._ohlcv_tertiary_last_rows_queued = int(
+                snap.get("ohlcv_tertiary_last_rows_queued", self._ohlcv_tertiary_last_rows_queued)
             )
             self._hmm_backfill_last_at = float(snap.get("hmm_backfill_last_at", self._hmm_backfill_last_at))
             self._hmm_backfill_last_rows = int(snap.get("hmm_backfill_last_rows", self._hmm_backfill_last_rows))
@@ -1448,12 +1562,37 @@ class BotRuntime:
                     self._hmm_backfill_stall_count_secondary,
                 )
             )
+            self._hmm_backfill_last_at_tertiary = float(
+                snap.get("hmm_backfill_last_at_tertiary", self._hmm_backfill_last_at_tertiary)
+            )
+            self._hmm_backfill_last_rows_tertiary = int(
+                snap.get("hmm_backfill_last_rows_tertiary", self._hmm_backfill_last_rows_tertiary)
+            )
+            self._hmm_backfill_last_message_tertiary = str(
+                snap.get(
+                    "hmm_backfill_last_message_tertiary",
+                    self._hmm_backfill_last_message_tertiary,
+                )
+                or ""
+            )
+            self._hmm_backfill_stall_count_tertiary = int(
+                snap.get(
+                    "hmm_backfill_stall_count_tertiary",
+                    self._hmm_backfill_stall_count_tertiary,
+                )
+            )
             raw_hmm_state_secondary = snap.get("hmm_state_secondary", self._hmm_state_secondary)
             if isinstance(raw_hmm_state_secondary, dict):
                 self._hmm_state_secondary = dict(raw_hmm_state_secondary)
+            raw_hmm_state_tertiary = snap.get("hmm_state_tertiary", self._hmm_state_tertiary)
+            if isinstance(raw_hmm_state_tertiary, dict):
+                self._hmm_state_tertiary = dict(raw_hmm_state_tertiary)
             raw_hmm_consensus = snap.get("hmm_consensus", self._hmm_consensus)
             if isinstance(raw_hmm_consensus, dict):
                 self._hmm_consensus = dict(raw_hmm_consensus)
+            raw_tertiary_transition = snap.get("hmm_tertiary_transition", self._hmm_tertiary_transition)
+            if isinstance(raw_tertiary_transition, dict):
+                self._hmm_tertiary_transition = dict(raw_tertiary_transition)
             self._regime_tier = int(snap.get("regime_tier", self._regime_tier))
             self._regime_tier = max(0, min(2, self._regime_tier))
             self._regime_tier_entered_at = float(snap.get("regime_tier_entered_at", self._regime_tier_entered_at))
@@ -1544,6 +1683,51 @@ class BotRuntime:
                 self._ai_override_source_conviction = None
             if self._ai_override_until is not None and float(self._ai_override_until) <= _now():
                 self._clear_ai_override()
+            raw_accum_state = str(snap.get("accum_state", self._accum_state) or "IDLE").strip().upper()
+            if raw_accum_state not in {"IDLE", "ARMED", "ACTIVE", "COMPLETED", "STOPPED"}:
+                raw_accum_state = "IDLE"
+            self._accum_state = raw_accum_state
+            raw_accum_dir = str(snap.get("accum_direction", self._accum_direction) or "").strip().lower()
+            self._accum_direction = raw_accum_dir if raw_accum_dir in {"doge", "usd"} else None
+            raw_trigger_from = str(
+                snap.get("accum_trigger_from_regime", self._accum_trigger_from_regime) or "RANGING"
+            ).strip().upper()
+            raw_trigger_to = str(
+                snap.get("accum_trigger_to_regime", self._accum_trigger_to_regime) or "RANGING"
+            ).strip().upper()
+            if raw_trigger_from not in {"BEARISH", "RANGING", "BULLISH"}:
+                raw_trigger_from = "RANGING"
+            if raw_trigger_to not in {"BEARISH", "RANGING", "BULLISH"}:
+                raw_trigger_to = "RANGING"
+            self._accum_trigger_from_regime = raw_trigger_from
+            self._accum_trigger_to_regime = raw_trigger_to
+            self._accum_start_ts = max(0.0, float(snap.get("accum_start_ts", self._accum_start_ts) or 0.0))
+            self._accum_start_price = max(0.0, float(snap.get("accum_start_price", self._accum_start_price) or 0.0))
+            self._accum_spent_usd = max(0.0, float(snap.get("accum_spent_usd", self._accum_spent_usd) or 0.0))
+            self._accum_acquired_doge = max(
+                0.0,
+                float(snap.get("accum_acquired_doge", self._accum_acquired_doge) or 0.0),
+            )
+            self._accum_n_buys = max(0, int(snap.get("accum_n_buys", self._accum_n_buys) or 0))
+            self._accum_last_buy_ts = max(0.0, float(snap.get("accum_last_buy_ts", self._accum_last_buy_ts) or 0.0))
+            self._accum_budget_usd = max(0.0, float(snap.get("accum_budget_usd", self._accum_budget_usd) or 0.0))
+            self._accum_armed_at = max(0.0, float(snap.get("accum_armed_at", self._accum_armed_at) or 0.0))
+            self._accum_hold_streak = max(0, int(snap.get("accum_hold_streak", self._accum_hold_streak) or 0))
+            self._accum_last_session_end_ts = max(
+                0.0,
+                float(snap.get("accum_last_session_end_ts", self._accum_last_session_end_ts) or 0.0),
+            )
+            raw_last_session_summary = snap.get("accum_last_session_summary", self._accum_last_session_summary)
+            self._accum_last_session_summary = (
+                dict(raw_last_session_summary) if isinstance(raw_last_session_summary, dict) else {}
+            )
+            self._accum_manual_stop_requested = bool(
+                snap.get("accum_manual_stop_requested", self._accum_manual_stop_requested)
+            )
+            self._accum_cooldown_remaining_sec = max(
+                0,
+                int(snap.get("accum_cooldown_remaining_sec", self._accum_cooldown_remaining_sec) or 0),
+            )
             self._entry_adds_deferred_total = int(snap.get("entry_adds_deferred_total", self._entry_adds_deferred_total))
             self._entry_adds_drained_total = int(snap.get("entry_adds_drained_total", self._entry_adds_drained_total))
             self._entry_adds_last_deferred_at = float(
@@ -1731,6 +1915,55 @@ class BotRuntime:
         except Exception as e:
             logger.debug("Open-order telemetry refresh failed: %s", e)
 
+    def _cleanup_recovery_orders_on_startup(self) -> tuple[int, int, int]:
+        if self._recovery_orders_enabled():
+            return 0, 0, 0
+
+        cleared = 0
+        cancelled = 0
+        failed = 0
+        seen_txids: set[str] = set()
+
+        for sid in sorted(self.slots.keys()):
+            slot = self.slots[sid]
+            recoveries = tuple(slot.state.recovery_orders)
+            if not recoveries:
+                continue
+
+            for rec in recoveries:
+                txid = str(rec.txid or "").strip()
+                if not txid or txid in seen_txids:
+                    continue
+                seen_txids.add(txid)
+                try:
+                    ok = self._cancel_order(txid)
+                except Exception as e:
+                    logger.warning(
+                        "startup recovery cleanup: cancel failed slot=%s recovery_id=%s txid=%s: %s",
+                        sid,
+                        int(rec.recovery_id),
+                        txid,
+                        e,
+                    )
+                    failed += 1
+                    continue
+                if ok:
+                    cancelled += 1
+                else:
+                    failed += 1
+
+            cleared += len(recoveries)
+            slot.state = replace(slot.state, recovery_orders=tuple())
+
+        if cleared > 0:
+            logger.info(
+                "startup recovery cleanup: cleared=%d cancelled=%d failed=%d",
+                cleared,
+                cancelled,
+                failed,
+            )
+        return cleared, cancelled, failed
+
     # ------------------ Lifecycle ------------------
 
     def initialize(self) -> None:
@@ -1747,6 +1980,7 @@ class BotRuntime:
         # Restore runtime snapshot.
         self._load_snapshot()
         self._sanitize_slot_alias_state()
+        self._cleanup_recovery_orders_on_startup()
 
         # Ensure at least slot 0 exists.
         if not self.slots:
@@ -1889,11 +2123,17 @@ class BotRuntime:
 
     def _hmm_training_depth_default(self, *, state_key: str = "primary") -> dict[str, Any]:
         use_secondary = str(state_key).lower() == "secondary"
+        use_tertiary = str(state_key).lower() == "tertiary"
         if use_secondary:
             target_candles = max(1, int(getattr(config, "HMM_SECONDARY_TRAINING_CANDLES", 1440)))
             min_train_samples = max(1, int(getattr(config, "HMM_SECONDARY_MIN_TRAIN_SAMPLES", 200)))
             interval_min = max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15)))
             key = "secondary"
+        elif use_tertiary:
+            target_candles = max(1, int(getattr(config, "HMM_TERTIARY_TRAINING_CANDLES", 500)))
+            min_train_samples = max(1, int(getattr(config, "HMM_TERTIARY_MIN_TRAIN_SAMPLES", 150)))
+            interval_min = max(1, int(getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60)))
+            key = "tertiary"
         else:
             target_candles = max(1, int(getattr(config, "HMM_TRAINING_CANDLES", 4000)))
             min_train_samples = max(1, int(getattr(config, "HMM_MIN_TRAIN_SAMPLES", 500)))
@@ -1923,6 +2163,7 @@ class BotRuntime:
         *,
         current_candles: int,
         secondary: bool = False,
+        tertiary: bool = False,
         target_candles: int | None = None,
         min_train_samples: int | None = None,
         interval_min: int | None = None,
@@ -1955,6 +2196,32 @@ class BotRuntime:
                 ),
             )
             state_key = "secondary"
+        elif tertiary:
+            target = max(
+                1,
+                int(
+                    target_candles
+                    if target_candles is not None
+                    else getattr(config, "HMM_TERTIARY_TRAINING_CANDLES", 500)
+                ),
+            )
+            min_train = max(
+                1,
+                int(
+                    min_train_samples
+                    if min_train_samples is not None
+                    else getattr(config, "HMM_TERTIARY_MIN_TRAIN_SAMPLES", 150)
+                ),
+            )
+            interval = max(
+                1,
+                int(
+                    interval_min
+                    if interval_min is not None
+                    else getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60)
+                ),
+            )
+            state_key = "tertiary"
         else:
             target = max(
                 1,
@@ -2006,6 +2273,8 @@ class BotRuntime:
         }
         if secondary:
             self._hmm_training_depth_secondary = out
+        elif tertiary:
+            self._hmm_training_depth_tertiary = out
         else:
             self._hmm_training_depth = out
         return out
@@ -2153,6 +2422,7 @@ class BotRuntime:
     def _collect_open_exits(self, now_ts: float | None = None) -> list[dict[str, Any]]:
         now = float(now_ts if now_ts is not None else _now())
         rows: list[dict[str, Any]] = []
+        include_recoveries = self._recovery_orders_enabled()
         for slot in self.slots.values():
             for o in slot.state.orders:
                 if o.role != "exit":
@@ -2168,18 +2438,19 @@ class BotRuntime:
                         "volume": float(o.volume or 0.0),
                     }
                 )
-            for r in slot.state.recovery_orders:
-                entry_filled_at = float(r.entry_filled_at or 0.0)
-                if entry_filled_at <= 0.0:
-                    continue
-                rows.append(
-                    {
-                        "regime_at_entry": r.regime_at_entry,
-                        "trade_id": str(r.trade_id or ""),
-                        "age_sec": max(0.0, now - entry_filled_at),
-                        "volume": float(r.volume or 0.0),
-                    }
-                )
+            if include_recoveries:
+                for r in slot.state.recovery_orders:
+                    entry_filled_at = float(r.entry_filled_at or 0.0)
+                    if entry_filled_at <= 0.0:
+                        continue
+                    rows.append(
+                        {
+                            "regime_at_entry": r.regime_at_entry,
+                            "trade_id": str(r.trade_id or ""),
+                            "age_sec": max(0.0, now - entry_filled_at),
+                            "volume": float(r.volume or 0.0),
+                        }
+                    )
         return rows
 
     def _update_throughput(self) -> None:
@@ -2222,9 +2493,32 @@ class BotRuntime:
             ),
         }
 
-    def _refresh_hmm_state_from_detector(self, *, secondary: bool = False) -> None:
-        detector = self._hmm_detector_secondary if secondary else self._hmm_detector
-        if secondary:
+    def _refresh_hmm_state_from_detector(
+        self,
+        *,
+        secondary: bool = False,
+        tertiary: bool = False,
+    ) -> None:
+        detector = (
+            self._hmm_detector_tertiary
+            if tertiary
+            else self._hmm_detector_secondary
+            if secondary
+            else self._hmm_detector
+        )
+        if tertiary:
+            if not isinstance(self._hmm_state_tertiary, dict):
+                self._hmm_state_tertiary = self._hmm_default_state(
+                    enabled=bool(getattr(config, "HMM_ENABLED", False))
+                    and bool(getattr(config, "HMM_TERTIARY_ENABLED", False)),
+                    interval_min=max(1, int(getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60))),
+                )
+            state = self._hmm_state_tertiary
+            enabled_flag = bool(getattr(config, "HMM_ENABLED", False)) and bool(
+                getattr(config, "HMM_TERTIARY_ENABLED", False)
+            )
+            interval_min = max(1, int(getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60)))
+        elif secondary:
             if not isinstance(self._hmm_state_secondary, dict):
                 self._hmm_state_secondary = self._hmm_default_state(
                     enabled=bool(getattr(config, "HMM_ENABLED", False))
@@ -2306,13 +2600,19 @@ class BotRuntime:
     def _init_hmm_runtime(self) -> None:
         primary_interval = max(1, int(getattr(config, "HMM_OHLCV_INTERVAL_MIN", 1)))
         secondary_interval = max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15)))
+        tertiary_interval = max(1, int(getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60)))
         hmm_enabled = bool(getattr(config, "HMM_ENABLED", False))
         multi_enabled = bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False))
+        tertiary_enabled = bool(getattr(config, "HMM_TERTIARY_ENABLED", False))
 
         self._hmm_state = self._hmm_default_state(enabled=hmm_enabled, interval_min=primary_interval)
         self._hmm_state_secondary = self._hmm_default_state(
             enabled=bool(hmm_enabled and multi_enabled),
             interval_min=secondary_interval,
+        )
+        self._hmm_state_tertiary = self._hmm_default_state(
+            enabled=bool(hmm_enabled and tertiary_enabled),
+            interval_min=tertiary_interval,
         )
         self._hmm_consensus = dict(self._hmm_state)
         self._hmm_consensus.update({
@@ -2322,11 +2622,13 @@ class BotRuntime:
         })
         self._hmm_detector = None
         self._hmm_detector_secondary = None
+        self._hmm_detector_tertiary = None
         self._hmm_module = None
         self._hmm_numpy = None
 
         if not hmm_enabled:
             self._hmm_consensus = self._compute_hmm_consensus()
+            self._update_hmm_tertiary_transition(_now())
             return
 
         try:
@@ -2364,6 +2666,27 @@ class BotRuntime:
                         "Secondary HMM runtime unavailable, continuing with primary HMM only: %s",
                         e,
                     )
+            if tertiary_enabled:
+                try:
+                    self._hmm_detector_tertiary = hmm_mod.RegimeDetector(
+                        config=self._hmm_runtime_config(
+                            min_train_samples=max(
+                                1,
+                                int(getattr(config, "HMM_TERTIARY_MIN_TRAIN_SAMPLES", 150)),
+                            ),
+                        )
+                    )
+                    self._hmm_state_tertiary["available"] = True
+                    self._hmm_state_tertiary["error"] = ""
+                    self._refresh_hmm_state_from_detector(tertiary=True)
+                except Exception as e:
+                    self._hmm_state_tertiary["available"] = False
+                    self._hmm_state_tertiary["trained"] = False
+                    self._hmm_state_tertiary["error"] = str(e)
+                    logger.warning(
+                        "Tertiary HMM runtime unavailable, continuing without 1h detector: %s",
+                        e,
+                    )
             logger.info("HMM runtime initialized (advisory mode enabled)")
         except Exception as e:
             self._hmm_state["available"] = False
@@ -2371,8 +2694,13 @@ class BotRuntime:
             self._hmm_state["error"] = str(e)
             self._hmm_state_secondary["available"] = False
             self._hmm_state_secondary["trained"] = False
+            self._hmm_state_secondary["error"] = str(e)
+            self._hmm_state_tertiary["available"] = False
+            self._hmm_state_tertiary["trained"] = False
+            self._hmm_state_tertiary["error"] = str(e)
             logger.warning("HMM runtime unavailable, continuing with trend-only logic: %s", e)
         self._hmm_consensus = self._compute_hmm_consensus()
+        self._update_hmm_tertiary_transition(_now())
 
     def _snapshot_hmm_state(self) -> dict[str, Any]:
         if not self._hmm_module:
@@ -2394,6 +2722,18 @@ class BotRuntime:
                     )
                     out["_hmm_secondary_trained"] = bool(
                         sec_snap.get("_hmm_trained", False)
+                    )
+            if self._hmm_detector_tertiary and hasattr(self._hmm_module, "serialize_for_snapshot"):
+                ter_snap = self._hmm_module.serialize_for_snapshot(self._hmm_detector_tertiary)
+                if isinstance(ter_snap, dict):
+                    out["_hmm_tertiary_regime_state"] = dict(
+                        ter_snap.get("_hmm_regime_state", {}) or {}
+                    )
+                    out["_hmm_tertiary_last_train_ts"] = float(
+                        ter_snap.get("_hmm_last_train_ts", 0.0) or 0.0
+                    )
+                    out["_hmm_tertiary_trained"] = bool(
+                        ter_snap.get("_hmm_trained", False)
                     )
         except Exception as e:
             logger.warning("HMM snapshot serialization failed: %s", e)
@@ -2418,11 +2758,24 @@ class BotRuntime:
                     "_hmm_trained": snapshot.get("_hmm_secondary_trained", False),
                 }
                 self._hmm_module.restore_from_snapshot(self._hmm_detector_secondary, sec_snap)
+            if (
+                self._hmm_detector_tertiary
+                and "_hmm_tertiary_regime_state" in snapshot
+                and hasattr(self._hmm_module, "restore_from_snapshot")
+            ):
+                ter_snap = {
+                    "_hmm_regime_state": snapshot.get("_hmm_tertiary_regime_state", {}),
+                    "_hmm_last_train_ts": snapshot.get("_hmm_tertiary_last_train_ts", 0.0),
+                    "_hmm_trained": snapshot.get("_hmm_tertiary_trained", False),
+                }
+                self._hmm_module.restore_from_snapshot(self._hmm_detector_tertiary, ter_snap)
         except Exception as e:
             logger.warning("HMM snapshot restore failed: %s", e)
         finally:
             self._refresh_hmm_state_from_detector()
             self._refresh_hmm_state_from_detector(secondary=True)
+            self._refresh_hmm_state_from_detector(tertiary=True)
+            self._update_hmm_tertiary_transition(_now())
 
     def _train_hmm(self, *, now: float | None = None, reason: str = "scheduled") -> bool:
         if not self._hmm_detector or self._hmm_numpy is None:
@@ -2576,6 +2929,129 @@ class BotRuntime:
             self._hmm_state_secondary["error"] = f"inference_failed:{e}"
         finally:
             self._refresh_hmm_state_from_detector(secondary=True)
+
+    def _train_hmm_tertiary(self, *, now: float | None = None, reason: str = "scheduled") -> bool:
+        if not bool(getattr(config, "HMM_TERTIARY_ENABLED", False)):
+            return False
+        if not self._hmm_detector_tertiary or self._hmm_numpy is None:
+            return False
+
+        now_ts = float(now if now is not None else _now())
+        retry_sec = max(
+            60.0,
+            float(
+                getattr(
+                    config,
+                    "HMM_TERTIARY_SYNC_INTERVAL_SEC",
+                    getattr(config, "HMM_OHLCV_SYNC_INTERVAL_SEC", 300.0),
+                )
+            ),
+        )
+        is_trained = bool(getattr(self._hmm_detector_tertiary, "_trained", False))
+        if (
+            (not is_trained)
+            and (now_ts - self._hmm_last_train_attempt_ts_tertiary) < retry_sec
+            and reason != "startup"
+        ):
+            return False
+
+        self._hmm_last_train_attempt_ts_tertiary = now_ts
+        interval_min = max(1, int(getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60)))
+        target_candles = max(1, int(getattr(config, "HMM_TERTIARY_TRAINING_CANDLES", 500)))
+        min_train_samples = max(1, int(getattr(config, "HMM_TERTIARY_MIN_TRAIN_SAMPLES", 150)))
+        closes, volumes = self._fetch_training_candles(
+            count=target_candles,
+            interval_min=interval_min,
+        )
+
+        bootstrap_used = False
+        if min(len(closes), len(volumes)) < min_train_samples:
+            boot_closes, boot_volumes = self._fetch_bootstrap_tertiary_candles(
+                target_candles=target_candles,
+            )
+            if min(len(boot_closes), len(boot_volumes)) > min(len(closes), len(volumes)):
+                closes, volumes = boot_closes, boot_volumes
+                bootstrap_used = True
+
+        self._update_hmm_training_depth(
+            current_candles=min(len(closes), len(volumes)),
+            tertiary=True,
+            target_candles=target_candles,
+            min_train_samples=min_train_samples,
+            interval_min=interval_min,
+            now=now_ts,
+        )
+        if not closes or not volumes:
+            self._hmm_state_tertiary["error"] = "no_training_candles"
+            self._refresh_hmm_state_from_detector(tertiary=True)
+            return False
+
+        try:
+            closes_arr = self._hmm_numpy.asarray(closes, dtype=float)
+            volumes_arr = self._hmm_numpy.asarray(volumes, dtype=float)
+            ok = bool(self._hmm_detector_tertiary.train(closes_arr, volumes_arr))
+        except Exception as e:
+            logger.warning("Tertiary HMM train failed (%s): %s", reason, e)
+            self._hmm_state_tertiary["error"] = f"train_failed:{e}"
+            self._refresh_hmm_state_from_detector(tertiary=True)
+            return False
+
+        if ok:
+            self._hmm_state_tertiary["error"] = ""
+            src = "bootstrap_15m" if bootstrap_used else "native_1h"
+            logger.info("Tertiary HMM trained (%s, %s) with %d candles", reason, src, len(closes))
+        else:
+            self._hmm_state_tertiary["error"] = "train_skipped_or_failed"
+        self._refresh_hmm_state_from_detector(tertiary=True)
+        self._update_hmm_tertiary_transition(now_ts)
+        return ok
+
+    def _update_hmm_tertiary(self, now: float) -> None:
+        if not bool(getattr(config, "HMM_TERTIARY_ENABLED", False)):
+            self._update_hmm_tertiary_transition(now)
+            return
+        if not self._hmm_detector_tertiary or self._hmm_numpy is None:
+            self._refresh_hmm_state_from_detector(tertiary=True)
+            self._update_hmm_tertiary_transition(now)
+            return
+
+        trained = bool(getattr(self._hmm_detector_tertiary, "_trained", False))
+        if not trained:
+            self._train_hmm_tertiary(now=now, reason="startup")
+            trained = bool(getattr(self._hmm_detector_tertiary, "_trained", False))
+        else:
+            try:
+                if bool(self._hmm_detector_tertiary.needs_retrain()):
+                    self._train_hmm_tertiary(now=now, reason="periodic")
+            except Exception as e:
+                logger.debug("Tertiary HMM retrain check failed: %s", e)
+
+        if not trained:
+            self._refresh_hmm_state_from_detector(tertiary=True)
+            self._update_hmm_tertiary_transition(now)
+            return
+
+        interval_min = max(1, int(getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60)))
+        closes, volumes = self._fetch_recent_candles(
+            count=int(getattr(config, "HMM_TERTIARY_RECENT_CANDLES", 30)),
+            interval_min=interval_min,
+        )
+        if not closes or not volumes:
+            self._refresh_hmm_state_from_detector(tertiary=True)
+            self._update_hmm_tertiary_transition(now)
+            return
+
+        try:
+            closes_arr = self._hmm_numpy.asarray(closes, dtype=float)
+            volumes_arr = self._hmm_numpy.asarray(volumes, dtype=float)
+            self._hmm_detector_tertiary.update(closes_arr, volumes_arr)
+            self._hmm_state_tertiary["error"] = ""
+        except Exception as e:
+            logger.warning("Tertiary HMM inference failed: %s", e)
+            self._hmm_state_tertiary["error"] = f"inference_failed:{e}"
+        finally:
+            self._refresh_hmm_state_from_detector(tertiary=True)
+            self._update_hmm_tertiary_transition(now)
 
     @staticmethod
     def _normalize_consensus_weights(w1_raw: Any, w15_raw: Any) -> tuple[float, float]:
@@ -2772,11 +3248,24 @@ class BotRuntime:
         }
 
     def _update_hmm(self, now: float) -> None:
+        multi_enabled = bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False))
+        tertiary_enabled = bool(getattr(config, "HMM_TERTIARY_ENABLED", False))
+
         if not bool(getattr(config, "HMM_ENABLED", False)):
+            if tertiary_enabled:
+                self._update_hmm_tertiary(now)
+            else:
+                self._update_hmm_tertiary_transition(now)
             self._hmm_consensus = self._compute_hmm_consensus()
             self._record_regime_history_sample(now)
             return
         if not self._hmm_detector or self._hmm_numpy is None:
+            if multi_enabled:
+                self._update_hmm_secondary(now)
+            if tertiary_enabled:
+                self._update_hmm_tertiary(now)
+            else:
+                self._update_hmm_tertiary_transition(now)
             self._hmm_consensus = self._compute_hmm_consensus()
             self._record_regime_history_sample(now)
             return
@@ -2794,8 +3283,12 @@ class BotRuntime:
 
         if not trained:
             self._refresh_hmm_state_from_detector()
-            if bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)):
+            if multi_enabled:
                 self._update_hmm_secondary(now)
+            if tertiary_enabled:
+                self._update_hmm_tertiary(now)
+            else:
+                self._update_hmm_tertiary_transition(now)
             self._hmm_consensus = self._compute_hmm_consensus()
             self._record_regime_history_sample(now)
             return
@@ -2807,8 +3300,12 @@ class BotRuntime:
         )
         if not closes or not volumes:
             self._refresh_hmm_state_from_detector()
-            if bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)):
+            if multi_enabled:
                 self._update_hmm_secondary(now)
+            if tertiary_enabled:
+                self._update_hmm_tertiary(now)
+            else:
+                self._update_hmm_tertiary_transition(now)
             self._hmm_consensus = self._compute_hmm_consensus()
             self._record_regime_history_sample(now)
             return
@@ -2823,8 +3320,12 @@ class BotRuntime:
             self._hmm_state["error"] = f"inference_failed:{e}"
         finally:
             self._refresh_hmm_state_from_detector()
-            if bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)):
+            if multi_enabled:
                 self._update_hmm_secondary(now)
+            if tertiary_enabled:
+                self._update_hmm_tertiary(now)
+            else:
+                self._update_hmm_tertiary_transition(now)
             self._hmm_consensus = self._compute_hmm_consensus()
             self._record_regime_history_sample(now)
 
@@ -2844,6 +3345,14 @@ class BotRuntime:
                 interval_min=max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15))),
             )
         )
+        tertiary = dict(
+            self._hmm_state_tertiary
+            or self._hmm_default_state(
+                enabled=bool(getattr(config, "HMM_ENABLED", False))
+                and bool(getattr(config, "HMM_TERTIARY_ENABLED", False)),
+                interval_min=max(1, int(getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60))),
+            )
+        )
         training_depth_primary = dict(
             self._hmm_training_depth
             or self._hmm_training_depth_default(state_key="primary")
@@ -2852,12 +3361,19 @@ class BotRuntime:
             self._hmm_training_depth_secondary
             or self._hmm_training_depth_default(state_key="secondary")
         )
+        training_depth_tertiary = dict(
+            self._hmm_training_depth_tertiary
+            or self._hmm_training_depth_default(state_key="tertiary")
+        )
         consensus = dict(self._hmm_consensus or self._compute_hmm_consensus())
         source_mode = self._hmm_source_mode()
         source = dict(self._policy_hmm_source() or primary)
         source_interval = int(source.get("interval_min", primary.get("interval_min", 1)) or 1)
         secondary_interval = max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15)))
-        if source_interval == secondary_interval and bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)):
+        tertiary_interval = max(1, int(getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60)))
+        if source_interval == tertiary_interval and bool(getattr(config, "HMM_TERTIARY_ENABLED", False)):
+            training_depth = training_depth_tertiary
+        elif source_interval == secondary_interval and bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)):
             training_depth = training_depth_secondary
         else:
             training_depth = training_depth_primary
@@ -2894,10 +3410,13 @@ class BotRuntime:
             "agreement": str(consensus.get("agreement", "primary_only")),
             "primary": primary,
             "secondary": secondary,
+            "tertiary": tertiary,
             "consensus": consensus,
+            "tertiary_transition": dict(self._hmm_tertiary_transition or {}),
             "training_depth": training_depth,
             "training_depth_primary": training_depth_primary,
             "training_depth_secondary": training_depth_secondary,
+            "training_depth_tertiary": training_depth_tertiary,
             "regime_history_30m": list(self._regime_history_30m),
         }
         return out
@@ -2972,6 +3491,156 @@ class BotRuntime:
                 return [0.0, 1.0, 0.0]
         return [0.0, 1.0, 0.0]
 
+    @staticmethod
+    def _resample_candles_from_lower_interval(
+        rows: list[dict[str, float | int | None]],
+        *,
+        group_size: int,
+        base_interval_sec: float,
+    ) -> list[dict[str, float | int | None]]:
+        if group_size <= 1 or not rows:
+            return []
+
+        step_sec = max(1.0, float(base_interval_sec))
+        out: list[dict[str, float | int | None]] = []
+        block: list[dict[str, float | int | None]] = []
+        prev_ts = None
+
+        for row in sorted(rows, key=lambda r: float(r.get("time", 0.0) or 0.0)):
+            try:
+                ts = float(row.get("time", 0.0) or 0.0)
+                o = float(row.get("open", 0.0) or 0.0)
+                h = float(row.get("high", 0.0) or 0.0)
+                l = float(row.get("low", 0.0) or 0.0)
+                c = float(row.get("close", 0.0) or 0.0)
+                v = float(row.get("volume", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if ts <= 0 or min(o, h, l, c) <= 0 or v < 0:
+                continue
+
+            contiguous = (
+                prev_ts is not None
+                and abs(ts - (float(prev_ts) + step_sec)) <= 1.0
+            )
+            if block and not contiguous:
+                block = []
+            block.append(row)
+            prev_ts = ts
+
+            if len(block) < group_size:
+                continue
+
+            try:
+                b_open = float(block[0].get("open", 0.0) or 0.0)
+                b_close = float(block[-1].get("close", 0.0) or 0.0)
+                b_high = max(float(x.get("high", 0.0) or 0.0) for x in block)
+                b_low = min(float(x.get("low", 0.0) or 0.0) for x in block)
+                b_volume = sum(float(x.get("volume", 0.0) or 0.0) for x in block)
+            except Exception:
+                block = []
+                continue
+
+            if min(b_open, b_high, b_low, b_close) > 0 and b_volume >= 0:
+                out.append(
+                    {
+                        "time": float(block[0].get("time", 0.0) or 0.0),
+                        "open": b_open,
+                        "high": b_high,
+                        "low": b_low,
+                        "close": b_close,
+                        "volume": b_volume,
+                        "trade_count": None,
+                    }
+                )
+            block = []
+
+        return out
+
+    def _fetch_bootstrap_tertiary_candles(self, *, target_candles: int) -> tuple[list[float], list[float]]:
+        tertiary_interval = max(1, int(getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60)))
+        secondary_interval = max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15)))
+        if tertiary_interval <= secondary_interval:
+            return [], []
+        if tertiary_interval % secondary_interval != 0:
+            return [], []
+
+        group_size = max(1, tertiary_interval // secondary_interval)
+        base_rows_target = max(1, int(target_candles)) * group_size
+        rows = self._load_recent_ohlcv_rows(
+            count=base_rows_target,
+            interval_min=secondary_interval,
+        )
+        if not rows:
+            return [], []
+
+        resampled = self._resample_candles_from_lower_interval(
+            rows,
+            group_size=group_size,
+            base_interval_sec=float(secondary_interval * 60),
+        )
+        if len(resampled) > int(target_candles):
+            resampled = resampled[-int(target_candles):]
+        return self._extract_close_volume(resampled)
+
+    def _update_hmm_tertiary_transition(self, now: float) -> None:
+        state = dict(self._hmm_state_tertiary or {})
+        regime = str(state.get("regime", "RANGING") or "RANGING").upper()
+        if regime not in {"BEARISH", "RANGING", "BULLISH"}:
+            regime = "RANGING"
+        confidence = max(0.0, min(1.0, float(state.get("confidence", 0.0) or 0.0)))
+        is_ready = bool(state.get("available")) and bool(state.get("trained"))
+
+        transition = dict(self._hmm_tertiary_transition or {})
+        from_regime = str(transition.get("from_regime", regime) or regime).upper()
+        to_regime = str(transition.get("to_regime", regime) or regime).upper()
+        changed_at = float(transition.get("changed_at", 0.0) or 0.0)
+        confirmation_count = int(transition.get("confirmation_count", 0) or 0)
+
+        if not is_ready:
+            self._hmm_tertiary_transition = {
+                "from_regime": regime,
+                "to_regime": regime,
+                "transition_age_sec": 0.0,
+                "confidence": confidence,
+                "confirmed": False,
+                "confirmation_count": 0,
+                "changed_at": 0.0,
+            }
+            return
+
+        if changed_at <= 0.0:
+            changed_at = float(state.get("last_update_ts", 0.0) or now)
+            from_regime = regime
+            to_regime = regime
+            confirmation_count = 1
+
+        if regime != to_regime:
+            from_regime = to_regime
+            to_regime = regime
+            changed_at = float(state.get("last_update_ts", 0.0) or now)
+            confirmation_count = 1
+        else:
+            interval_sec = max(
+                60.0,
+                float(max(1, int(getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60))) * 60),
+            )
+            age_sec = max(0.0, float(now) - changed_at)
+            confirmation_count = max(1, int(age_sec // interval_sec) + 1)
+
+        transition_age_sec = max(0.0, float(now) - changed_at)
+        confirm_needed = max(1, int(getattr(config, "ACCUM_CONFIRMATION_CANDLES", 2)))
+        confirmed = bool(from_regime != to_regime and confirmation_count >= confirm_needed)
+        self._hmm_tertiary_transition = {
+            "from_regime": from_regime,
+            "to_regime": to_regime,
+            "transition_age_sec": transition_age_sec,
+            "confidence": confidence,
+            "confirmed": confirmed,
+            "confirmation_count": int(confirmation_count),
+            "changed_at": changed_at,
+        }
+
     def _fill_rate_1h(self, now: float) -> int:
         cutoff = float(now) - 3600.0
         count = 0
@@ -2995,22 +3664,39 @@ class BotRuntime:
                 interval_min=max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15))),
             )
         )
+        tertiary = dict(
+            self._hmm_state_tertiary
+            or self._hmm_default_state(
+                enabled=bool(getattr(config, "HMM_ENABLED", False))
+                and bool(getattr(config, "HMM_TERTIARY_ENABLED", False)),
+                interval_min=max(1, int(getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60))),
+            )
+        )
         consensus = dict(self._hmm_consensus or self._compute_hmm_consensus())
         source = dict(self._policy_hmm_source() or primary)
         source_interval = int(source.get("interval_min", primary.get("interval_min", 1)) or 1)
         secondary_interval = max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15)))
-        if source_interval == secondary_interval and bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)):
+        tertiary_interval = max(1, int(getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60)))
+        if source_interval == tertiary_interval and bool(getattr(config, "HMM_TERTIARY_ENABLED", False)):
+            depth = dict(self._hmm_training_depth_tertiary or self._hmm_training_depth_default(state_key="tertiary"))
+        elif source_interval == secondary_interval and bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)):
             depth = dict(self._hmm_training_depth_secondary or self._hmm_training_depth_default(state_key="secondary"))
         else:
             depth = dict(self._hmm_training_depth or self._hmm_training_depth_default(state_key="primary"))
         confidence_modifier, _mod_source = self._hmm_confidence_modifier_for_source(source)
 
         transmat = None
+        transmat_1h = None
         try:
             if self._hmm_detector is not None:
                 transmat = getattr(self._hmm_detector, "transmat", None)
         except Exception:
             transmat = None
+        try:
+            if self._hmm_detector_tertiary is not None:
+                transmat_1h = getattr(self._hmm_detector_tertiary, "transmat", None)
+        except Exception:
+            transmat_1h = None
 
         capacity = self._compute_capacity_health(now)
         safe_cap = max(1, int(capacity.get("open_orders_safe_cap") or 1))
@@ -3026,7 +3712,10 @@ class BotRuntime:
         else:
             directional_trend = "neutral"
 
-        recovery_order_count = sum(len(slot.state.recovery_orders) for slot in self.slots.values())
+        if self._recovery_orders_enabled():
+            recovery_order_count = sum(len(slot.state.recovery_orders) for slot in self.slots.values())
+        else:
+            recovery_order_count = 0
         throughput_payload = self._throughput.status_payload() if self._throughput is not None else {}
         bull_edge = 0.0
         bear_edge = 0.0
@@ -3042,6 +3731,24 @@ class BotRuntime:
             bear_edge = ((_bucket_mult("bearish_A") + _bucket_mult("bearish_B")) * 0.5) - 1.0
             range_edge = ((_bucket_mult("ranging_A") + _bucket_mult("ranging_B")) * 0.5) - 1.0
 
+        free_usd, free_doge = self._available_free_balances(prefer_fresh=False)
+        scoreboard = self._compute_doge_bias_scoreboard() or {}
+        idle_usd = max(0.0, float(scoreboard.get("idle_usd", 0.0) or 0.0))
+        idle_usd_pct = max(0.0, min(100.0, float(scoreboard.get("idle_usd_pct", 0.0) or 0.0)))
+        util_ratio = max(0.0, min(1.0, 1.0 - (idle_usd_pct / 100.0)))
+
+        ai_opinion = dict(self._ai_regime_opinion or {})
+        accum_signal = str(ai_opinion.get("accumulation_signal", "hold") or "hold").strip().lower()
+        if accum_signal not in {"accumulate_doge", "hold", "accumulate_usd"}:
+            accum_signal = "hold"
+        accum_conviction = max(0, min(100, int(ai_opinion.get("accumulation_conviction", 0) or 0)))
+        accum_status = self._accumulation_status_payload(now=now)
+        accum_state = str(accum_status.get("state", "IDLE") or "IDLE").strip().upper() or "IDLE"
+        accum_active = bool(accum_status.get("active", False))
+        accum_budget_used = max(0.0, float(accum_status.get("spent_usd", 0.0) or 0.0))
+        accum_budget_remaining = max(0.0, float(accum_status.get("budget_remaining_usd", 0.0) or 0.0))
+        accum_cooldown_remaining = max(0, int(accum_status.get("cooldown_remaining_sec", 0) or 0))
+
         return {
             "hmm_primary": {
                 "regime": str(primary.get("regime", "RANGING")),
@@ -3055,14 +3762,26 @@ class BotRuntime:
                 "bias_signal": float(secondary.get("bias_signal", 0.0) or 0.0),
                 "probabilities": self._hmm_prob_triplet(secondary),
             },
+            "hmm_tertiary": {
+                "regime": str(tertiary.get("regime", "RANGING")),
+                "confidence": float(tertiary.get("confidence", 0.0) or 0.0),
+                "bias_signal": float(tertiary.get("bias_signal", 0.0) or 0.0),
+                "probabilities": self._hmm_prob_triplet(tertiary),
+                "transition": dict(self._hmm_tertiary_transition or {}),
+            },
             "hmm_consensus": {
                 "agreement": str(consensus.get("agreement", "primary_only")),
                 "effective_regime": str(consensus.get("effective_regime", consensus.get("regime", "RANGING"))),
                 "effective_confidence": float(consensus.get("effective_confidence", consensus.get("confidence", 0.0)) or 0.0),
                 "effective_bias": float(consensus.get("effective_bias", consensus.get("bias_signal", 0.0)) or 0.0),
             },
+            "consensus_1h_weight": float(getattr(config, "CONSENSUS_1H_WEIGHT", 0.30)),
             "transition_matrix_1m": transmat,
+            "transition_matrix_1h": transmat_1h,
             "training_quality": str(depth.get("quality_tier", "shallow")),
+            "training_quality_1h": str(
+                (self._hmm_training_depth_tertiary or {}).get("quality_tier", "shallow")
+            ),
             "confidence_modifier": float(confidence_modifier),
             "regime_history_30m": list(self._regime_history_30m),
             "mechanical_tier": {
@@ -3082,6 +3801,548 @@ class BotRuntime:
                 "kelly_edge_bearish": float(bear_edge),
                 "kelly_edge_ranging": float(range_edge),
             },
+            "capital": {
+                "free_usd": float(free_usd),
+                "idle_usd": float(idle_usd),
+                "idle_usd_pct": float(idle_usd_pct),
+                "free_doge": float(free_doge),
+                "util_ratio": float(util_ratio),
+            },
+            "accumulation": {
+                "enabled": bool(getattr(config, "ACCUM_ENABLED", False)),
+                "state": str(accum_state),
+                "active": bool(accum_active),
+                "signal": str(accum_signal),
+                "conviction": int(accum_conviction),
+                "budget_used_usd": float(accum_budget_used),
+                "budget_remaining_usd": float(accum_budget_remaining),
+                "cooldown_remaining_sec": int(accum_cooldown_remaining),
+            },
+        }
+
+    def _accumulation_signal_conviction(self) -> tuple[str, int]:
+        opinion = dict(self._ai_regime_opinion or {})
+        signal = str(opinion.get("accumulation_signal", "hold") or "hold").strip().lower()
+        if signal not in {"accumulate_doge", "hold", "accumulate_usd"}:
+            signal = "hold"
+        conviction = max(0, min(100, int(opinion.get("accumulation_conviction", 0) or 0)))
+        return signal, conviction
+
+    @staticmethod
+    def _normalize_regime_label(value: Any, fallback: str = "RANGING") -> str:
+        label = str(value or fallback).strip().upper()
+        if label not in {"BEARISH", "RANGING", "BULLISH"}:
+            return str(fallback).strip().upper()
+        return label
+
+    def _accumulation_trigger_label(self, from_regime: str, to_regime: str) -> str:
+        from_norm = self._normalize_regime_label(from_regime, "RANGING").lower()
+        to_norm = self._normalize_regime_label(to_regime, "RANGING").lower()
+        return f"1h_{from_norm}_to_{to_norm}"
+
+    def _accumulation_idle_budget(self) -> tuple[float, float]:
+        free_usd, _free_doge = self._available_free_balances(prefer_fresh=False)
+        scoreboard = self._compute_doge_bias_scoreboard() or {}
+        idle_usd_raw = scoreboard.get("idle_usd", free_usd)
+        try:
+            idle_usd = max(0.0, float(idle_usd_raw))
+        except (TypeError, ValueError):
+            idle_usd = max(0.0, float(free_usd))
+        reserve_usd = max(0.0, float(getattr(config, "ACCUM_RESERVE_USD", 50.0)))
+        max_budget_usd = max(0.0, float(getattr(config, "ACCUM_MAX_BUDGET_USD", 50.0)))
+        budget_usd = min(max_budget_usd, max(0.0, idle_usd - reserve_usd))
+        return idle_usd, budget_usd
+
+    def _clear_accumulation_live_state(self) -> None:
+        self._accum_state = "IDLE"
+        self._accum_direction = None
+        self._accum_trigger_from_regime = "RANGING"
+        self._accum_trigger_to_regime = "RANGING"
+        self._accum_start_ts = 0.0
+        self._accum_start_price = 0.0
+        self._accum_spent_usd = 0.0
+        self._accum_acquired_doge = 0.0
+        self._accum_n_buys = 0
+        self._accum_last_buy_ts = 0.0
+        self._accum_budget_usd = 0.0
+        self._accum_armed_at = 0.0
+        self._accum_hold_streak = 0
+        self._accum_manual_stop_requested = False
+
+    def _arm_accumulation(
+        self,
+        now: float,
+        *,
+        from_regime: str,
+        to_regime: str,
+        budget_usd: float,
+        idle_usd: float,
+    ) -> None:
+        self._accum_state = "ARMED"
+        self._accum_direction = "doge"
+        self._accum_trigger_from_regime = self._normalize_regime_label(from_regime, "RANGING")
+        self._accum_trigger_to_regime = self._normalize_regime_label(to_regime, "RANGING")
+        self._accum_armed_at = float(now)
+        self._accum_start_ts = 0.0
+        self._accum_start_price = 0.0
+        self._accum_spent_usd = 0.0
+        self._accum_acquired_doge = 0.0
+        self._accum_n_buys = 0
+        self._accum_last_buy_ts = 0.0
+        self._accum_hold_streak = 0
+        self._accum_manual_stop_requested = False
+        self._accum_budget_usd = max(0.0, float(budget_usd))
+        logger.info(
+            "accumulation armed: trigger=%s budget=$%.4f idle_usd=$%.4f",
+            self._accumulation_trigger_label(self._accum_trigger_from_regime, self._accum_trigger_to_regime),
+            float(self._accum_budget_usd),
+            float(idle_usd),
+        )
+
+    def _activate_accumulation(self, now: float) -> bool:
+        if self.last_price <= 0:
+            logger.debug("accumulation activation deferred: price unavailable")
+            return False
+        self._accum_state = "ACTIVE"
+        self._accum_direction = "doge"
+        self._accum_start_ts = float(now)
+        self._accum_start_price = float(self.last_price)
+        self._accum_hold_streak = 0
+        if self._accum_budget_usd <= 0.0:
+            _idle_usd, budget_now = self._accumulation_idle_budget()
+            self._accum_budget_usd = max(0.0, float(budget_now))
+        logger.info(
+            "accumulation active: trigger=%s budget=$%.4f start_price=$%.6f",
+            self._accumulation_trigger_label(self._accum_trigger_from_regime, self._accum_trigger_to_regime),
+            float(self._accum_budget_usd),
+            float(self._accum_start_price),
+        )
+        return True
+
+    def _finalize_accumulation(
+        self,
+        *,
+        now: float,
+        terminal_state: str,
+        reason: str,
+        ai_signal: str,
+        ai_conviction: int,
+    ) -> None:
+        terminal = str(terminal_state or "STOPPED").strip().upper()
+        if terminal not in {"COMPLETED", "STOPPED"}:
+            terminal = "STOPPED"
+        spent_usd = max(0.0, float(self._accum_spent_usd))
+        acquired_doge = max(0.0, float(self._accum_acquired_doge))
+        start_ts = float(self._accum_start_ts or self._accum_armed_at or now)
+        elapsed_sec = max(0.0, float(now) - start_ts)
+        avg_price = (spent_usd / acquired_doge) if acquired_doge > 0 else None
+        current_price = float(self.last_price or 0.0)
+        current_drawdown_pct = None
+        if self._accum_start_price > 0 and current_price > 0:
+            current_drawdown_pct = ((current_price - float(self._accum_start_price)) / float(self._accum_start_price)) * 100.0
+
+        summary = {
+            "state": terminal,
+            "reason": str(reason),
+            "direction": str(self._accum_direction or "doge"),
+            "trigger_from_regime": str(self._accum_trigger_from_regime),
+            "trigger_to_regime": str(self._accum_trigger_to_regime),
+            "trigger": self._accumulation_trigger_label(
+                self._accum_trigger_from_regime,
+                self._accum_trigger_to_regime,
+            ),
+            "start_ts": float(start_ts),
+            "end_ts": float(now),
+            "elapsed_sec": float(elapsed_sec),
+            "start_price": (float(self._accum_start_price) if self._accum_start_price > 0 else None),
+            "end_price": (float(current_price) if current_price > 0 else None),
+            "budget_usd": float(max(0.0, float(self._accum_budget_usd))),
+            "spent_usd": float(spent_usd),
+            "acquired_doge": float(acquired_doge),
+            "avg_price": (float(avg_price) if avg_price is not None else None),
+            "n_buys": int(max(0, int(self._accum_n_buys))),
+            "ai_signal": str(ai_signal),
+            "ai_conviction": int(max(0, min(100, int(ai_conviction)))),
+            "current_drawdown_pct": (
+                float(current_drawdown_pct) if current_drawdown_pct is not None else None
+            ),
+        }
+        self._accum_last_session_summary = summary
+        self._accum_last_session_end_ts = float(now)
+        self._accum_manual_stop_requested = False
+        cooldown_sec = max(0.0, float(getattr(config, "ACCUM_COOLDOWN_SEC", 3600.0)))
+        self._accum_cooldown_remaining_sec = int(cooldown_sec)
+        self._accum_state = terminal
+        logger.info(
+            "accumulation %s: reason=%s spent=$%.4f acquired=%.8f buys=%d",
+            terminal.lower(),
+            str(reason),
+            float(spent_usd),
+            float(acquired_doge),
+            int(self._accum_n_buys),
+        )
+
+    def _execute_accum_buy(self, *, usd_notional: float, now: float) -> tuple[bool, str, float, float]:
+        price = float(self.last_price or 0.0)
+        target_usd = max(0.0, float(usd_notional))
+        if price <= 0.0:
+            return False, "price_unavailable", 0.0, 0.0
+        if target_usd <= 0.0:
+            return False, "non_positive_notional", 0.0, 0.0
+
+        vol_decimals = max(0, int(self.constraints.get("volume_decimals", 0)))
+        raw_volume = target_usd / price
+        if vol_decimals <= 0:
+            volume = float(floor(raw_volume))
+        else:
+            scale = float(10 ** vol_decimals)
+            volume = floor(raw_volume * scale) / scale
+        if volume <= 0.0:
+            return False, "rounded_volume_zero", 0.0, 0.0
+
+        min_volume = max(0.0, float(self.constraints.get("min_volume", 0.0)))
+        min_cost = max(0.0, float(self.constraints.get("min_cost_usd", 0.0)))
+        estimated_cost = volume * price
+        if volume + 1e-12 < min_volume:
+            return False, "below_min_volume", 0.0, 0.0
+        if min_cost > 0.0 and estimated_cost + 1e-12 < min_cost:
+            return False, "below_min_cost", 0.0, 0.0
+
+        if not self._try_reserve_loop_funds(side="buy", volume=volume, price=price):
+            return False, "insufficient_usd", 0.0, 0.0
+        if not self._consume_private_budget(1, "accumulation_market_buy"):
+            self._release_loop_reservation(side="buy", volume=volume, price=price)
+            return False, "api_budget_exhausted", 0.0, 0.0
+
+        userref = int((int(now * 1000) % 900_000_000) + 100_000_000)
+        try:
+            txid = kraken_client.place_order(
+                side="buy",
+                volume=volume,
+                price=price,
+                pair=self.pair,
+                ordertype="market",
+                post_only=False,
+                userref=userref,
+            )
+            if not txid:
+                self._release_loop_reservation(side="buy", volume=volume, price=price)
+                return False, "empty_txid", 0.0, 0.0
+            self.ledger.commit_order("buy", price, volume)
+            return True, str(txid), float(estimated_cost), float(volume)
+        except Exception as e:
+            self._release_loop_reservation(side="buy", volume=volume, price=price)
+            return False, str(e), 0.0, 0.0
+
+    def stop_accumulation(self) -> tuple[bool, str]:
+        state = str(self._accum_state or "IDLE").strip().upper()
+        if state not in {"ARMED", "ACTIVE"}:
+            return False, "no active accumulation session"
+        signal, conviction = self._accumulation_signal_conviction()
+        self._accum_manual_stop_requested = True
+        self._finalize_accumulation(
+            now=_now(),
+            terminal_state="STOPPED",
+            reason="manual_stop",
+            ai_signal=signal,
+            ai_conviction=conviction,
+        )
+        return True, "accumulation stopped"
+
+    def _update_accumulation(self, now: float) -> None:
+        now_ts = float(now)
+        cooldown_sec = max(0.0, float(getattr(config, "ACCUM_COOLDOWN_SEC", 3600.0)))
+        if self._accum_last_session_end_ts > 0.0 and cooldown_sec > 0.0:
+            self._accum_cooldown_remaining_sec = int(
+                max(0.0, cooldown_sec - max(0.0, now_ts - float(self._accum_last_session_end_ts)))
+            )
+        else:
+            self._accum_cooldown_remaining_sec = 0
+
+        state = str(self._accum_state or "IDLE").strip().upper()
+        if state not in {"IDLE", "ARMED", "ACTIVE", "COMPLETED", "STOPPED"}:
+            state = "IDLE"
+            self._accum_state = state
+
+        if state in {"COMPLETED", "STOPPED"}:
+            self._clear_accumulation_live_state()
+            state = "IDLE"
+
+        signal, conviction = self._accumulation_signal_conviction()
+        min_conviction = max(0, min(100, int(getattr(config, "ACCUM_MIN_CONVICTION", 60))))
+        idle_usd, budget_now = self._accumulation_idle_budget()
+        capacity_band = str(self._compute_capacity_health(now_ts).get("status_band") or "normal").strip().lower()
+
+        transition = dict(self._hmm_tertiary_transition or {})
+        from_regime = self._normalize_regime_label(transition.get("from_regime", "RANGING"), "RANGING")
+        to_regime = self._normalize_regime_label(transition.get("to_regime", "RANGING"), "RANGING")
+        confirmed = bool(transition.get("confirmed", False))
+        tertiary_state = dict(self._hmm_state_tertiary or {})
+        current_regime = self._normalize_regime_label(tertiary_state.get("regime", to_regime), to_regime)
+
+        if not bool(getattr(config, "ACCUM_ENABLED", False)):
+            if state in {"ARMED", "ACTIVE"}:
+                self._finalize_accumulation(
+                    now=now_ts,
+                    terminal_state="STOPPED",
+                    reason="accum_disabled",
+                    ai_signal=signal,
+                    ai_conviction=conviction,
+                )
+            return
+
+        if state == "IDLE":
+            if self._accum_cooldown_remaining_sec > 0:
+                return
+            if capacity_band == "stop":
+                return
+            if not (confirmed and from_regime != to_regime):
+                return
+            if budget_now <= 0.0:
+                return
+            self._arm_accumulation(
+                now_ts,
+                from_regime=from_regime,
+                to_regime=to_regime,
+                budget_usd=budget_now,
+                idle_usd=idle_usd,
+            )
+            state = "ARMED"
+
+        if state == "ARMED":
+            if self._accum_manual_stop_requested:
+                self._finalize_accumulation(
+                    now=now_ts,
+                    terminal_state="STOPPED",
+                    reason="manual_stop",
+                    ai_signal=signal,
+                    ai_conviction=conviction,
+                )
+                return
+            if (
+                not confirmed
+                or from_regime != self._accum_trigger_from_regime
+                or to_regime != self._accum_trigger_to_regime
+            ):
+                logger.info("accumulation disarmed: transition no longer confirmed")
+                self._clear_accumulation_live_state()
+                return
+            if budget_now <= 0.0:
+                logger.info("accumulation disarmed: no idle budget above reserve")
+                self._clear_accumulation_live_state()
+                return
+            if self._accum_budget_usd <= 0.0:
+                self._accum_budget_usd = budget_now
+            else:
+                self._accum_budget_usd = min(float(self._accum_budget_usd), float(budget_now))
+
+            if signal == "hold":
+                self._accum_hold_streak = int(self._accum_hold_streak) + 1
+            else:
+                self._accum_hold_streak = 0
+            if self._accum_hold_streak >= 3:
+                logger.info("accumulation disarmed: AI hold streak reached %d", int(self._accum_hold_streak))
+                self._clear_accumulation_live_state()
+                return
+            if signal != "accumulate_doge" or conviction < min_conviction:
+                return
+            if capacity_band == "stop":
+                return
+            if not self._activate_accumulation(now_ts):
+                return
+            state = "ACTIVE"
+
+        if state != "ACTIVE":
+            return
+
+        if self._accum_manual_stop_requested:
+            self._finalize_accumulation(
+                now=now_ts,
+                terminal_state="STOPPED",
+                reason="manual_stop",
+                ai_signal=signal,
+                ai_conviction=conviction,
+            )
+            return
+        if capacity_band == "stop":
+            self._finalize_accumulation(
+                now=now_ts,
+                terminal_state="STOPPED",
+                reason="capacity_stop",
+                ai_signal=signal,
+                ai_conviction=conviction,
+            )
+            return
+        if current_regime == self._accum_trigger_from_regime:
+            self._finalize_accumulation(
+                now=now_ts,
+                terminal_state="STOPPED",
+                reason="transition_revert",
+                ai_signal=signal,
+                ai_conviction=conviction,
+            )
+            return
+
+        if signal == "hold":
+            self._accum_hold_streak = int(self._accum_hold_streak) + 1
+        else:
+            self._accum_hold_streak = 0
+        if self._accum_hold_streak >= 2:
+            self._finalize_accumulation(
+                now=now_ts,
+                terminal_state="STOPPED",
+                reason="ai_hold_streak",
+                ai_signal=signal,
+                ai_conviction=conviction,
+            )
+            return
+
+        max_drawdown_pct = max(0.0, float(getattr(config, "ACCUM_MAX_DRAWDOWN_PCT", 3.0)))
+        if self._accum_start_price > 0 and self.last_price > 0:
+            drawdown_pct = ((float(self._accum_start_price) - float(self.last_price)) / float(self._accum_start_price)) * 100.0
+            if drawdown_pct > max_drawdown_pct:
+                self._finalize_accumulation(
+                    now=now_ts,
+                    terminal_state="STOPPED",
+                    reason="drawdown_breach",
+                    ai_signal=signal,
+                    ai_conviction=conviction,
+                )
+                return
+
+        if self._accum_budget_usd <= 0.0:
+            self._accum_budget_usd = float(budget_now)
+        elif budget_now > 0.0:
+            self._accum_budget_usd = min(float(self._accum_budget_usd), float(budget_now))
+        self._accum_budget_usd = max(float(self._accum_spent_usd), float(self._accum_budget_usd))
+
+        budget_remaining = max(0.0, float(self._accum_budget_usd) - float(self._accum_spent_usd))
+        if budget_remaining <= 1e-9:
+            self._finalize_accumulation(
+                now=now_ts,
+                terminal_state="COMPLETED",
+                reason="budget_exhausted",
+                ai_signal=signal,
+                ai_conviction=conviction,
+            )
+            return
+
+        interval_sec = max(1.0, float(getattr(config, "ACCUM_INTERVAL_SEC", 120.0)))
+        if self._accum_last_buy_ts > 0.0 and (now_ts - float(self._accum_last_buy_ts)) < interval_sec:
+            return
+
+        chunk_usd_cfg = max(0.0, float(getattr(config, "ACCUM_CHUNK_USD", 2.0)))
+        chunk_usd = min(chunk_usd_cfg, budget_remaining)
+        if chunk_usd <= 0.0:
+            self._finalize_accumulation(
+                now=now_ts,
+                terminal_state="COMPLETED",
+                reason="budget_exhausted",
+                ai_signal=signal,
+                ai_conviction=conviction,
+            )
+            return
+
+        ok, msg, spent_usd, acquired_doge = self._execute_accum_buy(usd_notional=chunk_usd, now=now_ts)
+        if not ok:
+            if msg in {"api_budget_exhausted", "price_unavailable"}:
+                return
+            self._finalize_accumulation(
+                now=now_ts,
+                terminal_state="STOPPED",
+                reason=f"order_failed:{str(msg)[:64]}",
+                ai_signal=signal,
+                ai_conviction=conviction,
+            )
+            return
+
+        self._accum_spent_usd = float(self._accum_spent_usd) + float(spent_usd)
+        self._accum_acquired_doge = float(self._accum_acquired_doge) + float(acquired_doge)
+        self._accum_n_buys = int(self._accum_n_buys) + 1
+        self._accum_last_buy_ts = float(now_ts)
+
+        logger.info(
+            "accumulation buy: spent=$%.4f acquired=%.8f total_spent=$%.4f/%.4f buys=%d",
+            float(spent_usd),
+            float(acquired_doge),
+            float(self._accum_spent_usd),
+            float(self._accum_budget_usd),
+            int(self._accum_n_buys),
+        )
+
+        if float(self._accum_spent_usd) + 1e-9 >= float(self._accum_budget_usd):
+            self._finalize_accumulation(
+                now=now_ts,
+                terminal_state="COMPLETED",
+                reason="budget_exhausted",
+                ai_signal=signal,
+                ai_conviction=conviction,
+            )
+
+    def _accumulation_status_payload(self, now: float | None = None) -> dict[str, Any]:
+        now_ts = float(now if now is not None else _now())
+        cooldown_sec = max(0.0, float(getattr(config, "ACCUM_COOLDOWN_SEC", 3600.0)))
+        if self._accum_last_session_end_ts > 0.0 and cooldown_sec > 0.0:
+            cooldown_remaining = max(0.0, cooldown_sec - max(0.0, now_ts - float(self._accum_last_session_end_ts)))
+        else:
+            cooldown_remaining = 0.0
+        self._accum_cooldown_remaining_sec = int(cooldown_remaining)
+
+        state = str(self._accum_state or "IDLE").strip().upper()
+        if state not in {"IDLE", "ARMED", "ACTIVE", "COMPLETED", "STOPPED"}:
+            state = "IDLE"
+        direction = str(self._accum_direction or "").strip().lower()
+        direction = direction if direction in {"doge", "usd"} else None
+
+        spent_usd = max(0.0, float(self._accum_spent_usd))
+        acquired_doge = max(0.0, float(self._accum_acquired_doge))
+        budget_usd = max(0.0, float(self._accum_budget_usd))
+        budget_remaining_usd = max(0.0, budget_usd - spent_usd)
+        avg_price = (spent_usd / acquired_doge) if acquired_doge > 0.0 else None
+        start_ref = float(self._accum_start_ts if self._accum_start_ts > 0.0 else self._accum_armed_at)
+        elapsed_sec = max(0.0, now_ts - start_ref) if start_ref > 0.0 and state in {"ARMED", "ACTIVE"} else 0.0
+
+        current_drawdown_pct = None
+        if self._accum_start_price > 0.0 and self.last_price > 0.0:
+            current_drawdown_pct = ((float(self.last_price) - float(self._accum_start_price)) / float(self._accum_start_price)) * 100.0
+
+        ai_signal, ai_conviction = self._accumulation_signal_conviction()
+        trigger_from = self._normalize_regime_label(self._accum_trigger_from_regime, "RANGING")
+        trigger_to = self._normalize_regime_label(self._accum_trigger_to_regime, "RANGING")
+
+        return {
+            "enabled": bool(getattr(config, "ACCUM_ENABLED", False)),
+            "state": str(state),
+            "active": bool(state == "ACTIVE"),
+            "direction": direction,
+            "budget_usd": float(budget_usd),
+            "spent_usd": float(spent_usd),
+            "budget_remaining_usd": float(budget_remaining_usd),
+            "acquired_doge": float(acquired_doge),
+            "avg_price": (float(avg_price) if avg_price is not None else None),
+            "n_buys": int(max(0, int(self._accum_n_buys))),
+            "start_ts": (float(self._accum_start_ts) if self._accum_start_ts > 0.0 else None),
+            "elapsed_sec": float(elapsed_sec),
+            "start_price": (float(self._accum_start_price) if self._accum_start_price > 0.0 else None),
+            "current_drawdown_pct": (
+                float(current_drawdown_pct) if current_drawdown_pct is not None else None
+            ),
+            "max_drawdown_pct": float(max(0.0, float(getattr(config, "ACCUM_MAX_DRAWDOWN_PCT", 3.0)))),
+            "trigger": self._accumulation_trigger_label(trigger_from, trigger_to),
+            "trigger_from_regime": str(trigger_from),
+            "trigger_to_regime": str(trigger_to),
+            "ai_accumulation_signal": str(ai_signal),
+            "ai_accumulation_conviction": int(ai_conviction),
+            "armed_at": (float(self._accum_armed_at) if self._accum_armed_at > 0.0 else None),
+            "last_buy_ts": (float(self._accum_last_buy_ts) if self._accum_last_buy_ts > 0.0 else None),
+            "cooldown_remaining_sec": int(self._accum_cooldown_remaining_sec),
+            "manual_stop_requested": bool(self._accum_manual_stop_requested),
+            "last_session_end_ts": (
+                float(self._accum_last_session_end_ts) if self._accum_last_session_end_ts > 0.0 else None
+            ),
+            "last_session_summary": (
+                dict(self._accum_last_session_summary) if isinstance(self._accum_last_session_summary, dict) else None
+            ),
         }
 
     def _clear_ai_override(self) -> None:
@@ -3238,9 +4499,14 @@ class BotRuntime:
                     "recommended_tier": 0,
                     "recommended_direction": "symmetric",
                     "conviction": 0,
+                    "accumulation_signal": "hold",
+                    "accumulation_conviction": 0,
                     "rationale": "",
                     "watch_for": "",
+                    "suggested_ttl_minutes": 0,
                     "panelist": "",
+                    "provider": "",
+                    "model": "",
                     "error": str(e),
                 },
                 "trigger": str(trigger),
@@ -3289,10 +4555,16 @@ class BotRuntime:
         if recommended_direction not in {"symmetric", "long_bias", "short_bias"}:
             recommended_direction = "symmetric"
         conviction = max(0, min(100, int(opinion.get("conviction", 0) or 0)))
+        accumulation_signal = str(opinion.get("accumulation_signal", "hold") or "hold").strip().lower()
+        if accumulation_signal not in {"accumulate_doge", "hold", "accumulate_usd"}:
+            accumulation_signal = "hold"
+        accumulation_conviction = max(0, min(100, int(opinion.get("accumulation_conviction", 0) or 0)))
         rationale = str(opinion.get("rationale", "") or "")[:500]
         watch_for = str(opinion.get("watch_for", "") or "")[:200]
         suggested_ttl_minutes = max(0, min(60, int(opinion.get("suggested_ttl_minutes", 0) or 0)))
         panelist = str(opinion.get("panelist", "") or "")
+        provider = str(opinion.get("provider", "") or "")
+        model = str(opinion.get("model", "") or "")
         error = str(opinion.get("error", "") or "")
 
         mechanical_ref = pending.get("mechanical_at_request", {})
@@ -3319,10 +4591,14 @@ class BotRuntime:
             "recommended_tier": int(recommended_tier),
             "recommended_direction": str(recommended_direction),
             "conviction": int(conviction),
+            "accumulation_signal": str(accumulation_signal),
+            "accumulation_conviction": int(accumulation_conviction),
             "rationale": rationale,
             "watch_for": watch_for,
             "suggested_ttl_minutes": int(suggested_ttl_minutes),
             "panelist": panelist,
+            "provider": provider,
+            "model": model,
             "error": error,
             "agreement": agreement,
             "trigger": str(pending.get("trigger", "")),
@@ -3344,6 +4620,8 @@ class BotRuntime:
                 "ai_tier": int(recommended_tier),
                 "ai_direction": str(recommended_direction),
                 "conviction": int(conviction),
+                "accumulation_signal": str(accumulation_signal),
+                "accumulation_conviction": int(accumulation_conviction),
                 "agreement": str(agreement),
                 "action": action,
             }
@@ -3940,15 +5218,23 @@ class BotRuntime:
             recommended_direction = "symmetric"
         agreement = str(opinion.get("agreement", "unknown") or "unknown")
         conviction = max(0, min(100, int(opinion.get("conviction", 0) or 0)))
+        accumulation_signal = str(opinion.get("accumulation_signal", "hold") or "hold").strip().lower()
+        if accumulation_signal not in {"accumulate_doge", "hold", "accumulate_usd"}:
+            accumulation_signal = "hold"
+        accumulation_conviction = max(0, min(100, int(opinion.get("accumulation_conviction", 0) or 0)))
 
         opinion_payload = {
             "recommended_tier": int(recommended_tier),
             "recommended_direction": str(recommended_direction),
             "conviction": int(conviction),
+            "accumulation_signal": str(accumulation_signal),
+            "accumulation_conviction": int(accumulation_conviction),
             "rationale": str(opinion.get("rationale", "") or ""),
             "watch_for": str(opinion.get("watch_for", "") or ""),
             "suggested_ttl_minutes": int(opinion.get("suggested_ttl_minutes", 0) or 0),
             "panelist": str(opinion.get("panelist", "") or ""),
+            "provider": str(opinion.get("provider", "") or ""),
+            "model": str(opinion.get("model", "") or ""),
             "agreement": agreement,
             "error": str(opinion.get("error", "") or ""),
             "trigger": str(opinion.get("trigger", "") or ""),
@@ -4068,6 +5354,9 @@ class BotRuntime:
         if state_key == "secondary":
             last_sync_ts = float(self._ohlcv_secondary_last_sync_ts)
             since_cursor = int(self._ohlcv_secondary_since_cursor) if self._ohlcv_secondary_since_cursor else None
+        elif state_key == "tertiary":
+            last_sync_ts = float(self._ohlcv_tertiary_last_sync_ts)
+            since_cursor = int(self._ohlcv_tertiary_since_cursor) if self._ohlcv_tertiary_since_cursor else None
         else:
             last_sync_ts = float(self._ohlcv_last_sync_ts)
             since_cursor = int(self._ohlcv_since_cursor) if self._ohlcv_since_cursor else None
@@ -4077,6 +5366,8 @@ class BotRuntime:
 
         if state_key == "secondary":
             self._ohlcv_secondary_last_sync_ts = now
+        elif state_key == "tertiary":
+            self._ohlcv_tertiary_last_sync_ts = now
         else:
             self._ohlcv_last_sync_ts = now
 
@@ -4102,12 +5393,17 @@ class BotRuntime:
                 if state_key == "secondary":
                     self._ohlcv_secondary_last_rows_queued = len(candles)
                     self._ohlcv_secondary_last_candle_ts = float(candles[-1]["time"])
+                elif state_key == "tertiary":
+                    self._ohlcv_tertiary_last_rows_queued = len(candles)
+                    self._ohlcv_tertiary_last_candle_ts = float(candles[-1]["time"])
                 else:
                     self._ohlcv_last_rows_queued = len(candles)
                     self._ohlcv_last_candle_ts = float(candles[-1]["time"])
             else:
                 if state_key == "secondary":
                     self._ohlcv_secondary_last_rows_queued = 0
+                elif state_key == "tertiary":
+                    self._ohlcv_tertiary_last_rows_queued = 0
                 else:
                     self._ohlcv_last_rows_queued = 0
 
@@ -4116,6 +5412,8 @@ class BotRuntime:
                     next_cursor = int(last_cursor)
                     if state_key == "secondary":
                         self._ohlcv_secondary_since_cursor = next_cursor
+                    elif state_key == "tertiary":
+                        self._ohlcv_tertiary_since_cursor = next_cursor
                     else:
                         self._ohlcv_since_cursor = next_cursor
                 except (TypeError, ValueError):
@@ -4123,6 +5421,8 @@ class BotRuntime:
             elif candles:
                 if state_key == "secondary":
                     self._ohlcv_secondary_since_cursor = int(float(candles[-1]["time"]))
+                elif state_key == "tertiary":
+                    self._ohlcv_tertiary_since_cursor = int(float(candles[-1]["time"]))
                 else:
                     self._ohlcv_since_cursor = int(float(candles[-1]["time"]))
         except Exception as e:
@@ -4165,6 +5465,23 @@ class BotRuntime:
                 state_key="secondary",
             )
 
+        if bool(getattr(config, "HMM_TERTIARY_ENABLED", False)):
+            self._sync_ohlcv_candles_for_interval(
+                now_ts,
+                interval_min=max(1, int(getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60))),
+                sync_interval_sec=max(
+                    30.0,
+                    float(
+                        getattr(
+                            config,
+                            "HMM_TERTIARY_SYNC_INTERVAL_SEC",
+                            getattr(config, "HMM_OHLCV_SYNC_INTERVAL_SEC", 300.0),
+                        )
+                    ),
+                ),
+                state_key="tertiary",
+            )
+
 
     def backfill_ohlcv_history(
         self,
@@ -4182,6 +5499,8 @@ class BotRuntime:
             msg = "ohlcv pipeline disabled"
             if state_key == "secondary":
                 self._hmm_backfill_last_message_secondary = msg
+            elif state_key == "tertiary":
+                self._hmm_backfill_last_message_tertiary = msg
             else:
                 self._hmm_backfill_last_message = msg
             return False, msg
@@ -4189,6 +5508,8 @@ class BotRuntime:
         default_target = (
             int(getattr(config, "HMM_SECONDARY_TRAINING_CANDLES", 720))
             if state_key == "secondary"
+            else int(getattr(config, "HMM_TERTIARY_TRAINING_CANDLES", 500))
+            if state_key == "tertiary"
             else int(getattr(config, "HMM_TRAINING_CANDLES", 720))
         )
         target = max(1, int(target_candles if target_candles is not None else default_target))
@@ -4199,6 +5520,8 @@ class BotRuntime:
                 int(
                     getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15)
                     if state_key == "secondary"
+                    else getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60)
+                    if state_key == "tertiary"
                     else getattr(config, "HMM_OHLCV_INTERVAL_MIN", 5)
                 ),
             )
@@ -4221,6 +5544,10 @@ class BotRuntime:
                 self._hmm_backfill_last_at_secondary = _now()
                 self._hmm_backfill_last_rows_secondary = 0
                 self._hmm_backfill_last_message_secondary = f"already_ready:{existing_count}/{target}"
+            elif state_key == "tertiary":
+                self._hmm_backfill_last_at_tertiary = _now()
+                self._hmm_backfill_last_rows_tertiary = 0
+                self._hmm_backfill_last_message_tertiary = f"already_ready:{existing_count}/{target}"
             else:
                 self._hmm_backfill_last_at = _now()
                 self._hmm_backfill_last_rows = 0
@@ -4231,6 +5558,8 @@ class BotRuntime:
         stall_count = (
             self._hmm_backfill_stall_count_secondary
             if state_key == "secondary"
+            else self._hmm_backfill_stall_count_tertiary
+            if state_key == "tertiary"
             else self._hmm_backfill_stall_count
         )
         if stall_count >= stall_limit:
@@ -4239,6 +5568,10 @@ class BotRuntime:
                 self._hmm_backfill_last_at_secondary = _now()
                 self._hmm_backfill_last_rows_secondary = 0
                 self._hmm_backfill_last_message_secondary = msg
+            elif state_key == "tertiary":
+                self._hmm_backfill_last_at_tertiary = _now()
+                self._hmm_backfill_last_rows_tertiary = 0
+                self._hmm_backfill_last_message_tertiary = msg
             else:
                 self._hmm_backfill_last_at = _now()
                 self._hmm_backfill_last_rows = 0
@@ -4260,6 +5593,8 @@ class BotRuntime:
             except Exception as e:
                 if state_key == "secondary":
                     self._hmm_backfill_last_message_secondary = f"fetch_failed:{e}"
+                elif state_key == "tertiary":
+                    self._hmm_backfill_last_message_tertiary = f"fetch_failed:{e}"
                 else:
                     self._hmm_backfill_last_message = f"fetch_failed:{e}"
                 break
@@ -4297,11 +5632,15 @@ class BotRuntime:
         if new_unique == 0:
             if state_key == "secondary":
                 self._hmm_backfill_stall_count_secondary += 1
+            elif state_key == "tertiary":
+                self._hmm_backfill_stall_count_tertiary += 1
             else:
                 self._hmm_backfill_stall_count += 1
         else:
             if state_key == "secondary":
                 self._hmm_backfill_stall_count_secondary = 0
+            elif state_key == "tertiary":
+                self._hmm_backfill_stall_count_tertiary = 0
             else:
                 self._hmm_backfill_stall_count = 0
 
@@ -4309,6 +5648,10 @@ class BotRuntime:
             self._hmm_backfill_last_at_secondary = _now()
             self._hmm_backfill_last_rows_secondary = int(queued_rows)
             current_stalls = self._hmm_backfill_stall_count_secondary
+        elif state_key == "tertiary":
+            self._hmm_backfill_last_at_tertiary = _now()
+            self._hmm_backfill_last_rows_tertiary = int(queued_rows)
+            current_stalls = self._hmm_backfill_stall_count_tertiary
         else:
             self._hmm_backfill_last_at = _now()
             self._hmm_backfill_last_rows = int(queued_rows)
@@ -4319,6 +5662,8 @@ class BotRuntime:
             backfill_msg += f" stalls={current_stalls}"
         if state_key == "secondary":
             self._hmm_backfill_last_message_secondary = backfill_msg
+        elif state_key == "tertiary":
+            self._hmm_backfill_last_message_tertiary = backfill_msg
         else:
             self._hmm_backfill_last_message = backfill_msg
         self._hmm_readiness_cache.pop(state_key, None)
@@ -4358,40 +5703,72 @@ class BotRuntime:
         secondary_collect_enabled = bool(getattr(config, "HMM_SECONDARY_OHLCV_ENABLED", False)) or bool(
             getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)
         )
-        if not secondary_collect_enabled:
+        if secondary_collect_enabled:
+            secondary_readiness = self._hmm_data_readiness(
+                now_ts,
+                interval_min=max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15))),
+                training_target=max(1, int(getattr(config, "HMM_SECONDARY_TRAINING_CANDLES", 720))),
+                min_samples=max(1, int(getattr(config, "HMM_SECONDARY_MIN_TRAIN_SAMPLES", 200))),
+                sync_interval_sec=max(
+                    30.0,
+                    float(
+                        getattr(
+                            config,
+                            "HMM_SECONDARY_SYNC_INTERVAL_SEC",
+                            getattr(config, "HMM_OHLCV_SYNC_INTERVAL_SEC", 300.0),
+                        )
+                    ),
+                ),
+                state_key="secondary",
+            )
+            if bool(secondary_readiness.get("ready_for_target_window", False)):
+                logger.info("OHLCV startup backfill skipped (secondary already ready)")
+            else:
+                ok, msg = self.backfill_ohlcv_history(
+                    target_candles=int(getattr(config, "HMM_SECONDARY_TRAINING_CANDLES", 720)),
+                    max_pages=int(getattr(config, "HMM_OHLCV_BACKFILL_MAX_PAGES", 40)),
+                    interval_min=max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15))),
+                    state_key="secondary",
+                )
+                if ok:
+                    logger.info("OHLCV startup backfill (secondary): %s", msg)
+                else:
+                    logger.warning("OHLCV startup backfill (secondary): %s", msg)
+
+        if not bool(getattr(config, "HMM_TERTIARY_ENABLED", False)):
             return
 
-        secondary_readiness = self._hmm_data_readiness(
+        tertiary_readiness = self._hmm_data_readiness(
             now_ts,
-            interval_min=max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15))),
-            training_target=max(1, int(getattr(config, "HMM_SECONDARY_TRAINING_CANDLES", 720))),
-            min_samples=max(1, int(getattr(config, "HMM_SECONDARY_MIN_TRAIN_SAMPLES", 200))),
+            interval_min=max(1, int(getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60))),
+            training_target=max(1, int(getattr(config, "HMM_TERTIARY_TRAINING_CANDLES", 500))),
+            min_samples=max(1, int(getattr(config, "HMM_TERTIARY_MIN_TRAIN_SAMPLES", 150))),
             sync_interval_sec=max(
                 30.0,
                 float(
                     getattr(
                         config,
-                        "HMM_SECONDARY_SYNC_INTERVAL_SEC",
+                        "HMM_TERTIARY_SYNC_INTERVAL_SEC",
                         getattr(config, "HMM_OHLCV_SYNC_INTERVAL_SEC", 300.0),
                     )
                 ),
             ),
-            state_key="secondary",
+            state_key="tertiary",
         )
-        if bool(secondary_readiness.get("ready_for_target_window", False)):
-            logger.info("OHLCV startup backfill skipped (secondary already ready)")
+        if bool(tertiary_readiness.get("ready_for_target_window", False)):
+            logger.info("OHLCV startup backfill skipped (tertiary already ready)")
             return
 
         ok, msg = self.backfill_ohlcv_history(
-            target_candles=int(getattr(config, "HMM_SECONDARY_TRAINING_CANDLES", 720)),
+            target_candles=int(getattr(config, "HMM_TERTIARY_TRAINING_CANDLES", 500)),
             max_pages=int(getattr(config, "HMM_OHLCV_BACKFILL_MAX_PAGES", 40)),
-            interval_min=max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15))),
-            state_key="secondary",
+            interval_min=max(1, int(getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60))),
+            state_key="tertiary",
         )
         if ok:
-            logger.info("OHLCV startup backfill (secondary): %s", msg)
+            logger.info("OHLCV startup backfill (tertiary): %s", msg)
         else:
-            logger.warning("OHLCV startup backfill (secondary): %s", msg)
+            logger.warning("OHLCV startup backfill (tertiary): %s", msg)
 
     def _load_recent_ohlcv_rows(
         self,
@@ -4488,13 +5865,21 @@ class BotRuntime:
         """
         now_ts = float(now if now is not None else _now())
         ttl = max(5.0, float(getattr(config, "HMM_READINESS_CACHE_SEC", 300.0)))
-        use_state_key = "secondary" if str(state_key).lower() == "secondary" else "primary"
+        key_raw = str(state_key).lower()
+        if key_raw == "secondary":
+            use_state_key = "secondary"
+        elif key_raw == "tertiary":
+            use_state_key = "tertiary"
+        else:
+            use_state_key = "primary"
         if interval_min is None:
             interval = max(
                 1,
                 int(
                     getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15)
                     if use_state_key == "secondary"
+                    else getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60)
+                    if use_state_key == "tertiary"
                     else getattr(config, "HMM_OHLCV_INTERVAL_MIN", 5)
                 ),
             )
@@ -4506,6 +5891,8 @@ class BotRuntime:
                 int(
                     getattr(config, "HMM_SECONDARY_TRAINING_CANDLES", 720)
                     if use_state_key == "secondary"
+                    else getattr(config, "HMM_TERTIARY_TRAINING_CANDLES", 500)
+                    if use_state_key == "tertiary"
                     else getattr(config, "HMM_TRAINING_CANDLES", 720)
                 ),
             )
@@ -4517,6 +5904,8 @@ class BotRuntime:
                 int(
                     getattr(config, "HMM_SECONDARY_MIN_TRAIN_SAMPLES", 200)
                     if use_state_key == "secondary"
+                    else getattr(config, "HMM_TERTIARY_MIN_TRAIN_SAMPLES", 150)
+                    if use_state_key == "tertiary"
                     else getattr(config, "HMM_MIN_TRAIN_SAMPLES", 500)
                 ),
             )
@@ -4526,6 +5915,8 @@ class BotRuntime:
             sync_interval = (
                 float(getattr(config, "HMM_SECONDARY_SYNC_INTERVAL_SEC", 300.0))
                 if use_state_key == "secondary"
+                else float(getattr(config, "HMM_TERTIARY_SYNC_INTERVAL_SEC", 3600.0))
+                if use_state_key == "tertiary"
                 else float(getattr(config, "HMM_OHLCV_SYNC_INTERVAL_SEC", 300.0))
             )
         else:
@@ -4544,9 +5935,12 @@ class BotRuntime:
             secondary_collect_enabled = bool(getattr(config, "HMM_SECONDARY_OHLCV_ENABLED", False)) or bool(
                 getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)
             )
+            tertiary_collect_enabled = bool(getattr(config, "HMM_TERTIARY_ENABLED", False))
             enabled = bool(getattr(config, "HMM_OHLCV_ENABLED", True))
             if use_state_key == "secondary":
                 enabled = bool(enabled and secondary_collect_enabled)
+            elif use_state_key == "tertiary":
+                enabled = bool(enabled and tertiary_collect_enabled)
             rows = supabase_store.load_ohlcv_candles(
                 limit=target,
                 pair=self.pair,
@@ -4597,6 +5991,13 @@ class BotRuntime:
                 backfill_last_at = float(self._hmm_backfill_last_at_secondary)
                 backfill_last_rows = int(self._hmm_backfill_last_rows_secondary)
                 backfill_last_message = str(self._hmm_backfill_last_message_secondary or "")
+            elif use_state_key == "tertiary":
+                last_sync_ts = float(self._ohlcv_tertiary_last_sync_ts)
+                last_sync_rows_queued = int(self._ohlcv_tertiary_last_rows_queued)
+                sync_cursor = self._ohlcv_tertiary_since_cursor
+                backfill_last_at = float(self._hmm_backfill_last_at_tertiary)
+                backfill_last_rows = int(self._hmm_backfill_last_rows_tertiary)
+                backfill_last_message = str(self._hmm_backfill_last_message_tertiary or "")
             else:
                 last_sync_ts = float(self._ohlcv_last_sync_ts)
                 last_sync_rows_queued = int(self._ohlcv_last_rows_queued)
@@ -4642,16 +6043,22 @@ class BotRuntime:
                 "backfill_last_at": (
                     float(self._hmm_backfill_last_at_secondary)
                     if use_state_key == "secondary"
+                    else float(self._hmm_backfill_last_at_tertiary)
+                    if use_state_key == "tertiary"
                     else float(self._hmm_backfill_last_at)
                 ),
                 "backfill_last_rows": (
                     int(self._hmm_backfill_last_rows_secondary)
                     if use_state_key == "secondary"
+                    else int(self._hmm_backfill_last_rows_tertiary)
+                    if use_state_key == "tertiary"
                     else int(self._hmm_backfill_last_rows)
                 ),
                 "backfill_last_message": (
                     str(self._hmm_backfill_last_message_secondary or "")
                     if use_state_key == "secondary"
+                    else str(self._hmm_backfill_last_message_tertiary or "")
+                    if use_state_key == "tertiary"
                     else str(self._hmm_backfill_last_message or "")
                 ),
             }
@@ -5887,6 +7294,8 @@ class BotRuntime:
         return True, f"profit_pct set to {self.profit_pct:.3f}%"
 
     def soft_close(self, slot_id: int, recovery_id: int) -> tuple[bool, str]:
+        if not self._recovery_orders_enabled():
+            return False, _recovery_disabled_message("soft_close")
         if bool(config.STICKY_MODE_ENABLED):
             return False, "soft_close disabled in sticky mode; use release_slot"
         slot = self.slots.get(slot_id)
@@ -5933,6 +7342,8 @@ class BotRuntime:
         return True, f"soft-close repriced recovery {recovery_id}"
 
     def soft_close_next(self) -> tuple[bool, str]:
+        if not self._recovery_orders_enabled():
+            return False, _recovery_disabled_message("soft_close_next")
         if bool(config.STICKY_MODE_ENABLED):
             return False, "soft_close_next disabled in sticky mode; use release_slot"
         oldest: tuple[int, sm.RecoveryOrder] | None = None
@@ -6012,6 +7423,8 @@ class BotRuntime:
         Triggered each main-loop cycle.  Processes a small batch (default 2)
         per cycle to stay within rate limits while steadily draining orphans.
         """
+        if not self._recovery_orders_enabled():
+            return
         cap_threshold = float(config.AUTO_SOFT_CLOSE_CAPACITY_PCT)
         batch_size = max(1, min(int(config.AUTO_SOFT_CLOSE_BATCH), 5))
 
@@ -6102,6 +7515,8 @@ class BotRuntime:
 
         Priority is deterministic: furthest-from-market first, then oldest.
         """
+        if not self._recovery_orders_enabled():
+            return
         if not bool(config.AUTO_RECOVERY_DRAIN_ENABLED):
             return
         if self.last_price <= 0:
@@ -6215,6 +7630,8 @@ class BotRuntime:
         max_batch per call to stay within Kraken rate limits (2 API calls each:
         cancel old + place new).  Call repeatedly until remaining == 0.
         """
+        if not self._recovery_orders_enabled():
+            return False, _recovery_disabled_message("cancel_stale_recoveries")
         if bool(config.STICKY_MODE_ENABLED):
             return False, "cancel_stale_recoveries disabled in sticky mode; use release_slot"
         if self.last_price <= 0:
@@ -6846,6 +8263,7 @@ class BotRuntime:
             self._update_rebalancer(loop_now)
             self._update_regime_tier(loop_now)
             self._maybe_schedule_ai_regime(loop_now)
+            self._update_accumulation(loop_now)
             self._apply_tier2_suppression(loop_now)
             self._clear_expired_regime_cooldown(loop_now)
             # Prioritize older deferred entries each loop, while avoiding stale placements
@@ -7038,9 +8456,17 @@ class BotRuntime:
                         else max(1, int(getattr(config, "HMM_OHLCV_INTERVAL_MIN", 1)))
                     )
                     secondary_interval = max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15)))
-                    state_key = "secondary" if interval == secondary_interval else "primary"
+                    tertiary_interval = max(1, int(getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60)))
+                    if interval == tertiary_interval:
+                        state_key = "tertiary"
+                    elif interval == secondary_interval:
+                        state_key = "secondary"
+                    else:
+                        state_key = "primary"
                     if state_key == "secondary":
                         self._hmm_backfill_stall_count_secondary = 0
+                    elif state_key == "tertiary":
+                        self._hmm_backfill_stall_count_tertiary = 0
                     else:
                         self._hmm_backfill_stall_count = 0
                     ok, msg = self.backfill_ohlcv_history(
@@ -7642,6 +9068,32 @@ class BotRuntime:
                     "ready_for_target_window": False,
                     "gaps": ["pipeline_disabled"],
                 }
+            if bool(getattr(config, "HMM_TERTIARY_ENABLED", False)):
+                hmm_data_pipeline_tertiary = self._hmm_data_readiness(
+                    now,
+                    interval_min=max(1, int(getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60))),
+                    training_target=max(1, int(getattr(config, "HMM_TERTIARY_TRAINING_CANDLES", 500))),
+                    min_samples=max(1, int(getattr(config, "HMM_TERTIARY_MIN_TRAIN_SAMPLES", 150))),
+                    sync_interval_sec=max(
+                        30.0,
+                        float(
+                            getattr(
+                                config,
+                                "HMM_TERTIARY_SYNC_INTERVAL_SEC",
+                                getattr(config, "HMM_OHLCV_SYNC_INTERVAL_SEC", 300.0),
+                            )
+                        ),
+                    ),
+                    state_key="tertiary",
+                )
+            else:
+                hmm_data_pipeline_tertiary = {
+                    "enabled": False,
+                    "state_key": "tertiary",
+                    "ready_for_min_train": False,
+                    "ready_for_target_window": False,
+                    "gaps": ["pipeline_disabled"],
+                }
             hmm_regime = self._hmm_status_payload()
             hmm_consensus = dict(self._hmm_consensus or self._compute_hmm_consensus())
             hmm_consensus["source_mode"] = self._hmm_source_mode()
@@ -7687,6 +9139,7 @@ class BotRuntime:
                 "daily_loss_lock_utc_day": daily_loss_lock_day,
                 "total_round_trips": total_round_trips,
                 "total_orphans": total_orphans,
+                "recovery_orders_enabled": self._recovery_orders_enabled(),
                 "pnl_audit": {
                     "ok": bool(pnl_audit.get("ok")),
                     "message": self._format_pnl_audit_message(pnl_audit),
@@ -7771,6 +9224,7 @@ class BotRuntime:
                 "slot_vintage": slot_vintage,
                 "hmm_data_pipeline": hmm_data_pipeline,
                 "hmm_data_pipeline_secondary": hmm_data_pipeline_secondary,
+                "hmm_data_pipeline_tertiary": hmm_data_pipeline_tertiary,
                 "hmm_regime": hmm_regime,
                 "hmm_consensus": hmm_consensus,
                 "regime_history_30m": list(self._regime_history_30m),
@@ -7789,6 +9243,7 @@ class BotRuntime:
                 },
                 "regime_directional": regime_directional,
                 "ai_regime_advisor": ai_regime_advisor,
+                "accumulation": self._accumulation_status_payload(now),
                 "release_health": {
                     "sticky_release_total": int(self._sticky_release_total),
                     "sticky_release_last_at": self._sticky_release_last_at or None,
@@ -7955,11 +9410,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
             action = (body.get("action") or "").strip()
             parsed: dict[str, float | int | str] = {}
             sticky_mode_enabled = bool(config.STICKY_MODE_ENABLED)
+            recovery_orders_enabled = _recovery_orders_enabled_flag()
             if sticky_mode_enabled and action in ("soft_close", "soft_close_next", "cancel_stale_recoveries"):
                 self._send_json(
                     {"ok": False, "message": f"{action} disabled in sticky mode; use release_slot"},
                     400,
                 )
+                return
+            if not recovery_orders_enabled and action in ("soft_close", "soft_close_next", "cancel_stale_recoveries"):
+                self._send_json({"ok": False, "message": _recovery_disabled_message(action)}, 400)
                 return
 
             if action in ("set_entry_pct", "set_profit_pct"):
@@ -8041,7 +9500,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     except (TypeError, ValueError):
                         self._send_json({"ok": False, "message": "invalid ttl_sec"}, 400)
                         return
-            elif action in ("ai_regime_revert", "ai_regime_dismiss"):
+            elif action in ("ai_regime_revert", "ai_regime_dismiss", "accum_stop"):
                 pass
             elif action in ("pause", "resume", "add_slot", "soft_close_next", "reconcile_drift", "audit_pnl"):
                 pass
@@ -8096,6 +9555,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     ok, msg = _RUNTIME.revert_ai_regime_override()
                 elif action == "ai_regime_dismiss":
                     ok, msg = _RUNTIME.dismiss_ai_regime_opinion()
+                elif action == "accum_stop":
+                    ok, msg = _RUNTIME.stop_accumulation()
                 _RUNTIME._save_snapshot()
 
             self._send_json({"ok": bool(ok), "message": str(msg)}, 200 if ok else 400)

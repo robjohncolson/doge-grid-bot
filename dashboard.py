@@ -367,6 +367,7 @@ DASHBOARD_HTML = """<!doctype html>
           <button id=\"removeSlotBtn\" style=\"background:#c0392b\">Remove Slot</button>
           <button id=\"releaseEligibleBtn\" style=\"display:none\">Release Oldest Eligible</button>
           <button id=\"releaseBtn\" style=\"display:none\">Release Exit</button>
+          <button id=\"accumStopBtn\" style=\"display:none;background:#8f3a2f\">Stop Accumulation</button>
           <button id=\"softCloseBtn\">Close Oldest Waiting</button>
           <button id=\"reconcileBtn\">Reconcile Drift</button>
           <button id=\"cancelStaleBtn\">Refresh Waiting</button>
@@ -449,11 +450,13 @@ DASHBOARD_HTML = """<!doctype html>
         <div class=\"row\"><span class=\"k\">Regime</span><span id=\"hmmRegime\" class=\"v\"></span></div>
         <div class=\"row\" id=\"hmmRegime1mRow\" style=\"display:none\"><span class=\"k\">&nbsp;&nbsp;1m</span><span id=\"hmmRegime1m\" class=\"v\"></span></div>
         <div class=\"row\" id=\"hmmRegime15mRow\" style=\"display:none\"><span class=\"k\">&nbsp;&nbsp;15m</span><span id=\"hmmRegime15m\" class=\"v\"></span></div>
+        <div class=\"row\" id=\"hmmRegime1hRow\" style=\"display:none\"><span class=\"k\">&nbsp;&nbsp;1h</span><span id=\"hmmRegime1h\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Confidence</span><span id=\"hmmConfidence\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Bias Signal</span><span id=\"hmmBias\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Blend</span><span id=\"hmmBlend\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Data Window (1m)</span><span id=\"hmmWindow\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Data Window (15m)</span><span id=\"hmmWindowSecondary\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Data Window (1h)</span><span id=\"hmmWindowTertiary\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Training</span><span id=\"hmmTrainingSummary\" class=\"v\"></span></div>
         <div class=\"progress-track\"><div id=\"hmmTrainingBar\" class=\"progress-fill\"></div></div>
         <div class=\"row\"><span class=\"k\">Training ETA</span><span id=\"hmmTrainingEta\" class=\"v\"></span></div>
@@ -464,6 +467,8 @@ DASHBOARD_HTML = """<!doctype html>
           <div class=\"row\"><span class=\"k\">Status</span><span id=\"aiRegimeStatus\" class=\"v\">OFF</span></div>
           <div class=\"row\"><span class=\"k\">Mechanical</span><span id=\"aiRegimeMechanical\" class=\"v\">-</span></div>
           <div class=\"row\"><span class=\"k\">AI Opinion</span><span id=\"aiRegimeOpinion\" class=\"v\">-</span></div>
+          <div class=\"row\"><span class=\"k\">Provider</span><span id=\"aiRegimeProvider\" class=\"v\">-</span></div>
+          <div class=\"row\"><span class=\"k\">Accum Signal</span><span id=\"aiRegimeAccumSignal\" class=\"v\">-</span></div>
           <div class=\"row\"><span class=\"k\">Conviction</span><span id=\"aiRegimeConviction\" class=\"v\">-</span></div>
           <div class=\"row\"><span class=\"k\">Next Check</span><span id=\"aiRegimeNextRun\" class=\"v\">-</span></div>
           <div id=\"aiRegimeRationale\" class=\"tiny ai-rationale\"></div>
@@ -475,11 +480,24 @@ DASHBOARD_HTML = """<!doctype html>
           </div>
         </div>
 
+        <h3 style=\"margin-top:14px\">Strategic Accumulation</h3>
+        <div class=\"row\"><span class=\"k\">State</span><span id=\"accumState\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Trigger</span><span id=\"accumTrigger\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Budget</span><span id=\"accumBudget\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Spent</span><span id=\"accumSpent\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Remaining</span><span id=\"accumRemaining\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Drawdown</span><span id=\"accumDrawdown\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">AI Signal</span><span id=\"accumAiSignal\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Buys</span><span id=\"accumBuys\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Avg Price</span><span id=\"accumAvgPrice\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Cooldown</span><span id=\"accumCooldown\" class=\"v\"></span></div>
+        <div id=\"accumLastSession\" class=\"tiny\"></div>
+
         <h3 style=\"margin-top:14px\">Throughput Sizer</h3>
         <div class=\"row\"><span class=\"k\">Status</span><span id=\"throughputStatus\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Active Regime</span><span id=\"throughputActive\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Samples</span><span id=\"throughputSamples\" class=\"v\"></span></div>
-        <div class=\"row\"><span class=\"k\">Age Pressure</span><span id=\"throughputAgePressure\" class=\"v\"></span></div>
+        <div class=\"row\"><span id=\"throughputAgeLabel\" class=\"k\">Age Pressure (p90)</span><span id=\"throughputAgePressure\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Utilization</span><span id=\"throughputUtilization\" class=\"v\"></span></div>
         <div id=\"throughputBuckets\" class=\"tiny\"></div>
 
@@ -658,8 +676,13 @@ DASHBOARD_HTML = """<!doctype html>
       return Boolean(state && state.sticky_mode && state.sticky_mode.enabled);
     }
 
+    function isRecoveryOrdersEnabled() {
+      if (!state) return true;
+      return state.recovery_orders_enabled !== false;
+    }
+
     function commandCompletions() {
-      if (!isStickyModeEnabled()) return COMMAND_COMPLETIONS;
+      if (!isStickyModeEnabled() && isRecoveryOrdersEnabled()) return COMMAND_COMPLETIONS;
       return COMMAND_COMPLETIONS.filter((cmd) => cmd !== 'close' && cmd !== 'stale');
     }
 
@@ -803,6 +826,7 @@ DASHBOARD_HTML = """<!doctype html>
       if (verb === 'audit') return {type: 'action', action: 'audit_pnl', payload: {}};
       if (verb === 'drift') return {type: 'action', action: 'reconcile_drift', payload: {}};
       if (verb === 'stale') {
+        if (!isRecoveryOrdersEnabled()) return {error: 'stale disabled when recovery orders are disabled'};
         if (isStickyModeEnabled()) return {error: 'stale disabled in sticky mode; use :release'};
         let minDistancePct = 3.0;
         let maxBatch = 8;
@@ -863,6 +887,7 @@ DASHBOARD_HTML = """<!doctype html>
       }
 
       if (verb === 'close') {
+        if (!isRecoveryOrdersEnabled()) return {error: 'close disabled when recovery orders are disabled'};
         if (isStickyModeEnabled()) return {error: 'close disabled in sticky mode; use :release'};
         if (tokens.length === 1) return {type: 'action', action: 'soft_close_next', payload: {}};
         if (tokens.length < 3) return {error: 'usage: :close <slot> <rid>'};
@@ -986,6 +1011,10 @@ DASHBOARD_HTML = """<!doctype html>
     }
 
     function requestSoftCloseNext() {
+      if (!isRecoveryOrdersEnabled()) {
+        showToast('close disabled: recovery orders are disabled', 'error');
+        return;
+      }
       openConfirmDialog('Close oldest waiting exit?', async () => {
         await dispatchAction('soft_close_next');
       });
@@ -998,6 +1027,10 @@ DASHBOARD_HTML = """<!doctype html>
     }
 
     function requestCancelStaleRecoveries(minDistancePct = 3.0, maxBatch = 8) {
+      if (!isRecoveryOrdersEnabled()) {
+        showToast('refresh waiting disabled: recovery orders are disabled', 'error');
+        return;
+      }
       openConfirmDialog(
         `Refresh stale waiting exits now? min_distance=${minDistancePct}%, max_batch=${maxBatch}.`,
         async () => {
@@ -1010,6 +1043,10 @@ DASHBOARD_HTML = """<!doctype html>
     }
 
     function requestSoftClose(slotId, recoveryId) {
+      if (!isRecoveryOrdersEnabled()) {
+        showToast('close disabled: recovery orders are disabled', 'error');
+        return;
+      }
       openConfirmDialog(`Close waiting exit #${recoveryId} on slot #${slotId}?`, async () => {
         await dispatchAction('soft_close', {slot_id: slotId, recovery_id: recoveryId});
       });
@@ -1085,6 +1122,12 @@ DASHBOARD_HTML = """<!doctype html>
     function requestAiRegimeRevert() {
       openConfirmDialog('Revert to mechanical regime now?', async () => {
         await dispatchAction('ai_regime_revert');
+      });
+    }
+
+    function requestAccumStop() {
+      openConfirmDialog('Stop active accumulation session now?', async () => {
+        await dispatchAction('accum_stop');
       });
     }
 
@@ -1309,6 +1352,7 @@ DASHBOARD_HTML = """<!doctype html>
 
       const sticky = s.sticky_mode || {};
       const stickyEnabled = Boolean(sticky.enabled);
+      const recoveryOrdersEnabled = s.recovery_orders_enabled !== false;
       const vintage = s.slot_vintage || {};
       const waitingFresh = Number(vintage.fresh_0_1h || 0);
       const waitingAging = Number(vintage.aging_1_6h || 0);
@@ -1317,8 +1361,13 @@ DASHBOARD_HTML = """<!doctype html>
       const waitingAncient = Number(vintage.ancient_7d_plus || 0);
       const waitingTotal = waitingFresh + waitingAging + waitingStale + waitingOld + waitingAncient;
 
-      document.getElementById('orphansLabel').textContent = 'Waiting Exits';
-      document.getElementById('orphans').textContent = stickyEnabled ? waitingTotal : (waitingTotal || s.total_orphans);
+      document.getElementById('orphansLabel').textContent =
+        recoveryOrdersEnabled ? 'Waiting Exits' : 'Waiting Exits (disabled)';
+      if (recoveryOrdersEnabled) {
+        document.getElementById('orphans').textContent = stickyEnabled ? waitingTotal : (waitingTotal || s.total_orphans);
+      } else {
+        document.getElementById('orphans').textContent = 0;
+      }
       const dust = s.dust_sweep || {};
       const dustRowEl = document.getElementById('dustSweepRow');
       const dustValueEl = document.getElementById('dustSweep');
@@ -1396,6 +1445,7 @@ DASHBOARD_HTML = """<!doctype html>
       const hmmConsensus = s.hmm_consensus || {};
       const hmmPipe = s.hmm_data_pipeline || {};
       const hmmPipeSecondary = s.hmm_data_pipeline_secondary || {};
+      const hmmPipeTertiary = s.hmm_data_pipeline_tertiary || {};
       const hmmStatusEl = document.getElementById('hmmStatus');
       const hmmEnabled = Boolean(hmm.enabled);
       const hmmAvailable = Boolean(hmm.available);
@@ -1428,9 +1478,12 @@ DASHBOARD_HTML = """<!doctype html>
 
       const hmmPrimary = hmm.primary || {};
       const hmmSecondary = hmm.secondary || {};
+      const hmmTertiary = hmm.tertiary || {};
       const isMultiTF = Boolean(hmm.multi_timeframe) && hmmPrimary.regime && hmmSecondary.regime;
+      const hasTertiary = Boolean(hmmTertiary.regime) && (Boolean(hmmTertiary.enabled) || Boolean(hmmPipeTertiary.enabled));
       const row1m = document.getElementById('hmmRegime1mRow');
       const row15m = document.getElementById('hmmRegime15mRow');
+      const row1h = document.getElementById('hmmRegime1hRow');
       if (isMultiTF) {
         row1m.style.display = '';
         row15m.style.display = '';
@@ -1443,6 +1496,14 @@ DASHBOARD_HTML = """<!doctype html>
       } else {
         row1m.style.display = 'none';
         row15m.style.display = 'none';
+      }
+      if (hasTertiary) {
+        row1h.style.display = '';
+        const conf1h = hmmTertiary.confidence;
+        const confStr1h = conf1h === null || conf1h === undefined ? '' : ` (${fmt(Number(conf1h) * 100, 0)}%)`;
+        document.getElementById('hmmRegime1h').textContent = `${String(hmmTertiary.regime)}${confStr1h}`;
+      } else {
+        row1h.style.display = 'none';
       }
 
       const confidence = hmm.confidence;
@@ -1483,6 +1544,18 @@ DASHBOARD_HTML = """<!doctype html>
         windowText2 = `${samples2}/${target2 || '-'}${covText2}${spanText2}`;
       }
       document.getElementById('hmmWindowSecondary').textContent = windowText2;
+
+      const samples3 = Number(hmmPipeTertiary.samples || 0);
+      const target3 = Number(hmmPipeTertiary.training_target || 0);
+      const coverage3 = hmmPipeTertiary.coverage_pct;
+      const spanHours3 = hmmPipeTertiary.span_hours;
+      let windowText3 = '-';
+      if (target3 > 0 || samples3 > 0) {
+        const covText3 = coverage3 === null || coverage3 === undefined ? '' : ` (${fmt(Number(coverage3), 1)}%)`;
+        const spanText3 = spanHours3 === null || spanHours3 === undefined ? '' : `, ${fmt(Number(spanHours3), 1)}h`;
+        windowText3 = `${samples3}/${target3 || '-'}${covText3}${spanText3}`;
+      }
+      document.getElementById('hmmWindowTertiary').textContent = windowText3;
 
       const depth = (hmm && typeof hmm.training_depth === 'object') ? hmm.training_depth : {};
       const depthCurrent = Number(depth.current_candles || 0);
@@ -1529,6 +1602,9 @@ DASHBOARD_HTML = """<!doctype html>
       if (Array.isArray(hmmPipeSecondary.gaps) && hmmPipeSecondary.gaps.length) {
         hmmHints.push(...hmmPipeSecondary.gaps.map(x => `secondary:${String(x)}`));
       }
+      if (Array.isArray(hmmPipeTertiary.gaps) && hmmPipeTertiary.gaps.length) {
+        hmmHints.push(...hmmPipeTertiary.gaps.map(x => `tertiary:${String(x)}`));
+      }
       if (hmm.error) {
         hmmHints.push(`error:${String(hmm.error)}`);
       }
@@ -1538,11 +1614,17 @@ DASHBOARD_HTML = """<!doctype html>
       if (hmmPipeSecondary.backfill_last_message) {
         hmmHints.push(`backfill_secondary:${String(hmmPipeSecondary.backfill_last_message)}`);
       }
+      if (hmmPipeTertiary.backfill_last_message) {
+        hmmHints.push(`backfill_tertiary:${String(hmmPipeTertiary.backfill_last_message)}`);
+      }
       if (hmmPipe.freshness_ok === false && freshnessSec !== null && freshnessSec !== undefined) {
         hmmHints.push(`stale:${Math.round(Number(freshnessSec))}s`);
       }
       if (hmmPipeSecondary.freshness_ok === false && hmmPipeSecondary.freshness_sec !== null && hmmPipeSecondary.freshness_sec !== undefined) {
         hmmHints.push(`stale_secondary:${Math.round(Number(hmmPipeSecondary.freshness_sec))}s`);
+      }
+      if (hmmPipeTertiary.freshness_ok === false && hmmPipeTertiary.freshness_sec !== null && hmmPipeTertiary.freshness_sec !== undefined) {
+        hmmHints.push(`stale_tertiary:${Math.round(Number(hmmPipeTertiary.freshness_sec))}s`);
       }
       if (hmmPipe.backfill_last_at) {
         const agoSec = (Date.now() / 1000) - Number(hmmPipe.backfill_last_at);
@@ -1553,6 +1635,11 @@ DASHBOARD_HTML = """<!doctype html>
         const agoSec2 = (Date.now() / 1000) - Number(hmmPipeSecondary.backfill_last_at);
         const rows2 = Number(hmmPipeSecondary.backfill_last_rows || 0);
         hmmHints.push(`last_backfill_secondary:${rows2} rows, ${fmtAgeSeconds(agoSec2)} ago`);
+      }
+      if (hmmPipeTertiary.backfill_last_at) {
+        const agoSec3 = (Date.now() / 1000) - Number(hmmPipeTertiary.backfill_last_at);
+        const rows3 = Number(hmmPipeTertiary.backfill_last_rows || 0);
+        hmmHints.push(`last_backfill_tertiary:${rows3} rows, ${fmtAgeSeconds(agoSec3)} ago`);
       }
       document.getElementById('hmmHints').textContent =
         hmmHints.length ? `Hints: ${hmmHints.join(' | ')}` : '';
@@ -1567,6 +1654,10 @@ DASHBOARD_HTML = """<!doctype html>
       const aiError = String(aiOpinion.error || '');
       const aiConviction = Number(aiOpinion.conviction || 0);
       const aiPanelist = String(aiOpinion.panelist || '');
+      const aiProvider = String(aiOpinion.provider || '').trim();
+      const aiModel = String(aiOpinion.model || '').trim();
+      const aiAccumulationSignal = String(aiOpinion.accumulation_signal || 'hold').trim().toLowerCase();
+      const aiAccumulationConviction = Number(aiOpinion.accumulation_conviction || 0);
       const minConviction = Number(ai.min_conviction || 50);
       const defaultTtlSec = Number(ai.default_ttl_sec || 1800);
       const capacityBand = String((s.capacity_fill_health || {}).status_band || '').toLowerCase();
@@ -1575,6 +1666,8 @@ DASHBOARD_HTML = """<!doctype html>
       const aiStatusEl = document.getElementById('aiRegimeStatus');
       const aiMechanicalEl = document.getElementById('aiRegimeMechanical');
       const aiOpinionEl = document.getElementById('aiRegimeOpinion');
+      const aiProviderEl = document.getElementById('aiRegimeProvider');
+      const aiAccumSignalEl = document.getElementById('aiRegimeAccumSignal');
       const aiConvictionEl = document.getElementById('aiRegimeConviction');
       const aiNextRunEl = document.getElementById('aiRegimeNextRun');
       const aiRationaleEl = document.getElementById('aiRegimeRationale');
@@ -1613,6 +1706,17 @@ DASHBOARD_HTML = """<!doctype html>
       aiStatusEl.style.color = '';
       aiMechanicalEl.textContent = fmtTierDir(mechTier, mechDir);
       aiOpinionEl.textContent = fmtTierDir(opTier, opDir);
+      const providerSummary = aiProvider
+        ? (aiModel ? `${aiProvider}/${aiModel}` : aiProvider)
+        : (aiPanelist || '-');
+      aiProviderEl.textContent = providerSummary || '-';
+      const accumSignalNorm = ['accumulate_doge', 'hold', 'accumulate_usd'].includes(aiAccumulationSignal)
+        ? aiAccumulationSignal
+        : 'hold';
+      const accumSignalConv = Number.isFinite(aiAccumulationConviction)
+        ? `${Math.max(0, Math.min(100, Math.round(aiAccumulationConviction)))}%`
+        : '0%';
+      aiAccumSignalEl.textContent = `${accumSignalNorm} (${accumSignalConv})`;
       aiConvictionEl.textContent = Number.isFinite(aiConviction)
         ? `${Math.max(0, Math.min(100, Math.round(aiConviction)))}%${aiPanelist ? ` (${aiPanelist})` : ''}`
         : '-';
@@ -1687,6 +1791,68 @@ DASHBOARD_HTML = """<!doctype html>
       const suggestedTtl = ai.suggested_ttl_sec || defaultTtlSec;
       aiApplyBtn.textContent = `Apply Override (${fmtAgeSeconds(suggestedTtl)})`;
 
+      // --- Strategic Accumulation ---
+      const accumInfo = s.accumulation || {};
+      const accumEnabled = Boolean(accumInfo.enabled);
+      const accumMode = String(accumInfo.state || 'IDLE').toUpperCase();
+      const accumDirection = accumInfo.direction ? String(accumInfo.direction).toUpperCase() : '';
+      let accumStateText = accumEnabled ? accumMode : 'OFF';
+      if (accumEnabled && accumDirection && accumMode !== 'IDLE') {
+        accumStateText = `${accumMode} (${accumDirection})`;
+      }
+      const accumStateEl = document.getElementById('accumState');
+      accumStateEl.textContent = accumStateText;
+      accumStateEl.style.color = '';
+      if (!accumEnabled) {
+        accumStateEl.style.color = 'var(--muted)';
+      } else if (accumMode === 'ACTIVE') {
+        accumStateEl.style.color = 'var(--good)';
+      } else if (accumMode === 'ARMED') {
+        accumStateEl.style.color = 'var(--warn)';
+      } else if (accumMode === 'STOPPED') {
+        accumStateEl.style.color = 'var(--bad)';
+      }
+      document.getElementById('accumTrigger').textContent = String(accumInfo.trigger || '-');
+      const budgetUsd = Number(accumInfo.budget_usd || 0.0);
+      const spentUsd = Number(accumInfo.spent_usd || 0.0);
+      const remainingUsd = Number(accumInfo.budget_remaining_usd || 0.0);
+      document.getElementById('accumBudget').textContent = accumEnabled ? `$${fmt(budgetUsd, 2)}` : '-';
+      document.getElementById('accumSpent').textContent = accumEnabled ? `$${fmt(spentUsd, 2)}` : '-';
+      document.getElementById('accumRemaining').textContent = accumEnabled ? `$${fmt(remainingUsd, 2)}` : '-';
+      const drawdownNow = Number(accumInfo.current_drawdown_pct);
+      const drawdownMax = Number(accumInfo.max_drawdown_pct);
+      document.getElementById('accumDrawdown').textContent =
+        accumEnabled && Number.isFinite(drawdownNow) && Number.isFinite(drawdownMax)
+          ? `${fmt(drawdownNow, 2)}% / max ${fmt(drawdownMax, 2)}%`
+          : '-';
+      const accumAiSignal = String(accumInfo.ai_accumulation_signal || 'hold').toLowerCase();
+      const accumAiConv = Math.max(0, Math.min(100, Number(accumInfo.ai_accumulation_conviction || 0)));
+      document.getElementById('accumAiSignal').textContent =
+        accumEnabled ? `${accumAiSignal} (${fmt(accumAiConv, 0)}%)` : '-';
+      document.getElementById('accumBuys').textContent =
+        accumEnabled ? String(Number(accumInfo.n_buys || 0)) : '-';
+      const avgPrice = Number(accumInfo.avg_price);
+      document.getElementById('accumAvgPrice').textContent =
+        accumEnabled && Number.isFinite(avgPrice) && avgPrice > 0 ? `$${fmt(avgPrice, 6)}` : '-';
+      const cooldownSec = Number(accumInfo.cooldown_remaining_sec || 0);
+      document.getElementById('accumCooldown').textContent =
+        accumEnabled ? (cooldownSec > 0 ? fmtAgeSeconds(cooldownSec) : 'ready') : '-';
+      const accumLastSessionEl = document.getElementById('accumLastSession');
+      const lastSession = (accumInfo && typeof accumInfo.last_session_summary === 'object')
+        ? accumInfo.last_session_summary
+        : null;
+      if (lastSession && Object.keys(lastSession).length > 0) {
+        const lsState = String(lastSession.state || '-').toUpperCase();
+        const lsReason = String(lastSession.reason || '');
+        const lsSpent = Number(lastSession.spent_usd || 0.0);
+        const lsDoge = Number(lastSession.acquired_doge || 0.0);
+        const lsBuys = Number(lastSession.n_buys || 0);
+        accumLastSessionEl.textContent =
+          `Last: ${lsState} (${lsReason || 'n/a'}) spent $${fmt(lsSpent, 2)} acquired ${fmt(lsDoge, 4)} DOGE in ${lsBuys} buys`;
+      } else {
+        accumLastSessionEl.textContent = '';
+      }
+
       const throughput = s.throughput_sizer || { enabled: false };
       const throughputStatusEl = document.getElementById('throughputStatus');
       const throughputEnabled = Boolean(throughput.enabled);
@@ -1705,9 +1871,19 @@ DASHBOARD_HTML = """<!doctype html>
       document.getElementById('throughputActive').textContent = String(throughput.active_regime || '-');
       document.getElementById('throughputSamples').textContent =
         throughputEnabled ? String(Number(throughput.last_update_n || 0)) : '-';
-      const agePressure = Number(throughput.age_pressure || 1.0);
+      const agePressureReference = String(throughput.age_pressure_reference || 'p90').toLowerCase();
+      document.getElementById('throughputAgeLabel').textContent = `Age Pressure (${agePressureReference})`;
+      const agePressureRaw = Number(throughput.age_pressure);
+      const agePressure = Number.isFinite(agePressureRaw) ? agePressureRaw : 1.0;
+      const ageRefRaw = Number(throughput.age_pressure_ref_age_sec);
+      const ageRefSec = Number.isFinite(ageRefRaw) ? Math.max(0, ageRefRaw) : 0.0;
+      let agePressureDetails = ' (healthy)';
+      if (agePressure < 0.999) {
+        const refText = ageRefSec > 0 ? fmtAgeSeconds(ageRefSec) : '-';
+        agePressureDetails = ` (${agePressureReference} age: ${refText})`;
+      }
       document.getElementById('throughputAgePressure').textContent =
-        throughputEnabled ? `${fmt(agePressure * 100, 1)}%` : '-';
+        throughputEnabled ? `${fmt(agePressure * 100, 1)}%${agePressureDetails}` : '-';
       const utilRatio = Number(throughput.util_ratio || 0.0);
       document.getElementById('throughputUtilization').textContent =
         throughputEnabled ? `${fmt(utilRatio * 100, 1)}%` : '-';
@@ -1834,10 +2010,16 @@ DASHBOARD_HTML = """<!doctype html>
       const cancelStaleBtn = document.getElementById('cancelStaleBtn');
       const releaseBtn = document.getElementById('releaseBtn');
       const releaseEligibleBtn = document.getElementById('releaseEligibleBtn');
-      softCloseBtn.style.display = stickyEnabled ? 'none' : '';
-      cancelStaleBtn.style.display = stickyEnabled ? 'none' : '';
+      const accumStopBtn = document.getElementById('accumStopBtn');
+      const recoveryOrdersEnabled = s.recovery_orders_enabled !== false;
+      softCloseBtn.style.display = stickyEnabled || !recoveryOrdersEnabled ? 'none' : '';
+      cancelStaleBtn.style.display = stickyEnabled || !recoveryOrdersEnabled ? 'none' : '';
       releaseBtn.style.display = stickyEnabled ? '' : 'none';
       releaseEligibleBtn.style.display = stickyEnabled ? '' : 'none';
+      const accumState = String(((s.accumulation || {}).state) || 'IDLE').toUpperCase();
+      const accumCanStop = accumState === 'ARMED' || accumState === 'ACTIVE';
+      accumStopBtn.style.display = accumCanStop ? '' : 'none';
+      accumStopBtn.disabled = !accumCanStop;
 
       const cfh = s.capacity_fill_health || {};
       const band = String(cfh.status_band || '-').toUpperCase();
@@ -2121,8 +2303,9 @@ DASHBOARD_HTML = """<!doctype html>
       const slot = s.slots.find((x) => x.slot_id === selectedSlot) || s.slots[0];
       if (!slot) return;
       const stickyEnabled = isStickyModeEnabled();
+      const recoveryOrdersEnabled = s.recovery_orders_enabled !== false;
       const orphansTitle = document.getElementById('orphansTitle');
-      orphansTitle.textContent = 'Waiting Exits';
+      orphansTitle.textContent = recoveryOrdersEnabled ? 'Waiting Exits' : 'Waiting Exits (disabled)';
 
       const sb = document.getElementById('stateBar');
       const alias = slot.slot_alias || slot.slot_label || `slot-${slot.slot_id}`;
@@ -2162,7 +2345,8 @@ DASHBOARD_HTML = """<!doctype html>
       rb.innerHTML = '';
       for (const r of slot.recovery_orders) {
         const tr = document.createElement('tr');
-        const actionHtml = stickyEnabled ? '-' : `<button data-rid=\"${r.recovery_id}\">close</button>`;
+        const canCloseRecovery = !stickyEnabled && recoveryOrdersEnabled;
+        const actionHtml = canCloseRecovery ? `<button data-rid=\"${r.recovery_id}\">close</button>` : '-';
         tr.innerHTML = `
           <td>${r.recovery_id}</td>
           <td>${r.trade_id}.${r.cycle}</td>
@@ -2172,7 +2356,7 @@ DASHBOARD_HTML = """<!doctype html>
           <td>$${fmt(r.price, 6)}</td>
           <td>${actionHtml}</td>
         `;
-        if (!stickyEnabled) {
+        if (canCloseRecovery) {
           tr.querySelector('button').onclick = () => requestSoftClose(slot.slot_id, r.recovery_id);
         }
         rb.appendChild(tr);
@@ -2405,6 +2589,7 @@ DASHBOARD_HTML = """<!doctype html>
     document.getElementById('softCloseBtn').onclick = () => requestSoftCloseNext();
     document.getElementById('reconcileBtn').onclick = () => requestReconcileDrift();
     document.getElementById('cancelStaleBtn').onclick = () => requestCancelStaleRecoveries();
+    document.getElementById('accumStopBtn').onclick = () => requestAccumStop();
     document.getElementById('addLayerBtn').onclick = () => {
       const source = document.getElementById('layerSourceSelect').value || 'AUTO';
       requestAddLayer(source);
