@@ -596,8 +596,8 @@ REBALANCE_MAX_SIZE_MULT: float = _env("REBALANCE_MAX_SIZE_MULT", 1.5, float)
 DUST_SWEEP_ENABLED: bool = _env("DUST_SWEEP_ENABLED", True, bool)
 # Ignore tiny balance noise below this threshold (USD).
 DUST_MIN_THRESHOLD: float = _env("DUST_MIN_THRESHOLD", 0.50, float)
-# Cap additive bump per order as % of base B-side size.
-DUST_MAX_BUMP_PCT: float = _env("DUST_MAX_BUMP_PCT", 25.0, float)
+# Cap additive bump per order as % of base B-side size (0 = uncapped, fund guard is safety net).
+DUST_MAX_BUMP_PCT: float = _env("DUST_MAX_BUMP_PCT", 0.0, float)
 
 # ---------------------------------------------------------------------------
 # Entry backoff after consecutive losses

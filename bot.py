@@ -760,18 +760,20 @@ class BotRuntime:
         if not self.ledger._synced and self._loop_available_usd is None:
             return 0.0
 
-        base_no_dust = max(0.0, float(self._slot_order_size_usd(slot, trade_id=None)))
-        if base_no_dust <= 0.0:
-            return 0.0
-
         dividend = max(0.0, float(self._compute_dust_dividend()))
         if dividend <= 0.0:
             return 0.0
 
-        max_bump = base_no_dust * (max(0.0, float(self._dust_max_bump_pct)) / 100.0)
-        if max_bump <= 0.0:
-            return 0.0
-        return min(dividend, max_bump)
+        # DUST_MAX_BUMP_PCT <= 0 means uncapped (fund guard is the safety net).
+        cap_pct = max(0.0, float(self._dust_max_bump_pct))
+        if cap_pct > 0.0:
+            base_no_dust = max(0.0, float(self._slot_order_size_usd(slot, trade_id=None)))
+            if base_no_dust <= 0.0:
+                return 0.0
+            max_bump = base_no_dust * (cap_pct / 100.0)
+            return min(dividend, max_bump)
+
+        return dividend
 
     def _slot_order_size_usd(
         self,
