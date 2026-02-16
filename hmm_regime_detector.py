@@ -386,6 +386,31 @@ class RegimeDetector:
         elapsed = time.time() - self._last_train_ts
         return elapsed >= self.cfg["HMM_RETRAIN_INTERVAL_SEC"]
 
+    @property
+    def transmat(self) -> Optional[list[list[float]]]:
+        """
+        Return the trained transition matrix as a plain list-of-lists.
+
+        Returns None when the model has not been trained yet.
+        """
+        if not self._trained or self.model is None:
+            return None
+
+        matrix = getattr(self.model, "transmat_", None)
+        if matrix is None:
+            return None
+
+        try:
+            arr = np.asarray(matrix, dtype=float)
+        except Exception:
+            return None
+
+        if arr.ndim != 2 or arr.shape[0] <= 0 or arr.shape[1] <= 0:
+            return None
+        if not np.isfinite(arr).all():
+            return None
+        return arr.tolist()
+
 
 # ---------------------------------------------------------------------------
 # 4. Integration helpers: blending with §15 trend system

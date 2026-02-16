@@ -33,6 +33,7 @@ import urllib.request
 import urllib.error
 from collections import Counter
 from datetime import datetime, timezone
+from math import isfinite
 
 import config
 
@@ -65,6 +66,27 @@ _panelist_consecutive_fails: dict = {}   # name -> int
 _panelist_skip_until: dict = {}          # name -> timestamp
 SKIP_THRESHOLD = 3        # consecutive failures before skipping
 SKIP_COOLDOWN = 3600      # seconds to skip a panelist (1 hour)
+
+_REGIME_DIRECTIONS = {"symmetric", "long_bias", "short_bias"}
+_REGIME_LABELS = {"BEARISH", "RANGING", "BULLISH"}
+_REGIME_QUALITY_TIERS = {"shallow", "baseline", "deep", "full"}
+
+_REGIME_SYSTEM_PROMPT = (
+    "You are a regime analyst for a DOGE/USD grid trading bot. You receive "
+    "technical signals from a Hidden Markov Model (3-state: BEARISH, "
+    "RANGING, BULLISH) running on two timeframes (1-minute and 15-minute), "
+    "plus operational metrics. Your job is to interpret these signals "
+    "holistically and recommend a trading posture.\n\n"
+    "The bot uses a 3-tier system:\n"
+    "- Tier 0 (Symmetric): Both sides trade equally. Default/safe.\n"
+    "- Tier 1 (Asymmetric): Favor one side with spacing bias.\n"
+    "- Tier 2 (Aggressive): Suppress the against-trend side entirely.\n\n"
+    "Recommend a tier and direction using ALL signals. Consider timeframe "
+    "agreement/convergence, transition matrix stickiness, operational "
+    "signals, and whether confidence is rising/falling over recent history. "
+    "Be conservative. Tier 2 is rare. When uncertain, recommend Tier 0 "
+    "(symmetric). Return JSON only."
+)
 
 
 def _build_panel() -> list:
@@ -263,6 +285,355 @@ def _call_panelist(prompt: str, panelist: dict, pair_display: str = "DOGE/USD") 
     except Exception as e:
         logger.warning("%s error: %s", panelist["name"], e)
         return ("", str(e))
+
+
+# ---------------------------------------------------------------------------
+# Regime advisor helpers
+# ---------------------------------------------------------------------------
+
+def _default_regime_opinion(error: str = "") -> dict:
+    return {
+        "recommended_tier": 0,
+        "recommended_direction": "symmetric",
+        "conviction": 0,
+        "rationale": "",
+        "watch_for": "",
+        "panelist": "",
+        "error": _clip_text(error, 200),
+    }
+
+
+def _safe_float(value, default: float = 0.0, minimum=None, maximum=None) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        out = float(default)
+    if not isfinite(out):
+        out = float(default)
+    if minimum is not None and out < minimum:
+        out = float(minimum)
+    if maximum is not None and out > maximum:
+        out = float(maximum)
+    return out
+
+
+def _safe_int(value, default: int = 0, minimum=None, maximum=None) -> int:
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        try:
+            out = int(float(value))
+        except (TypeError, ValueError):
+            out = int(default)
+    if minimum is not None and out < minimum:
+        out = int(minimum)
+    if maximum is not None and out > maximum:
+        out = int(maximum)
+    return out
+
+
+def _clip_text(value, max_len: int) -> str:
+    text = str(value or "").strip()
+    if max_len > 0 and len(text) > max_len:
+        return text[:max_len]
+    return text
+
+
+def _normalize_regime(value) -> str:
+    regime = str(value or "RANGING").strip().upper()
+    if regime not in _REGIME_LABELS:
+        return "RANGING"
+    return regime
+
+
+def _normalize_direction(value) -> str:
+    direction = str(value or "symmetric").strip().lower()
+    if direction not in _REGIME_DIRECTIONS:
+        return "symmetric"
+    return direction
+
+
+def _sanitize_probabilities(values) -> list:
+    if not isinstance(values, (list, tuple)):
+        return [0.0, 1.0, 0.0]
+    probs = []
+    for raw in list(values)[:3]:
+        probs.append(round(_safe_float(raw, 0.0, 0.0, 1.0), 4))
+    while len(probs) < 3:
+        probs.append(0.0)
+    if sum(probs) <= 0.0:
+        return [0.0, 1.0, 0.0]
+    return probs
+
+
+def _sanitize_transition_matrix(values) -> list:
+    if not isinstance(values, (list, tuple)):
+        return []
+    matrix = []
+    for row in list(values)[:3]:
+        if not isinstance(row, (list, tuple)):
+            return []
+        sanitized = []
+        for raw in list(row)[:3]:
+            sanitized.append(round(_safe_float(raw, 0.0, 0.0, 1.0), 4))
+        while len(sanitized) < 3:
+            sanitized.append(0.0)
+        matrix.append(sanitized)
+    while len(matrix) < 3 and matrix:
+        matrix.append([0.0, 0.0, 0.0])
+    return matrix
+
+
+def _sanitize_hmm_state(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        payload = {}
+    return {
+        "regime": _normalize_regime(payload.get("regime")),
+        "confidence": round(_safe_float(payload.get("confidence"), 0.0, 0.0, 1.0), 4),
+        "bias_signal": round(_safe_float(payload.get("bias_signal"), 0.0, -1.0, 1.0), 4),
+        "probabilities": _sanitize_probabilities(payload.get("probabilities")),
+    }
+
+
+def _build_regime_context(payload: dict) -> dict:
+    """
+    Build the structured regime context payload for the LLM prompt.
+
+    The caller supplies one dict with all source fields; this function
+    normalizes schema/limits before JSON serialization.
+    """
+    if not isinstance(payload, dict):
+        payload = {}
+
+    hmm = payload.get("hmm")
+    if not isinstance(hmm, dict):
+        hmm = {}
+
+    primary = hmm.get("primary_1m")
+    if not isinstance(primary, dict):
+        primary = payload.get("hmm_primary")
+    if not isinstance(primary, dict):
+        primary = payload.get("primary_1m")
+    if not isinstance(primary, dict):
+        primary = {}
+
+    secondary = hmm.get("secondary_15m")
+    if not isinstance(secondary, dict):
+        secondary = payload.get("hmm_secondary")
+    if not isinstance(secondary, dict):
+        secondary = payload.get("secondary_15m")
+    if not isinstance(secondary, dict):
+        secondary = {}
+
+    consensus = hmm.get("consensus")
+    if not isinstance(consensus, dict):
+        consensus = payload.get("hmm_consensus")
+    if not isinstance(consensus, dict):
+        consensus = payload.get("consensus")
+    if not isinstance(consensus, dict):
+        consensus = {}
+
+    transition_matrix = hmm.get("transition_matrix_1m")
+    if transition_matrix is None:
+        transition_matrix = payload.get("transition_matrix_1m")
+
+    training_quality = str(
+        hmm.get("training_quality", payload.get("training_quality", "shallow"))
+    ).strip().lower()
+    if training_quality not in _REGIME_QUALITY_TIERS:
+        training_quality = "shallow"
+
+    confidence_modifier = round(
+        _safe_float(
+            hmm.get("confidence_modifier", payload.get("confidence_modifier", 1.0)),
+            1.0,
+            0.5,
+            1.0,
+        ),
+        4,
+    )
+
+    history_raw = payload.get("regime_history_30m")
+    if not isinstance(history_raw, list):
+        history_raw = []
+    history = []
+    for item in history_raw[-60:]:
+        if not isinstance(item, dict):
+            continue
+        history.append({
+            "ts": int(_safe_float(item.get("ts"), 0.0, 0.0)),
+            "regime": _normalize_regime(item.get("regime")),
+            "conf": round(
+                _safe_float(item.get("conf", item.get("confidence")), 0.0, 0.0, 1.0),
+                4,
+            ),
+        })
+
+    mechanical = payload.get("mechanical_tier")
+    if not isinstance(mechanical, dict):
+        mechanical = {}
+
+    operational = payload.get("operational")
+    if not isinstance(operational, dict):
+        operational = {}
+
+    directional_trend = _clip_text(
+        str(operational.get("directional_trend", "unknown")).strip().lower(),
+        24,
+    )
+    if not directional_trend:
+        directional_trend = "unknown"
+
+    capacity_band = _clip_text(
+        str(operational.get("capacity_band", "normal")).strip().lower(),
+        24,
+    )
+    if not capacity_band:
+        capacity_band = "normal"
+
+    return {
+        "hmm": {
+            "primary_1m": _sanitize_hmm_state(primary),
+            "secondary_15m": _sanitize_hmm_state(secondary),
+            "consensus": {
+                "agreement": _clip_text(consensus.get("agreement", "unknown"), 40),
+                "effective_regime": _normalize_regime(
+                    consensus.get("effective_regime", consensus.get("regime")),
+                ),
+                "effective_confidence": round(
+                    _safe_float(consensus.get("effective_confidence"), 0.0, 0.0, 1.0),
+                    4,
+                ),
+                "effective_bias": round(
+                    _safe_float(consensus.get("effective_bias"), 0.0, -1.0, 1.0),
+                    4,
+                ),
+            },
+            "transition_matrix_1m": _sanitize_transition_matrix(transition_matrix),
+            "training_quality": training_quality,
+            "confidence_modifier": confidence_modifier,
+        },
+        "regime_history_30m": history,
+        "mechanical_tier": {
+            "current": _safe_int(mechanical.get("current"), 0, 0, 2),
+            "direction": _normalize_direction(mechanical.get("direction", "symmetric")),
+            "since": int(_safe_float(mechanical.get("since"), 0.0, 0.0)),
+        },
+        "operational": {
+            "directional_trend": directional_trend,
+            "trend_detected_at": int(_safe_float(operational.get("trend_detected_at"), 0.0, 0.0)),
+            "fill_rate_1h": _safe_int(operational.get("fill_rate_1h"), 0, 0),
+            "recovery_order_count": _safe_int(operational.get("recovery_order_count"), 0, 0),
+            "capacity_headroom": round(
+                _safe_float(operational.get("capacity_headroom"), 0.0, 0.0, 100.0),
+                2,
+            ),
+            "capacity_band": capacity_band,
+            "kelly_edge_bullish": round(
+                _safe_float(operational.get("kelly_edge_bullish"), 0.0, -1.0, 1.0),
+                6,
+            ),
+            "kelly_edge_bearish": round(
+                _safe_float(operational.get("kelly_edge_bearish"), 0.0, -1.0, 1.0),
+                6,
+            ),
+            "kelly_edge_ranging": round(
+                _safe_float(operational.get("kelly_edge_ranging"), 0.0, -1.0, 1.0),
+                6,
+            ),
+        },
+    }
+
+
+def _ordered_regime_panel(panel: list) -> list:
+    if not panel:
+        return []
+
+    prefer_reasoning = bool(getattr(config, "AI_REGIME_PREFER_REASONING", True))
+    if prefer_reasoning:
+        priority = {"Kimi-K2.5": 0, "Llama-70B": 1, "Llama-8B": 2}
+    else:
+        priority = {"Llama-70B": 0, "Llama-8B": 1, "Kimi-K2.5": 2}
+
+    with_index = list(enumerate(panel))
+    with_index.sort(
+        key=lambda item: (
+            priority.get(str(item[1].get("name", "")).strip(), 50),
+            item[0],
+        )
+    )
+    return [p for _, p in with_index]
+
+
+def _call_panelist_messages(messages: list, panelist: dict) -> tuple:
+    timeout = 30 if panelist.get("reasoning") else 15
+    max_tokens = min(int(panelist.get("max_tokens", _INSTRUCT_MAX_TOKENS)), 512)
+
+    payload = json.dumps({
+        "model": panelist["model"],
+        "messages": messages,
+        "temperature": 0.2,
+        "max_tokens": max_tokens,
+    }).encode("utf-8")
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {panelist['key']}",
+        "User-Agent": "DOGEGridBot/1.0",
+    }
+
+    req = urllib.request.Request(panelist["url"], data=payload, headers=headers)
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+            choices = body.get("choices", [])
+            if choices:
+                msg = choices[0].get("message", {})
+                content = msg.get("content")
+                if not content:
+                    content = msg.get("reasoning_content")
+                return (content.strip(), "") if content else ("", "empty_response")
+            return ("", "no_choices")
+    except urllib.error.HTTPError as e:
+        return ("", f"http_{e.code}")
+    except urllib.error.URLError as e:
+        return ("", f"connection_error:{e.reason}")
+    except Exception as e:
+        return ("", str(e))
+
+
+def _parse_regime_opinion(response: str) -> tuple:
+    if not response:
+        return ({}, "empty_response")
+
+    stripped = response.strip()
+    json_start = stripped.find("{")
+    json_end = stripped.rfind("}")
+    if json_start < 0 or json_end <= json_start:
+        return ({}, "parse_error")
+
+    try:
+        parsed = json.loads(stripped[json_start:json_end + 1])
+    except Exception:
+        return ({}, "parse_error")
+
+    if not isinstance(parsed, dict):
+        return ({}, "parse_error")
+
+    tier_raw = parsed.get("recommended_tier")
+    tier = _safe_int(tier_raw, 0)
+    if tier not in (0, 1, 2):
+        tier = 0
+
+    opinion = {
+        "recommended_tier": tier,
+        "recommended_direction": _normalize_direction(parsed.get("recommended_direction")),
+        "conviction": _safe_int(parsed.get("conviction"), 0, 0, 100),
+        "rationale": _clip_text(parsed.get("rationale"), 500),
+        "watch_for": _clip_text(parsed.get("watch_for"), 200),
+    }
+    return (opinion, "")
 
 
 # ---------------------------------------------------------------------------
@@ -480,6 +851,76 @@ def log_approval_decision(action: str, decision: str):
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+def get_regime_opinion(context: dict) -> dict:
+    """
+    Query a single preferred panelist for regime interpretation.
+
+    Fallback order:
+      1) Kimi-K2.5 (reasoning), when enabled and available
+      2) Llama-70B
+      3) Llama-8B
+
+    Returns a validated dict and never raises.
+    """
+    if not bool(getattr(config, "AI_REGIME_ADVISOR_ENABLED", False)):
+        return _default_regime_opinion("disabled")
+
+    try:
+        panel = _ordered_regime_panel(_build_panel())
+        if not panel:
+            return _default_regime_opinion("no_panelists")
+
+        prompt_context = _build_regime_context(context)
+        messages = [
+            {"role": "system", "content": _REGIME_SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps(prompt_context, default=str)},
+        ]
+
+        last_error = "all_panelists_failed"
+        for panelist in panel:
+            name = str(panelist.get("name", "")).strip() or "unknown"
+            logger.info("AI regime advisor: querying %s...", name)
+
+            response, err = _call_panelist_messages(messages, panelist)
+            if not response:
+                reason = _clip_text(err or "empty_response", 120)
+                last_error = f"{name}:{reason}"
+                logger.warning(
+                    "AI regime advisor: panelist %s failed (%s), trying next",
+                    name,
+                    reason,
+                )
+                continue
+
+            parsed, parse_err = _parse_regime_opinion(response)
+            if parse_err:
+                last_error = f"{name}:{parse_err}"
+                logger.warning(
+                    "AI regime advisor: panelist %s returned invalid JSON (%s), trying next",
+                    name,
+                    parse_err,
+                )
+                continue
+
+            result = _default_regime_opinion("")
+            result.update(parsed)
+            result["panelist"] = name
+            logger.info(
+                "AI regime advisor: %s -> tier %d %s (%d%% conviction)",
+                name,
+                result["recommended_tier"],
+                result["recommended_direction"],
+                result["conviction"],
+            )
+            return result
+
+        return _default_regime_opinion(last_error)
+
+    except Exception as e:
+        logger.exception("AI regime advisor failed")
+        return _default_regime_opinion(str(e))
+
 
 def get_recommendation(market_data: dict, stats_context: str = "") -> dict:
     """

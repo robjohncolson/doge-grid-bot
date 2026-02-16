@@ -162,6 +162,63 @@ DASHBOARD_HTML = """<!doctype html>
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     .tiny { font-size: 11px; color: var(--muted); }
     .right { text-align: right; }
+    .progress-track {
+      width: 100%;
+      height: 8px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,.03);
+      overflow: hidden;
+      margin: 6px 0 4px;
+    }
+    .progress-fill {
+      height: 100%;
+      width: 0%;
+      transition: width .25s ease;
+      background: var(--line);
+    }
+    .progress-fill.shallow { background: #6e7681; }
+    .progress-fill.baseline { background: var(--warn); }
+    .progress-fill.deep { background: #3fb950; }
+    .progress-fill.full { background: var(--good); }
+    .ai-regime-card {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px;
+      margin-top: 8px;
+      background: rgba(255,255,255,.02);
+    }
+    .ai-regime-card.agree {
+      border-color: var(--line);
+      background: rgba(255,255,255,.02);
+    }
+    .ai-regime-card.disagree {
+      border-color: rgba(210,153,34,.55);
+      background: rgba(210,153,34,.09);
+    }
+    .ai-regime-card.override {
+      border-color: rgba(240,136,62,.65);
+      background: rgba(240,136,62,.10);
+    }
+    .ai-regime-card.disabled {
+      opacity: .72;
+    }
+    .ai-regime-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 8px;
+      flex-wrap: wrap;
+    }
+    .ai-regime-actions button {
+      padding: 6px 10px;
+      font-size: 12px;
+    }
+    .ai-rationale {
+      margin-top: 6px;
+    }
+    .ai-watch {
+      margin-top: 4px;
+    }
 
     #kbMode {
       letter-spacing: .06em;
@@ -387,7 +444,26 @@ DASHBOARD_HTML = """<!doctype html>
         <div class=\"row\"><span class=\"k\">Blend</span><span id=\"hmmBlend\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Data Window (1m)</span><span id=\"hmmWindow\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Data Window (15m)</span><span id=\"hmmWindowSecondary\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Training</span><span id=\"hmmTrainingSummary\" class=\"v\"></span></div>
+        <div class=\"progress-track\"><div id=\"hmmTrainingBar\" class=\"progress-fill\"></div></div>
+        <div class=\"row\"><span class=\"k\">Training ETA</span><span id=\"hmmTrainingEta\" class=\"v\"></span></div>
         <div id=\"hmmHints\" class=\"tiny\"></div>
+
+        <h3 style=\"margin-top:14px\">AI Regime Advisor</h3>
+        <div id=\"aiRegimeCard\" class=\"ai-regime-card disabled\">
+          <div class=\"row\"><span class=\"k\">Status</span><span id=\"aiRegimeStatus\" class=\"v\">OFF</span></div>
+          <div class=\"row\"><span class=\"k\">Mechanical</span><span id=\"aiRegimeMechanical\" class=\"v\">-</span></div>
+          <div class=\"row\"><span class=\"k\">AI Opinion</span><span id=\"aiRegimeOpinion\" class=\"v\">-</span></div>
+          <div class=\"row\"><span class=\"k\">Conviction</span><span id=\"aiRegimeConviction\" class=\"v\">-</span></div>
+          <div class=\"row\"><span class=\"k\">Next Check</span><span id=\"aiRegimeNextRun\" class=\"v\">-</span></div>
+          <div id=\"aiRegimeRationale\" class=\"tiny ai-rationale\"></div>
+          <div id=\"aiRegimeWatch\" class=\"tiny ai-watch\"></div>
+          <div id=\"aiRegimeActions\" class=\"ai-regime-actions\">
+            <button id=\"aiApplyOverrideBtn\" type=\"button\">Apply Override (30m)</button>
+            <button id=\"aiDismissBtn\" type=\"button\">Dismiss</button>
+            <button id=\"aiRevertBtn\" type=\"button\">Revert to Mechanical</button>
+          </div>
+        </div>
 
         <h3 style=\"margin-top:14px\">Kelly Sizing</h3>
         <div class=\"row\"><span class=\"k\">Status</span><span id=\"kellyStatus\" class=\"v\"></span></div>
@@ -982,6 +1058,25 @@ DASHBOARD_HTML = """<!doctype html>
       });
     }
 
+    function requestAiRegimeOverride(ttlSec = 1800) {
+      const ttl = Number.isFinite(Number(ttlSec)) ? Math.max(1, Math.round(Number(ttlSec))) : 1800;
+      openConfirmDialog(`Apply AI regime override for ${fmtAgeSeconds(ttl)}?`, async () => {
+        await dispatchAction('ai_regime_override', {ttl_sec: ttl});
+      });
+    }
+
+    function requestAiRegimeDismiss() {
+      openConfirmDialog('Dismiss current AI disagreement?', async () => {
+        await dispatchAction('ai_regime_dismiss');
+      });
+    }
+
+    function requestAiRegimeRevert() {
+      openConfirmDialog('Revert to mechanical regime now?', async () => {
+        await dispatchAction('ai_regime_revert');
+      });
+    }
+
     function requestSetMetric(metric, value) {
       const oldValue = Number(metric === 'entry' ? state && state.entry_pct : state && state.profit_pct);
       const action = metric === 'entry' ? 'set_entry_pct' : 'set_profit_pct';
@@ -1359,6 +1454,44 @@ DASHBOARD_HTML = """<!doctype html>
       }
       document.getElementById('hmmWindowSecondary').textContent = windowText2;
 
+      const depth = (hmm && typeof hmm.training_depth === 'object') ? hmm.training_depth : {};
+      const depthCurrent = Number(depth.current_candles || 0);
+      const depthTarget = Number(depth.target_candles || 0);
+      const depthPctRaw = Number(depth.pct_complete || (depthTarget > 0 ? (depthCurrent / depthTarget) * 100 : 0));
+      const depthPct = Math.max(0, Math.min(100, Number.isFinite(depthPctRaw) ? depthPctRaw : 0));
+      const depthTier = String(depth.quality_tier || 'shallow').toLowerCase();
+      const depthMod = Number(depth.confidence_modifier || 1.0);
+      const depthSummaryEl = document.getElementById('hmmTrainingSummary');
+      const depthEtaEl = document.getElementById('hmmTrainingEta');
+      const depthBarEl = document.getElementById('hmmTrainingBar');
+      const tierLabelMap = { shallow: 'Shallow', baseline: 'Baseline', deep: 'Deep', full: 'Full' };
+      const tierColorMap = {
+        shallow: 'var(--muted)',
+        baseline: 'var(--warn)',
+        deep: '#3fb950',
+        full: 'var(--good)',
+      };
+      const currentStr = Number.isFinite(depthCurrent) ? Math.round(depthCurrent).toLocaleString() : '-';
+      const targetStr = Number.isFinite(depthTarget) && depthTarget > 0 ? Math.round(depthTarget).toLocaleString() : '-';
+      const tierLabel = tierLabelMap[depthTier] || 'Shallow';
+      depthSummaryEl.textContent = `${currentStr}/${targetStr} (${fmt(depthPct, 1)}%) - ${tierLabel} (x${fmt(depthMod, 2)})`;
+      depthSummaryEl.style.color = tierColorMap[depthTier] || 'var(--muted)';
+      depthBarEl.style.width = `${depthPct}%`;
+      depthBarEl.className = `progress-fill ${depthTier in tierLabelMap ? depthTier : 'shallow'}`;
+
+      const etaIso = depth.estimated_full_at;
+      if (etaIso) {
+        const etaTs = Date.parse(String(etaIso));
+        if (Number.isFinite(etaTs)) {
+          const etaSec = Math.max(0, etaTs / 1000 - nowSec);
+          depthEtaEl.textContent = etaSec > 0 ? `~${fmtAgeSeconds(etaSec)}` : 'full';
+        } else {
+          depthEtaEl.textContent = '-';
+        }
+      } else {
+        depthEtaEl.textContent = depthTarget > 0 && depthCurrent >= depthTarget ? 'full' : '-';
+      }
+
       const hmmHints = [];
       if (Array.isArray(hmmPipe.gaps) && hmmPipe.gaps.length) {
         hmmHints.push(...hmmPipe.gaps.map(x => String(x)));
@@ -1393,6 +1526,135 @@ DASHBOARD_HTML = """<!doctype html>
       }
       document.getElementById('hmmHints').textContent =
         hmmHints.length ? `Hints: ${hmmHints.join(' | ')}` : '';
+
+      // --- AI Regime Advisor ---
+      const ai = s.ai_regime_advisor || {};
+      const aiOpinion = (ai && typeof ai.opinion === 'object') ? ai.opinion : {};
+      const aiOverride = (ai && typeof ai.override === 'object') ? ai.override : {};
+      const aiEnabled = Boolean(ai.enabled);
+      const aiDismissed = Boolean(ai.dismissed);
+      const aiAgreement = String(aiOpinion.agreement || 'unknown');
+      const aiError = String(aiOpinion.error || '');
+      const aiConviction = Number(aiOpinion.conviction || 0);
+      const aiPanelist = String(aiOpinion.panelist || '');
+      const minConviction = Number(ai.min_conviction || 50);
+      const defaultTtlSec = Number(ai.default_ttl_sec || 1800);
+      const capacityBand = String((s.capacity_fill_health || {}).status_band || '').toLowerCase();
+
+      const aiCardEl = document.getElementById('aiRegimeCard');
+      const aiStatusEl = document.getElementById('aiRegimeStatus');
+      const aiMechanicalEl = document.getElementById('aiRegimeMechanical');
+      const aiOpinionEl = document.getElementById('aiRegimeOpinion');
+      const aiConvictionEl = document.getElementById('aiRegimeConviction');
+      const aiNextRunEl = document.getElementById('aiRegimeNextRun');
+      const aiRationaleEl = document.getElementById('aiRegimeRationale');
+      const aiWatchEl = document.getElementById('aiRegimeWatch');
+      const aiApplyBtn = document.getElementById('aiApplyOverrideBtn');
+      const aiDismissBtn = document.getElementById('aiDismissBtn');
+      const aiRevertBtn = document.getElementById('aiRevertBtn');
+
+      const fmtTierDir = (tierRaw, dirRaw) => {
+        const tier = Math.max(0, Math.min(2, Number(tierRaw || 0)));
+        const dir = String(dirRaw || 'symmetric').toLowerCase();
+        if (tier <= 0) return 'Tier 0 symmetric';
+        if (dir === 'long_bias') return `Tier ${tier} long_bias`;
+        if (dir === 'short_bias') return `Tier ${tier} short_bias`;
+        return `Tier ${tier} symmetric`;
+      };
+
+      const mechTier = Number(
+        aiOpinion.mechanical_tier != null
+          ? aiOpinion.mechanical_tier
+          : ((s.regime_directional || {}).mechanical_tier != null
+              ? (s.regime_directional || {}).mechanical_tier
+              : ((s.regime_directional || {}).tier || 0)),
+      );
+      const mechDir = String(
+        aiOpinion.mechanical_direction
+          || (s.regime_directional || {}).mechanical_direction
+          || 'symmetric',
+      );
+      const opTier = Number(aiOpinion.recommended_tier || 0);
+      const opDir = String(aiOpinion.recommended_direction || 'symmetric');
+      const disagreement = ['ai_upgrade', 'ai_downgrade', 'ai_flip'].includes(aiAgreement) && !aiDismissed && !aiError;
+      const overrideActive = Boolean(aiOverride.active);
+
+      aiCardEl.className = 'ai-regime-card';
+      aiStatusEl.style.color = '';
+      aiMechanicalEl.textContent = fmtTierDir(mechTier, mechDir);
+      aiOpinionEl.textContent = fmtTierDir(opTier, opDir);
+      aiConvictionEl.textContent = Number.isFinite(aiConviction)
+        ? `${Math.max(0, Math.min(100, Math.round(aiConviction)))}%${aiPanelist ? ` (${aiPanelist})` : ''}`
+        : '-';
+      aiNextRunEl.textContent = ai.next_run_in_sec == null ? '-' : `~${fmtAgeSeconds(Number(ai.next_run_in_sec || 0))}`;
+      aiRationaleEl.textContent = aiOpinion.rationale ? `"${String(aiOpinion.rationale)}"` : '';
+      aiWatchEl.textContent = aiOpinion.watch_for ? `Watch: ${String(aiOpinion.watch_for)}` : '';
+
+      aiApplyBtn.style.display = 'none';
+      aiDismissBtn.style.display = 'none';
+      aiRevertBtn.style.display = 'none';
+      aiApplyBtn.disabled = true;
+
+      if (!aiEnabled) {
+        aiCardEl.classList.add('disabled');
+        aiStatusEl.textContent = 'OFF';
+        aiStatusEl.style.color = 'var(--muted)';
+        aiRationaleEl.textContent = 'AI regime advisor is disabled.';
+        aiWatchEl.textContent = '';
+      } else if (overrideActive) {
+        aiCardEl.classList.add('override');
+        aiStatusEl.textContent = 'OVERRIDE ACTIVE';
+        aiStatusEl.style.color = '#f0883e';
+        aiOpinionEl.textContent = fmtTierDir(aiOverride.tier, aiOverride.direction);
+        aiMechanicalEl.textContent = `Mechanical would be ${fmtTierDir(mechTier, mechDir)}`;
+        aiConvictionEl.textContent = aiOverride.source_conviction == null
+          ? '-'
+          : `${Math.max(0, Math.min(100, Math.round(Number(aiOverride.source_conviction))))}%`;
+        aiNextRunEl.textContent = aiOverride.remaining_sec == null
+          ? '-'
+          : `${fmtAgeSeconds(Number(aiOverride.remaining_sec || 0))} remaining`;
+        aiRationaleEl.textContent = 'Mechanical tier continues running underneath this temporary override.';
+        aiWatchEl.textContent = '';
+        aiRevertBtn.style.display = '';
+      } else if (disagreement) {
+        aiCardEl.classList.add('disagree');
+        aiStatusEl.textContent = 'DISAGREES';
+        aiStatusEl.style.color = 'var(--warn)';
+        aiApplyBtn.style.display = '';
+        aiDismissBtn.style.display = '';
+        const isUpgrade = aiAgreement === 'ai_upgrade';
+        const blockedByCapacity = isUpgrade && capacityBand === 'stop';
+        const convictionOk = Number.isFinite(aiConviction) && aiConviction >= minConviction;
+        aiApplyBtn.disabled = !(convictionOk && !blockedByCapacity);
+        if (!convictionOk) {
+          aiWatchEl.textContent = `Override disabled: conviction ${Math.round(aiConviction)}% below floor ${Math.round(minConviction)}%.`;
+        } else if (blockedByCapacity) {
+          aiWatchEl.textContent = 'Override disabled: capacity stop gate blocks upgrades.';
+        }
+      } else {
+        aiCardEl.classList.add('agree');
+        if (aiError) {
+          aiStatusEl.textContent = 'UNAVAILABLE';
+          aiStatusEl.style.color = 'var(--warn)';
+          aiRationaleEl.textContent = `AI advisor error: ${aiError}`;
+          aiWatchEl.textContent = '';
+        } else if (aiDismissed) {
+          aiStatusEl.textContent = 'DISMISSED';
+          aiStatusEl.style.color = 'var(--muted)';
+          aiRationaleEl.textContent = 'Current disagreement dismissed until the next opinion cycle.';
+        } else if (aiAgreement === 'agree') {
+          aiStatusEl.textContent = 'AGREES';
+          aiStatusEl.style.color = 'var(--good)';
+        } else {
+          aiStatusEl.textContent = 'WAITING';
+          aiStatusEl.style.color = 'var(--muted)';
+          if (!aiOpinion.ts) {
+            aiRationaleEl.textContent = 'No AI opinion yet.';
+          }
+        }
+      }
+
+      aiApplyBtn.textContent = `Apply Override (${fmtAgeSeconds(defaultTtlSec)})`;
 
       const kelly = s.kelly || { enabled: false };
       const kellyStatusEl = document.getElementById('kellyStatus');
@@ -2092,6 +2354,13 @@ DASHBOARD_HTML = """<!doctype html>
       if (value === null) return;
       requestSetMetric('profit', value);
     };
+    document.getElementById('aiApplyOverrideBtn').onclick = () => {
+      const ai = state && state.ai_regime_advisor ? state.ai_regime_advisor : {};
+      const ttl = Number(ai.default_ttl_sec || 1800);
+      requestAiRegimeOverride(ttl);
+    };
+    document.getElementById('aiDismissBtn').onclick = () => requestAiRegimeDismiss();
+    document.getElementById('aiRevertBtn').onclick = () => requestAiRegimeRevert();
 
     document.getElementById('confirmOkBtn').onclick = () => { void confirmAccept(); };
     document.getElementById('confirmCancelBtn').onclick = () => confirmCancel();

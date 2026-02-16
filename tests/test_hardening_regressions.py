@@ -1,6 +1,7 @@
 import io
 import time
 import unittest
+from collections import deque
 from types import SimpleNamespace
 from unittest import mock
 
@@ -1769,6 +1770,296 @@ class BotEventLogTests(unittest.TestCase):
         self.assertTrue(regime["shadow_enabled"])
         self.assertFalse(regime["actuation_enabled"])
 
+    def test_hmm_status_payload_exposes_confidence_modifier_fields(self):
+        rt = bot.BotRuntime()
+        rt._hmm_state.update({
+            "enabled": True,
+            "available": True,
+            "trained": True,
+            "regime": "BULLISH",
+            "regime_id": 2,
+            "confidence": 0.60,
+            "bias_signal": 0.40,
+            "last_update_ts": 1000.0,
+        })
+        rt._hmm_training_depth = {
+            "confidence_modifier": 0.70,
+        }
+
+        with mock.patch.object(config, "HMM_ENABLED", True):
+            payload = rt._hmm_status_payload()
+
+        self.assertAlmostEqual(float(payload["confidence"]), 0.60)
+        self.assertAlmostEqual(float(payload["confidence_raw"]), 0.60)
+        self.assertAlmostEqual(float(payload["confidence_modifier"]), 0.70)
+        self.assertAlmostEqual(float(payload["confidence_effective"]), 0.42)
+        self.assertEqual(payload["confidence_modifier_source"], "primary")
+
+    def test_hmm_status_payload_includes_training_depth_block(self):
+        rt = bot.BotRuntime()
+        rt._hmm_training_depth = {
+            "state_key": "primary",
+            "current_candles": 1200,
+            "target_candles": 4000,
+            "min_train_samples": 500,
+            "quality_tier": "baseline",
+            "confidence_modifier": 0.85,
+            "pct_complete": 30.0,
+            "interval_min": 1,
+            "estimated_full_at": "2026-02-16T14:00:00+00:00",
+            "updated_at": 1000.0,
+        }
+        rt._hmm_state.update({
+            "enabled": True,
+            "available": True,
+            "trained": True,
+            "confidence": 0.5,
+        })
+
+        with mock.patch.object(config, "HMM_ENABLED", True):
+            payload = rt._hmm_status_payload()
+
+        self.assertIn("training_depth", payload)
+        depth = payload["training_depth"]
+        self.assertEqual(depth["current_candles"], 1200)
+        self.assertEqual(depth["target_candles"], 4000)
+        self.assertEqual(depth["quality_tier"], "baseline")
+        self.assertAlmostEqual(float(depth["confidence_modifier"]), 0.85)
+        self.assertAlmostEqual(float(depth["pct_complete"]), 30.0)
+
+    def test_record_regime_history_30m_prunes_old_samples(self):
+        rt = bot.BotRuntime()
+        rt._regime_history_30m.clear()
+        rt._hmm_state.update({
+            "enabled": True,
+            "available": True,
+            "trained": True,
+            "regime": "BULLISH",
+            "confidence": 0.55,
+            "bias_signal": 0.22,
+        })
+
+        with mock.patch.object(config, "HMM_ENABLED", True):
+            rt._record_regime_history_sample(now=1000.0)
+            rt._record_regime_history_sample(now=1200.0)
+            rt._record_regime_history_sample(now=2901.0)
+
+        self.assertEqual(len(rt._regime_history_30m), 2)
+        first = rt._regime_history_30m[0]
+        latest = rt._regime_history_30m[-1]
+        self.assertAlmostEqual(float(first["ts"]), 1200.0)
+        self.assertAlmostEqual(float(latest["ts"]), 2901.0)
+        self.assertEqual(latest["regime"], "BULLISH")
+        self.assertAlmostEqual(float(latest["conf"]), 0.55)
+        self.assertAlmostEqual(float(latest["bias"]), 0.22)
+
+    def test_status_payload_exposes_regime_history_30m(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(market_price=0.1, now=1000.0),
+            )
+        }
+        rt._regime_history_30m = deque([
+            {"ts": 1000.0, "regime": "RANGING", "conf": 0.1, "bias": 0.0},
+            {"ts": 1300.0, "regime": "BULLISH", "conf": 0.4, "bias": 0.3},
+        ])
+
+        payload = rt.status_payload()
+        self.assertIn("regime_history_30m", payload)
+        self.assertEqual(len(payload["regime_history_30m"]), 2)
+        self.assertIn("regime_history_30m", payload["hmm_regime"])
+        self.assertEqual(len(payload["hmm_regime"]["regime_history_30m"]), 2)
+
+    def test_status_payload_exposes_ai_regime_advisor_block(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(market_price=0.1, now=1000.0),
+            )
+        }
+        rt._ai_regime_last_run_ts = 900.0
+        rt._ai_regime_opinion = {
+            "recommended_tier": 1,
+            "recommended_direction": "long_bias",
+            "conviction": 72,
+            "rationale": "Momentum building.",
+            "watch_for": "15m confidence > 0.20.",
+            "panelist": "Llama-70B",
+            "agreement": "ai_upgrade",
+            "error": "",
+            "ts": 905.0,
+            "mechanical_tier": 0,
+            "mechanical_direction": "symmetric",
+        }
+        rt._ai_regime_history = deque([
+            {
+                "ts": 905.0,
+                "mechanical_tier": 0,
+                "mechanical_direction": "symmetric",
+                "ai_tier": 1,
+                "ai_direction": "long_bias",
+                "conviction": 72,
+                "agreement": "ai_upgrade",
+                "action": "pending",
+            }
+        ])
+        now_ts = time.time()
+        rt._ai_override_tier = 1
+        rt._ai_override_direction = "long_bias"
+        rt._ai_override_applied_at = now_ts - 60.0
+        rt._ai_override_until = now_ts + 1800.0
+        rt._ai_override_source_conviction = 72
+
+        with mock.patch.object(config, "AI_REGIME_ADVISOR_ENABLED", True):
+            payload = rt.status_payload()
+
+        self.assertIn("ai_regime_advisor", payload)
+        block = payload["ai_regime_advisor"]
+        self.assertTrue(block["enabled"])
+        self.assertIn("default_ttl_sec", block)
+        self.assertIn("min_conviction", block)
+        self.assertEqual(block["opinion"]["recommended_tier"], 1)
+        self.assertEqual(block["opinion"]["recommended_direction"], "long_bias")
+        self.assertEqual(block["opinion"]["agreement"], "ai_upgrade")
+        self.assertTrue(block["override"]["active"])
+        self.assertEqual(block["override"]["tier"], 1)
+        self.assertEqual(len(block["history"]), 1)
+
+    def test_maybe_schedule_ai_regime_periodic_and_event_triggers(self):
+        rt = bot.BotRuntime()
+        rt._hmm_consensus = {"agreement": "primary_only"}
+
+        with mock.patch.object(config, "AI_REGIME_ADVISOR_ENABLED", True):
+            with mock.patch.object(config, "AI_REGIME_INTERVAL_SEC", 300.0):
+                with mock.patch.object(config, "AI_REGIME_DEBOUNCE_SEC", 60.0):
+                    with mock.patch.object(rt, "_start_ai_regime_run") as start_mock:
+                        rt._ai_regime_last_run_ts = 0.0
+                        rt._maybe_schedule_ai_regime(now=1000.0)
+                        start_mock.assert_called_once()
+                        self.assertEqual(start_mock.call_args[0][1], "periodic")
+
+                    with mock.patch.object(rt, "_start_ai_regime_run") as start_mock:
+                        rt._ai_regime_last_run_ts = 1000.0
+                        rt._ai_regime_last_mechanical_tier = 0
+                        rt._regime_mechanical_tier = 1
+                        rt._ai_regime_last_consensus_agreement = "primary_only"
+                        rt._hmm_consensus = {"agreement": "primary_only"}
+                        rt._maybe_schedule_ai_regime(now=1120.0)
+                        start_mock.assert_called_once()
+                        self.assertEqual(start_mock.call_args[0][1], "mechanical_tier_change")
+
+    def test_update_regime_tier_ai_override_enforces_one_tier_hop(self):
+        rt = bot.BotRuntime()
+        rt._hmm_state.update({
+            "available": True,
+            "trained": True,
+            "regime": "BULLISH",
+            "confidence": 0.10,
+            "bias_signal": 0.40,
+            "last_update_ts": 1000.0,
+        })
+        rt._ai_override_tier = 2
+        rt._ai_override_direction = "long_bias"
+        rt._ai_override_applied_at = 900.0
+        rt._ai_override_until = 1900.0
+        rt._ai_override_source_conviction = 80
+
+        with mock.patch.object(config, "HMM_ENABLED", True):
+            with mock.patch.object(config, "REGIME_SHADOW_ENABLED", True):
+                with mock.patch.object(config, "REGIME_DIRECTIONAL_ENABLED", False):
+                    with mock.patch.object(config, "AI_OVERRIDE_MIN_CONVICTION", 50):
+                        rt._update_regime_tier(now=1000.0)
+
+        self.assertEqual(rt._regime_mechanical_tier, 0)
+        self.assertEqual(rt._regime_tier, 1)
+        self.assertEqual(rt._regime_shadow_state.get("reason"), "ai_override")
+        self.assertTrue(bool(rt._regime_shadow_state.get("override_active")))
+
+    def test_update_regime_tier_ai_override_respects_capacity_stop_gate(self):
+        rt = bot.BotRuntime()
+        rt._hmm_state.update({
+            "available": True,
+            "trained": True,
+            "regime": "BULLISH",
+            "confidence": 0.10,
+            "bias_signal": 0.40,
+            "last_update_ts": 1000.0,
+        })
+        rt._ai_override_tier = 1
+        rt._ai_override_direction = "long_bias"
+        rt._ai_override_applied_at = 900.0
+        rt._ai_override_until = 1900.0
+        rt._ai_override_source_conviction = 90
+
+        with mock.patch.object(config, "HMM_ENABLED", True):
+            with mock.patch.object(config, "REGIME_SHADOW_ENABLED", True):
+                with mock.patch.object(config, "REGIME_DIRECTIONAL_ENABLED", False):
+                    with mock.patch.object(rt, "_compute_capacity_health", return_value={"status_band": "stop"}):
+                        rt._update_regime_tier(now=1000.0)
+
+        self.assertEqual(rt._regime_mechanical_tier, 0)
+        self.assertEqual(rt._regime_tier, 0)
+        self.assertNotEqual(rt._regime_shadow_state.get("reason"), "ai_override")
+
+    def test_update_regime_tier_applies_training_depth_modifier(self):
+        rt = bot.BotRuntime()
+        rt._hmm_state.update({
+            "available": True,
+            "trained": True,
+            "regime": "BULLISH",
+            "confidence": 0.60,
+            "bias_signal": 0.70,
+            "last_update_ts": 1000.0,
+        })
+        rt._hmm_training_depth = {
+            "confidence_modifier": 0.70,
+        }
+
+        with mock.patch.object(config, "HMM_ENABLED", True):
+            with mock.patch.object(config, "REGIME_SHADOW_ENABLED", True):
+                with mock.patch.object(config, "REGIME_DIRECTIONAL_ENABLED", False):
+                    rt._update_regime_tier(now=1000.0)
+
+        self.assertEqual(rt._regime_tier, 1)
+        self.assertAlmostEqual(float(rt._regime_shadow_state.get("confidence_raw", 0.0)), 0.60)
+        self.assertAlmostEqual(float(rt._regime_shadow_state.get("confidence", 0.0)), 0.42)
+        self.assertAlmostEqual(float(rt._regime_shadow_state.get("confidence_effective", 0.0)), 0.42)
+        self.assertAlmostEqual(float(rt._regime_shadow_state.get("confidence_modifier", 0.0)), 0.70)
+        self.assertEqual(rt._regime_shadow_state.get("confidence_modifier_source"), "primary")
+
+    def test_update_regime_tier_manual_override_bypasses_modifier(self):
+        rt = bot.BotRuntime()
+        rt._hmm_state.update({
+            "available": True,
+            "trained": True,
+            "regime": "BULLISH",
+            "confidence": 0.60,
+            "bias_signal": 0.70,
+            "last_update_ts": 1000.0,
+        })
+        rt._hmm_training_depth = {
+            "confidence_modifier": 0.70,
+        }
+
+        with mock.patch.object(config, "HMM_ENABLED", True):
+            with mock.patch.object(config, "REGIME_SHADOW_ENABLED", True):
+                with mock.patch.object(config, "REGIME_DIRECTIONAL_ENABLED", False):
+                    with mock.patch.object(config, "REGIME_MANUAL_OVERRIDE", "BULLISH"):
+                        with mock.patch.object(config, "REGIME_MANUAL_CONFIDENCE", 0.80):
+                            rt._update_regime_tier(now=1000.0)
+
+        self.assertEqual(rt._regime_tier, 2)
+        self.assertAlmostEqual(float(rt._regime_shadow_state.get("confidence_raw", 0.0)), 0.80)
+        self.assertAlmostEqual(float(rt._regime_shadow_state.get("confidence", 0.0)), 0.80)
+        self.assertAlmostEqual(float(rt._regime_shadow_state.get("confidence_effective", 0.0)), 0.80)
+        self.assertAlmostEqual(float(rt._regime_shadow_state.get("confidence_modifier", 0.0)), 1.0)
+        self.assertEqual(rt._regime_shadow_state.get("confidence_modifier_source"), "manual_override")
+
     def test_update_regime_tier_shadow_does_not_actuate_slot_modes(self):
         rt = bot.BotRuntime()
         rt.last_price = 0.1
@@ -2731,6 +3022,26 @@ class BotEventLogTests(unittest.TestCase):
         self.assertAlmostEqual(rt._trend_target_locked_until, 9999.0)
         self.assertAlmostEqual(rt._trend_last_update_ts, 7777.0)
 
+    def test_load_snapshot_clears_expired_ai_override(self):
+        rt = bot.BotRuntime()
+        snap = rt._global_snapshot()
+        snap["ai_override_tier"] = 1
+        snap["ai_override_direction"] = "long_bias"
+        snap["ai_override_applied_at"] = 1000.0
+        snap["ai_override_until"] = 1200.0
+        snap["ai_override_source_conviction"] = 80
+
+        with mock.patch("supabase_store.load_state", return_value=snap):
+            with mock.patch("supabase_store.load_max_event_id", return_value=0):
+                with mock.patch("bot._now", return_value=1500.0):
+                    rt._load_snapshot()
+
+        self.assertIsNone(rt._ai_override_tier)
+        self.assertIsNone(rt._ai_override_direction)
+        self.assertIsNone(rt._ai_override_until)
+        self.assertIsNone(rt._ai_override_applied_at)
+        self.assertIsNone(rt._ai_override_source_conviction)
+
     def test_daily_loss_lock_pauses_on_aggregate_utc_threshold(self):
         rt = bot.BotRuntime()
         rt.mode = "RUNNING"
@@ -3342,6 +3653,9 @@ class DashboardApiHardeningTests(unittest.TestCase):
             self.raise_on_pause = False
             self.resume_result = (True, "running")
             self.release_slot_calls = []
+            self.ai_override_calls = []
+            self.ai_revert_calls = 0
+            self.ai_dismiss_calls = 0
 
         def pause(self, _reason):
             if self.raise_on_pause:
@@ -3381,6 +3695,18 @@ class DashboardApiHardeningTests(unittest.TestCase):
 
         def audit_pnl(self):
             return True, "audit ok"
+
+        def apply_ai_regime_override(self, ttl_sec=None):
+            self.ai_override_calls.append(ttl_sec)
+            return True, "AI override applied"
+
+        def revert_ai_regime_override(self):
+            self.ai_revert_calls += 1
+            return True, "override cancelled"
+
+        def dismiss_ai_regime_opinion(self):
+            self.ai_dismiss_calls += 1
+            return True, "ai disagreement dismissed"
 
         def _save_snapshot(self):
             return None
@@ -3492,6 +3818,59 @@ class DashboardApiHardeningTests(unittest.TestCase):
         code, payload = handler.sent[0]
         self.assertEqual(code, 200)
         self.assertEqual(payload, {"ok": True, "message": "layer ok"})
+
+    def test_api_action_ai_regime_override_routes_ok(self):
+        runtime = self._RuntimeStub()
+        bot._RUNTIME = runtime
+        handler = self._HandlerStub({"action": "ai_regime_override", "ttl_sec": 600})
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(runtime.ai_override_calls, [600])
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 200)
+        self.assertIsInstance(payload, dict)
+        self.assertTrue(payload.get("ok"))
+
+    def test_api_action_ai_regime_override_invalid_ttl_returns_json_400(self):
+        bot._RUNTIME = self._RuntimeStub()
+        handler = self._HandlerStub({"action": "ai_regime_override", "ttl_sec": "nope"})
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 400)
+        self.assertEqual(payload, {"ok": False, "message": "invalid ttl_sec"})
+
+    def test_api_action_ai_regime_revert_routes_ok(self):
+        runtime = self._RuntimeStub()
+        bot._RUNTIME = runtime
+        handler = self._HandlerStub({"action": "ai_regime_revert"})
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(runtime.ai_revert_calls, 1)
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 200)
+        self.assertIsInstance(payload, dict)
+        self.assertTrue(payload.get("ok"))
+
+    def test_api_action_ai_regime_dismiss_routes_ok(self):
+        runtime = self._RuntimeStub()
+        bot._RUNTIME = runtime
+        handler = self._HandlerStub({"action": "ai_regime_dismiss"})
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(runtime.ai_dismiss_calls, 1)
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 200)
+        self.assertIsInstance(payload, dict)
+        self.assertTrue(payload.get("ok"))
 
     def test_api_action_release_slot_routes_ok(self):
         runtime = self._RuntimeStub()
