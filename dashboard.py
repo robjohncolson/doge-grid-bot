@@ -2011,7 +2011,6 @@ DASHBOARD_HTML = """<!doctype html>
       const releaseBtn = document.getElementById('releaseBtn');
       const releaseEligibleBtn = document.getElementById('releaseEligibleBtn');
       const accumStopBtn = document.getElementById('accumStopBtn');
-      const recoveryOrdersEnabled = s.recovery_orders_enabled !== false;
       softCloseBtn.style.display = stickyEnabled || !recoveryOrdersEnabled ? 'none' : '';
       cancelStaleBtn.style.display = stickyEnabled || !recoveryOrdersEnabled ? 'none' : '';
       releaseBtn.style.display = stickyEnabled ? '' : 'none';
