@@ -32,6 +32,7 @@ import os
 import json
 import threading
 from datetime import datetime, timezone
+from statistics import median
 
 import config
 import kraken_client
@@ -84,12 +85,18 @@ class CompletedCycle:
         gross_profit:   (sell - buy) * volume, before fees
         fees:           Total fees (entry + exit legs)
         net_profit:     gross_profit - fees
+        entry_fee_actual: Kraken-reported entry-leg fee used for this cycle
+        exit_fee_actual:  Kraken-reported exit-leg fee used for this cycle
+        entry_cost_actual: Kraken-reported entry-leg cost used for this cycle
+        exit_cost_actual:  Kraken-reported exit-leg cost used for this cycle
         entry_time:     Unix timestamp of entry fill (0 if unknown)
         exit_time:      Unix timestamp of exit fill
     """
     def __init__(self, trade_id: str, cycle: int, entry_side: str,
                  entry_price: float, exit_price: float, volume: float,
                  gross_profit: float, fees: float, net_profit: float,
+                 entry_fee_actual: float = 0.0, exit_fee_actual: float = 0.0,
+                 entry_cost_actual: float = 0.0, exit_cost_actual: float = 0.0,
                  entry_time: float = 0.0, exit_time: float = 0.0,
                  regime_at_entry: int | None = None):
         self.trade_id = trade_id
@@ -101,6 +108,10 @@ class CompletedCycle:
         self.gross_profit = gross_profit
         self.fees = fees
         self.net_profit = net_profit
+        self.entry_fee_actual = float(entry_fee_actual or 0.0)
+        self.exit_fee_actual = float(exit_fee_actual or 0.0)
+        self.entry_cost_actual = float(entry_cost_actual or 0.0)
+        self.exit_cost_actual = float(exit_cost_actual or 0.0)
         self.entry_time = entry_time
         self.exit_time = exit_time
         self.regime_at_entry = _normalize_regime_id(regime_at_entry)
@@ -116,6 +127,10 @@ class CompletedCycle:
             "gross_profit": round(self.gross_profit, 6),
             "fees": round(self.fees, 6),
             "net_profit": round(self.net_profit, 6),
+            "entry_fee_actual": round(self.entry_fee_actual, 8),
+            "exit_fee_actual": round(self.exit_fee_actual, 8),
+            "entry_cost_actual": round(self.entry_cost_actual, 8),
+            "exit_cost_actual": round(self.exit_cost_actual, 8),
             "entry_time": self.entry_time,
             "exit_time": self.exit_time,
             "regime_at_entry": self.regime_at_entry,
@@ -133,6 +148,10 @@ class CompletedCycle:
             gross_profit=d.get("gross_profit", 0.0),
             fees=d.get("fees", 0.0),
             net_profit=d.get("net_profit", 0.0),
+            entry_fee_actual=d.get("entry_fee_actual", 0.0),
+            exit_fee_actual=d.get("exit_fee_actual", 0.0),
+            entry_cost_actual=d.get("entry_cost_actual", 0.0),
+            exit_cost_actual=d.get("exit_cost_actual", 0.0),
             entry_time=d.get("entry_time", 0.0),
             exit_time=d.get("exit_time", 0.0),
             regime_at_entry=_normalize_regime_id(d.get("regime_at_entry")),
@@ -243,6 +262,12 @@ class GridOrder:
         self.trade_id = None               # "A" (short/sell-entry) or "B" (long/buy-entry)
         self.cycle = 0                     # Increments each completed round trip
         self.entry_filled_at = 0.0         # When the entry fill created this exit (for recovery timeout)
+        # Kraken-reported fill values captured when this order closes.
+        self.actual_fee = None
+        self.actual_cost = None
+        # Carried from the matched entry leg into exit orders.
+        self.matched_entry_fee = None
+        self.matched_entry_cost = None
 
     def __repr__(self):
         tid = f" {self.trade_id}.{self.cycle}" if self.trade_id else ""
@@ -271,6 +296,8 @@ class GridState:
 
         # Tracking
         self.total_profit_usd = 0.0      # Cumulative realized profit
+        # Watermark for trimmed cycles and non-cycle balance adjustments.
+        self.base_profit_usd = 0.0
         self.today_profit_usd = 0.0      # Today's realized profit (resets at midnight UTC)
         self.today_loss_usd = 0.0        # Today's realized losses (for daily loss limit)
         self.today_fees_usd = 0.0       # Today's fees paid (resets at midnight UTC)
@@ -361,6 +388,14 @@ class GridState:
 
         # Seed buy cost tracking: total USD spent on market-buy seed purchases
         self.seed_cost_usd = 0.0
+        # Rounding-residual recycler (entry-side specific).
+        self.rounding_residual_a = 0.0
+        self.rounding_residual_b = 0.0
+        # Residual quote carry for buy-side allocation.
+        self.carry_usd = 0.0
+        # Observed fee-rate telemetry (actual fee / actual cost).
+        self.observed_fee_rates: list = []
+        self.observed_fee_rate_median = float(config.MAKER_FEE_PCT) / 100.0
 
         # Multi-slot fields (for N independent A/B state machines per pair)
         self.slot_id = 0              # 0 = primary, 1+ = additional slots
@@ -466,6 +501,119 @@ class GridState:
         return 0.0  # 0 = unlimited (backward compat)
 
 
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _default_fee_rate(state: GridState) -> float:
+    fallback = max(0.0, float(config.MAKER_FEE_PCT)) / 100.0
+    observed = max(0.0, _safe_float(getattr(state, "observed_fee_rate_median", 0.0)))
+    samples = len(list(getattr(state, "observed_fee_rates", []) or []))
+    min_samples = max(10, int(getattr(config, "FEE_OBSERVATION_WINDOW", 100) * 0.1))
+    if (bool(getattr(config, "FEE_TIER_AUTO_DETECT", False))
+            and samples >= min_samples and observed > 0.0):
+        return observed
+    return fallback
+
+
+def _estimate_fee(state: GridState, price: float, volume: float) -> float:
+    return max(0.0, _safe_float(price) * _safe_float(volume) * _default_fee_rate(state))
+
+
+def _observe_fee_rate(state: GridState, fee: float, cost: float) -> None:
+    if not bool(getattr(config, "FEE_TIER_AUTO_DETECT", False)):
+        return
+    fee_v = max(0.0, _safe_float(fee))
+    cost_v = max(0.0, _safe_float(cost))
+    if fee_v <= 0.0 or cost_v <= 0.0:
+        return
+    rate = fee_v / cost_v
+    if rate <= 0.0:
+        return
+    rates = list(getattr(state, "observed_fee_rates", []) or [])
+    rates.append(rate)
+    # Keep a bounded rolling window for stability.
+    window = max(10, int(getattr(config, "FEE_OBSERVATION_WINDOW", 100)))
+    if len(rates) > window:
+        rates = rates[-window:]
+    state.observed_fee_rates = rates
+    try:
+        state.observed_fee_rate_median = float(median(rates))
+    except Exception:
+        state.observed_fee_rate_median = rate
+
+
+def _actual_fee_for_order(state: GridState, order: GridOrder, price: float, volume: float) -> float:
+    fee = _safe_float(getattr(order, "actual_fee", None), 0.0)
+    if fee > 0.0:
+        return fee
+    return _estimate_fee(state, price, volume)
+
+
+def _actual_cost_for_order(order: GridOrder, price: float, volume: float) -> float:
+    cost = _safe_float(getattr(order, "actual_cost", None), 0.0)
+    if cost > 0.0:
+        return cost
+    return max(0.0, _safe_float(price) * _safe_float(volume))
+
+
+def _actual_fee_snapshot(order: GridOrder) -> float:
+    """Raw Kraken-reported fee for audit fields (0 when unavailable)."""
+    return max(0.0, _safe_float(getattr(order, "actual_fee", None), 0.0))
+
+
+def _actual_cost_snapshot(order: GridOrder) -> float:
+    """Raw Kraken-reported cost for audit fields (0 when unavailable)."""
+    return max(0.0, _safe_float(getattr(order, "actual_cost", None), 0.0))
+
+
+def _log_fee_delta(state: GridState, order: GridOrder, source: str) -> None:
+    if not bool(getattr(config, "DURABLE_SETTLEMENT_ENABLED", True)):
+        return
+    actual = _actual_fee_snapshot(order)
+    if actual <= 0.0:
+        return
+    estimated = _estimate_fee(state, order.price, order.volume)
+    if estimated <= 0.0:
+        return
+    delta = actual - estimated
+    delta_pct = (delta / estimated) * 100.0
+    logger.info(
+        "Fee delta [%s %s %s]: actual=$%.6f est=$%.6f delta=%+.6f (%+.2f%%)",
+        source,
+        order.side.upper(),
+        getattr(order, "order_role", "?"),
+        actual,
+        estimated,
+        delta,
+        delta_pct,
+    )
+
+
+def _derived_total_profit_usd(state: GridState) -> float:
+    base = _safe_float(getattr(state, "base_profit_usd", 0.0))
+    active = sum(_safe_float(c.net_profit) for c in getattr(state, "completed_cycles", []))
+    return base + active
+
+
+def _maybe_sync_derived_profit(state: GridState, *, reason: str = "") -> float:
+    derived = _derived_total_profit_usd(state)
+    if bool(getattr(config, "DURABLE_PROFIT_DERIVATION", False)):
+        drift = _safe_float(state.total_profit_usd) - derived
+        if abs(drift) > 0.01:
+            logger.warning(
+                "Derived profit sync (%s): drift=%+.6f -> total_profit_usd=%.6f",
+                reason or "runtime",
+                drift,
+                derived,
+            )
+        state.total_profit_usd = derived
+    return derived
+
+
 def get_capital_deployed(state: GridState, current_price: float) -> float:
     """Total USD-equivalent exposure for this pair.
 
@@ -531,6 +679,7 @@ def restore_state_snapshot(state: GridState, snapshot: dict, source: str = "snap
 
     state.center_price = snapshot.get("center_price", 0.0)
     state.total_profit_usd = snapshot.get("total_profit_usd", 0.0)
+    state.base_profit_usd = snapshot.get("base_profit_usd", 0.0)
     state.today_profit_usd = snapshot.get("today_profit_usd", 0.0)
     state.today_loss_usd = snapshot.get("today_loss_usd", 0.0)
     state.today_fees_usd = snapshot.get("today_fees_usd", 0.0)
@@ -603,6 +752,23 @@ def restore_state_snapshot(state: GridState, snapshot: dict, source: str = "snap
     state.last_volatility_adjust = snapshot.get("last_volatility_adjust", 0.0)
     state.last_s1_rebalance = snapshot.get("last_s1_rebalance", 0.0)
     state.seed_cost_usd = snapshot.get("seed_cost_usd", 0.0)
+    state.rounding_residual_a = snapshot.get("rounding_residual_a", 0.0)
+    state.rounding_residual_b = snapshot.get("rounding_residual_b", 0.0)
+    state.carry_usd = snapshot.get("carry_usd", 0.0)
+    state.observed_fee_rates = list(snapshot.get("observed_fee_rates", []) or [])
+    state.observed_fee_rates = [
+        _safe_float(v, 0.0) for v in state.observed_fee_rates if _safe_float(v, 0.0) > 0.0
+    ]
+    if state.observed_fee_rates:
+        state.observed_fee_rate_median = _safe_float(
+            snapshot.get("observed_fee_rate_median", median(state.observed_fee_rates)),
+            median(state.observed_fee_rates),
+        )
+    else:
+        state.observed_fee_rate_median = _safe_float(
+            snapshot.get("observed_fee_rate_median", float(config.MAKER_FEE_PCT) / 100.0),
+            float(config.MAKER_FEE_PCT) / 100.0,
+        )
     state.slot_id = snapshot.get("slot_id", state.slot_id)
     state.winding_down = snapshot.get("winding_down", False)
     if state.consecutive_losses_a or state.consecutive_losses_b:
@@ -628,6 +794,8 @@ def restore_state_snapshot(state: GridState, snapshot: dict, source: str = "snap
             state.profit_pct, saved_profit_pct,
         )
         state.profit_pct = saved_profit_pct
+
+    _maybe_sync_derived_profit(state, reason="restore_state_snapshot")
 
     saved_at = snapshot.get("saved_at", 0)
     age_min = (time.time() - saved_at) / 60 if saved_at else 0
@@ -664,12 +832,18 @@ def save_state(state: GridState):
                 "cycle": getattr(o, "cycle", 0),
                 "matched_buy_price": o.matched_buy_price,
                 "matched_sell_price": getattr(o, "matched_sell_price", None),
+                "matched_entry_fee": getattr(o, "matched_entry_fee", None),
+                "matched_entry_cost": getattr(o, "matched_entry_cost", None),
+                "actual_fee": getattr(o, "actual_fee", None),
+                "actual_cost": getattr(o, "actual_cost", None),
                 "entry_filled_at": getattr(o, "entry_filled_at", 0.0),
             })
 
+    derived_profit = _maybe_sync_derived_profit(state, reason="save_state")
     snapshot = {
         "center_price": state.center_price,
-        "total_profit_usd": state.total_profit_usd,
+        "total_profit_usd": derived_profit if bool(getattr(config, "DURABLE_PROFIT_DERIVATION", False)) else state.total_profit_usd,
+        "base_profit_usd": state.base_profit_usd,
         "today_profit_usd": state.today_profit_usd,
         "today_loss_usd": state.today_loss_usd,
         "today_fees_usd": state.today_fees_usd,
@@ -722,6 +896,11 @@ def save_state(state: GridState):
         "last_volatility_adjust": state.last_volatility_adjust,
         "last_s1_rebalance": state.last_s1_rebalance,
         "seed_cost_usd": state.seed_cost_usd,
+        "rounding_residual_a": state.rounding_residual_a,
+        "rounding_residual_b": state.rounding_residual_b,
+        "carry_usd": state.carry_usd,
+        "observed_fee_rates": list(state.observed_fee_rates),
+        "observed_fee_rate_median": state.observed_fee_rate_median,
         "slot_id": state.slot_id,
         "winding_down": state.winding_down,
     }
@@ -867,7 +1046,7 @@ def migrate_pnl_from_fills(state: GridState):
 
         _trim_completed_cycles(state)
         # Update accumulators from reconstructed data
-        state.total_profit_usd = sum(c.net_profit for c in state.completed_cycles)
+        state.total_profit_usd = _derived_total_profit_usd(state)
         state.total_round_trips = len(state.completed_cycles)
         logger.info(
             "P&L migration: reconstructed %d cycles, total_profit=$%.4f "
@@ -1106,6 +1285,19 @@ def calculate_volume_for_price(price: float, state: GridState = None) -> float:
         return 0.0
     size_usd = state.order_size_usd if state else config.ORDER_SIZE_USD
     volume = size_usd / price
+    min_vol = state.min_volume if state and state.pair_config else ORDERMIN_DOGE
+    if volume < min_vol:
+        volume = float(min_vol)
+    vol_dec = state.volume_decimals if state else 0
+    if vol_dec == 0:
+        volume = float(int(volume))
+    else:
+        volume = round(volume, vol_dec)
+    return volume
+
+
+def _normalize_pair_volume(state: GridState, volume: float) -> float:
+    """Apply pair min-volume and precision normalization."""
     min_vol = state.min_volume if state and state.pair_config else ORDERMIN_DOGE
     if volume < min_vol:
         volume = float(min_vol)
@@ -1373,6 +1565,14 @@ def _check_trade_history_fallback(state: GridState, open_orders: list,
             vol_exec = float(trade_info.get("vol", order.volume))
             if vol_exec > 0:
                 order.volume = vol_exec
+            if bool(getattr(config, "DURABLE_SETTLEMENT_ENABLED", True)):
+                order.actual_fee = _safe_float(trade_info.get("fee"), 0.0)
+                order.actual_cost = _safe_float(
+                    trade_info.get("cost"),
+                    order.price * order.volume,
+                )
+                _observe_fee_rate(state, order.actual_fee, order.actual_cost)
+                _log_fee_delta(state, order, "trade_history")
             order.status = "filled"
             filled.append(order)
             logger.warning(
@@ -1455,6 +1655,14 @@ def check_fills_live(state: GridState, current_price: float = 0.0) -> list:
             vol_exec = float(info.get("vol_exec", order.volume))
             if vol_exec > 0:
                 order.volume = vol_exec
+            if bool(getattr(config, "DURABLE_SETTLEMENT_ENABLED", True)):
+                order.actual_fee = _safe_float(info.get("fee"), 0.0)
+                order.actual_cost = _safe_float(
+                    info.get("cost"),
+                    order.price * order.volume,
+                )
+                _observe_fee_rate(state, order.actual_fee, order.actual_cost)
+                _log_fee_delta(state, order, "query_orders")
             order.status = "filled"
             filled.append(order)
             vd = max(state.volume_decimals, 2)
@@ -1958,6 +2166,7 @@ def execute_accumulation(state: GridState, usd_amount: float, current_price: flo
     state.doge_accumulated += doge_amount
     state.last_accumulation = time.time()
     state.total_profit_usd -= usd_amount  # Remove from available profit
+    state.base_profit_usd -= usd_amount
 
     logger.info(
         "Total DOGE accumulated: %.2f (lifetime)",
@@ -2287,6 +2496,8 @@ def _build_pair_with_position(state: GridState, last_fill: dict,
                 o.matched_buy_price = fill_price
             else:
                 o.matched_sell_price = fill_price
+            o.matched_entry_fee = last_fill.get("actual_fee")
+            o.matched_entry_cost = last_fill.get("actual_cost")
             o.trade_id = exit_tid
             o.cycle = exit_cyc
             exit_found = True
@@ -2305,7 +2516,9 @@ def _build_pair_with_position(state: GridState, last_fill: dict,
             matched_buy=fill_price if fill_side == "buy" else None,
             matched_sell=fill_price if fill_side == "sell" else None,
             trade_id=exit_tid, cycle=exit_cyc,
-            volume_override=last_fill.get("volume"))
+            volume_override=last_fill.get("volume"),
+            matched_entry_fee=last_fill.get("actual_fee"),
+            matched_entry_cost=last_fill.get("actual_cost"))
     else:
         logger.info(
             "Position recovery: %s entry $%.6f -- %s exit [%s.%d] @ $%.6f on book",
@@ -2457,7 +2670,8 @@ def _attempt_seed_buy(state, sell_entry_price, volume, trade_id, cycle):
 
 def _place_pair_order(state, side, price, role, matched_buy=None,
                       matched_sell=None, trade_id=None, cycle=None,
-                      skip_budget_check=False, volume_override=None):
+                      skip_budget_check=False, volume_override=None,
+                      matched_entry_fee=None, matched_entry_cost=None):
     """
     Place a single pair order and add it to state.grid_orders.
     Returns the GridOrder on success, None on failure.
@@ -2466,9 +2680,31 @@ def _place_pair_order(state, side, price, role, matched_buy=None,
     cycle:    int -- current cycle number for this trade.
     volume_override: optional explicit volume (used to preserve position size
         when placing/replacing exits for already-filled entries).
+    matched_entry_fee/cost: entry-leg settlement values carried into exits.
     """
+    residual_attr = "rounding_residual_b" if side == "buy" else "rounding_residual_a"
+    pending_residual = None
     if volume_override is None:
-        volume = calculate_volume_for_price(price, state)
+        if (bool(getattr(config, "ROUNDING_RESIDUAL_ENABLED", False))
+                and role == "entry" and price > 0):
+            target_usd = max(0.0, _safe_float(state.order_size_usd, 0.0))
+            prior_residual = _safe_float(getattr(state, residual_attr, 0.0), 0.0)
+            effective_usd = max(0.0, target_usd + prior_residual)
+            raw_volume = effective_usd / price
+            volume = _normalize_pair_volume(state, raw_volume)
+            if volume <= 0:
+                volume = calculate_volume_for_price(price, state)
+            actual_usd = max(0.0, _safe_float(price) * _safe_float(volume))
+            residual = effective_usd - actual_usd
+            cap_pct = max(0.0, _safe_float(getattr(config, "ROUNDING_RESIDUAL_CAP_PCT", 0.25), 0.25))
+            cap_abs = target_usd * cap_pct
+            if cap_abs > 0:
+                residual = max(-cap_abs, min(cap_abs, residual))
+            else:
+                residual = 0.0
+            pending_residual = residual
+        else:
+            volume = calculate_volume_for_price(price, state)
     else:
         try:
             volume = float(volume_override)
@@ -2479,14 +2715,7 @@ def _place_pair_order(state, side, price, role, matched_buy=None,
             )
             volume = calculate_volume_for_price(price, state)
         else:
-            min_vol = state.min_volume if state and state.pair_config else ORDERMIN_DOGE
-            if volume < min_vol:
-                volume = float(min_vol)
-            vol_dec = state.volume_decimals if state else 0
-            if vol_dec == 0:
-                volume = float(int(volume))
-            else:
-                volume = round(volume, vol_dec)
+            volume = _normalize_pair_volume(state, volume)
             if volume <= 0:
                 volume = calculate_volume_for_price(price, state)
     level = -1 if side == "buy" else +1
@@ -2496,6 +2725,10 @@ def _place_pair_order(state, side, price, role, matched_buy=None,
         order.matched_buy_price = matched_buy
     if matched_sell is not None:
         order.matched_sell_price = matched_sell
+    if matched_entry_fee is not None:
+        order.matched_entry_fee = matched_entry_fee
+    if matched_entry_cost is not None:
+        order.matched_entry_cost = matched_entry_cost
     # Assign trade identity
     if trade_id is not None:
         order.trade_id = trade_id
@@ -2522,6 +2755,8 @@ def _place_pair_order(state, side, price, role, matched_buy=None,
         order.status = "open"
         order.placed_at = time.time()
         state.grid_orders.append(order)
+        if pending_residual is not None:
+            setattr(state, residual_attr, pending_residual)
         if role == "entry":
             state.total_entries_placed += 1
         logger.info(
@@ -2607,16 +2842,25 @@ def _close_orphaned_exit(state, filled_entry):
     if close_vol is None:
         close_vol = min(filled_entry.volume, orphan.volume)
 
-    # Compute PnL (same formula as normal round trip)
-    if filled_entry.side == "sell":
-        # Long closed: bought at cost_basis, sold at fill price
-        buy_p, sell_p = cost_basis, filled_entry.price
-    else:
-        # Short closed: sold at cost_basis, bought at fill price
-        buy_p, sell_p = filled_entry.price, cost_basis
+    # Compute PnL (actual-first, estimate fallback)
+    entry_fee = _safe_float(getattr(orphan, "matched_entry_fee", None), 0.0)
+    if entry_fee <= 0.0:
+        entry_fee = _estimate_fee(state, cost_basis, close_vol)
+    entry_cost = _safe_float(getattr(orphan, "matched_entry_cost", None), 0.0)
+    if entry_cost <= 0.0:
+        entry_cost = max(0.0, cost_basis * close_vol)
 
-    gross = (sell_p - buy_p) * close_vol
-    fees = (buy_p * close_vol + sell_p * close_vol) * config.MAKER_FEE_PCT / 100.0
+    exit_cost = _actual_cost_for_order(filled_entry, filled_entry.price, close_vol)
+    exit_fee = _actual_fee_for_order(state, filled_entry, filled_entry.price, close_vol)
+    if filled_entry.side == "sell":
+        # Long closed: bought at cost_basis, sold at fill price.
+        buy_cost, sell_cost = entry_cost, exit_cost
+    else:
+        # Short closed: sold at cost_basis, bought at fill price.
+        buy_cost, sell_cost = exit_cost, entry_cost
+
+    gross = sell_cost - buy_cost
+    fees = entry_fee + exit_fee
     net_profit = gross - fees
 
     # Book the round trip
@@ -2772,7 +3016,9 @@ def reprice_thin_exits(state: GridState, current_price: float) -> int:
             matched_buy=o.matched_buy_price if o.side == "sell" else None,
             matched_sell=getattr(o, "matched_sell_price", None) if o.side == "buy" else None,
             trade_id=tid, cycle=cyc,
-            volume_override=o.volume)
+            volume_override=o.volume,
+            matched_entry_fee=getattr(o, "matched_entry_fee", None),
+            matched_entry_cost=getattr(o, "matched_entry_cost", None))
         if new_o:
             new_o.entry_filled_at = getattr(o, "entry_filled_at", 0.0)
             repriced += 1
@@ -2917,6 +3163,10 @@ MAX_COMPLETED_CYCLES = 200  # Keep most recent N completed cycles
 def _trim_completed_cycles(state: GridState):
     """Trim completed_cycles list to most recent MAX_COMPLETED_CYCLES."""
     if len(state.completed_cycles) > MAX_COMPLETED_CYCLES:
+        trim_n = len(state.completed_cycles) - MAX_COMPLETED_CYCLES
+        removed = state.completed_cycles[:trim_n]
+        if removed:
+            state.base_profit_usd += sum(_safe_float(c.net_profit) for c in removed)
         state.completed_cycles = state.completed_cycles[-MAX_COMPLETED_CYCLES:]
 
 
@@ -2968,8 +3218,10 @@ def handle_pair_fill(state: GridState, filled_orders: list,
                 tid, cyc, filled.price, filled.volume, state.base_display,
             )
 
-            # Track buy fill fee
-            buy_fee = filled.price * filled.volume * config.MAKER_FEE_PCT / 100.0
+            # Track buy fill fee (actual-first, estimate fallback)
+            buy_fee = _actual_fee_for_order(state, filled, filled.price, filled.volume)
+            entry_fee_actual = _actual_fee_snapshot(filled)
+            entry_cost_actual = _actual_cost_snapshot(filled)
             state.total_fees_usd += buy_fee
             state.today_fees_usd += buy_fee
             state.recent_fills.append({
@@ -2988,7 +3240,9 @@ def handle_pair_fill(state: GridState, filled_orders: list,
                 state, "sell", exit_price, "exit",
                 matched_buy=filled.price,
                 trade_id=tid, cycle=cyc,
-                volume_override=filled.volume)
+                volume_override=filled.volume,
+                matched_entry_fee=entry_fee_actual if entry_fee_actual > 0 else None,
+                matched_entry_cost=entry_cost_actual if entry_cost_actual > 0 else None)
             if o:
                 o.entry_filled_at = time.time()
                 new_orders.append(o)
@@ -3001,10 +3255,19 @@ def handle_pair_fill(state: GridState, filled_orders: list,
             tid = tid or "B"
             buy_price = filled.matched_buy_price
             gross = None
+            entry_fee = 0.0
+            entry_cost = 0.0
+            exit_fee = _actual_fee_for_order(state, filled, filled.price, filled.volume)
+            exit_cost = _actual_cost_for_order(filled, filled.price, filled.volume)
             if buy_price is not None:
-                gross = (filled.price - buy_price) * filled.volume
-                fees = (buy_price * filled.volume * config.MAKER_FEE_PCT / 100.0 +
-                        filled.price * filled.volume * config.MAKER_FEE_PCT / 100.0)
+                entry_fee = _safe_float(getattr(filled, "matched_entry_fee", None), 0.0)
+                if entry_fee <= 0.0:
+                    entry_fee = _estimate_fee(state, buy_price, filled.volume)
+                entry_cost = _safe_float(getattr(filled, "matched_entry_cost", None), 0.0)
+                if entry_cost <= 0.0:
+                    entry_cost = max(0.0, buy_price * filled.volume)
+                gross = exit_cost - entry_cost
+                fees = entry_fee + exit_fee
                 net_profit = gross - fees
                 state.total_round_trips += 1
                 state.round_trips_today += 1
@@ -3013,12 +3276,12 @@ def handle_pair_fill(state: GridState, filled_orders: list,
                     "  [%s.%d] Sell exit at $%.6f has no matched_buy_price -- booking $0",
                     tid, cyc, filled.price)
                 net_profit = 0.0
-                fees = filled.price * filled.volume * config.MAKER_FEE_PCT / 100.0
+                fees = exit_fee
 
             state.total_profit_usd += net_profit
             state.today_profit_usd += net_profit
             # Only track sell leg fee here (buy leg was tracked when buy entry filled)
-            sell_leg_fee = filled.price * filled.volume * config.MAKER_FEE_PCT / 100.0
+            sell_leg_fee = exit_fee
             state.total_fees_usd += sell_leg_fee
             state.today_fees_usd += sell_leg_fee
             if net_profit < 0:
@@ -3064,6 +3327,10 @@ def handle_pair_fill(state: GridState, filled_orders: list,
                 entry_price=buy_price or 0, exit_price=filled.price,
                 volume=filled.volume,
                 gross_profit=gross or 0, fees=fees, net_profit=net_profit,
+                entry_fee_actual=max(0.0, _safe_float(getattr(filled, "matched_entry_fee", None), 0.0)),
+                exit_fee_actual=_actual_fee_snapshot(filled),
+                entry_cost_actual=max(0.0, _safe_float(getattr(filled, "matched_entry_cost", None), 0.0)),
+                exit_cost_actual=_actual_cost_snapshot(filled),
                 entry_time=entry_t, exit_time=time.time(),
             ))
             _trim_completed_cycles(state)
@@ -3112,8 +3379,10 @@ def handle_pair_fill(state: GridState, filled_orders: list,
                 tid, cyc, filled.price, filled.volume, state.base_display,
             )
 
-            # Track sell fill fee
-            sell_fee = filled.price * filled.volume * config.MAKER_FEE_PCT / 100.0
+            # Track sell fill fee (actual-first, estimate fallback)
+            sell_fee = _actual_fee_for_order(state, filled, filled.price, filled.volume)
+            entry_fee_actual = _actual_fee_snapshot(filled)
+            entry_cost_actual = _actual_cost_snapshot(filled)
             state.total_fees_usd += sell_fee
             state.today_fees_usd += sell_fee
             state.recent_fills.append({
@@ -3132,7 +3401,9 @@ def handle_pair_fill(state: GridState, filled_orders: list,
                 state, "buy", exit_price, "exit",
                 matched_sell=filled.price,
                 trade_id=tid, cycle=cyc,
-                volume_override=filled.volume)
+                volume_override=filled.volume,
+                matched_entry_fee=entry_fee_actual if entry_fee_actual > 0 else None,
+                matched_entry_cost=entry_cost_actual if entry_cost_actual > 0 else None)
             if o:
                 o.entry_filled_at = time.time()
                 new_orders.append(o)
@@ -3145,10 +3416,19 @@ def handle_pair_fill(state: GridState, filled_orders: list,
             tid = tid or "A"
             sell_price = filled.matched_sell_price
             gross = None
+            entry_fee = 0.0
+            entry_cost = 0.0
+            exit_fee = _actual_fee_for_order(state, filled, filled.price, filled.volume)
+            exit_cost = _actual_cost_for_order(filled, filled.price, filled.volume)
             if sell_price is not None:
-                gross = (sell_price - filled.price) * filled.volume
-                fees = (filled.price * filled.volume * config.MAKER_FEE_PCT / 100.0 +
-                        sell_price * filled.volume * config.MAKER_FEE_PCT / 100.0)
+                entry_fee = _safe_float(getattr(filled, "matched_entry_fee", None), 0.0)
+                if entry_fee <= 0.0:
+                    entry_fee = _estimate_fee(state, sell_price, filled.volume)
+                entry_cost = _safe_float(getattr(filled, "matched_entry_cost", None), 0.0)
+                if entry_cost <= 0.0:
+                    entry_cost = max(0.0, sell_price * filled.volume)
+                gross = entry_cost - exit_cost
+                fees = entry_fee + exit_fee
                 net_profit = gross - fees
                 state.total_round_trips += 1
                 state.round_trips_today += 1
@@ -3157,12 +3437,12 @@ def handle_pair_fill(state: GridState, filled_orders: list,
                     "  [%s.%d] Buy exit at $%.6f has no matched_sell_price -- booking $0",
                     tid, cyc, filled.price)
                 net_profit = 0.0
-                fees = filled.price * filled.volume * config.MAKER_FEE_PCT / 100.0
+                fees = exit_fee
 
             state.total_profit_usd += net_profit
             state.today_profit_usd += net_profit
             # Only track buy leg fee here (sell leg was tracked when sell entry filled)
-            buy_leg_fee = filled.price * filled.volume * config.MAKER_FEE_PCT / 100.0
+            buy_leg_fee = exit_fee
             state.total_fees_usd += buy_leg_fee
             state.today_fees_usd += buy_leg_fee
             if net_profit < 0:
@@ -3208,6 +3488,10 @@ def handle_pair_fill(state: GridState, filled_orders: list,
                 entry_price=sell_price or 0, exit_price=filled.price,
                 volume=filled.volume,
                 gross_profit=gross or 0, fees=fees, net_profit=net_profit,
+                entry_fee_actual=max(0.0, _safe_float(getattr(filled, "matched_entry_fee", None), 0.0)),
+                exit_fee_actual=_actual_fee_snapshot(filled),
+                entry_cost_actual=max(0.0, _safe_float(getattr(filled, "matched_entry_cost", None), 0.0)),
+                exit_cost_actual=_actual_cost_snapshot(filled),
                 entry_time=entry_t, exit_time=time.time(),
             ))
             _trim_completed_cycles(state)
@@ -3263,6 +3547,7 @@ def handle_pair_fill(state: GridState, filled_orders: list,
         else:
             logger.info("PAIR STATE: %s -> %s", old_state, new_state)
     state.pair_state = new_state
+    _maybe_sync_derived_profit(state, reason="handle_pair_fill")
 
     return new_orders
 
@@ -3680,19 +3965,26 @@ def check_recovery_fills(state: GridState, order_info: dict) -> bool:
             # Surprise fill!  Book the round-trip P&L.
             fill_price = float(info.get("price", r.price))
             fill_vol = float(info.get("vol_exec", r.volume))
+            entry_cost = max(0.0, r.entry_price * fill_vol)
+            exit_cost = _safe_float(info.get("cost"), fill_price * fill_vol)
+            entry_fee = _estimate_fee(state, r.entry_price, fill_vol)
+            exit_fee_actual = max(0.0, _safe_float(info.get("fee"), 0.0))
+            exit_fee = exit_fee_actual if exit_fee_actual > 0.0 else _estimate_fee(state, fill_price, fill_vol)
+            if exit_fee_actual > 0.0:
+                _observe_fee_rate(state, exit_fee_actual, exit_cost)
             if r.side == "sell":
                 # Trade B recovery: bought at entry_price, sold at fill_price
-                gross = (fill_price - r.entry_price) * fill_vol
+                gross = exit_cost - entry_cost
             else:
                 # Trade A recovery: sold at entry_price, bought at fill_price
-                gross = (r.entry_price - fill_price) * fill_vol
-            fees = (r.entry_price * fill_vol * config.MAKER_FEE_PCT / 100.0 +
-                    fill_price * fill_vol * config.MAKER_FEE_PCT / 100.0)
+                gross = entry_cost - exit_cost
+            fees = entry_fee + exit_fee
             net = gross - fees
             state.total_profit_usd += net
             state.today_profit_usd += net
-            state.total_fees_usd += fees
-            state.today_fees_usd += fees
+            # Entry leg fee was already tracked when the entry originally filled.
+            state.total_fees_usd += exit_fee
+            state.today_fees_usd += exit_fee
             state.total_round_trips += 1
             state.round_trips_today += 1
             state.total_recovery_wins += net
@@ -3713,6 +4005,10 @@ def check_recovery_fills(state: GridState, order_info: dict) -> bool:
                 entry_price=r.entry_price, exit_price=fill_price,
                 volume=fill_vol, gross_profit=gross, fees=fees,
                 net_profit=net,
+                entry_fee_actual=0.0,
+                exit_fee_actual=exit_fee_actual,
+                entry_cost_actual=0.0,
+                exit_cost_actual=exit_cost,
                 entry_time=r.entry_filled_at, exit_time=time.time(),
             ))
             _trim_completed_cycles(state)
@@ -4414,7 +4710,9 @@ def check_stale_exits(state: GridState, current_price: float) -> bool:
             matched_buy=o.matched_buy_price,
             matched_sell=o.matched_sell_price,
             trade_id=tid, cycle=cyc,
-            volume_override=o.volume)
+            volume_override=o.volume,
+            matched_entry_fee=getattr(o, "matched_entry_fee", None),
+            matched_entry_cost=getattr(o, "matched_entry_cost", None))
         if new_o:
             new_o.entry_filled_at = o.entry_filled_at  # Preserve original time
 
@@ -4577,7 +4875,9 @@ def check_s2_break_glass(state: GridState, current_price: float) -> bool:
                             matched_sell=worse.matched_sell_price,
                             trade_id=worse_tid,
                             cycle=getattr(worse, "cycle", 0),
-                            volume_override=worse.volume)
+                            volume_override=worse.volume,
+                            matched_entry_fee=getattr(worse, "matched_entry_fee", None),
+                            matched_entry_cost=getattr(worse, "matched_entry_cost", None))
                         if new_o:
                             new_o.entry_filled_at = worse.entry_filled_at
 
@@ -4713,6 +5013,10 @@ def _identify_order_3tier(order_info: dict, state: GridState,
             "order_role": saved.get("order_role", "entry"),
             "matched_buy_price": saved.get("matched_buy_price"),
             "matched_sell_price": saved.get("matched_sell_price"),
+            "matched_entry_fee": saved.get("matched_entry_fee"),
+            "matched_entry_cost": saved.get("matched_entry_cost"),
+            "actual_fee": saved.get("actual_fee"),
+            "actual_cost": saved.get("actual_cost"),
             "method": "saved_txid",
         }
 
@@ -4733,6 +5037,10 @@ def _identify_order_3tier(order_info: dict, state: GridState,
                         "order_role": "exit",
                         "matched_buy_price": None,
                         "matched_sell_price": rf["price"],
+                        "matched_entry_fee": None,
+                        "matched_entry_cost": None,
+                        "actual_fee": None,
+                        "actual_cost": None,
                         "method": "price_match",
                     }
     elif side == "sell":
@@ -4747,6 +5055,10 @@ def _identify_order_3tier(order_info: dict, state: GridState,
                         "order_role": "exit",
                         "matched_buy_price": rf["price"],
                         "matched_sell_price": None,
+                        "matched_entry_fee": None,
+                        "matched_entry_cost": None,
+                        "actual_fee": None,
+                        "actual_cost": None,
                         "method": "price_match",
                     }
 
@@ -4759,6 +5071,10 @@ def _identify_order_3tier(order_info: dict, state: GridState,
             "order_role": "entry",
             "matched_buy_price": None,
             "matched_sell_price": None,
+            "matched_entry_fee": None,
+            "matched_entry_cost": None,
+            "actual_fee": None,
+            "actual_cost": None,
             "method": "side_convention",
         }
     else:
@@ -4768,6 +5084,10 @@ def _identify_order_3tier(order_info: dict, state: GridState,
             "order_role": "entry",
             "matched_buy_price": None,
             "matched_sell_price": None,
+            "matched_entry_fee": None,
+            "matched_entry_cost": None,
+            "actual_fee": None,
+            "actual_cost": None,
             "method": "side_convention",
         }
 
@@ -4901,6 +5221,10 @@ def reconcile_pair_on_startup(state: GridState, current_price: float,
         # Restore entry_filled_at from saved state (for recovery timeout tracking)
         saved = saved_by_txid.get(o["txid"], {})
         order.entry_filled_at = saved.get("entry_filled_at", 0.0)
+        order.matched_entry_fee = identity.get("matched_entry_fee", saved.get("matched_entry_fee"))
+        order.matched_entry_cost = identity.get("matched_entry_cost", saved.get("matched_entry_cost"))
+        order.actual_fee = identity.get("actual_fee", saved.get("actual_fee"))
+        order.actual_cost = identity.get("actual_cost", saved.get("actual_cost"))
 
         state.grid_orders.append(order)
         adopted += 1

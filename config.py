@@ -208,6 +208,42 @@ MAKER_FEE_PCT: float = 0.25
 ROUND_TRIP_FEE_PCT: float = MAKER_FEE_PCT * 2  # 0.50%
 
 # ---------------------------------------------------------------------------
+# Durable profit/exit accounting toggles
+# ---------------------------------------------------------------------------
+
+# Capture/propagate settlement metadata (actual Kraken fee/cost).
+# Safe default ON: this augments state, it does not force PnL cutover alone.
+DURABLE_SETTLEMENT_ENABLED: bool = _env("DURABLE_SETTLEMENT_ENABLED", True, bool)
+
+# Derive persisted total_profit_usd from cycle ledger + base watermark.
+# Default OFF for staged rollout.
+DURABLE_PROFIT_DERIVATION: bool = _env("DURABLE_PROFIT_DERIVATION", False, bool)
+
+# Quote-first B-side allocation cutover (bot.py allocator path).
+# Default OFF until shadow comparisons are stable.
+QUOTE_FIRST_ALLOCATION: bool = _env("QUOTE_FIRST_ALLOCATION", False, bool)
+
+# Recycle per-side rounding residual into subsequent entry sizing.
+# Default OFF for staged rollout.
+ROUNDING_RESIDUAL_ENABLED: bool = _env("ROUNDING_RESIDUAL_ENABLED", False, bool)
+
+# Auto-detect effective maker fee tier from observed (actual_fee / actual_cost).
+# Default OFF to keep fallback strictly config-driven unless enabled.
+FEE_TIER_AUTO_DETECT: bool = _env("FEE_TIER_AUTO_DETECT", False, bool)
+
+# Reserve this much USD from deployable quote to avoid overshoot on rounding/slippage.
+ALLOCATION_SAFETY_BUFFER_USD: float = _env("ALLOCATION_SAFETY_BUFFER_USD", 0.50, float)
+
+# Rolling window for observed fee-rate samples when auto-detect is enabled.
+FEE_OBSERVATION_WINDOW: int = _env("FEE_OBSERVATION_WINDOW", 100, int)
+
+# Threshold for operator warnings when configured and observed fee rates diverge.
+FEE_MISMATCH_THRESHOLD_PCT: float = _env("FEE_MISMATCH_THRESHOLD_PCT", 10.0, float)
+
+# Residual clamp as a fraction of ORDER_SIZE_USD per side (e.g. 0.25 = 25% cap).
+ROUNDING_RESIDUAL_CAP_PCT: float = _env("ROUNDING_RESIDUAL_CAP_PCT", 0.25, float)
+
+# ---------------------------------------------------------------------------
 # Risk management
 # ---------------------------------------------------------------------------
 

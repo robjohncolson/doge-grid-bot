@@ -261,6 +261,8 @@ class BotRuntime:
         self._dust_max_bump_pct: float = max(0.0, float(getattr(config, "DUST_MAX_BUMP_PCT", 25.0)))
         self._dust_last_absorbed_usd: float = 0.0
         self._dust_last_dividend_usd: float = 0.0
+        self._quote_first_carry_usd: float = 0.0
+        self._loop_quote_first_meta: dict | None = None
         self._last_balance_snapshot: dict | None = None
         self._last_balance_ts = 0.0
 
@@ -788,12 +790,36 @@ class BotRuntime:
         return matched
 
     def _slot_wants_buy_entry(self, slot: SlotRuntime) -> bool:
-        """Conservative buy-entry intent gate for dust reservation."""
-        phase = sm.derive_phase(slot.state)
+        """True when slot can and should place a new B-side buy entry now."""
+        st = slot.state
+        if bool(st.short_only):
+            return False
+        # A txid-bound buy entry is already working on Kraken.
+        # Unbound local entries still count as "wants buy" until placed.
+        if any(o.role == "entry" and o.side == "buy" and bool(o.txid) for o in st.orders):
+            return False
+        phase = sm.derive_phase(st)
         return phase in ("S0", "S1a")
+
+    def _committed_buy_quote_usd(self) -> float:
+        """USD currently committed by live buy-side orders across all slots."""
+        committed = 0.0
+        for slot in self.slots.values():
+            st = slot.state
+            for o in st.orders:
+                if o.side == "buy" and bool(o.txid):
+                    committed += max(0.0, float(o.volume) * float(o.price))
+            for r in st.recovery_orders:
+                if r.side == "buy" and bool(r.txid):
+                    committed += max(0.0, float(r.volume) * float(r.price))
+        return committed
 
     def _compute_dust_dividend(self) -> float:
         """Per-slot USD surplus that can be folded into B-side sizing."""
+        if bool(getattr(config, "QUOTE_FIRST_ALLOCATION", False)):
+            self._loop_dust_dividend = 0.0
+            self._dust_last_dividend_usd = 0.0
+            return 0.0
         if self._loop_dust_dividend is not None:
             return max(0.0, float(self._loop_dust_dividend))
 
@@ -818,8 +844,10 @@ class BotRuntime:
             if not self._slot_wants_buy_entry(slot):
                 continue
             buy_count += 1
-            # trade_id=None returns the baseline (no dust, no rebalancer skew).
-            reserved += max(0.0, float(self._slot_order_size_usd(slot, trade_id=None)))
+        if buy_count > 0:
+            # Reserve buy-ready slots at their account-aware B-side baseline.
+            # This captures the slot-count split and leaves only true surplus as dividend.
+            reserved = max(0.0, float(self._b_side_base_usd())) * buy_count
 
         surplus = available - reserved
         if buy_count <= 0 or surplus < float(self._dust_min_threshold_usd):
@@ -837,6 +865,8 @@ class BotRuntime:
     def _dust_bump_usd(self, slot: SlotRuntime, trade_id: str | None) -> float:
         if trade_id != "B" or not self._dust_sweep_enabled:
             return 0.0
+        if not self._slot_wants_buy_entry(slot):
+            return 0.0
         if not self.ledger._synced and self._loop_available_usd is None:
             return 0.0
 
@@ -847,7 +877,7 @@ class BotRuntime:
         # DUST_MAX_BUMP_PCT <= 0 means uncapped (fund guard is the safety net).
         cap_pct = max(0.0, float(self._dust_max_bump_pct))
         if cap_pct > 0.0:
-            base_no_dust = max(0.0, float(self._slot_order_size_usd(slot, trade_id=None)))
+            base_no_dust = max(0.0, float(self._b_side_base_usd()))
             if base_no_dust <= 0.0:
                 return 0.0
             max_bump = base_no_dust * (cap_pct / 100.0)
@@ -856,10 +886,11 @@ class BotRuntime:
         return dividend
 
     def _b_side_base_usd(self) -> float:
-        """Per-slot B-side base: available USD divided evenly across all slots.
+        """Per-slot B-side base sizing.
 
-        Cached per loop.  Falls back to ORDER_SIZE_USD when balance is
-        unavailable.  The fund guard remains the hard safety-net.
+        Legacy path: divide available USD across all slots.
+        Quote-first path (QUOTE_FIRST_ALLOCATION): allocate only across buy-ready
+        slots with committed-buy subtraction and carry recycling.
         """
         if self._loop_b_side_base is not None:
             return self._loop_b_side_base
@@ -873,8 +904,42 @@ class BotRuntime:
             self._loop_b_side_base = float(config.ORDER_SIZE_USD)
             return self._loop_b_side_base
 
+        if bool(getattr(config, "QUOTE_FIRST_ALLOCATION", False)):
+            buy_ready_slots = sum(1 for slot in self.slots.values() if self._slot_wants_buy_entry(slot))
+            committed_buy_quote = self._committed_buy_quote_usd()
+            safety_buffer = max(0.0, float(getattr(config, "ALLOCATION_SAFETY_BUFFER_USD", 0.50)))
+            deployable_usd = max(0.0, available - committed_buy_quote - safety_buffer)
+            carry_in = max(0.0, float(self._quote_first_carry_usd))
+            allocation_pool = deployable_usd + carry_in
+
+            if buy_ready_slots > 0 and allocation_pool > 0.0:
+                per_slot = floor((allocation_pool * 100.0) / buy_ready_slots) / 100.0
+                if not isfinite(per_slot) or per_slot < 0.0:
+                    per_slot = 0.0
+                allocated = per_slot * buy_ready_slots
+                carry_out = max(0.0, allocation_pool - allocated)
+            else:
+                per_slot = 0.0
+                allocated = 0.0
+                carry_out = max(0.0, allocation_pool)
+
+            self._quote_first_carry_usd = carry_out
+            self._loop_b_side_base = per_slot
+            self._loop_quote_first_meta = {
+                "enabled": True,
+                "buy_ready_slots": int(buy_ready_slots),
+                "committed_buy_quote_usd": float(committed_buy_quote),
+                "deployable_usd": float(deployable_usd),
+                "allocation_pool_usd": float(allocation_pool),
+                "allocated_usd": float(allocated),
+                "carry_usd": float(carry_out),
+                "unallocated_spendable_usd": float(max(0.0, deployable_usd - allocated)),
+            }
+            return self._loop_b_side_base
+
         n_slots = max(1, len(self.slots))
         base = available / n_slots
+        self._loop_quote_first_meta = None
         self._loop_b_side_base = max(float(config.ORDER_SIZE_USD), base)
         return self._loop_b_side_base
 
@@ -883,6 +948,7 @@ class BotRuntime:
         slot: SlotRuntime,
         trade_id: str | None = None,
         price_override: float | None = None,
+        include_dust: bool = True,
     ) -> float:
         base_order = float(config.ORDER_SIZE_USD)
         if trade_id == "B":
@@ -902,6 +968,11 @@ class BotRuntime:
         if layer_price > 0:
             layer_usd = effective_layers * max(0.0, float(config.CAPITAL_LAYER_DOGE_PER_ORDER)) * layer_price
         base_with_layers = max(base, base + layer_usd)
+        # Dust sweep for B-side: allocate current free-USD surplus across slots
+        # that are actively waiting for a fresh buy entry this loop.
+        if include_dust and trade_id == "B" and not bool(getattr(config, "QUOTE_FIRST_ALLOCATION", False)):
+            dust_bump = self._dust_bump_usd(slot, trade_id=trade_id)
+            base_with_layers = max(0.0, base_with_layers + dust_bump)
         if self._throughput is not None:
             throughput_usd, _ = self._throughput.size_for_slot(
                 base_with_layers,
@@ -909,11 +980,6 @@ class BotRuntime:
                 trade_id=trade_id,
             )
             base_with_layers = max(0.0, float(throughput_usd))
-        # Dust sweep is redundant for B-side (account-aware base already
-        # deploys all available USD).  Still active for any future non-B use.
-        if trade_id != "B":
-            dust_bump = self._dust_bump_usd(slot, trade_id=trade_id)
-            base_with_layers = max(0.0, base_with_layers + dust_bump)
         if trade_id is None or not bool(config.REBALANCE_ENABLED):
             return base_with_layers
 
@@ -1409,6 +1475,7 @@ class BotRuntime:
             "release_recon_blocked_reason": str(self._release_recon_blocked_reason or ""),
             "dust_last_absorbed_usd": float(self._dust_last_absorbed_usd),
             "dust_last_dividend_usd": float(self._dust_last_dividend_usd),
+            "quote_first_carry_usd": float(self._quote_first_carry_usd),
         }
         if self._throughput is not None:
             snap["throughput_sizer_state"] = self._throughput.snapshot_state()
@@ -1753,6 +1820,10 @@ class BotRuntime:
                 0.0,
                 float(snap.get("dust_last_dividend_usd", self._dust_last_dividend_usd)),
             )
+            self._quote_first_carry_usd = max(
+                0.0,
+                float(snap.get("quote_first_carry_usd", self._quote_first_carry_usd)),
+            )
             hist = snap.get("rebalancer_sign_flip_history", [])
             cleaned_hist: list[float] = []
             if isinstance(hist, list):
@@ -1820,6 +1891,7 @@ class BotRuntime:
         self._loop_available_doge = None
         self._loop_dust_dividend = None
         self._loop_b_side_base = None
+        self._loop_quote_first_meta = None
         self._loop_effective_layers = None
         # Sync capital ledger with fresh Kraken balance
         bal = self._safe_balance()
@@ -1838,6 +1910,7 @@ class BotRuntime:
         self._loop_available_doge = None
         self._loop_dust_dividend = None
         self._loop_b_side_base = None
+        self._loop_quote_first_meta = None
         self._loop_effective_layers = None
         self.ledger.clear()
 
@@ -6755,6 +6828,34 @@ class BotRuntime:
                         self._defer_entry_due_scheduler(slot_id, action, source)
                         continue
 
+                # Retarget B-entry volume at execution time so follow-up entries
+                # use fresh balance-aware sizing after the triggering exit event.
+                if action.role == "entry" and action.side == "buy" and action.trade_id == "B":
+                    cfg = self._engine_cfg(slot)
+                    target_usd = self._slot_order_size_usd(slot, trade_id="B")
+                    refreshed_vol = sm.compute_order_volume(float(action.price), cfg, float(target_usd))
+                    if refreshed_vol is None:
+                        logger.info(
+                            "slot %s B-entry deferred: target $%.4f below exchange minimum at px=%.6f",
+                            slot_id,
+                            float(target_usd),
+                            float(action.price),
+                        )
+                        slot.state = sm.remove_order(slot.state, action.local_id)
+                        _mark_entry_fallback_for_insufficient_funds(action)
+                        self._normalize_slot_mode(slot_id)
+                        continue
+                    refreshed_vol = float(refreshed_vol)
+                    if abs(refreshed_vol - float(action.volume)) > 1e-12:
+                        action = replace(action, volume=refreshed_vol)
+                        patched_orders: list[sm.OrderState] = []
+                        for o in slot.state.orders:
+                            if o.local_id == action.local_id:
+                                patched_orders.append(replace(o, volume=refreshed_vol))
+                            else:
+                                patched_orders.append(o)
+                        slot.state = replace(slot.state, orders=tuple(patched_orders))
+
                 reserved_locally = self._try_reserve_loop_funds(
                     side=action.side,
                     volume=action.volume,
@@ -6851,7 +6952,7 @@ class BotRuntime:
                 text = (
                     f"<b>{self.pair_display} {action.trade_id}.{action.cycle}</b> "
                     f"net ${action.net_profit:.4f} "
-                    f"(gross ${action.gross_profit:.4f}, fees ${action.fees:.4f})"
+                    f"(gross ${action.gross_profit:.4f}, fees ${action.fees:.4f}, settled ${action.settled_usd:.4f})"
                     f"{' [recovery]' if action.from_recovery else ''}"
                 )
                 notifier._send_message(text)
@@ -8966,6 +9067,7 @@ class BotRuntime:
                     "cycle_a": st.cycle_a,
                     "cycle_b": st.cycle_b,
                     "total_profit": st.total_profit,
+                    "total_settled_usd": float(getattr(st, "total_settled_usd", st.total_profit)),
                     "total_profit_doge": slot_realized_doge,
                     "unrealized_profit": slot_unrealized_profit,
                     "unrealized_profit_doge": slot_unrealized_doge,
@@ -8980,6 +9082,7 @@ class BotRuntime:
                 total_unrealized_profit += slot_unrealized_profit
 
             total_profit = sum(s.state.total_profit for s in self.slots.values())
+            total_settled_usd = sum(float(getattr(s.state, "total_settled_usd", s.state.total_profit)) for s in self.slots.values())
             total_loss = sum(s.state.today_realized_loss for s in self.slots.values())
             total_round_trips = sum(s.state.total_round_trips for s in self.slots.values())
             total_orphans = sum(len(s.state.recovery_orders) for s in self.slots.values())
@@ -9110,6 +9213,7 @@ class BotRuntime:
             # otherwise use cached value from last loop.
             _live_dust = self._compute_dust_dividend()
             dust_dividend_usd = float(_live_dust if _live_dust > 0 else self._dust_last_dividend_usd)
+            buy_ready_slots = sum(1 for slot in self.slots.values() if self._slot_wants_buy_entry(slot))
             dust_available_usd: float | None = None
             if self._loop_available_usd is not None:
                 dust_available_usd = float(self._loop_available_usd)
@@ -9129,6 +9233,7 @@ class BotRuntime:
                 "top_phase": top_phase,
                 "slot_count": len(self.slots),
                 "total_profit": total_profit,
+                "total_settled_usd": total_settled_usd,
                 "total_profit_doge": total_profit_doge,
                 "total_unrealized_profit": total_unrealized_profit,
                 "total_unrealized_doge": total_unrealized_doge,
@@ -9240,6 +9345,14 @@ class BotRuntime:
                 "b_side_sizing": {
                     "base_usd": float(_bsb) if (_bsb := getattr(self, "_loop_b_side_base", None)) is not None else None,
                     "slot_count": len(self.slots),
+                    "buy_ready_slots": int(buy_ready_slots),
+                    "quote_first_enabled": bool(getattr(config, "QUOTE_FIRST_ALLOCATION", False)),
+                    "carry_usd": float(self._quote_first_carry_usd),
+                    "committed_buy_quote_usd": float((self._loop_quote_first_meta or {}).get("committed_buy_quote_usd", 0.0)),
+                    "deployable_usd": float((self._loop_quote_first_meta or {}).get("deployable_usd", 0.0)),
+                    "allocation_pool_usd": float((self._loop_quote_first_meta or {}).get("allocation_pool_usd", 0.0)),
+                    "allocated_usd": float((self._loop_quote_first_meta or {}).get("allocated_usd", 0.0)),
+                    "unallocated_spendable_usd": float((self._loop_quote_first_meta or {}).get("unallocated_spendable_usd", 0.0)),
                 },
                 "regime_directional": regime_directional,
                 "ai_regime_advisor": ai_regime_advisor,
