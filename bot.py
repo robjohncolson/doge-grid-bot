@@ -240,6 +240,7 @@ class BotRuntime:
         self._loop_available_usd: float | None = None
         self._loop_available_doge: float | None = None
         self._loop_dust_dividend: float | None = None
+        self._loop_b_side_base: float | None = None
         self._loop_effective_layers: dict[str, float | int | None] | None = None
         self._dust_sweep_enabled: bool = bool(getattr(config, "DUST_SWEEP_ENABLED", True))
         self._dust_min_threshold_usd: float = max(0.0, float(getattr(config, "DUST_MIN_THRESHOLD", 0.50)))
@@ -781,6 +782,29 @@ class BotRuntime:
 
         return dividend
 
+    def _b_side_base_usd(self) -> float:
+        """Per-slot B-side base: available USD divided evenly across all slots.
+
+        Cached per loop.  Falls back to ORDER_SIZE_USD when balance is
+        unavailable.  The fund guard remains the hard safety-net.
+        """
+        if self._loop_b_side_base is not None:
+            return self._loop_b_side_base
+
+        available = 0.0
+        if self._loop_available_usd is not None:
+            available = max(0.0, float(self._loop_available_usd))
+        elif self.ledger._synced:
+            available = max(0.0, float(self.ledger.available_usd))
+        else:
+            self._loop_b_side_base = float(config.ORDER_SIZE_USD)
+            return self._loop_b_side_base
+
+        n_slots = max(1, len(self.slots))
+        base = available / n_slots
+        self._loop_b_side_base = max(float(config.ORDER_SIZE_USD), base)
+        return self._loop_b_side_base
+
     def _slot_order_size_usd(
         self,
         slot: SlotRuntime,
@@ -788,11 +812,13 @@ class BotRuntime:
         price_override: float | None = None,
     ) -> float:
         base_order = float(config.ORDER_SIZE_USD)
-        compound_mode = str(getattr(config, "STICKY_COMPOUNDING_MODE", "legacy_profit")).strip().lower()
-        if bool(config.STICKY_MODE_ENABLED) and compound_mode == "fixed":
+        if trade_id == "B":
+            # Account-aware: divide available USD evenly across all slots.
+            base = self._b_side_base_usd()
+        elif bool(config.STICKY_MODE_ENABLED) and str(getattr(config, "STICKY_COMPOUNDING_MODE", "legacy_profit")).strip().lower() == "fixed":
             base = max(base_order, base_order)
         else:
-            # Independent compounding per slot.
+            # Independent compounding per slot (A-side and baseline queries).
             base = max(base_order, base_order + slot.state.total_profit)
         layer_metrics = self._current_layer_metrics(mark_price=self._layer_mark_price(slot))
         effective_layers = int(layer_metrics.get("effective_layers", 0))
@@ -810,8 +836,11 @@ class BotRuntime:
                 trade_id=trade_id,
             )
             base_with_layers = max(0.0, float(throughput_usd))
-        dust_bump = self._dust_bump_usd(slot, trade_id=trade_id)
-        base_with_layers = max(0.0, base_with_layers + dust_bump)
+        # Dust sweep is redundant for B-side (account-aware base already
+        # deploys all available USD).  Still active for any future non-B use.
+        if trade_id != "B":
+            dust_bump = self._dust_bump_usd(slot, trade_id=trade_id)
+            base_with_layers = max(0.0, base_with_layers + dust_bump)
         if trade_id is None or not bool(config.REBALANCE_ENABLED):
             return base_with_layers
 
@@ -1606,6 +1635,7 @@ class BotRuntime:
         self._loop_available_usd = None
         self._loop_available_doge = None
         self._loop_dust_dividend = None
+        self._loop_b_side_base = None
         self._loop_effective_layers = None
         # Sync capital ledger with fresh Kraken balance
         bal = self._safe_balance()
@@ -1623,6 +1653,7 @@ class BotRuntime:
         self._loop_available_usd = None
         self._loop_available_doge = None
         self._loop_dust_dividend = None
+        self._loop_b_side_base = None
         self._loop_effective_layers = None
         self.ledger.clear()
 
@@ -7751,6 +7782,10 @@ class BotRuntime:
                     "current_dividend_usd": dust_dividend_usd,
                     "lifetime_absorbed_usd": float(self._dust_last_absorbed_usd),
                     "available_usd": dust_available_usd,
+                },
+                "b_side_sizing": {
+                    "base_usd": float(_bsb) if (_bsb := getattr(self, "_loop_b_side_base", None)) is not None else None,
+                    "slot_count": len(self.slots),
                 },
                 "regime_directional": regime_directional,
                 "ai_regime_advisor": ai_regime_advisor,

@@ -833,7 +833,8 @@ class BotEventLogTests(unittest.TestCase):
 
         self.assertAlmostEqual(out, 0.5, places=8)
 
-    def test_dust_bump_capped(self):
+    def test_b_side_account_aware_sizing(self):
+        """B-side uses available_usd / slot_count instead of per-slot profit compounding."""
         rt = bot.BotRuntime()
         slot = bot.SlotRuntime(
             slot_id=0,
@@ -842,8 +843,7 @@ class BotEventLogTests(unittest.TestCase):
         rt.slots = {0: slot}
         rt._loop_available_usd = 7.0
         rt._loop_dust_dividend = None
-        rt._dust_sweep_enabled = True
-        rt._dust_max_bump_pct = 25.0
+        rt._loop_b_side_base = None
 
         with mock.patch.object(config, "ORDER_SIZE_USD", 2.0):
             with mock.patch.object(config, "REBALANCE_ENABLED", False):
@@ -851,7 +851,8 @@ class BotEventLogTests(unittest.TestCase):
                     with mock.patch.object(rt, "_layer_mark_price", return_value=0.1):
                         out = rt._slot_order_size_usd(slot, trade_id="B")
 
-        self.assertAlmostEqual(out, 2.5, places=8)
+        # max(ORDER_SIZE_USD, available / slots) = max(2.0, 7.0/1) = 7.0
+        self.assertAlmostEqual(out, 7.0, places=8)
 
     def test_dust_disabled(self):
         rt = bot.BotRuntime()
@@ -871,7 +872,9 @@ class BotEventLogTests(unittest.TestCase):
                         out = rt._slot_order_size_usd(slot, trade_id="B")
                         dividend = rt._compute_dust_dividend()
 
-        self.assertAlmostEqual(out, 2.0, places=8)
+        # B-side still uses account-aware base even with dust disabled.
+        # max(2.0, 7.0/1) = 7.0
+        self.assertAlmostEqual(out, 7.0, places=8)
         self.assertGreater(dividend, 0.0)
 
     def test_dust_below_threshold(self):
@@ -894,7 +897,8 @@ class BotEventLogTests(unittest.TestCase):
                         dividend = rt._compute_dust_dividend()
 
         self.assertAlmostEqual(dividend, 0.0, places=8)
-        self.assertAlmostEqual(out, 2.0, places=8)
+        # B-side: max(2.0, 2.3/1) = 2.3
+        self.assertAlmostEqual(out, 2.3, places=8)
 
     def test_dust_no_buy_slots(self):
         rt = bot.BotRuntime()
@@ -949,9 +953,10 @@ class BotEventLogTests(unittest.TestCase):
                         with mock.patch.object(rt, "_current_regime_id", return_value=2):
                             out = rt._slot_order_size_usd(slot, trade_id="B")
 
-        self.assertAlmostEqual(out, 5.0, places=8)
+        # B-side base = max(2.0, 10.0/1) = 10.0, throughput returns 4.0, no dust bump
+        self.assertAlmostEqual(out, 4.0, places=8)
         self.assertIn(
-            mock.call(2.0, regime_label="bullish", trade_id="B"),
+            mock.call(10.0, regime_label="bullish", trade_id="B"),
             rt._throughput.size_for_slot.call_args_list,
         )
 
@@ -976,7 +981,9 @@ class BotEventLogTests(unittest.TestCase):
                             with mock.patch.object(rt, "_layer_mark_price", return_value=0.1):
                                 out = rt._slot_order_size_usd(slot, trade_id="B")
 
-        self.assertAlmostEqual(out, 2.5, places=8)
+        # B-side base = max(2.0, 3.0/1) = 3.0, rebalancer 1.5x = 4.5,
+        # fund guard caps at max(3.0, 3.0-3.0) = 3.0
+        self.assertAlmostEqual(out, 3.0, places=8)
 
     @mock.patch("supabase_store.save_fill")
     def test_replay_missed_fills_aggregates_and_applies_once(self, _save_fill):
