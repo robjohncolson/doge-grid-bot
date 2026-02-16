@@ -772,10 +772,10 @@ class BotEventLogTests(unittest.TestCase):
         self.assertAlmostEqual(float(cfg_active.entry_pct_a), 0.525)
         self.assertAlmostEqual(float(cfg_active.entry_pct_b), 0.245)
 
-    def test_slot_order_size_usd_applies_kelly_multiplier(self):
+    def test_slot_order_size_usd_applies_throughput_multiplier(self):
         rt = bot.BotRuntime()
-        rt._kelly = mock.Mock()
-        rt._kelly.size_for_slot.return_value = (3.5, "kelly_aggregate")
+        rt._throughput = mock.Mock()
+        rt._throughput.size_for_slot.return_value = (3.5, "tp_aggregate")
         slot = bot.SlotRuntime(
             slot_id=0,
             state=sm.PairState(
@@ -793,7 +793,7 @@ class BotEventLogTests(unittest.TestCase):
                             out = rt._slot_order_size_usd(slot, trade_id="A")
 
         self.assertAlmostEqual(out, 3.5)
-        rt._kelly.size_for_slot.assert_called_once_with(2.0, regime_label="bullish")
+        rt._throughput.size_for_slot.assert_called_once_with(2.0, regime_label="bullish", trade_id="A")
 
     def test_dust_dividend_zero_when_no_surplus(self):
         rt = bot.BotRuntime()
@@ -928,10 +928,10 @@ class BotEventLogTests(unittest.TestCase):
 
         self.assertAlmostEqual(out, 0.0, places=8)
 
-    def test_dust_interacts_with_kelly(self):
+    def test_dust_interacts_with_throughput(self):
         rt = bot.BotRuntime()
-        rt._kelly = mock.Mock()
-        rt._kelly.size_for_slot.return_value = (4.0, "kelly_aggregate")
+        rt._throughput = mock.Mock()
+        rt._throughput.size_for_slot.return_value = (4.0, "tp_aggregate")
         slot = bot.SlotRuntime(
             slot_id=0,
             state=sm.PairState(market_price=0.1, now=1000.0, total_profit=0.0),
@@ -950,6 +950,10 @@ class BotEventLogTests(unittest.TestCase):
                             out = rt._slot_order_size_usd(slot, trade_id="B")
 
         self.assertAlmostEqual(out, 5.0, places=8)
+        self.assertIn(
+            mock.call(2.0, regime_label="bullish", trade_id="B"),
+            rt._throughput.size_for_slot.call_args_list,
+        )
 
     def test_dust_fund_guard_clamp(self):
         rt = bot.BotRuntime()

@@ -532,29 +532,39 @@ CONSENSUS_15M_WEIGHT: float = _env("CONSENSUS_15M_WEIGHT", 0.7, float)
 CONSENSUS_DAMPEN_FACTOR: float = _env("CONSENSUS_DAMPEN_FACTOR", 0.5, float)
 
 # ---------------------------------------------------------------------------
-# Kelly criterion position sizing (advisory sizing layer)
+# Throughput sizer (fill-time-based advisory sizing layer)
 # ---------------------------------------------------------------------------
 
 # Master toggle: when disabled, runtime sizing is unchanged.
+TP_ENABLED: bool = _env("TP_ENABLED", False, bool)
+# Rolling window of completed cycles used to compute throughput statistics.
+TP_LOOKBACK_CYCLES: int = _env("TP_LOOKBACK_CYCLES", 500, int)
+# Global sample gate before throughput sizer activates.
+TP_MIN_SAMPLES: int = _env("TP_MIN_SAMPLES", 20, int)
+# Per regime x side sample gate before bucket-specific sizing is used.
+TP_MIN_SAMPLES_PER_BUCKET: int = _env("TP_MIN_SAMPLES_PER_BUCKET", 10, int)
+# Bucket sample count where confidence blending reaches 1.0.
+TP_FULL_CONFIDENCE_SAMPLES: int = _env("TP_FULL_CONFIDENCE_SAMPLES", 50, int)
+# Lower/upper multiplier bounds for throughput sizing.
+TP_FLOOR_MULT: float = _env("TP_FLOOR_MULT", 0.5, float)
+TP_CEILING_MULT: float = _env("TP_CEILING_MULT", 2.0, float)
+# Weight for right-censored open exits in fill-time distribution.
+TP_CENSORED_WEIGHT: float = _env("TP_CENSORED_WEIGHT", 0.5, float)
+# Age-pressure throttle controls.
+TP_AGE_PRESSURE_TRIGGER: float = _env("TP_AGE_PRESSURE_TRIGGER", 1.5, float)
+TP_AGE_PRESSURE_SENSITIVITY: float = _env("TP_AGE_PRESSURE_SENSITIVITY", 0.5, float)
+TP_AGE_PRESSURE_FLOOR: float = _env("TP_AGE_PRESSURE_FLOOR", 0.3, float)
+# Capital utilization penalty controls.
+TP_UTIL_THRESHOLD: float = _env("TP_UTIL_THRESHOLD", 0.7, float)
+TP_UTIL_SENSITIVITY: float = _env("TP_UTIL_SENSITIVITY", 0.8, float)
+TP_UTIL_FLOOR: float = _env("TP_UTIL_FLOOR", 0.4, float)
+# Optional recency weighting on completed cycle stats.
+TP_RECENCY_HALFLIFE: int = _env("TP_RECENCY_HALFLIFE", 100, int)
+# Emit throughput summary logs at update cadence.
+TP_LOG_UPDATES: bool = _env("TP_LOG_UPDATES", True, bool)
+
+# Legacy Kelly toggle retained for backward compatibility only (dead config).
 KELLY_ENABLED: bool = _env("KELLY_ENABLED", False, bool)
-# Fractional Kelly multiplier (0.25 = quarter Kelly).
-KELLY_FRACTION: float = _env("KELLY_FRACTION", 0.25, float)
-# Global sample gate before Kelly activates.
-KELLY_MIN_SAMPLES: int = _env("KELLY_MIN_SAMPLES", 30, int)
-# Per-regime sample gate before regime-specific Kelly is used.
-KELLY_MIN_REGIME_SAMPLES: int = _env("KELLY_MIN_REGIME_SAMPLES", 15, int)
-# Rolling window size for cycle history used in Kelly computation.
-KELLY_LOOKBACK: int = _env("KELLY_LOOKBACK", 500, int)
-# Lower/upper bounds for Kelly sizing multiplier.
-KELLY_FLOOR_MULT: float = _env("KELLY_FLOOR_MULT", 0.5, float)
-KELLY_CEILING_MULT: float = _env("KELLY_CEILING_MULT", 2.0, float)
-# Multiplier used when Kelly detects no edge (still clamped by floor/ceiling).
-KELLY_NEGATIVE_EDGE_MULT: float = _env("KELLY_NEGATIVE_EDGE_MULT", 0.5, float)
-# Recency weighting controls.
-KELLY_RECENCY_WEIGHTING: bool = _env("KELLY_RECENCY_WEIGHTING", True, bool)
-KELLY_RECENCY_HALFLIFE: int = _env("KELLY_RECENCY_HALFLIFE", 100, int)
-# Emit Kelly summary logs at update cadence.
-KELLY_LOG_UPDATES: bool = _env("KELLY_LOG_UPDATES", True, bool)
 
 # ---------------------------------------------------------------------------
 # Directional regime controls (Phase 0 shadow mode defaults)

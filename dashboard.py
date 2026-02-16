@@ -475,12 +475,13 @@ DASHBOARD_HTML = """<!doctype html>
           </div>
         </div>
 
-        <h3 style=\"margin-top:14px\">Kelly Sizing</h3>
-        <div class=\"row\"><span class=\"k\">Status</span><span id=\"kellyStatus\" class=\"v\"></span></div>
-        <div class=\"row\"><span class=\"k\">Active Regime</span><span id=\"kellyActive\" class=\"v\"></span></div>
-        <div class=\"row\"><span class=\"k\">Fraction</span><span id=\"kellyFraction\" class=\"v\"></span></div>
-        <div class=\"row\"><span class=\"k\">Samples</span><span id=\"kellySamples\" class=\"v\"></span></div>
-        <div id=\"kellyBuckets\" class=\"tiny\"></div>
+        <h3 style=\"margin-top:14px\">Throughput Sizer</h3>
+        <div class=\"row\"><span class=\"k\">Status</span><span id=\"throughputStatus\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Active Regime</span><span id=\"throughputActive\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Samples</span><span id=\"throughputSamples\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Age Pressure</span><span id=\"throughputAgePressure\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Utilization</span><span id=\"throughputUtilization\" class=\"v\"></span></div>
+        <div id=\"throughputBuckets\" class=\"tiny\"></div>
 
         <h3 style=\"margin-top:14px\">Directional Regime</h3>
         <div class=\"row\"><span class=\"k\">Tier</span><span id=\"regTier\" class=\"v\"></span></div>
@@ -1686,47 +1687,59 @@ DASHBOARD_HTML = """<!doctype html>
       const suggestedTtl = ai.suggested_ttl_sec || defaultTtlSec;
       aiApplyBtn.textContent = `Apply Override (${fmtAgeSeconds(suggestedTtl)})`;
 
-      const kelly = s.kelly || { enabled: false };
-      const kellyStatusEl = document.getElementById('kellyStatus');
-      const kellyEnabled = Boolean(kelly.enabled);
-      const kellyAggregate = (kelly && typeof kelly.aggregate === 'object') ? kelly.aggregate : null;
-      const kellyActive = Boolean(kellyAggregate && kellyAggregate.sufficient_data);
-      if (!kellyEnabled) {
-        kellyStatusEl.textContent = 'OFF';
-        kellyStatusEl.style.color = '';
-      } else if (kellyActive) {
-        kellyStatusEl.textContent = 'ACTIVE';
-        kellyStatusEl.style.color = 'var(--good)';
+      const throughput = s.throughput_sizer || { enabled: false };
+      const throughputStatusEl = document.getElementById('throughputStatus');
+      const throughputEnabled = Boolean(throughput.enabled);
+      const throughputAggregate = (throughput && typeof throughput.aggregate === 'object') ? throughput.aggregate : null;
+      const throughputActive = Boolean(throughputAggregate && throughputAggregate.sufficient_data);
+      if (!throughputEnabled) {
+        throughputStatusEl.textContent = 'OFF';
+        throughputStatusEl.style.color = '';
+      } else if (throughputActive) {
+        throughputStatusEl.textContent = 'ACTIVE';
+        throughputStatusEl.style.color = 'var(--good)';
       } else {
-        kellyStatusEl.textContent = 'WARMING';
-        kellyStatusEl.style.color = 'var(--warn)';
+        throughputStatusEl.textContent = 'WARMING';
+        throughputStatusEl.style.color = 'var(--warn)';
       }
-      document.getElementById('kellyActive').textContent = String(kelly.active_regime || '-');
-      const kellyFraction = Number(kelly.kelly_fraction || 0);
-      document.getElementById('kellyFraction').textContent =
-        kellyEnabled ? `${fmt(kellyFraction * 100, 1)}%` : '-';
-      document.getElementById('kellySamples').textContent =
-        kellyEnabled ? String(Number(kelly.last_update_n || 0)) : '-';
+      document.getElementById('throughputActive').textContent = String(throughput.active_regime || '-');
+      document.getElementById('throughputSamples').textContent =
+        throughputEnabled ? String(Number(throughput.last_update_n || 0)) : '-';
+      const agePressure = Number(throughput.age_pressure || 1.0);
+      document.getElementById('throughputAgePressure').textContent =
+        throughputEnabled ? `${fmt(agePressure * 100, 1)}%` : '-';
+      const utilRatio = Number(throughput.util_ratio || 0.0);
+      document.getElementById('throughputUtilization').textContent =
+        throughputEnabled ? `${fmt(utilRatio * 100, 1)}%` : '-';
 
-      const kellyBucketNames = ['aggregate', 'bullish', 'ranging', 'bearish'];
-      const kellyBits = [];
-      for (const name of kellyBucketNames) {
-        const row = (kelly && typeof kelly[name] === 'object') ? kelly[name] : null;
+      const throughputBucketNames = [
+        'aggregate',
+        'bearish_A',
+        'bearish_B',
+        'ranging_A',
+        'ranging_B',
+        'bullish_A',
+        'bullish_B',
+      ];
+      const throughputBits = [];
+      for (const name of throughputBucketNames) {
+        const row = (throughput && typeof throughput[name] === 'object') ? throughput[name] : null;
         if (!row) {
-          kellyBits.push(`${name}: no_data`);
+          throughputBits.push(`${name}: no_data`);
           continue;
         }
-        const n = Number(row.n_total || 0);
+        const n = Number(row.n_completed || 0);
         if (Boolean(row.sufficient_data)) {
-          const mult = row.multiplier;
-          const edge = row.edge;
-          kellyBits.push(`${name}: m=${fmt(mult, 3)} edge=${fmt(edge, 3)} n=${n}`);
+          const mult = Number(row.multiplier || 1.0);
+          const medianFillSec = Number(row.median_fill_sec || 0.0);
+          const fillText = medianFillSec > 0 ? fmtAgeSeconds(medianFillSec) : '-';
+          throughputBits.push(`${name}: x${fmt(mult, 2)} (${fillText})`);
         } else {
-          kellyBits.push(`${name}: ${String(row.reason || 'insufficient_samples')} n=${n}`);
+          throughputBits.push(`${name}: ${String(row.reason || 'insufficient_samples')} n=${n}`);
         }
       }
-      document.getElementById('kellyBuckets').textContent =
-        kellyEnabled ? kellyBits.join(' | ') : 'Kelly disabled';
+      document.getElementById('throughputBuckets').textContent =
+        throughputEnabled ? throughputBits.join(' | ') : 'Throughput disabled';
 
       // --- Directional Regime ---
       const reg = s.regime_directional || {};

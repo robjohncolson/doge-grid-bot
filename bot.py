@@ -30,7 +30,7 @@ from typing import Any
 import config
 import dashboard
 import kraken_client
-from kelly_sizer import KellyConfig, KellySizer
+from throughput_sizer import ThroughputConfig, ThroughputSizer
 import notifier
 import ai_advisor
 import state_machine as sm
@@ -400,20 +400,26 @@ class BotRuntime:
         self._sticky_release_last_at: float = 0.0
         self._release_recon_blocked: bool = False
         self._release_recon_blocked_reason: str = ""
-        self._kelly: KellySizer | None = None
-        if bool(getattr(config, "KELLY_ENABLED", False)):
-            self._kelly = KellySizer(
-                KellyConfig(
-                    kelly_fraction=float(getattr(config, "KELLY_FRACTION", 0.25)),
-                    min_samples_total=int(getattr(config, "KELLY_MIN_SAMPLES", 30)),
-                    min_samples_per_regime=int(getattr(config, "KELLY_MIN_REGIME_SAMPLES", 15)),
-                    lookback_cycles=int(getattr(config, "KELLY_LOOKBACK", 500)),
-                    kelly_floor_mult=float(getattr(config, "KELLY_FLOOR_MULT", 0.5)),
-                    kelly_ceiling_mult=float(getattr(config, "KELLY_CEILING_MULT", 2.0)),
-                    negative_edge_mult=float(getattr(config, "KELLY_NEGATIVE_EDGE_MULT", 0.5)),
-                    use_recency_weighting=bool(getattr(config, "KELLY_RECENCY_WEIGHTING", True)),
-                    recency_halflife_cycles=int(getattr(config, "KELLY_RECENCY_HALFLIFE", 100)),
-                    log_kelly_updates=bool(getattr(config, "KELLY_LOG_UPDATES", True)),
+        self._throughput: ThroughputSizer | None = None
+        if bool(getattr(config, "TP_ENABLED", False)):
+            self._throughput = ThroughputSizer(
+                ThroughputConfig(
+                    enabled=bool(getattr(config, "TP_ENABLED", False)),
+                    lookback_cycles=int(getattr(config, "TP_LOOKBACK_CYCLES", 500)),
+                    min_samples=int(getattr(config, "TP_MIN_SAMPLES", 20)),
+                    min_samples_per_bucket=int(getattr(config, "TP_MIN_SAMPLES_PER_BUCKET", 10)),
+                    full_confidence_samples=int(getattr(config, "TP_FULL_CONFIDENCE_SAMPLES", 50)),
+                    floor_mult=float(getattr(config, "TP_FLOOR_MULT", 0.5)),
+                    ceiling_mult=float(getattr(config, "TP_CEILING_MULT", 2.0)),
+                    censored_weight=float(getattr(config, "TP_CENSORED_WEIGHT", 0.5)),
+                    age_pressure_trigger=float(getattr(config, "TP_AGE_PRESSURE_TRIGGER", 1.5)),
+                    age_pressure_sensitivity=float(getattr(config, "TP_AGE_PRESSURE_SENSITIVITY", 0.5)),
+                    age_pressure_floor=float(getattr(config, "TP_AGE_PRESSURE_FLOOR", 0.3)),
+                    util_threshold=float(getattr(config, "TP_UTIL_THRESHOLD", 0.7)),
+                    util_sensitivity=float(getattr(config, "TP_UTIL_SENSITIVITY", 0.8)),
+                    util_floor=float(getattr(config, "TP_UTIL_FLOOR", 0.4)),
+                    recency_halflife=int(getattr(config, "TP_RECENCY_HALFLIFE", 100)),
+                    log_updates=bool(getattr(config, "TP_LOG_UPDATES", True)),
                 )
             )
         self._init_hmm_runtime()
@@ -797,12 +803,13 @@ class BotRuntime:
         if layer_price > 0:
             layer_usd = effective_layers * max(0.0, float(config.CAPITAL_LAYER_DOGE_PER_ORDER)) * layer_price
         base_with_layers = max(base, base + layer_usd)
-        if self._kelly is not None:
-            kelly_usd, _ = self._kelly.size_for_slot(
+        if self._throughput is not None:
+            throughput_usd, _ = self._throughput.size_for_slot(
                 base_with_layers,
-                regime_label=self._kelly_regime_label(self._current_regime_id()),
+                regime_label=self._regime_label(self._current_regime_id()),
+                trade_id=trade_id,
             )
-            base_with_layers = max(0.0, float(kelly_usd))
+            base_with_layers = max(0.0, float(throughput_usd))
         dust_bump = self._dust_bump_usd(slot, trade_id=trade_id)
         base_with_layers = max(0.0, base_with_layers + dust_bump)
         if trade_id is None or not bool(config.REBALANCE_ENABLED):
@@ -1274,8 +1281,8 @@ class BotRuntime:
             "dust_last_absorbed_usd": float(self._dust_last_absorbed_usd),
             "dust_last_dividend_usd": float(self._dust_last_dividend_usd),
         }
-        if self._kelly is not None:
-            snap["kelly_state"] = self._kelly.snapshot_state()
+        if self._throughput is not None:
+            snap["throughput_sizer_state"] = self._throughput.snapshot_state()
         snap.update(self._snapshot_hmm_state())
         return snap
 
@@ -1544,8 +1551,8 @@ class BotRuntime:
             self._rebalancer_sign_flip_history = deque(sorted(cleaned_hist)[-20:])
             self._restore_hmm_snapshot(snap)
             self._hmm_consensus = self._compute_hmm_consensus()
-            if self._kelly is not None:
-                self._kelly.restore_state(snap.get("kelly_state", {}))
+            if self._throughput is not None:
+                self._throughput.restore_state(snap.get("throughput_sizer_state", {}))
 
             self.slots = {}
             slot_aliases = snap.get("slot_aliases", {})
@@ -2093,29 +2100,68 @@ class BotRuntime:
         return regime_id if regime_id in (0, 1, 2) else None
 
     @staticmethod
-    def _kelly_regime_label(regime_id: int | None) -> str:
+    def _regime_label(regime_id: int | None) -> str:
         return {0: "bearish", 1: "ranging", 2: "bullish"}.get(regime_id, "ranging")
 
-    def _collect_kelly_cycles(self) -> list[dict[str, Any]]:
+    def _collect_throughput_cycles(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for slot in self.slots.values():
             for c in slot.state.completed_cycles:
                 rows.append(
                     {
-                        "net_profit": float(c.net_profit),
-                        "regime_at_entry": c.regime_at_entry,
+                        "entry_time": float(c.entry_time or 0.0),
                         "exit_time": float(c.exit_time or 0.0),
+                        "trade_id": str(c.trade_id or ""),
+                        "net_profit": float(c.net_profit),
+                        "volume": float(c.volume or 0.0),
+                        "regime_at_entry": c.regime_at_entry,
                     }
                 )
         return rows
 
-    def _update_kelly(self) -> None:
-        if self._kelly is None:
+    def _collect_open_exits(self, now_ts: float | None = None) -> list[dict[str, Any]]:
+        now = float(now_ts if now_ts is not None else _now())
+        rows: list[dict[str, Any]] = []
+        for slot in self.slots.values():
+            for o in slot.state.orders:
+                if o.role != "exit":
+                    continue
+                entry_filled_at = float(o.entry_filled_at or 0.0)
+                if entry_filled_at <= 0.0:
+                    continue
+                rows.append(
+                    {
+                        "regime_at_entry": o.regime_at_entry,
+                        "trade_id": str(o.trade_id or ""),
+                        "age_sec": max(0.0, now - entry_filled_at),
+                        "volume": float(o.volume or 0.0),
+                    }
+                )
+            for r in slot.state.recovery_orders:
+                entry_filled_at = float(r.entry_filled_at or 0.0)
+                if entry_filled_at <= 0.0:
+                    continue
+                rows.append(
+                    {
+                        "regime_at_entry": r.regime_at_entry,
+                        "trade_id": str(r.trade_id or ""),
+                        "age_sec": max(0.0, now - entry_filled_at),
+                        "volume": float(r.volume or 0.0),
+                    }
+                )
+        return rows
+
+    def _update_throughput(self) -> None:
+        if self._throughput is None:
             return
-        rows = self._collect_kelly_cycles()
-        self._kelly.update(
-            rows,
-            regime_label=self._kelly_regime_label(self._current_regime_id()),
+        completed = self._collect_throughput_cycles()
+        open_exits = self._collect_open_exits()
+        _, free_doge = self._available_free_balances(prefer_fresh=False)
+        self._throughput.update(
+            completed,
+            open_exits=open_exits,
+            regime_label=self._regime_label(self._current_regime_id()),
+            free_doge=float(free_doge),
         )
 
     def _hmm_runtime_config(self, *, min_train_samples: int | None = None) -> dict[str, Any]:
@@ -2950,23 +2996,20 @@ class BotRuntime:
             directional_trend = "neutral"
 
         recovery_order_count = sum(len(slot.state.recovery_orders) for slot in self.slots.values())
-        kelly_payload = self._kelly.status_payload() if self._kelly is not None else {}
+        throughput_payload = self._throughput.status_payload() if self._throughput is not None else {}
         bull_edge = 0.0
         bear_edge = 0.0
         range_edge = 0.0
-        if isinstance(kelly_payload, dict):
-            try:
-                bull_edge = float((kelly_payload.get("bullish") or {}).get("edge", 0.0) or 0.0)
-            except Exception:
-                bull_edge = 0.0
-            try:
-                bear_edge = float((kelly_payload.get("bearish") or {}).get("edge", 0.0) or 0.0)
-            except Exception:
-                bear_edge = 0.0
-            try:
-                range_edge = float((kelly_payload.get("ranging") or {}).get("edge", 0.0) or 0.0)
-            except Exception:
-                range_edge = 0.0
+        if isinstance(throughput_payload, dict):
+            def _bucket_mult(name: str) -> float:
+                try:
+                    return float((throughput_payload.get(name) or {}).get("multiplier", 1.0) or 1.0)
+                except Exception:
+                    return 1.0
+
+            bull_edge = ((_bucket_mult("bullish_A") + _bucket_mult("bullish_B")) * 0.5) - 1.0
+            bear_edge = ((_bucket_mult("bearish_A") + _bucket_mult("bearish_B")) * 0.5) - 1.0
+            range_edge = ((_bucket_mult("ranging_A") + _bucket_mult("ranging_B")) * 0.5) - 1.0
 
         return {
             "hmm_primary": {
@@ -3003,6 +3046,7 @@ class BotRuntime:
                 "recovery_order_count": int(recovery_order_count),
                 "capacity_headroom": float(headroom_pct),
                 "capacity_band": str(capacity.get("status_band") or "normal"),
+                # Backward-compatible key names; values now proxy throughput bias.
                 "kelly_edge_bullish": float(bull_edge),
                 "kelly_edge_bearish": float(bear_edge),
                 "kelly_edge_ranging": float(range_edge),
@@ -3676,7 +3720,7 @@ class BotRuntime:
             "mechanical_direction": str(self._regime_mechanical_direction),
             "override_active": bool(reason == "ai_override"),
         }
-        self._update_kelly()
+        self._update_throughput()
 
     def _apply_tier2_suppression(self, now: float) -> None:
         if not bool(getattr(config, "REGIME_DIRECTIONAL_ENABLED", False)):
@@ -7699,7 +7743,9 @@ class BotRuntime:
                 "hmm_regime": hmm_regime,
                 "hmm_consensus": hmm_consensus,
                 "regime_history_30m": list(self._regime_history_30m),
-                "kelly": (self._kelly.status_payload() if self._kelly is not None else {"enabled": False}),
+                "throughput_sizer": (
+                    self._throughput.status_payload() if self._throughput is not None else {"enabled": False}
+                ),
                 "dust_sweep": {
                     "enabled": bool(self._dust_sweep_enabled),
                     "current_dividend_usd": dust_dividend_usd,
