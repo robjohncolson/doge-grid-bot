@@ -2513,6 +2513,8 @@ class BotRuntime:
         multi_enabled = bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False))
         source_mode = self._hmm_source_mode()
         primary_ready = bool(primary.get("available")) and bool(primary.get("trained"))
+        primary_probs = self._hmm_prob_triplet(primary)
+        secondary_probs = self._hmm_prob_triplet(secondary)
 
         if not primary_ready:
             return {
@@ -2532,6 +2534,11 @@ class BotRuntime:
                 "multi_timeframe": bool(multi_enabled),
                 "primary": primary,
                 "secondary": secondary,
+                "consensus_probabilities": {
+                    "bearish": 0.0,
+                    "ranging": 1.0,
+                    "bullish": 0.0,
+                },
                 "last_update_ts": float(primary.get("last_update_ts", 0.0) or 0.0),
                 "last_train_ts": float(primary.get("last_train_ts", 0.0) or 0.0),
                 "blend_factor": float(primary.get("blend_factor", getattr(config, "HMM_BLEND_WITH_TREND", 0.5))),
@@ -2546,6 +2553,11 @@ class BotRuntime:
                 "multi_timeframe": False,
                 "primary": primary,
                 "secondary": secondary,
+                "consensus_probabilities": {
+                    "bearish": primary_probs[0],
+                    "ranging": primary_probs[1],
+                    "bullish": primary_probs[2],
+                },
                 "effective_regime": str(out.get("regime", "RANGING") or "RANGING"),
                 "effective_confidence": float(out.get("confidence", 0.0) or 0.0),
                 "effective_bias": float(out.get("bias_signal", 0.0) or 0.0),
@@ -2560,6 +2572,11 @@ class BotRuntime:
                 "multi_timeframe": True,
                 "primary": primary,
                 "secondary": secondary,
+                "consensus_probabilities": {
+                    "bearish": primary_probs[0],
+                    "ranging": primary_probs[1],
+                    "bullish": primary_probs[2],
+                },
                 "effective_regime": str(out.get("regime", "RANGING") or "RANGING"),
                 "effective_confidence": float(out.get("confidence", 0.0) or 0.0),
                 "effective_bias": float(out.get("bias_signal", 0.0) or 0.0),
@@ -2583,6 +2600,10 @@ class BotRuntime:
             getattr(config, "CONSENSUS_1M_WEIGHT", 0.3),
             getattr(config, "CONSENSUS_15M_WEIGHT", 0.7),
         )
+        consensus_probs = [
+            w1 * primary_probs[i] + w15 * secondary_probs[i]
+            for i in range(3)
+        ]
 
         agreement = "conflict"
         if regime_1m == regime_15m:
@@ -2610,10 +2631,10 @@ class BotRuntime:
         tier1_conf = max(0.0, min(1.0, float(getattr(config, "REGIME_TIER1_CONFIDENCE", 0.20))))
         if effective_confidence < tier1_conf:
             effective_regime = "RANGING"
-        elif effective_bias > 0:
-            effective_regime = "BULLISH"
-        elif effective_bias < 0:
-            effective_regime = "BEARISH"
+        elif agreement == "full":
+            effective_regime = regime_1m
+        elif agreement == "1m_cooling":
+            effective_regime = regime_15m
         else:
             effective_regime = "RANGING"
 
@@ -2635,6 +2656,11 @@ class BotRuntime:
             "multi_timeframe": True,
             "primary": primary,
             "secondary": secondary,
+            "consensus_probabilities": {
+                "bearish": consensus_probs[0],
+                "ranging": consensus_probs[1],
+                "bullish": consensus_probs[2],
+            },
             "last_update_ts": max(
                 float(primary.get("last_update_ts", 0.0) or 0.0),
                 float(secondary.get("last_update_ts", 0.0) or 0.0),

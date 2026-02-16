@@ -1900,6 +1900,301 @@ class BotEventLogTests(unittest.TestCase):
         self.assertEqual(volumes, [1000.0, 1100.0, 1200.0])
         kraken_mock.assert_not_called()
 
+    def _compute_hmm_consensus_for_test(
+        self,
+        primary,
+        secondary,
+        *,
+        multi_enabled=True,
+        hmm_enabled=True,
+        tier1_conf=0.20,
+        dampen=0.5,
+        w1=0.3,
+        w15=0.7,
+    ):
+        rt = bot.BotRuntime()
+        rt._hmm_state.update(primary)
+        rt._hmm_state_secondary.update(secondary)
+
+        with mock.patch.object(config, "HMM_ENABLED", bool(hmm_enabled)):
+            with mock.patch.object(config, "HMM_MULTI_TIMEFRAME_ENABLED", bool(multi_enabled)):
+                with mock.patch.object(config, "REGIME_TIER1_CONFIDENCE", float(tier1_conf)):
+                    with mock.patch.object(config, "CONSENSUS_DAMPEN_FACTOR", float(dampen)):
+                        with mock.patch.object(config, "CONSENSUS_1M_WEIGHT", float(w1)):
+                            with mock.patch.object(config, "CONSENSUS_15M_WEIGHT", float(w15)):
+                                return rt._compute_hmm_consensus()
+
+    def test_consensus_ranging_with_negative_bias_keeps_ranging_label(self):
+        out = self._compute_hmm_consensus_for_test(
+            primary={
+                "available": True,
+                "trained": True,
+                "regime": "RANGING",
+                "confidence": 0.9884,
+                "bias_signal": 0.011,
+                "probabilities": {"bearish": 0.0003, "ranging": 0.9884, "bullish": 0.0113},
+            },
+            secondary={
+                "available": True,
+                "trained": True,
+                "regime": "RANGING",
+                "confidence": 0.9807,
+                "bias_signal": -0.019,
+                "probabilities": {"bearish": 0.0193, "ranging": 0.9807, "bullish": 0.0},
+            },
+            tier1_conf=0.20,
+            w1=0.3,
+            w15=0.7,
+        )
+
+        self.assertEqual(out["agreement"], "full")
+        self.assertEqual(out["regime"], "RANGING")
+        self.assertAlmostEqual(float(out["bias_signal"]), -0.01, places=6)
+
+    def test_consensus_ranging_with_positive_bias_keeps_ranging_label(self):
+        out = self._compute_hmm_consensus_for_test(
+            primary={
+                "available": True,
+                "trained": True,
+                "regime": "RANGING",
+                "confidence": 0.95,
+                "bias_signal": 0.03,
+                "probabilities": {"bearish": 0.01, "ranging": 0.98, "bullish": 0.01},
+            },
+            secondary={
+                "available": True,
+                "trained": True,
+                "regime": "RANGING",
+                "confidence": 0.94,
+                "bias_signal": 0.02,
+                "probabilities": {"bearish": 0.01, "ranging": 0.97, "bullish": 0.02},
+            },
+            tier1_conf=0.20,
+            w1=0.3,
+            w15=0.7,
+        )
+
+        self.assertEqual(out["agreement"], "full")
+        self.assertEqual(out["regime"], "RANGING")
+        self.assertAlmostEqual(float(out["bias_signal"]), 0.023, places=6)
+
+    def test_consensus_full_agreement_bullish_unchanged(self):
+        out = self._compute_hmm_consensus_for_test(
+            primary={
+                "available": True,
+                "trained": True,
+                "regime": "BULLISH",
+                "confidence": 0.70,
+                "bias_signal": 0.40,
+                "probabilities": {"bearish": 0.10, "ranging": 0.20, "bullish": 0.70},
+            },
+            secondary={
+                "available": True,
+                "trained": True,
+                "regime": "BULLISH",
+                "confidence": 0.80,
+                "bias_signal": 0.30,
+                "probabilities": {"bearish": 0.05, "ranging": 0.15, "bullish": 0.80},
+            },
+            tier1_conf=0.20,
+        )
+
+        self.assertEqual(out["agreement"], "full")
+        self.assertEqual(out["regime"], "BULLISH")
+
+    def test_consensus_full_agreement_bearish_unchanged(self):
+        out = self._compute_hmm_consensus_for_test(
+            primary={
+                "available": True,
+                "trained": True,
+                "regime": "BEARISH",
+                "confidence": 0.78,
+                "bias_signal": -0.30,
+                "probabilities": {"bearish": 0.80, "ranging": 0.15, "bullish": 0.05},
+            },
+            secondary={
+                "available": True,
+                "trained": True,
+                "regime": "BEARISH",
+                "confidence": 0.72,
+                "bias_signal": -0.50,
+                "probabilities": {"bearish": 0.75, "ranging": 0.20, "bullish": 0.05},
+            },
+            tier1_conf=0.20,
+        )
+
+        self.assertEqual(out["agreement"], "full")
+        self.assertEqual(out["regime"], "BEARISH")
+
+    def test_consensus_1m_cooling_uses_15m_label(self):
+        out = self._compute_hmm_consensus_for_test(
+            primary={
+                "available": True,
+                "trained": True,
+                "regime": "RANGING",
+                "confidence": 0.90,
+                "bias_signal": 0.02,
+                "probabilities": {"bearish": 0.05, "ranging": 0.90, "bullish": 0.05},
+            },
+            secondary={
+                "available": True,
+                "trained": True,
+                "regime": "BEARISH",
+                "confidence": 0.80,
+                "bias_signal": -0.60,
+                "probabilities": {"bearish": 0.80, "ranging": 0.15, "bullish": 0.05},
+            },
+            tier1_conf=0.20,
+            dampen=0.5,
+        )
+
+        self.assertEqual(out["agreement"], "1m_cooling")
+        self.assertEqual(out["regime"], "BEARISH")
+        self.assertAlmostEqual(float(out["confidence"]), 0.40, places=6)
+
+    def test_consensus_conflict_gives_ranging(self):
+        out = self._compute_hmm_consensus_for_test(
+            primary={
+                "available": True,
+                "trained": True,
+                "regime": "BULLISH",
+                "confidence": 0.85,
+                "bias_signal": 0.60,
+                "probabilities": {"bearish": 0.05, "ranging": 0.15, "bullish": 0.80},
+            },
+            secondary={
+                "available": True,
+                "trained": True,
+                "regime": "BEARISH",
+                "confidence": 0.82,
+                "bias_signal": -0.50,
+                "probabilities": {"bearish": 0.78, "ranging": 0.17, "bullish": 0.05},
+            },
+            tier1_conf=0.20,
+        )
+
+        self.assertEqual(out["agreement"], "conflict")
+        self.assertEqual(out["regime"], "RANGING")
+        self.assertAlmostEqual(float(out["confidence"]), 0.0, places=6)
+
+    def test_consensus_low_confidence_gives_ranging(self):
+        out = self._compute_hmm_consensus_for_test(
+            primary={
+                "available": True,
+                "trained": True,
+                "regime": "BULLISH",
+                "confidence": 0.12,
+                "bias_signal": 0.50,
+                "probabilities": {"bearish": 0.10, "ranging": 0.20, "bullish": 0.70},
+            },
+            secondary={
+                "available": True,
+                "trained": True,
+                "regime": "BULLISH",
+                "confidence": 0.15,
+                "bias_signal": 0.40,
+                "probabilities": {"bearish": 0.12, "ranging": 0.20, "bullish": 0.68},
+            },
+            tier1_conf=0.20,
+        )
+
+        self.assertEqual(out["agreement"], "full")
+        self.assertEqual(out["regime"], "RANGING")
+        self.assertLess(float(out["confidence"]), 0.20)
+
+    def test_consensus_probabilities_blended(self):
+        out = self._compute_hmm_consensus_for_test(
+            primary={
+                "available": True,
+                "trained": True,
+                "regime": "BULLISH",
+                "confidence": 0.85,
+                "bias_signal": 0.40,
+                "probabilities": {"bearish": 0.20, "ranging": 0.50, "bullish": 0.30},
+            },
+            secondary={
+                "available": True,
+                "trained": True,
+                "regime": "BULLISH",
+                "confidence": 0.90,
+                "bias_signal": 0.60,
+                "probabilities": {"bearish": 0.40, "ranging": 0.10, "bullish": 0.50},
+            },
+            w1=0.25,
+            w15=0.75,
+        )
+
+        probs = out["consensus_probabilities"]
+        self.assertAlmostEqual(float(probs["bearish"]), 0.35, places=6)
+        self.assertAlmostEqual(float(probs["ranging"]), 0.20, places=6)
+        self.assertAlmostEqual(float(probs["bullish"]), 0.45, places=6)
+
+    def test_consensus_probabilities_primary_only_uses_primary_probs(self):
+        out = self._compute_hmm_consensus_for_test(
+            primary={
+                "available": True,
+                "trained": True,
+                "regime": "BULLISH",
+                "confidence": 0.65,
+                "bias_signal": 0.32,
+                "probabilities": {"bearish": 0.20, "ranging": 0.10, "bullish": 0.70},
+            },
+            secondary={
+                "available": True,
+                "trained": True,
+                "regime": "BEARISH",
+                "confidence": 0.70,
+                "bias_signal": -0.22,
+                "probabilities": {"bearish": 0.70, "ranging": 0.20, "bullish": 0.10},
+            },
+            multi_enabled=False,
+        )
+
+        self.assertEqual(out["agreement"], "primary_only")
+        probs = out["consensus_probabilities"]
+        self.assertAlmostEqual(float(probs["bearish"]), 0.20, places=6)
+        self.assertAlmostEqual(float(probs["ranging"]), 0.10, places=6)
+        self.assertAlmostEqual(float(probs["bullish"]), 0.70, places=6)
+
+    def test_consensus_probabilities_primary_untrained_defaults_to_ranging(self):
+        out = self._compute_hmm_consensus_for_test(
+            primary={
+                "available": False,
+                "trained": False,
+            },
+            secondary={
+                "available": True,
+                "trained": True,
+                "regime": "BULLISH",
+                "confidence": 0.90,
+                "bias_signal": 0.80,
+                "probabilities": {"bearish": 0.10, "ranging": 0.10, "bullish": 0.80},
+            },
+            multi_enabled=True,
+        )
+
+        self.assertEqual(out["agreement"], "primary_untrained")
+        probs = out["consensus_probabilities"]
+        self.assertAlmostEqual(float(probs["bearish"]), 0.0, places=6)
+        self.assertAlmostEqual(float(probs["ranging"]), 1.0, places=6)
+        self.assertAlmostEqual(float(probs["bullish"]), 0.0, places=6)
+
+    def test_hmm_prob_triplet_dict_format(self):
+        out = bot.BotRuntime._hmm_prob_triplet({
+            "probabilities": {"bearish": "0.11", "ranging": 0.77, "bullish": 0.12},
+        })
+        self.assertEqual(out, [0.11, 0.77, 0.12])
+
+    def test_hmm_prob_triplet_list_format(self):
+        out = bot.BotRuntime._hmm_prob_triplet({
+            "probabilities": [0.21, 0.55, 0.24],
+        })
+        self.assertEqual(out, [0.21, 0.55, 0.24])
+
+    def test_hmm_prob_triplet_missing_defaults_to_ranging(self):
+        out = bot.BotRuntime._hmm_prob_triplet({})
+        self.assertEqual(out, [0.0, 1.0, 0.0])
+
     def test_status_payload_exposes_hmm_data_pipeline_block(self):
         rt = bot.BotRuntime()
         rt.last_price = 0.1
