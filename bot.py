@@ -32,6 +32,7 @@ import dashboard
 import kraken_client
 from kelly_sizer import KellyConfig, KellySizer
 import notifier
+import ai_advisor
 import state_machine as sm
 import supabase_store
 
@@ -300,6 +301,8 @@ class BotRuntime:
         self._hmm_detector_secondary: Any = None
         self._hmm_module: Any = None
         self._hmm_numpy: Any = None
+        self._regime_history_30m: deque[dict[str, Any]] = deque()
+        self._regime_history_window_sec: float = 1800.0
         self._hmm_state: dict[str, Any] = self._hmm_default_state()
         self._hmm_state_secondary: dict[str, Any] = self._hmm_default_state(
             enabled=bool(getattr(config, "HMM_ENABLED", False))
@@ -312,6 +315,12 @@ class BotRuntime:
             "source_mode": "primary",
             "multi_timeframe": False,
         })
+        self._hmm_training_depth: dict[str, Any] = self._hmm_training_depth_default(
+            state_key="primary"
+        )
+        self._hmm_training_depth_secondary: dict[str, Any] = self._hmm_training_depth_default(
+            state_key="secondary"
+        )
         self._hmm_last_train_attempt_ts: float = 0.0
         self._hmm_last_train_attempt_ts_secondary: float = 0.0
         self._hmm_backfill_last_at: float = 0.0
@@ -330,13 +339,37 @@ class BotRuntime:
         self._regime_tier2_last_downgrade_at: float = 0.0
         self._regime_cooldown_suppressed_side: str | None = None
         self._regime_tier_history: list[dict[str, Any]] = []
+        self._regime_mechanical_tier: int = 0
+        self._regime_mechanical_direction: str = "symmetric"
+        self._regime_mechanical_since: float = 0.0
+        self._regime_mechanical_tier_entered_at: float = 0.0
+        self._regime_mechanical_tier2_last_downgrade_at: float = 0.0
+        self._ai_regime_last_run_ts: float = 0.0
+        self._ai_regime_opinion: dict[str, Any] = {}
+        self._ai_regime_history: deque[dict[str, Any]] = deque()
+        self._ai_regime_dismissed: bool = False
+        self._ai_regime_thread_alive: bool = False
+        self._ai_regime_pending_result: dict[str, Any] | None = None
+        self._ai_regime_last_mechanical_tier: int = 0
+        self._ai_regime_last_mechanical_direction: str = "symmetric"
+        self._ai_regime_last_consensus_agreement: str = "primary_only"
+        self._ai_regime_last_trigger_reason: str = ""
+        self._ai_override_tier: int | None = None
+        self._ai_override_direction: str | None = None
+        self._ai_override_until: float | None = None
+        self._ai_override_applied_at: float | None = None
+        self._ai_override_source_conviction: int | None = None
         self._regime_shadow_state: dict[str, Any] = {
             "enabled": False,
             "shadow_enabled": False,
             "actuation_enabled": False,
             "tier": 0,
             "regime": "RANGING",
-            "confidence": 0.0,
+            "confidence": 0.0,  # effective confidence used for tier gating
+            "confidence_raw": 0.0,  # raw HMM confidence from detector/consensus
+            "confidence_effective": 0.0,
+            "confidence_modifier": 1.0,
+            "confidence_modifier_source": "none",
             "bias_signal": 0.0,
             "abs_bias": 0.0,
             "suppressed_side": None,
@@ -346,6 +379,9 @@ class BotRuntime:
             "hmm_ready": False,
             "last_eval_ts": 0.0,
             "reason": "init",
+            "mechanical_tier": 0,
+            "mechanical_direction": "symmetric",
+            "override_active": False,
         }
 
         # Daily loss lock (aggregate bot-level, UTC day).
@@ -1121,6 +1157,18 @@ class BotRuntime:
             "regime_cooldown_suppressed_side": self._regime_cooldown_suppressed_side,
             "regime_tier_history": list(self._regime_tier_history[-20:]),
             "regime_shadow_state": dict(self._regime_shadow_state or {}),
+            "regime_mechanical_tier": int(self._regime_mechanical_tier),
+            "regime_mechanical_direction": str(self._regime_mechanical_direction),
+            "regime_mechanical_since": float(self._regime_mechanical_since),
+            "regime_mechanical_tier_entered_at": float(self._regime_mechanical_tier_entered_at),
+            "regime_mechanical_tier2_last_downgrade_at": float(
+                self._regime_mechanical_tier2_last_downgrade_at
+            ),
+            "ai_override_tier": self._ai_override_tier,
+            "ai_override_direction": self._ai_override_direction,
+            "ai_override_until": self._ai_override_until,
+            "ai_override_applied_at": self._ai_override_applied_at,
+            "ai_override_source_conviction": self._ai_override_source_conviction,
             "entry_adds_deferred_total": self._entry_adds_deferred_total,
             "entry_adds_drained_total": self._entry_adds_drained_total,
             "entry_adds_last_deferred_at": self._entry_adds_last_deferred_at,
@@ -1302,6 +1350,71 @@ class BotRuntime:
             raw_regime_shadow_state = snap.get("regime_shadow_state", self._regime_shadow_state)
             if isinstance(raw_regime_shadow_state, dict):
                 self._regime_shadow_state = dict(raw_regime_shadow_state)
+            self._regime_mechanical_tier = max(
+                0,
+                min(2, int(snap.get("regime_mechanical_tier", self._regime_mechanical_tier))),
+            )
+            raw_mech_dir = str(
+                snap.get("regime_mechanical_direction", self._regime_mechanical_direction) or "symmetric"
+            ).strip().lower()
+            if raw_mech_dir not in {"symmetric", "long_bias", "short_bias"}:
+                raw_mech_dir = "symmetric"
+            self._regime_mechanical_direction = raw_mech_dir
+            self._regime_mechanical_since = float(
+                snap.get("regime_mechanical_since", self._regime_mechanical_since) or 0.0
+            )
+            self._regime_mechanical_tier_entered_at = float(
+                snap.get(
+                    "regime_mechanical_tier_entered_at",
+                    self._regime_mechanical_tier_entered_at,
+                )
+                or 0.0
+            )
+            self._regime_mechanical_tier2_last_downgrade_at = float(
+                snap.get(
+                    "regime_mechanical_tier2_last_downgrade_at",
+                    self._regime_mechanical_tier2_last_downgrade_at,
+                )
+                or 0.0
+            )
+            raw_override_tier = snap.get("ai_override_tier", self._ai_override_tier)
+            try:
+                self._ai_override_tier = (
+                    max(0, min(2, int(raw_override_tier)))
+                    if raw_override_tier is not None
+                    else None
+                )
+            except (TypeError, ValueError):
+                self._ai_override_tier = None
+            raw_override_dir = snap.get("ai_override_direction", self._ai_override_direction)
+            raw_override_dir = str(raw_override_dir).strip().lower() if raw_override_dir is not None else ""
+            if raw_override_dir not in {"symmetric", "long_bias", "short_bias"}:
+                self._ai_override_direction = None
+            else:
+                self._ai_override_direction = raw_override_dir
+            raw_override_until = snap.get("ai_override_until", self._ai_override_until)
+            try:
+                self._ai_override_until = float(raw_override_until) if raw_override_until is not None else None
+            except (TypeError, ValueError):
+                self._ai_override_until = None
+            raw_override_applied_at = snap.get("ai_override_applied_at", self._ai_override_applied_at)
+            try:
+                self._ai_override_applied_at = (
+                    float(raw_override_applied_at) if raw_override_applied_at is not None else None
+                )
+            except (TypeError, ValueError):
+                self._ai_override_applied_at = None
+            raw_source_conv = snap.get("ai_override_source_conviction", self._ai_override_source_conviction)
+            try:
+                self._ai_override_source_conviction = (
+                    max(0, min(100, int(raw_source_conv)))
+                    if raw_source_conv is not None
+                    else None
+                )
+            except (TypeError, ValueError):
+                self._ai_override_source_conviction = None
+            if self._ai_override_until is not None and float(self._ai_override_until) <= _now():
+                self._clear_ai_override()
             self._entry_adds_deferred_total = int(snap.get("entry_adds_deferred_total", self._entry_adds_deferred_total))
             self._entry_adds_drained_total = int(snap.get("entry_adds_drained_total", self._entry_adds_drained_total))
             self._entry_adds_last_deferred_at = float(
@@ -1604,6 +1717,190 @@ class BotRuntime:
                 raise
             if self.consecutive_api_errors >= config.MAX_CONSECUTIVE_ERRORS:
                 self.pause(f"{self.consecutive_api_errors} consecutive API errors")
+
+    @staticmethod
+    def _hmm_quality_tier(
+        current_candles: int,
+        target_candles: int,
+        min_train_samples: int,
+    ) -> tuple[str, float]:
+        current = max(0, int(current_candles))
+        target = max(1, int(target_candles))
+        min_train = max(1, int(min_train_samples))
+
+        if current >= target:
+            return "full", 1.00
+
+        baseline_threshold = max(min_train, int(round(target * 0.25)))
+        deep_threshold = max(min_train, int(round(target * 0.625)))
+        if deep_threshold <= baseline_threshold:
+            deep_threshold = baseline_threshold + 1
+
+        if current >= deep_threshold:
+            return "deep", 0.95
+        if current >= baseline_threshold:
+            return "baseline", 0.85
+        return "shallow", 0.70
+
+    def _hmm_training_depth_default(self, *, state_key: str = "primary") -> dict[str, Any]:
+        use_secondary = str(state_key).lower() == "secondary"
+        if use_secondary:
+            target_candles = max(1, int(getattr(config, "HMM_SECONDARY_TRAINING_CANDLES", 1440)))
+            min_train_samples = max(1, int(getattr(config, "HMM_SECONDARY_MIN_TRAIN_SAMPLES", 200)))
+            interval_min = max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15)))
+            key = "secondary"
+        else:
+            target_candles = max(1, int(getattr(config, "HMM_TRAINING_CANDLES", 4000)))
+            min_train_samples = max(1, int(getattr(config, "HMM_MIN_TRAIN_SAMPLES", 500)))
+            interval_min = max(1, int(getattr(config, "HMM_OHLCV_INTERVAL_MIN", 1)))
+            key = "primary"
+
+        quality_tier, modifier = self._hmm_quality_tier(
+            0,
+            target_candles,
+            min_train_samples,
+        )
+        return {
+            "state_key": key,
+            "current_candles": 0,
+            "target_candles": target_candles,
+            "min_train_samples": min_train_samples,
+            "quality_tier": quality_tier,
+            "confidence_modifier": modifier,
+            "pct_complete": 0.0,
+            "interval_min": interval_min,
+            "estimated_full_at": None,
+            "updated_at": 0.0,
+        }
+
+    def _update_hmm_training_depth(
+        self,
+        *,
+        current_candles: int,
+        secondary: bool = False,
+        target_candles: int | None = None,
+        min_train_samples: int | None = None,
+        interval_min: int | None = None,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        now_ts = float(now if now is not None else _now())
+        if secondary:
+            target = max(
+                1,
+                int(
+                    target_candles
+                    if target_candles is not None
+                    else getattr(config, "HMM_SECONDARY_TRAINING_CANDLES", 1440)
+                ),
+            )
+            min_train = max(
+                1,
+                int(
+                    min_train_samples
+                    if min_train_samples is not None
+                    else getattr(config, "HMM_SECONDARY_MIN_TRAIN_SAMPLES", 200)
+                ),
+            )
+            interval = max(
+                1,
+                int(
+                    interval_min
+                    if interval_min is not None
+                    else getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15)
+                ),
+            )
+            state_key = "secondary"
+        else:
+            target = max(
+                1,
+                int(
+                    target_candles
+                    if target_candles is not None
+                    else getattr(config, "HMM_TRAINING_CANDLES", 4000)
+                ),
+            )
+            min_train = max(
+                1,
+                int(
+                    min_train_samples
+                    if min_train_samples is not None
+                    else getattr(config, "HMM_MIN_TRAIN_SAMPLES", 500)
+                ),
+            )
+            interval = max(
+                1,
+                int(
+                    interval_min
+                    if interval_min is not None
+                    else getattr(config, "HMM_OHLCV_INTERVAL_MIN", 1)
+                ),
+            )
+            state_key = "primary"
+
+        current = max(0, int(current_candles))
+        quality_tier, modifier = self._hmm_quality_tier(current, target, min_train)
+        pct_complete = min(100.0, (current / target * 100.0)) if target > 0 else 100.0
+
+        estimated_full_at: str | None = None
+        if current < target:
+            remaining = target - current
+            eta_ts = now_ts + float(remaining * interval * 60)
+            estimated_full_at = datetime.fromtimestamp(eta_ts, timezone.utc).isoformat()
+
+        out = {
+            "state_key": state_key,
+            "current_candles": current,
+            "target_candles": target,
+            "min_train_samples": min_train,
+            "quality_tier": quality_tier,
+            "confidence_modifier": float(modifier),
+            "pct_complete": round(float(pct_complete), 2),
+            "interval_min": interval,
+            "estimated_full_at": estimated_full_at,
+            "updated_at": float(now_ts),
+        }
+        if secondary:
+            self._hmm_training_depth_secondary = out
+        else:
+            self._hmm_training_depth = out
+        return out
+
+    def _hmm_confidence_modifier_for_source(self, source: dict[str, Any] | None) -> tuple[float, str]:
+        if not isinstance(source, dict):
+            return 1.0, "default"
+        source_mode = str(source.get("source_mode", "") or "").strip().lower()
+        multi_enabled = bool(source.get("multi_timeframe", False))
+        if source_mode == "consensus" and multi_enabled:
+            primary_mod = float(self._hmm_training_depth.get("confidence_modifier", 1.0) or 1.0)
+            secondary_mod = float(
+                self._hmm_training_depth_secondary.get("confidence_modifier", 1.0) or 1.0
+            )
+            return max(0.0, min(1.0, min(primary_mod, secondary_mod))), "consensus_min"
+        primary_mod = float(self._hmm_training_depth.get("confidence_modifier", 1.0) or 1.0)
+        return max(0.0, min(1.0, primary_mod)), "primary"
+
+    def _record_regime_history_sample(self, now: float | None = None) -> None:
+        now_ts = float(now if now is not None else _now())
+        source = dict(self._policy_hmm_source() or {})
+        regime = str(source.get("regime", "RANGING") or "RANGING").upper()
+        confidence = max(0.0, min(1.0, float(source.get("confidence", 0.0) or 0.0)))
+        bias = max(-1.0, min(1.0, float(source.get("bias_signal", 0.0) or 0.0)))
+
+        self._regime_history_30m.append(
+            {
+                "ts": now_ts,
+                "regime": regime,
+                "conf": round(confidence, 4),
+                "bias": round(bias, 4),
+            }
+        )
+
+        cutoff = now_ts - float(self._regime_history_window_sec)
+        while self._regime_history_30m and float(self._regime_history_30m[0].get("ts", 0.0)) < cutoff:
+            self._regime_history_30m.popleft()
+        if len(self._regime_history_30m) > 512:
+            while len(self._regime_history_30m) > 512:
+                self._regime_history_30m.popleft()
 
     def _hmm_default_state(
         self,
@@ -1955,9 +2252,19 @@ class BotRuntime:
 
         self._hmm_last_train_attempt_ts = now_ts
         interval_min = max(1, int(getattr(config, "HMM_OHLCV_INTERVAL_MIN", 1)))
+        target_candles = max(1, int(getattr(config, "HMM_TRAINING_CANDLES", 4000)))
+        min_train_samples = max(1, int(getattr(config, "HMM_MIN_TRAIN_SAMPLES", 500)))
         closes, volumes = self._fetch_training_candles(
-            count=int(getattr(config, "HMM_TRAINING_CANDLES", 720)),
+            count=target_candles,
             interval_min=interval_min,
+        )
+        self._update_hmm_training_depth(
+            current_candles=min(len(closes), len(volumes)),
+            secondary=False,
+            target_candles=target_candles,
+            min_train_samples=min_train_samples,
+            interval_min=interval_min,
+            now=now_ts,
         )
         if not closes or not volumes:
             self._hmm_state["error"] = "no_training_candles"
@@ -2007,9 +2314,19 @@ class BotRuntime:
 
         self._hmm_last_train_attempt_ts_secondary = now_ts
         interval_min = max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15)))
+        target_candles = max(1, int(getattr(config, "HMM_SECONDARY_TRAINING_CANDLES", 1440)))
+        min_train_samples = max(1, int(getattr(config, "HMM_SECONDARY_MIN_TRAIN_SAMPLES", 200)))
         closes, volumes = self._fetch_training_candles(
-            count=int(getattr(config, "HMM_SECONDARY_TRAINING_CANDLES", 720)),
+            count=target_candles,
             interval_min=interval_min,
+        )
+        self._update_hmm_training_depth(
+            current_candles=min(len(closes), len(volumes)),
+            secondary=True,
+            target_candles=target_candles,
+            min_train_samples=min_train_samples,
+            interval_min=interval_min,
+            now=now_ts,
         )
         if not closes or not volumes:
             self._hmm_state_secondary["error"] = "no_training_candles"
@@ -2247,9 +2564,11 @@ class BotRuntime:
     def _update_hmm(self, now: float) -> None:
         if not bool(getattr(config, "HMM_ENABLED", False)):
             self._hmm_consensus = self._compute_hmm_consensus()
+            self._record_regime_history_sample(now)
             return
         if not self._hmm_detector or self._hmm_numpy is None:
             self._hmm_consensus = self._compute_hmm_consensus()
+            self._record_regime_history_sample(now)
             return
 
         trained = bool(getattr(self._hmm_detector, "_trained", False))
@@ -2268,6 +2587,7 @@ class BotRuntime:
             if bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)):
                 self._update_hmm_secondary(now)
             self._hmm_consensus = self._compute_hmm_consensus()
+            self._record_regime_history_sample(now)
             return
 
         interval_min = max(1, int(getattr(config, "HMM_OHLCV_INTERVAL_MIN", 1)))
@@ -2280,6 +2600,7 @@ class BotRuntime:
             if bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)):
                 self._update_hmm_secondary(now)
             self._hmm_consensus = self._compute_hmm_consensus()
+            self._record_regime_history_sample(now)
             return
 
         try:
@@ -2295,6 +2616,7 @@ class BotRuntime:
             if bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)):
                 self._update_hmm_secondary(now)
             self._hmm_consensus = self._compute_hmm_consensus()
+            self._record_regime_history_sample(now)
 
     def _hmm_status_payload(self) -> dict[str, Any]:
         primary = dict(
@@ -2312,15 +2634,32 @@ class BotRuntime:
                 interval_min=max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15))),
             )
         )
+        training_depth_primary = dict(
+            self._hmm_training_depth
+            or self._hmm_training_depth_default(state_key="primary")
+        )
+        training_depth_secondary = dict(
+            self._hmm_training_depth_secondary
+            or self._hmm_training_depth_default(state_key="secondary")
+        )
         consensus = dict(self._hmm_consensus or self._compute_hmm_consensus())
         source_mode = self._hmm_source_mode()
         source = dict(self._policy_hmm_source() or primary)
+        source_interval = int(source.get("interval_min", primary.get("interval_min", 1)) or 1)
+        secondary_interval = max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15)))
+        if source_interval == secondary_interval and bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)):
+            training_depth = training_depth_secondary
+        else:
+            training_depth = training_depth_primary
         raw_probs = source.get("probabilities", primary.get("probabilities"))
         probs = (
             dict(raw_probs)
             if isinstance(raw_probs, dict)
             else {"bearish": 0.0, "ranging": 1.0, "bullish": 0.0}
         )
+        confidence_raw = max(0.0, min(1.0, float(source.get("confidence", 0.0) or 0.0)))
+        confidence_modifier, confidence_modifier_source = self._hmm_confidence_modifier_for_source(source)
+        confidence_effective = max(0.0, min(1.0, confidence_raw * confidence_modifier))
         out = {
             "enabled": bool(source.get("enabled", False)),
             "available": bool(source.get("available", False)),
@@ -2328,7 +2667,11 @@ class BotRuntime:
             "interval_min": int(source.get("interval_min", primary.get("interval_min", 1))),
             "regime": str(source.get("regime", "RANGING")),
             "regime_id": int(source.get("regime_id", 1)),
-            "confidence": float(source.get("confidence", 0.0)),
+            "confidence": confidence_raw,
+            "confidence_raw": confidence_raw,
+            "confidence_effective": confidence_effective,
+            "confidence_modifier": float(confidence_modifier),
+            "confidence_modifier_source": str(confidence_modifier_source),
             "bias_signal": float(source.get("bias_signal", 0.0)),
             "probabilities": probs,
             "observation_count": int(source.get("observation_count", 0)),
@@ -2342,6 +2685,10 @@ class BotRuntime:
             "primary": primary,
             "secondary": secondary,
             "consensus": consensus,
+            "training_depth": training_depth,
+            "training_depth_primary": training_depth_primary,
+            "training_depth_secondary": training_depth_secondary,
+            "regime_history_30m": list(self._regime_history_30m),
         }
         return out
 
@@ -2351,6 +2698,503 @@ class BotRuntime:
             conf = max(0.0, min(1.0, float(getattr(config, "REGIME_MANUAL_CONFIDENCE", 0.75))))
             return raw, conf
         return None, 0.0
+
+    @staticmethod
+    def _tier_direction(
+        tier: int,
+        regime: str,
+        bias: float,
+        suppressed_side: str | None = None,
+    ) -> str:
+        use_tier = max(0, min(2, int(tier)))
+        if use_tier <= 0:
+            return "symmetric"
+        if use_tier >= 2:
+            if suppressed_side == "A":
+                return "long_bias"
+            if suppressed_side == "B":
+                return "short_bias"
+        reg = str(regime or "RANGING").upper()
+        if reg == "BULLISH" or float(bias) > 0.0:
+            return "long_bias"
+        if reg == "BEARISH" or float(bias) < 0.0:
+            return "short_bias"
+        return "symmetric"
+
+    @staticmethod
+    def _classify_ai_regime_agreement(
+        ai_tier: int,
+        ai_direction: str,
+        mechanical_tier: int,
+        mechanical_direction: str,
+    ) -> str:
+        ai_t = max(0, min(2, int(ai_tier)))
+        mech_t = max(0, min(2, int(mechanical_tier)))
+        ai_dir = str(ai_direction or "symmetric").strip().lower()
+        mech_dir = str(mechanical_direction or "symmetric").strip().lower()
+        if ai_t == mech_t and ai_dir == mech_dir:
+            return "agree"
+        if ai_t > mech_t:
+            return "ai_upgrade"
+        if ai_t < mech_t:
+            return "ai_downgrade"
+        return "ai_flip"
+
+    def _ai_regime_history_limit(self) -> int:
+        return max(1, int(getattr(config, "AI_REGIME_HISTORY_SIZE", 12)))
+
+    @staticmethod
+    def _hmm_prob_triplet(source: dict[str, Any]) -> list[float]:
+        raw = source.get("probabilities", {})
+        if isinstance(raw, dict):
+            try:
+                return [
+                    float(raw.get("bearish", 0.0) or 0.0),
+                    float(raw.get("ranging", 1.0) or 0.0),
+                    float(raw.get("bullish", 0.0) or 0.0),
+                ]
+            except (TypeError, ValueError):
+                return [0.0, 1.0, 0.0]
+        if isinstance(raw, (list, tuple)) and len(raw) >= 3:
+            try:
+                return [float(raw[0]), float(raw[1]), float(raw[2])]
+            except (TypeError, ValueError):
+                return [0.0, 1.0, 0.0]
+        return [0.0, 1.0, 0.0]
+
+    def _fill_rate_1h(self, now: float) -> int:
+        cutoff = float(now) - 3600.0
+        count = 0
+        for slot in self.slots.values():
+            for cyc in slot.state.completed_cycles:
+                try:
+                    exit_time = float(getattr(cyc, "exit_time", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    exit_time = 0.0
+                if exit_time >= cutoff:
+                    count += 1
+        return int(count)
+
+    def _build_ai_regime_context(self, now: float) -> dict[str, Any]:
+        primary = dict(self._hmm_state or self._hmm_default_state())
+        secondary = dict(
+            self._hmm_state_secondary
+            or self._hmm_default_state(
+                enabled=bool(getattr(config, "HMM_ENABLED", False))
+                and bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)),
+                interval_min=max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15))),
+            )
+        )
+        consensus = dict(self._hmm_consensus or self._compute_hmm_consensus())
+        source = dict(self._policy_hmm_source() or primary)
+        source_interval = int(source.get("interval_min", primary.get("interval_min", 1)) or 1)
+        secondary_interval = max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15)))
+        if source_interval == secondary_interval and bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)):
+            depth = dict(self._hmm_training_depth_secondary or self._hmm_training_depth_default(state_key="secondary"))
+        else:
+            depth = dict(self._hmm_training_depth or self._hmm_training_depth_default(state_key="primary"))
+        confidence_modifier, _mod_source = self._hmm_confidence_modifier_for_source(source)
+
+        transmat = None
+        try:
+            if self._hmm_detector is not None:
+                transmat = getattr(self._hmm_detector, "transmat", None)
+        except Exception:
+            transmat = None
+
+        capacity = self._compute_capacity_health(now)
+        safe_cap = max(1, int(capacity.get("open_orders_safe_cap") or 1))
+        headroom_count = int(capacity.get("open_order_headroom") or 0)
+        headroom_pct = max(0.0, min(100.0, (float(headroom_count) / float(safe_cap)) * 100.0))
+
+        trend_score = float(self._trend_score)
+        dead_zone = abs(float(getattr(config, "TREND_DEAD_ZONE", 0.001)))
+        if trend_score > dead_zone:
+            directional_trend = "bullish"
+        elif trend_score < -dead_zone:
+            directional_trend = "bearish"
+        else:
+            directional_trend = "neutral"
+
+        recovery_order_count = sum(len(slot.state.recovery_orders) for slot in self.slots.values())
+        kelly_payload = self._kelly.status_payload() if self._kelly is not None else {}
+        bull_edge = 0.0
+        bear_edge = 0.0
+        range_edge = 0.0
+        if isinstance(kelly_payload, dict):
+            try:
+                bull_edge = float((kelly_payload.get("bullish") or {}).get("edge", 0.0) or 0.0)
+            except Exception:
+                bull_edge = 0.0
+            try:
+                bear_edge = float((kelly_payload.get("bearish") or {}).get("edge", 0.0) or 0.0)
+            except Exception:
+                bear_edge = 0.0
+            try:
+                range_edge = float((kelly_payload.get("ranging") or {}).get("edge", 0.0) or 0.0)
+            except Exception:
+                range_edge = 0.0
+
+        return {
+            "hmm_primary": {
+                "regime": str(primary.get("regime", "RANGING")),
+                "confidence": float(primary.get("confidence", 0.0) or 0.0),
+                "bias_signal": float(primary.get("bias_signal", 0.0) or 0.0),
+                "probabilities": self._hmm_prob_triplet(primary),
+            },
+            "hmm_secondary": {
+                "regime": str(secondary.get("regime", "RANGING")),
+                "confidence": float(secondary.get("confidence", 0.0) or 0.0),
+                "bias_signal": float(secondary.get("bias_signal", 0.0) or 0.0),
+                "probabilities": self._hmm_prob_triplet(secondary),
+            },
+            "hmm_consensus": {
+                "agreement": str(consensus.get("agreement", "primary_only")),
+                "effective_regime": str(consensus.get("effective_regime", consensus.get("regime", "RANGING"))),
+                "effective_confidence": float(consensus.get("effective_confidence", consensus.get("confidence", 0.0)) or 0.0),
+                "effective_bias": float(consensus.get("effective_bias", consensus.get("bias_signal", 0.0)) or 0.0),
+            },
+            "transition_matrix_1m": transmat,
+            "training_quality": str(depth.get("quality_tier", "shallow")),
+            "confidence_modifier": float(confidence_modifier),
+            "regime_history_30m": list(self._regime_history_30m),
+            "mechanical_tier": {
+                "current": int(self._regime_mechanical_tier),
+                "direction": str(self._regime_mechanical_direction),
+                "since": int(float(self._regime_mechanical_since or 0.0)),
+            },
+            "operational": {
+                "directional_trend": directional_trend,
+                "trend_detected_at": int(float(self._trend_last_update_ts or 0.0)),
+                "fill_rate_1h": int(self._fill_rate_1h(now)),
+                "recovery_order_count": int(recovery_order_count),
+                "capacity_headroom": float(headroom_pct),
+                "capacity_band": str(capacity.get("status_band") or "normal"),
+                "kelly_edge_bullish": float(bull_edge),
+                "kelly_edge_bearish": float(bear_edge),
+                "kelly_edge_ranging": float(range_edge),
+            },
+        }
+
+    def _clear_ai_override(self) -> None:
+        self._ai_override_tier = None
+        self._ai_override_direction = None
+        self._ai_override_until = None
+        self._ai_override_applied_at = None
+        self._ai_override_source_conviction = None
+
+    def _mark_ai_history_latest(self, action: str) -> None:
+        if not self._ai_regime_history:
+            return
+        tail = dict(self._ai_regime_history[-1] or {})
+        tail["action"] = str(action)
+        self._ai_regime_history[-1] = tail
+
+    def apply_ai_regime_override(self, ttl_sec: int | None = None) -> tuple[bool, str]:
+        if not bool(getattr(config, "AI_REGIME_ADVISOR_ENABLED", False)):
+            return False, "ai regime advisor disabled"
+
+        opinion = dict(self._ai_regime_opinion or {})
+        if not opinion:
+            return False, "no ai opinion available"
+        if str(opinion.get("error", "") or "").strip():
+            return False, "ai opinion unavailable"
+
+        agreement = str(opinion.get("agreement", "unknown") or "unknown").strip().lower()
+        if agreement not in {"ai_upgrade", "ai_downgrade", "ai_flip"}:
+            return False, "ai opinion already agrees with mechanical"
+
+        try:
+            recommended_tier = int(opinion.get("recommended_tier", 0) or 0)
+        except (TypeError, ValueError):
+            recommended_tier = 0
+        recommended_tier = max(0, min(2, recommended_tier))
+        recommended_direction = str(opinion.get("recommended_direction", "symmetric") or "symmetric").strip().lower()
+        if recommended_direction not in {"symmetric", "long_bias", "short_bias"}:
+            recommended_direction = "symmetric"
+
+        try:
+            conviction = int(opinion.get("conviction", 0) or 0)
+        except (TypeError, ValueError):
+            conviction = 0
+        conviction = max(0, min(100, conviction))
+        min_conviction = max(0, min(100, int(getattr(config, "AI_OVERRIDE_MIN_CONVICTION", 50))))
+        if conviction < min_conviction:
+            return False, f"conviction {conviction} below minimum {min_conviction}"
+
+        mechanical_tier = max(0, min(2, int(self._regime_mechanical_tier)))
+        low = max(0, mechanical_tier - 1)
+        high = min(2, mechanical_tier + 1)
+        applied_tier = max(low, min(high, recommended_tier))
+        applied_direction = recommended_direction if applied_tier > 0 else "symmetric"
+
+        capacity_band = str(self._compute_capacity_health(_now()).get("status_band") or "normal").strip().lower()
+        if capacity_band == "stop" and applied_tier > mechanical_tier:
+            return False, "capacity stop gate blocks upgrade override"
+
+        default_ttl = max(1, int(getattr(config, "AI_OVERRIDE_TTL_SEC", 1800)))
+        max_ttl = max(1, int(getattr(config, "AI_OVERRIDE_MAX_TTL_SEC", 3600)))
+        if ttl_sec is None:
+            use_ttl = default_ttl
+        else:
+            try:
+                use_ttl = int(ttl_sec)
+            except (TypeError, ValueError):
+                use_ttl = default_ttl
+        use_ttl = max(1, min(use_ttl, max_ttl))
+
+        now_ts = _now()
+        self._ai_override_tier = int(applied_tier)
+        self._ai_override_direction = str(applied_direction)
+        self._ai_override_applied_at = float(now_ts)
+        self._ai_override_until = float(now_ts + use_ttl)
+        self._ai_override_source_conviction = int(conviction)
+        self._ai_regime_dismissed = False
+        self._mark_ai_history_latest("applied")
+        logger.info(
+            "AI regime advisor: override applied tier=%d direction=%s ttl=%ds conviction=%d",
+            int(applied_tier),
+            str(applied_direction),
+            int(use_ttl),
+            int(conviction),
+        )
+        return True, (
+            f"AI override applied: Tier {int(applied_tier)} {str(applied_direction)} "
+            f"for {int(use_ttl)}s"
+        )
+
+    def revert_ai_regime_override(self) -> tuple[bool, str]:
+        payload = self._ai_override_payload()
+        was_active = bool(payload.get("active"))
+        if (
+            self._ai_override_tier is None
+            and self._ai_override_direction is None
+            and self._ai_override_until is None
+        ):
+            return False, "no ai override active"
+        self._clear_ai_override()
+        self._mark_ai_history_latest("reverted")
+        logger.info("AI regime advisor: override cancelled by operator")
+        if was_active:
+            return True, "override cancelled; reverted to mechanical"
+        return True, "override state cleared"
+
+    def dismiss_ai_regime_opinion(self) -> tuple[bool, str]:
+        if not bool(getattr(config, "AI_REGIME_ADVISOR_ENABLED", False)):
+            return False, "ai regime advisor disabled"
+        opinion = dict(self._ai_regime_opinion or {})
+        if not opinion:
+            return False, "no ai opinion available"
+        agreement = str(opinion.get("agreement", "unknown") or "unknown").strip().lower()
+        if agreement not in {"ai_upgrade", "ai_downgrade", "ai_flip"}:
+            return False, "nothing to dismiss (no active disagreement)"
+        self._ai_regime_dismissed = True
+        self._mark_ai_history_latest("dismissed")
+        return True, "ai disagreement dismissed"
+
+    def _ai_override_payload(self, now: float | None = None) -> dict[str, Any]:
+        now_ts = float(now if now is not None else _now())
+        expires = float(self._ai_override_until or 0.0)
+        active = bool(self._ai_override_tier is not None and self._ai_override_direction and expires > now_ts)
+        remaining = max(0.0, expires - now_ts) if active else None
+        return {
+            "active": bool(active),
+            "tier": (int(self._ai_override_tier) if self._ai_override_tier is not None else None),
+            "direction": (str(self._ai_override_direction) if self._ai_override_direction else None),
+            "applied_at": (float(self._ai_override_applied_at) if self._ai_override_applied_at else None),
+            "expires_at": (float(expires) if active else None),
+            "remaining_sec": (int(remaining) if remaining is not None else None),
+            "source_conviction": (
+                int(self._ai_override_source_conviction)
+                if self._ai_override_source_conviction is not None
+                else None
+            ),
+        }
+
+    def _ai_regime_worker(self, context: dict[str, Any], trigger: str, requested_at: float) -> None:
+        try:
+            opinion = ai_advisor.get_regime_opinion(context)
+            pending = {
+                "opinion": dict(opinion or {}),
+                "trigger": str(trigger),
+                "requested_at": float(requested_at),
+                "completed_at": float(_now()),
+                "mechanical_at_request": dict(context.get("mechanical_tier", {})),
+                "consensus_at_request": str((context.get("hmm_consensus") or {}).get("agreement", "")),
+            }
+            self._ai_regime_pending_result = pending
+        except Exception as e:
+            self._ai_regime_pending_result = {
+                "opinion": {
+                    "recommended_tier": 0,
+                    "recommended_direction": "symmetric",
+                    "conviction": 0,
+                    "rationale": "",
+                    "watch_for": "",
+                    "panelist": "",
+                    "error": str(e),
+                },
+                "trigger": str(trigger),
+                "requested_at": float(requested_at),
+                "completed_at": float(_now()),
+                "mechanical_at_request": dict(context.get("mechanical_tier", {})),
+                "consensus_at_request": str((context.get("hmm_consensus") or {}).get("agreement", "")),
+            }
+        finally:
+            self._ai_regime_thread_alive = False
+
+    def _start_ai_regime_run(self, now: float, trigger: str) -> None:
+        if not bool(getattr(config, "AI_REGIME_ADVISOR_ENABLED", False)):
+            return
+        if self._ai_regime_thread_alive:
+            return
+        context = self._build_ai_regime_context(now)
+        self._ai_regime_last_run_ts = float(now)
+        self._ai_regime_last_trigger_reason = str(trigger)
+        self._ai_regime_last_mechanical_tier = int(self._regime_mechanical_tier)
+        self._ai_regime_last_mechanical_direction = str(self._regime_mechanical_direction)
+        self._ai_regime_last_consensus_agreement = str((self._hmm_consensus or {}).get("agreement", "primary_only"))
+        self._ai_regime_thread_alive = True
+        thread = threading.Thread(
+            target=self._ai_regime_worker,
+            args=(context, str(trigger), float(now)),
+            daemon=True,
+            name="ai-regime-advisor",
+        )
+        try:
+            thread.start()
+        except Exception:
+            self._ai_regime_thread_alive = False
+            raise
+
+    def _process_ai_regime_pending_result(self, now: float) -> None:
+        pending = self._ai_regime_pending_result
+        if not isinstance(pending, dict):
+            return
+        self._ai_regime_pending_result = None
+
+        raw_opinion = pending.get("opinion", {})
+        opinion = dict(raw_opinion) if isinstance(raw_opinion, dict) else {}
+        recommended_tier = max(0, min(2, int(opinion.get("recommended_tier", 0) or 0)))
+        recommended_direction = str(opinion.get("recommended_direction", "symmetric") or "symmetric").strip().lower()
+        if recommended_direction not in {"symmetric", "long_bias", "short_bias"}:
+            recommended_direction = "symmetric"
+        conviction = max(0, min(100, int(opinion.get("conviction", 0) or 0)))
+        rationale = str(opinion.get("rationale", "") or "")[:500]
+        watch_for = str(opinion.get("watch_for", "") or "")[:200]
+        panelist = str(opinion.get("panelist", "") or "")
+        error = str(opinion.get("error", "") or "")
+
+        mechanical_ref = pending.get("mechanical_at_request", {})
+        if not isinstance(mechanical_ref, dict):
+            mechanical_ref = {}
+        mechanical_tier = max(0, min(2, int(mechanical_ref.get("current", self._regime_mechanical_tier) or 0)))
+        mechanical_direction = str(
+            mechanical_ref.get("direction", self._regime_mechanical_direction) or "symmetric"
+        ).strip().lower()
+        if mechanical_direction not in {"symmetric", "long_bias", "short_bias"}:
+            mechanical_direction = "symmetric"
+
+        if error:
+            agreement = "error"
+        else:
+            agreement = self._classify_ai_regime_agreement(
+                recommended_tier,
+                recommended_direction,
+                mechanical_tier,
+                mechanical_direction,
+            )
+
+        self._ai_regime_opinion = {
+            "recommended_tier": int(recommended_tier),
+            "recommended_direction": str(recommended_direction),
+            "conviction": int(conviction),
+            "rationale": rationale,
+            "watch_for": watch_for,
+            "panelist": panelist,
+            "error": error,
+            "agreement": agreement,
+            "trigger": str(pending.get("trigger", "")),
+            "ts": float(pending.get("completed_at", now) or now),
+            "requested_at": float(pending.get("requested_at", now) or now),
+            "mechanical_tier": int(mechanical_tier),
+            "mechanical_direction": str(mechanical_direction),
+        }
+        self._ai_regime_dismissed = False
+
+        action = "none"
+        if agreement in {"ai_upgrade", "ai_downgrade", "ai_flip"} and not error:
+            action = "pending"
+        self._ai_regime_history.append(
+            {
+                "ts": float(pending.get("completed_at", now) or now),
+                "mechanical_tier": int(mechanical_tier),
+                "mechanical_direction": str(mechanical_direction),
+                "ai_tier": int(recommended_tier),
+                "ai_direction": str(recommended_direction),
+                "conviction": int(conviction),
+                "agreement": str(agreement),
+                "action": action,
+            }
+        )
+        while len(self._ai_regime_history) > self._ai_regime_history_limit():
+            self._ai_regime_history.popleft()
+
+        if error:
+            logger.info("AI regime advisor: %s", error)
+            return
+        if agreement == "agree":
+            logger.info(
+                "AI regime advisor: agrees with mechanical Tier %d %s (conviction %d)",
+                mechanical_tier,
+                mechanical_direction,
+                conviction,
+            )
+        else:
+            logger.info(
+                "AI regime advisor: Tier %d %s (conviction %d) -- mechanical Tier %d %s",
+                recommended_tier,
+                recommended_direction,
+                conviction,
+                mechanical_tier,
+                mechanical_direction,
+            )
+
+    def _maybe_schedule_ai_regime(self, now: float) -> None:
+        if not bool(getattr(config, "AI_REGIME_ADVISOR_ENABLED", False)):
+            return
+        if self._ai_regime_thread_alive:
+            return
+
+        self._process_ai_regime_pending_result(now)
+
+        last_run = float(self._ai_regime_last_run_ts or 0.0)
+        elapsed = now - last_run if last_run > 0.0 else float("inf")
+        debounce_sec = max(1.0, float(getattr(config, "AI_REGIME_DEBOUNCE_SEC", 60.0)))
+        interval_sec = max(1.0, float(getattr(config, "AI_REGIME_INTERVAL_SEC", 300.0)))
+        if elapsed < debounce_sec:
+            return
+
+        periodic_due = elapsed >= interval_sec
+        agreement_now = str((self._hmm_consensus or {}).get("agreement", "primary_only"))
+        mech_changed = (
+            int(self._regime_mechanical_tier) != int(self._ai_regime_last_mechanical_tier)
+            or str(self._regime_mechanical_direction) != str(self._ai_regime_last_mechanical_direction)
+        )
+        consensus_changed = agreement_now != str(self._ai_regime_last_consensus_agreement)
+        event_due = bool(mech_changed or consensus_changed)
+        if not (periodic_due or event_due):
+            return
+
+        if periodic_due:
+            trigger = "periodic"
+        elif mech_changed and consensus_changed:
+            trigger = "mechanical_and_consensus_change"
+        elif mech_changed:
+            trigger = "mechanical_tier_change"
+        else:
+            trigger = "consensus_mode_change"
+        self._start_ai_regime_run(now, trigger)
 
     def _regime_grace_elapsed(self, now: float) -> bool:
         if int(self._regime_tier) != 2:
@@ -2371,29 +3215,63 @@ class BotRuntime:
         shadow_enabled = bool(getattr(config, "REGIME_SHADOW_ENABLED", False))
         enabled = bool(actuation_enabled or shadow_enabled)
 
+        # Backward-compatible bootstrap for tests/snapshots that only seed
+        # effective regime fields.
+        if self._regime_mechanical_tier_entered_at <= 0.0 and self._regime_tier_entered_at > 0.0:
+            self._regime_mechanical_tier = max(0, min(2, int(self._regime_tier)))
+            self._regime_mechanical_tier_entered_at = float(self._regime_tier_entered_at)
+            if self._regime_mechanical_since <= 0.0:
+                self._regime_mechanical_since = float(self._regime_tier_entered_at)
+            reg = str((self._regime_shadow_state or {}).get("regime", "RANGING"))
+            reg_bias = float((self._regime_shadow_state or {}).get("bias_signal", 0.0) or 0.0)
+            self._regime_mechanical_direction = self._tier_direction(
+                int(self._regime_mechanical_tier),
+                reg,
+                reg_bias,
+                self._regime_side_suppressed,
+            )
+        if self._regime_mechanical_tier2_last_downgrade_at <= 0.0 and self._regime_tier2_last_downgrade_at > 0.0:
+            self._regime_mechanical_tier2_last_downgrade_at = float(self._regime_tier2_last_downgrade_at)
+
         if enabled:
             _, _, _, _, pre_source = self._policy_hmm_signal()
             last_hmm_update_ts = float(pre_source.get("last_update_ts", 0.0) or 0.0)
             if (now - last_hmm_update_ts) >= interval_sec:
                 self._update_hmm(now)
 
-        regime, confidence, bias, hmm_ready, _ = self._policy_hmm_signal()
+        regime, confidence_raw, bias, hmm_ready, policy_source = self._policy_hmm_signal()
+        confidence_modifier, confidence_modifier_source = self._hmm_confidence_modifier_for_source(
+            policy_source
+        )
+        confidence_effective = max(
+            0.0,
+            min(1.0, float(confidence_raw) * float(confidence_modifier)),
+        )
         reason = "disabled"
 
         override, override_conf = self._manual_regime_override()
         if override is not None:
             regime = override
-            confidence = override_conf
+            confidence_raw = override_conf
+            confidence_effective = override_conf
+            confidence_modifier = 1.0
+            confidence_modifier_source = "manual_override"
             bias = 1.0 if override == "BULLISH" else -1.0
             hmm_ready = True
             reason = "manual_override"
 
-        current_tier = int(self._regime_tier)
-        current_tier = max(0, min(2, current_tier))
+        current_effective_tier = max(0, min(2, int(self._regime_tier)))
+        current_mechanical_tier = max(0, min(2, int(self._regime_mechanical_tier)))
+        mechanical_target_tier = 0
         target_tier = 0
         suppressed_side: str | None = None
         directional_ok_tier1 = False
         directional_ok_tier2 = False
+        effective_regime = str(regime)
+        effective_bias = float(bias)
+        effective_confidence = float(confidence_effective)
+        effective_direction = "symmetric"
+        mechanical_reason = str(reason)
 
         if enabled and hmm_ready:
             tier1_conf = max(0.0, min(1.0, float(getattr(config, "REGIME_TIER1_CONFIDENCE", 0.20))))
@@ -2402,57 +3280,141 @@ class BotRuntime:
             tier2_bias_floor = max(0.0, min(1.0, float(getattr(config, "REGIME_TIER2_BIAS_FLOOR", 0.25))))
             hysteresis = max(0.0, min(1.0, float(getattr(config, "REGIME_HYSTERESIS", 0.05))))
             min_dwell_sec = max(0.0, float(getattr(config, "REGIME_MIN_DWELL_SEC", 300.0)))
-            entered_at = float(self._regime_tier_entered_at)
+            entered_at = float(self._regime_mechanical_tier_entered_at)
             dwell_elapsed = max(0.0, now - entered_at) if entered_at > 0 else min_dwell_sec
             abs_bias = abs(float(bias))
             directional = regime in ("BULLISH", "BEARISH")
             directional_ok_tier1 = bool(directional and abs_bias >= tier1_bias_floor)
             directional_ok_tier2 = bool(directional and abs_bias >= tier2_bias_floor)
 
-            if confidence >= tier2_conf:
-                target_tier = 2
-            elif confidence >= tier1_conf:
-                target_tier = 1
+            if confidence_effective >= tier2_conf:
+                mechanical_target_tier = 2
+            elif confidence_effective >= tier1_conf:
+                mechanical_target_tier = 1
             else:
-                target_tier = 0
+                mechanical_target_tier = 0
 
-            if target_tier == 2 and not directional_ok_tier2:
-                target_tier = 1 if directional_ok_tier1 else 0
-            elif target_tier == 1 and not directional_ok_tier1:
-                target_tier = 0
+            if mechanical_target_tier == 2 and not directional_ok_tier2:
+                mechanical_target_tier = 1 if directional_ok_tier1 else 0
+            elif mechanical_target_tier == 1 and not directional_ok_tier1:
+                mechanical_target_tier = 0
 
             # Hysteresis on downgrades only — but never override the
             # directional gate.  If the downgrade was caused by missing
             # directional evidence (RANGING or weak bias), hysteresis
             # must not re-promote back to the gated tier.
-            if target_tier < current_tier:
+            if mechanical_target_tier < current_mechanical_tier:
                 # Only apply hysteresis if the current tier's directional
                 # gate is still satisfied.
                 gate_ok_for_current = (
-                    (current_tier == 1 and directional_ok_tier1) or
-                    (current_tier == 2 and directional_ok_tier2) or
-                    current_tier == 0
+                    (current_mechanical_tier == 1 and directional_ok_tier1) or
+                    (current_mechanical_tier == 2 and directional_ok_tier2) or
+                    current_mechanical_tier == 0
                 )
                 if gate_ok_for_current:
-                    threshold = [0.0, tier1_conf, tier2_conf][current_tier]
-                    if confidence > (threshold - hysteresis):
-                        target_tier = current_tier
+                    threshold = [0.0, tier1_conf, tier2_conf][current_mechanical_tier]
+                    if confidence_effective > (threshold - hysteresis):
+                        mechanical_target_tier = current_mechanical_tier
 
             # Minimum dwell between transitions.
-            if target_tier != current_tier and dwell_elapsed < min_dwell_sec:
-                target_tier = current_tier
+            if mechanical_target_tier != current_mechanical_tier and dwell_elapsed < min_dwell_sec:
+                mechanical_target_tier = current_mechanical_tier
 
             # Tier 2 re-entry cooldown: prevent rapid 2->0->2 oscillation.
-            if target_tier == 2 and current_tier < 2:
+            if mechanical_target_tier == 2 and current_mechanical_tier < 2:
                 cooldown_sec = max(0.0, float(getattr(config, "REGIME_TIER2_REENTRY_COOLDOWN_SEC", 600.0)))
-                if cooldown_sec > 0 and self._regime_tier2_last_downgrade_at > 0:
-                    since_downgrade = now - self._regime_tier2_last_downgrade_at
+                if cooldown_sec > 0 and self._regime_mechanical_tier2_last_downgrade_at > 0:
+                    since_downgrade = now - self._regime_mechanical_tier2_last_downgrade_at
                     if since_downgrade < cooldown_sec:
-                        target_tier = 1 if directional_ok_tier1 else 0
+                        mechanical_target_tier = 1 if directional_ok_tier1 else 0
 
-            reason = "hmm_eval"
+            mechanical_reason = "hmm_eval"
         elif enabled:
-            reason = "hmm_not_ready"
+            mechanical_reason = "hmm_not_ready"
+
+        if int(mechanical_target_tier) != current_mechanical_tier:
+            if current_mechanical_tier == 2 and int(mechanical_target_tier) < 2:
+                self._regime_mechanical_tier2_last_downgrade_at = float(now)
+            elif int(mechanical_target_tier) == 2:
+                self._regime_mechanical_tier2_last_downgrade_at = 0.0
+            self._regime_mechanical_tier = int(mechanical_target_tier)
+            self._regime_mechanical_since = float(now)
+            self._regime_mechanical_tier_entered_at = float(now)
+        elif self._regime_mechanical_since <= 0.0:
+            self._regime_mechanical_since = float(now)
+        self._regime_mechanical_direction = self._tier_direction(
+            int(mechanical_target_tier),
+            str(regime),
+            float(bias),
+        )
+
+        target_tier = int(mechanical_target_tier)
+        reason = str(mechanical_reason)
+        effective_direction = str(self._regime_mechanical_direction)
+
+        # AI override lifecycle (manual apply/revert endpoint is added in P2).
+        if override is None:
+            ttl_max = max(1.0, float(getattr(config, "AI_OVERRIDE_MAX_TTL_SEC", 3600)))
+            applied_at = float(self._ai_override_applied_at or 0.0)
+            if applied_at > 0 and self._ai_override_until is not None:
+                capped_until = min(float(self._ai_override_until), applied_at + ttl_max)
+                self._ai_override_until = float(capped_until)
+
+            expires_at = float(self._ai_override_until or 0.0)
+            if expires_at > 0.0 and expires_at <= float(now):
+                logger.info("AI regime advisor: override expired, reverting to mechanical")
+                self._clear_ai_override()
+                expires_at = 0.0
+
+            if (
+                self._ai_override_tier is not None
+                and self._ai_override_direction in {"symmetric", "long_bias", "short_bias"}
+                and expires_at > float(now)
+            ):
+                source_conv = int(self._ai_override_source_conviction or 0)
+                min_conv = max(0, min(100, int(getattr(config, "AI_OVERRIDE_MIN_CONVICTION", 50))))
+                if source_conv >= min_conv:
+                    requested_tier = max(0, min(2, int(self._ai_override_tier)))
+                    requested_direction = str(self._ai_override_direction)
+                    low = max(0, int(mechanical_target_tier) - 1)
+                    high = min(2, int(mechanical_target_tier) + 1)
+                    applied_tier = max(low, min(high, requested_tier))
+                    applied_direction = requested_direction
+                    if applied_tier == 0:
+                        applied_direction = "symmetric"
+
+                    capacity_blocked = False
+                    capacity_band = str(self._compute_capacity_health(now).get("status_band") or "normal")
+                    if capacity_band == "stop" and applied_tier > int(mechanical_target_tier):
+                        applied_tier = int(mechanical_target_tier)
+                        applied_direction = str(self._regime_mechanical_direction)
+                        capacity_blocked = True
+
+                    target_tier = int(applied_tier)
+                    effective_direction = str(applied_direction)
+                    if (
+                        capacity_blocked
+                        and int(target_tier) == int(mechanical_target_tier)
+                        and str(effective_direction) == str(self._regime_mechanical_direction)
+                    ):
+                        reason = "ai_override_capacity_blocked"
+                    else:
+                        reason = "ai_override"
+                    effective_confidence = max(effective_confidence, max(0.0, min(1.0, source_conv / 100.0)))
+                    if effective_direction == "long_bias":
+                        effective_regime = "BULLISH"
+                        effective_bias = max(0.25, abs(float(bias)))
+                    elif effective_direction == "short_bias":
+                        effective_regime = "BEARISH"
+                        effective_bias = -max(0.25, abs(float(bias)))
+                    else:
+                        effective_regime = "RANGING"
+                        effective_bias = 0.0
+                else:
+                    reason = "ai_override_rejected_conviction"
+
+        current_tier = int(current_effective_tier)
+        current_tier = max(0, min(2, current_tier))
 
         changed = target_tier != current_tier
         prev_entered_at = float(self._regime_tier_entered_at)
@@ -2495,8 +3457,13 @@ class BotRuntime:
                     cooldown_sec,
                 )
 
-        if int(target_tier) == 2 and regime in ("BULLISH", "BEARISH"):
-            suppressed_side = "A" if bias > 0 else "B"
+        if int(target_tier) == 2:
+            if effective_direction == "long_bias":
+                suppressed_side = "A"
+            elif effective_direction == "short_bias":
+                suppressed_side = "B"
+            elif str(effective_regime) in ("BULLISH", "BEARISH"):
+                suppressed_side = "A" if float(effective_bias) > 0 else "B"
         self._regime_side_suppressed = suppressed_side
 
         if changed:
@@ -2504,9 +3471,13 @@ class BotRuntime:
                 "time": float(now),
                 "from_tier": int(current_tier),
                 "to_tier": int(target_tier),
-                "regime": str(regime),
-                "confidence": round(float(confidence), 3),
-                "bias": round(float(bias), 3),
+                "regime": str(effective_regime),
+                "confidence": round(float(effective_confidence), 3),
+                "confidence_raw": round(float(confidence_raw), 3),
+                "confidence_modifier": round(float(confidence_modifier), 3),
+                "bias": round(float(effective_bias), 3),
+                "mechanical_tier": int(mechanical_target_tier),
+                "mechanical_direction": str(self._regime_mechanical_direction),
                 "reason": str(reason),
             })
             if len(self._regime_tier_history) > 20:
@@ -2522,10 +3493,10 @@ class BotRuntime:
                 "from_label": str(tier_labels.get(int(current_tier), "symmetric")),
                 "to_label": str(tier_labels.get(int(target_tier), "symmetric")),
                 "dwell_sec": float(prev_dwell_sec),
-                "regime": str(regime),
-                "confidence": float(confidence),
-                "bias_signal": float(bias),
-                "abs_bias": abs(float(bias)),
+                "regime": str(effective_regime),
+                "confidence": float(effective_confidence),
+                "bias_signal": float(effective_bias),
+                "abs_bias": abs(float(effective_bias)),
                 "suppressed_side": suppressed_side,
                 "favored_side": ("B" if suppressed_side == "A" else "A" if suppressed_side == "B" else None),
                 "reason": str(reason),
@@ -2539,9 +3510,9 @@ class BotRuntime:
                 "[REGIME][shadow] tier %d -> %d regime=%s conf=%.3f bias=%.3f suppressed=%s",
                 current_tier,
                 int(target_tier),
-                regime,
-                confidence,
-                bias,
+                effective_regime,
+                effective_confidence,
+                effective_bias,
                 suppressed_side or "-",
             )
 
@@ -2550,10 +3521,14 @@ class BotRuntime:
             "shadow_enabled": shadow_enabled,
             "actuation_enabled": actuation_enabled,
             "tier": int(target_tier),
-            "regime": regime,
-            "confidence": float(confidence),
-            "bias_signal": float(bias),
-            "abs_bias": abs(float(bias)),
+            "regime": str(effective_regime),
+            "confidence": float(effective_confidence),
+            "confidence_raw": float(confidence_raw),
+            "confidence_effective": float(confidence_effective),
+            "confidence_modifier": float(confidence_modifier),
+            "confidence_modifier_source": str(confidence_modifier_source),
+            "bias_signal": float(effective_bias),
+            "abs_bias": abs(float(effective_bias)),
             "suppressed_side": suppressed_side,
             "favored_side": ("B" if suppressed_side == "A" else "A" if suppressed_side == "B" else None),
             "directional_ok_tier1": bool(directional_ok_tier1),
@@ -2561,6 +3536,9 @@ class BotRuntime:
             "hmm_ready": bool(hmm_ready),
             "last_eval_ts": float(now),
             "reason": reason,
+            "mechanical_tier": int(mechanical_target_tier),
+            "mechanical_direction": str(self._regime_mechanical_direction),
+            "override_active": bool(reason == "ai_override"),
         }
         self._update_kelly()
 
@@ -2707,6 +3685,10 @@ class BotRuntime:
             "favored_side": favored,
             "regime": str(state.get("regime", regime_default)),
             "confidence": float(state.get("confidence", confidence_default)),
+            "confidence_raw": float(state.get("confidence_raw", confidence_default)),
+            "confidence_effective": float(state.get("confidence_effective", confidence_default)),
+            "confidence_modifier": float(state.get("confidence_modifier", 1.0)),
+            "confidence_modifier_source": str(state.get("confidence_modifier_source", "none")),
             "bias_signal": float(state.get("bias_signal", bias_default)),
             "abs_bias": float(state.get("abs_bias", abs(float(bias_default)))),
             "directional_ok_tier1": bool(state.get("directional_ok_tier1", False)),
@@ -2725,6 +3707,59 @@ class BotRuntime:
             "tier_history": list(self._regime_tier_history[-20:]),
             "last_eval_ts": float(state.get("last_eval_ts", self._regime_last_eval_ts)),
             "reason": str(state.get("reason", "")),
+        }
+
+    def _ai_regime_status_payload(self, now: float | None = None) -> dict[str, Any]:
+        now_ts = float(now if now is not None else _now())
+        enabled = bool(getattr(config, "AI_REGIME_ADVISOR_ENABLED", False))
+        last_run_ts = float(self._ai_regime_last_run_ts or 0.0)
+        last_run_age = (now_ts - last_run_ts) if last_run_ts > 0.0 else None
+        interval_sec = max(1.0, float(getattr(config, "AI_REGIME_INTERVAL_SEC", 300.0)))
+        if not enabled:
+            next_run_in = None
+        elif last_run_ts <= 0.0:
+            next_run_in = 0
+        else:
+            next_run_in = int(max(0.0, interval_sec - max(0.0, now_ts - last_run_ts)))
+
+        opinion = dict(self._ai_regime_opinion or {})
+        recommended_tier = max(0, min(2, int(opinion.get("recommended_tier", 0) or 0)))
+        recommended_direction = str(opinion.get("recommended_direction", "symmetric") or "symmetric").strip().lower()
+        if recommended_direction not in {"symmetric", "long_bias", "short_bias"}:
+            recommended_direction = "symmetric"
+        agreement = str(opinion.get("agreement", "unknown") or "unknown")
+        conviction = max(0, min(100, int(opinion.get("conviction", 0) or 0)))
+
+        opinion_payload = {
+            "recommended_tier": int(recommended_tier),
+            "recommended_direction": str(recommended_direction),
+            "conviction": int(conviction),
+            "rationale": str(opinion.get("rationale", "") or ""),
+            "watch_for": str(opinion.get("watch_for", "") or ""),
+            "panelist": str(opinion.get("panelist", "") or ""),
+            "agreement": agreement,
+            "error": str(opinion.get("error", "") or ""),
+            "trigger": str(opinion.get("trigger", "") or ""),
+            "ts": float(opinion.get("ts", 0.0) or 0.0),
+            "mechanical_tier": int(opinion.get("mechanical_tier", self._regime_mechanical_tier) or 0),
+            "mechanical_direction": str(
+                opinion.get("mechanical_direction", self._regime_mechanical_direction) or "symmetric"
+            ),
+        }
+
+        return {
+            "enabled": enabled,
+            "thread_alive": bool(self._ai_regime_thread_alive),
+            "dismissed": bool(self._ai_regime_dismissed),
+            "default_ttl_sec": int(max(1, int(getattr(config, "AI_OVERRIDE_TTL_SEC", 1800)))),
+            "max_ttl_sec": int(max(1, int(getattr(config, "AI_OVERRIDE_MAX_TTL_SEC", 3600)))),
+            "min_conviction": int(max(0, min(100, int(getattr(config, "AI_OVERRIDE_MIN_CONVICTION", 50))))),
+            "last_run_ts": (last_run_ts if last_run_ts > 0.0 else None),
+            "last_run_age_sec": (float(last_run_age) if last_run_age is not None else None),
+            "next_run_in_sec": next_run_in,
+            "opinion": opinion_payload,
+            "override": self._ai_override_payload(now_ts),
+            "history": list(self._ai_regime_history),
         }
 
     def _normalize_kraken_ohlcv_rows(
@@ -3409,10 +4444,15 @@ class BotRuntime:
         return max(0.0, _now() - self.last_price_ts)
 
     def _volatility_profit_pct(self) -> float:
-        # Volatility-aware runtime target from rolling absolute returns.
+        # Volatility-aware runtime target: user's profit_pct is the base,
+        # volatility applies a bounded multiplier (same pattern as entry_pct + HMM).
+        base = self.profit_pct
+        if base <= 0:
+            base = float(config.VOLATILITY_PROFIT_FLOOR)
+
         samples = [p for _, p in self.price_history[-180:]]
         if len(samples) < 12:
-            return self.profit_pct
+            return base
 
         ranges = []
         for i in range(1, len(samples)):
@@ -3421,11 +4461,17 @@ class BotRuntime:
             if prev > 0:
                 ranges.append(abs(cur - prev) / prev * 100.0)
         if not ranges:
-            return self.profit_pct
+            return base
 
-        med_range = median(ranges) * 2.0
-        target = med_range * float(config.VOLATILITY_PROFIT_FACTOR)
-        target = max(float(config.VOLATILITY_PROFIT_FLOOR), target)
+        vol_suggested = median(ranges) * 2.0 * float(config.VOLATILITY_PROFIT_FACTOR)
+
+        # Express as multiplier on user's base, clamped to configured bounds.
+        raw_mult = vol_suggested / base if base > 0 else 1.0
+        mult = max(float(config.VOLATILITY_PROFIT_MULT_FLOOR),
+                   min(float(config.VOLATILITY_PROFIT_MULT_CEILING), raw_mult))
+        target = base * mult
+
+        # Absolute ceiling still applies.
         target = min(float(config.VOLATILITY_PROFIT_CEILING), target)
 
         # Never below fee floor.
@@ -5545,6 +6591,7 @@ class BotRuntime:
             self._update_daily_loss_lock(loop_now)
             self._update_rebalancer(loop_now)
             self._update_regime_tier(loop_now)
+            self._maybe_schedule_ai_regime(loop_now)
             self._apply_tier2_suppression(loop_now)
             self._clear_expired_regime_cooldown(loop_now)
             # Prioritize older deferred entries each loop, while avoiding stale placements
@@ -6346,6 +7393,7 @@ class BotRuntime:
             hmm_consensus["source_mode"] = self._hmm_source_mode()
             hmm_consensus["multi_timeframe"] = bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False))
             regime_directional = self._regime_status_payload(now)
+            ai_regime_advisor = self._ai_regime_status_payload(now)
             oldest_exit_age_sec = float(slot_vintage.get("oldest_exit_age_sec", 0.0) or 0.0)
             stuck_capital_pct = float(slot_vintage.get("stuck_capital_pct", 0.0) or 0.0)
             slot_vintage["vintage_warn"] = oldest_exit_age_sec >= 3.0 * 86400.0
@@ -6460,8 +7508,10 @@ class BotRuntime:
                 "hmm_data_pipeline_secondary": hmm_data_pipeline_secondary,
                 "hmm_regime": hmm_regime,
                 "hmm_consensus": hmm_consensus,
+                "regime_history_30m": list(self._regime_history_30m),
                 "kelly": (self._kelly.status_payload() if self._kelly is not None else {"enabled": False}),
                 "regime_directional": regime_directional,
+                "ai_regime_advisor": ai_regime_advisor,
                 "release_health": {
                     "sticky_release_total": int(self._sticky_release_total),
                     "sticky_release_last_at": self._sticky_release_last_at or None,
@@ -6703,6 +7753,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 parsed["source"] = source
             elif action == "remove_layer":
                 pass
+            elif action == "ai_regime_override":
+                ttl_raw = body.get("ttl_sec", None)
+                if ttl_raw in (None, ""):
+                    parsed["ttl_sec"] = int(getattr(config, "AI_OVERRIDE_TTL_SEC", 1800))
+                else:
+                    try:
+                        parsed["ttl_sec"] = int(ttl_raw)
+                    except (TypeError, ValueError):
+                        self._send_json({"ok": False, "message": "invalid ttl_sec"}, 400)
+                        return
+            elif action in ("ai_regime_revert", "ai_regime_dismiss"):
+                pass
             elif action in ("pause", "resume", "add_slot", "soft_close_next", "reconcile_drift", "audit_pnl"):
                 pass
             else:
@@ -6750,6 +7812,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     ok, msg = _RUNTIME.reconcile_drift()
                 elif action == "audit_pnl":
                     ok, msg = _RUNTIME.audit_pnl()
+                elif action == "ai_regime_override":
+                    ok, msg = _RUNTIME.apply_ai_regime_override(int(parsed.get("ttl_sec", 0)))
+                elif action == "ai_regime_revert":
+                    ok, msg = _RUNTIME.revert_ai_regime_override()
+                elif action == "ai_regime_dismiss":
+                    ok, msg = _RUNTIME.dismiss_ai_regime_opinion()
                 _RUNTIME._save_snapshot()
 
             self._send_json({"ok": bool(ok), "message": str(msg)}, 200 if ok else 400)

@@ -3907,7 +3907,7 @@ def adjust_profit_from_volatility(state: GridState, stats_results: dict) -> bool
     if not median_range or median_range <= 0:
         return False
 
-    vol_target = median_range * config.VOLATILITY_PROFIT_FACTOR
+    vol_suggested = median_range * config.VOLATILITY_PROFIT_FACTOR
 
     # Directional squeeze: tighten profit target when market is trending.
     # directionality = 0.0 (ranging) to 1.0 (max directional).
@@ -3915,12 +3915,20 @@ def adjust_profit_from_volatility(state: GridState, stats_results: dict) -> bool
     squeeze = config.DIRECTIONAL_SQUEEZE
     dir_factor = 1.0 - directionality * squeeze  # 1.0 at range, (1-squeeze) at max trend
 
-    proposed = vol_target * dir_factor
+    vol_suggested *= dir_factor
+
+    # User's profit_pct is the base; volatility applies a bounded multiplier.
+    base = state.profit_pct
+    if base <= 0:
+        base = float(config.VOLATILITY_PROFIT_FLOOR)
+    raw_mult = vol_suggested / base if base > 0 else 1.0
+    mult = max(float(config.VOLATILITY_PROFIT_MULT_FLOOR),
+               min(float(config.VOLATILITY_PROFIT_MULT_CEILING), raw_mult))
+    proposed = base * mult
+
     # Hard floor: never go below round-trip fees + safety buffer.
-    # This prevents the razor-thin margin that causes guaranteed losses.
     fee_floor = config.ROUND_TRIP_FEE_PCT + 0.20
-    floor = max(config.VOLATILITY_PROFIT_FLOOR, fee_floor)
-    proposed = max(floor, min(proposed, config.VOLATILITY_PROFIT_CEILING))
+    proposed = max(fee_floor, min(proposed, config.VOLATILITY_PROFIT_CEILING))
 
     # Noise filter: skip if change is too small
     if abs(proposed - state.profit_pct) < config.VOLATILITY_PROFIT_MIN_CHANGE:

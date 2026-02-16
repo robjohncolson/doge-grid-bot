@@ -242,6 +242,16 @@ POLL_INTERVAL_SECONDS: int = _env("POLL_INTERVAL_SECONDS", 30, int)
 # 3600 = once per hour = 24 calls/day, well within Groq free tier.
 AI_ADVISOR_INTERVAL: int = _env("AI_ADVISOR_INTERVAL", 3600, int)
 
+# AI Regime Advisor controls (HMM second-opinion layer).
+AI_REGIME_ADVISOR_ENABLED: bool = _env("AI_REGIME_ADVISOR_ENABLED", False, bool)
+AI_REGIME_INTERVAL_SEC: float = _env("AI_REGIME_INTERVAL_SEC", 300.0, float)
+AI_REGIME_DEBOUNCE_SEC: float = _env("AI_REGIME_DEBOUNCE_SEC", 60.0, float)
+AI_OVERRIDE_TTL_SEC: int = _env("AI_OVERRIDE_TTL_SEC", 1800, int)
+AI_OVERRIDE_MAX_TTL_SEC: int = _env("AI_OVERRIDE_MAX_TTL_SEC", 3600, int)
+AI_OVERRIDE_MIN_CONVICTION: int = _env("AI_OVERRIDE_MIN_CONVICTION", 50, int)
+AI_REGIME_HISTORY_SIZE: int = _env("AI_REGIME_HISTORY_SIZE", 12, int)
+AI_REGIME_PREFER_REASONING: bool = _env("AI_REGIME_PREFER_REASONING", True, bool)
+
 # Hour (UTC) to send daily P&L summary via Telegram.
 # 0 = midnight UTC.
 DAILY_SUMMARY_HOUR_UTC: int = _env("DAILY_SUMMARY_HOUR_UTC", 0, int)
@@ -476,10 +486,14 @@ HMM_OHLCV_BACKFILL_MAX_PAGES: int = _env("HMM_OHLCV_BACKFILL_MAX_PAGES", 40, int
 HMM_BACKFILL_MAX_STALLS: int = _env("HMM_BACKFILL_MAX_STALLS", 3, int)
 
 # Readiness targets for HMM training/inference windows.
-HMM_TRAINING_CANDLES: int = _env("HMM_TRAINING_CANDLES", 720, int)
+HMM_TRAINING_CANDLES: int = _env("HMM_TRAINING_CANDLES", 4000, int)
 HMM_RECENT_CANDLES: int = _env("HMM_RECENT_CANDLES", 100, int)
 HMM_MIN_TRAIN_SAMPLES: int = _env("HMM_MIN_TRAIN_SAMPLES", 500, int)
 HMM_READINESS_CACHE_SEC: float = _env("HMM_READINESS_CACHE_SEC", 300.0, float)
+# Optional deep-window recency decay (applied as resampling in runtime).
+HMM_DEEP_DECAY_ENABLED: bool = _env("HMM_DEEP_DECAY_ENABLED", False, bool)
+# Half-life in candles for deep-window decay weighting.
+HMM_DEEP_DECAY_HALFLIFE: int = _env("HMM_DEEP_DECAY_HALFLIFE", 1440, int)
 
 # HMM detector runtime knobs (advisory-only layer; reducer remains unchanged).
 HMM_ENABLED: bool = _env("HMM_ENABLED", False, bool)
@@ -498,7 +512,7 @@ HMM_MULTI_TIMEFRAME_SOURCE: str = _env("HMM_MULTI_TIMEFRAME_SOURCE", "primary", 
 HMM_SECONDARY_INTERVAL_MIN: int = _env("HMM_SECONDARY_INTERVAL_MIN", 15, int)
 HMM_SECONDARY_OHLCV_ENABLED: bool = _env("HMM_SECONDARY_OHLCV_ENABLED", False, bool)
 HMM_SECONDARY_SYNC_INTERVAL_SEC: float = _env("HMM_SECONDARY_SYNC_INTERVAL_SEC", 300.0, float)
-HMM_SECONDARY_TRAINING_CANDLES: int = _env("HMM_SECONDARY_TRAINING_CANDLES", 720, int)
+HMM_SECONDARY_TRAINING_CANDLES: int = _env("HMM_SECONDARY_TRAINING_CANDLES", 1440, int)
 HMM_SECONDARY_RECENT_CANDLES: int = _env("HMM_SECONDARY_RECENT_CANDLES", 50, int)
 HMM_SECONDARY_MIN_TRAIN_SAMPLES: int = _env("HMM_SECONDARY_MIN_TRAIN_SAMPLES", 200, int)
 CONSENSUS_1M_WEIGHT: float = _env("CONSENSUS_1M_WEIGHT", 0.3, float)
@@ -583,6 +597,10 @@ VOLATILITY_PROFIT_FACTOR: float = _env("VOLATILITY_PROFIT_FACTOR", 0.8, float)
 VOLATILITY_PROFIT_FLOOR: float = _env("VOLATILITY_PROFIT_FLOOR", 1.0, float)  # DOGE-like margins
 VOLATILITY_PROFIT_CEILING: float = _env("VOLATILITY_PROFIT_CEILING", 3.0, float)
 VOLATILITY_PROFIT_MIN_CHANGE: float = _env("VOLATILITY_PROFIT_MIN_CHANGE", 0.05, float)
+# Multiplier bounds: how far volatility can adjust profit_pct from the user's setting.
+# 0.5 = can tighten to 50% of user's base; 2.0 = can widen to 200%.
+VOLATILITY_PROFIT_MULT_FLOOR: float = _env("VOLATILITY_PROFIT_MULT_FLOOR", 0.5, float)
+VOLATILITY_PROFIT_MULT_CEILING: float = _env("VOLATILITY_PROFIT_MULT_CEILING", 2.0, float)
 
 # Squeeze profit target when market is directional (trend_ratio deviates from 0.5).
 # 0.0 = disabled (no squeeze), 1.0 = full squeeze (halves target at max directionality).
