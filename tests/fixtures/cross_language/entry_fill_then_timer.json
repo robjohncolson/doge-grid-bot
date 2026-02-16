@@ -1,0 +1,89 @@
+{
+  "name": "entry_fill_then_timer",
+  "config": {
+    "entry_pct": 0.2,
+    "profit_pct": 1.0,
+    "refresh_pct": 1.0,
+    "order_size_usd": 2.0,
+    "price_decimals": 6,
+    "volume_decimals": 0,
+    "min_volume": 13.0,
+    "min_cost_usd": 0.0,
+    "maker_fee_pct": 0.25,
+    "s1_orphan_after_sec": 600.0,
+    "s2_orphan_after_sec": 1800.0,
+    "loss_backoff_start": 3,
+    "loss_cooldown_start": 5,
+    "loss_cooldown_sec": 900.0,
+    "max_recovery_slots": 2
+  },
+  "initial_state": {
+    "market_price": 0.1,
+    "now": 1000.0,
+    "orders": [
+      {
+        "local_id": 1,
+        "side": "sell",
+        "role": "entry",
+        "price": 0.1002,
+        "volume": 13.0,
+        "trade_id": "A",
+        "cycle": 1,
+        "txid": "TX-A-ENTRY",
+        "placed_at": 999.0
+      },
+      {
+        "local_id": 2,
+        "side": "buy",
+        "role": "entry",
+        "price": 0.0998,
+        "volume": 13.0,
+        "trade_id": "B",
+        "cycle": 1,
+        "txid": "TX-B-ENTRY",
+        "placed_at": 999.0
+      }
+    ],
+    "recovery_orders": [],
+    "completed_cycles": [],
+    "cycle_a": 1,
+    "cycle_b": 1,
+    "next_order_id": 3,
+    "next_recovery_id": 1,
+    "total_profit": 0.0,
+    "total_fees": 0.0,
+    "today_realized_loss": 0.0,
+    "total_round_trips": 0,
+    "profit_pct_runtime": 1.0
+  },
+  "order_size_usd": 2.0,
+  "order_sizes": null,
+  "events": [
+    {
+      "type": "FillEvent",
+      "payload": {
+        "order_local_id": 2,
+        "txid": "TX-B-ENTRY",
+        "side": "buy",
+        "price": 0.0998,
+        "volume": 13.0,
+        "fee": 0.01,
+        "timestamp": 1001.0
+      }
+    },
+    {
+      "type": "TimerTick",
+      "payload": {
+        "timestamp": 1002.0
+      }
+    }
+  ],
+  "expected": {
+    "phase": "S1b",
+    "open_orders": 2,
+    "recovery_orders": 0,
+    "round_trips": 0,
+    "invariants": []
+  }
+}
+
