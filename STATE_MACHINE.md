@@ -30,6 +30,9 @@ Core data model (`PairState`) is per slot and contains:
 - Active orders (`orders`)
 - Orphaned exits (`recovery_orders`)
 - Completed cycles (`completed_cycles`)
+- Dual realized trackers:
+  - `total_profit` (net cycle PnL after both fill fees)
+  - `total_settled_usd` (estimated quote-balance USD delta)
 - Regime vintage tags on orders/recoveries/cycles (`regime_at_entry`: `0`/`1`/`2` or `None`)
 - Cycle counters (`cycle_a`, `cycle_b`)
 - Risk counters and cooldown timers
@@ -186,8 +189,10 @@ If filled order is an entry:
 If filled order is an exit:
 
 - Book completed cycle (`_book_cycle`)
+- Booked cycle now includes fee split (`entry_fee`, `exit_fee`), quote-fee estimate
+  (`quote_fee`), and quote-settlement estimate (`settled_usd`)
 - Booked cycle carries `regime_at_entry` from the filled exit order
-- Update realized loss counters and cooldown timers
+- Update realized loss counters, cooldown timers, and cumulative settlement trackers
 - Increment cycle counter for that trade (`cycle_a` or `cycle_b`)
 - Attempt follow-up entry for same trade unless blocked by:
   - fallback mode (`long_only` / `short_only`)
@@ -246,6 +251,12 @@ base = max(ORDER_SIZE_USD, ORDER_SIZE_USD + slot.total_profit)
 layer_usd = effective_layers * CAPITAL_LAYER_DOGE_PER_ORDER * market_price
 base_with_layers = max(base, base + layer_usd)
 ```
+
+B-side sizing behavior:
+
+- Base remains account-aware (`available_usd / slot_count`, floored by `ORDER_SIZE_USD`)
+- A dust dividend (when enabled) redistributes free-USD surplus across
+  buy-ready slots each loop so realized gains are absorbed instead of idling
 
 Kelly criterion sizing (master toggle `KELLY_ENABLED`) is an advisory layer
 applied after `base_with_layers` and before rebalancer skew.

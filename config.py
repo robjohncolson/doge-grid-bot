@@ -373,6 +373,70 @@ STICKY_MODE_ENABLED: bool = _env("STICKY_MODE_ENABLED", False, bool)
 STICKY_TARGET_SLOTS: int = _env("STICKY_TARGET_SLOTS", 80, int)
 STICKY_MAX_TARGET_SLOTS: int = _env("STICKY_MAX_TARGET_SLOTS", 100, int)
 
+# Self-healing position ledger (local-first, optional Supabase replication).
+POSITION_LEDGER_ENABLED: bool = _env("POSITION_LEDGER_ENABLED", True, bool)
+POSITION_JOURNAL_LOCAL_LIMIT: int = _env("POSITION_JOURNAL_LOCAL_LIMIT", 500, int)
+if POSITION_JOURNAL_LOCAL_LIMIT < 50:
+    POSITION_JOURNAL_LOCAL_LIMIT = 50
+
+# Distance-weighted age bands for self-healing exits.
+AGE_BAND_FRESH_SEC: int = _env("AGE_BAND_FRESH_SEC", 21600, int)     # 6h
+AGE_BAND_AGING_SEC: int = _env("AGE_BAND_AGING_SEC", 86400, int)     # 24h
+AGE_BAND_STALE_SEC: int = _env("AGE_BAND_STALE_SEC", 259200, int)    # 72h
+AGE_BAND_STUCK_SEC: int = _env("AGE_BAND_STUCK_SEC", 604800, int)    # 168h
+if AGE_BAND_FRESH_SEC < 60:
+    AGE_BAND_FRESH_SEC = 60
+if AGE_BAND_AGING_SEC <= AGE_BAND_FRESH_SEC:
+    AGE_BAND_AGING_SEC = AGE_BAND_FRESH_SEC + 60
+if AGE_BAND_STALE_SEC <= AGE_BAND_AGING_SEC:
+    AGE_BAND_STALE_SEC = AGE_BAND_AGING_SEC + 60
+if AGE_BAND_STUCK_SEC <= AGE_BAND_STALE_SEC:
+    AGE_BAND_STUCK_SEC = AGE_BAND_STALE_SEC + 60
+AGE_DISTANCE_WEIGHT: float = _env("AGE_DISTANCE_WEIGHT", 5.0, float)
+if AGE_DISTANCE_WEIGHT <= 0:
+    AGE_DISTANCE_WEIGHT = 5.0
+
+# Subsidy repricing controls.
+SUBSIDY_ENABLED: bool = _env("SUBSIDY_ENABLED", False, bool)
+SUBSIDY_REPRICE_INTERVAL_SEC: int = _env("SUBSIDY_REPRICE_INTERVAL_SEC", 3600, int)
+if SUBSIDY_REPRICE_INTERVAL_SEC < 60:
+    SUBSIDY_REPRICE_INTERVAL_SEC = 60
+_SUBSIDY_AUTO_REPRICE_BAND_RAW: str = _env("SUBSIDY_AUTO_REPRICE_BAND", "stuck", str)
+SUBSIDY_AUTO_REPRICE_BAND: str = str(_SUBSIDY_AUTO_REPRICE_BAND_RAW).strip().lower()
+if SUBSIDY_AUTO_REPRICE_BAND not in {"stale", "stuck", "write_off"}:
+    SUBSIDY_AUTO_REPRICE_BAND = "stuck"
+SUBSIDY_WRITE_OFF_AUTO: bool = _env("SUBSIDY_WRITE_OFF_AUTO", False, bool)
+
+# Churner mode controls (regime-gated, self-healing helper cycles).
+CHURNER_ENABLED: bool = _env("CHURNER_ENABLED", False, bool)
+CHURNER_ENTRY_PCT: float = _env("CHURNER_ENTRY_PCT", 0.15, float)
+if CHURNER_ENTRY_PCT <= 0:
+    CHURNER_ENTRY_PCT = 0.15
+CHURNER_PROFIT_PCT: float = _env("CHURNER_PROFIT_PCT", ROUND_TRIP_FEE_PCT + 0.10, float)
+if CHURNER_PROFIT_PCT <= ROUND_TRIP_FEE_PCT:
+    CHURNER_PROFIT_PCT = ROUND_TRIP_FEE_PCT + 0.10
+CHURNER_ORDER_SIZE_USD: float = _env("CHURNER_ORDER_SIZE_USD", ORDER_SIZE_USD, float)
+if CHURNER_ORDER_SIZE_USD <= 0:
+    CHURNER_ORDER_SIZE_USD = ORDER_SIZE_USD
+CHURNER_TIMEOUT_SEC: int = _env("CHURNER_TIMEOUT_SEC", 300, int)
+if CHURNER_TIMEOUT_SEC < 60:
+    CHURNER_TIMEOUT_SEC = 60
+CHURNER_EXIT_TIMEOUT_SEC: int = _env("CHURNER_EXIT_TIMEOUT_SEC", 600, int)
+if CHURNER_EXIT_TIMEOUT_SEC < CHURNER_TIMEOUT_SEC:
+    CHURNER_EXIT_TIMEOUT_SEC = CHURNER_TIMEOUT_SEC
+CHURNER_MIN_HEADROOM: int = _env("CHURNER_MIN_HEADROOM", 10, int)
+if CHURNER_MIN_HEADROOM < 0:
+    CHURNER_MIN_HEADROOM = 0
+CHURNER_RESERVE_USD: float = _env("CHURNER_RESERVE_USD", 5.0, float)
+if CHURNER_RESERVE_USD < 0:
+    CHURNER_RESERVE_USD = 0.0
+
+# Dependency enforcement: churner/subsidy rely on ledger primitives.
+if CHURNER_ENABLED and not POSITION_LEDGER_ENABLED:
+    POSITION_LEDGER_ENABLED = True
+if SUBSIDY_ENABLED and not POSITION_LEDGER_ENABLED:
+    POSITION_LEDGER_ENABLED = True
+
 # Sticky release gate controls.
 RELEASE_MIN_AGE_SEC: int = _env("RELEASE_MIN_AGE_SEC", 7 * 86400, int)
 RELEASE_MIN_DISTANCE_PCT: float = _env("RELEASE_MIN_DISTANCE_PCT", 10.0, float)
@@ -664,6 +728,8 @@ REGIME_MIN_DWELL_SEC: float = _env("REGIME_MIN_DWELL_SEC", 300.0, float)
 REGIME_SUPPRESSION_GRACE_SEC: float = _env("REGIME_SUPPRESSION_GRACE_SEC", 60.0, float)
 REGIME_TIER2_REENTRY_COOLDOWN_SEC: float = _env("REGIME_TIER2_REENTRY_COOLDOWN_SEC", 600.0, float)
 REGIME_EVAL_INTERVAL_SEC: float = _env("REGIME_EVAL_INTERVAL_SEC", 300.0, float)
+# Accelerated eval interval used during BOCPD alerts.
+REGIME_EVAL_INTERVAL_FAST: float = _env("REGIME_EVAL_INTERVAL_FAST", 60.0, float)
 
 # Optional manual override (empty string = auto/HMM-driven).
 REGIME_MANUAL_OVERRIDE: str = _env("REGIME_MANUAL_OVERRIDE", "", str)
@@ -672,6 +738,90 @@ REGIME_MANUAL_CONFIDENCE: float = _env("REGIME_MANUAL_CONFIDENCE", 0.75, float)
 # Mapping from skew signal -> size multiplier.
 REBALANCE_SIZE_SENSITIVITY: float = _env("REBALANCE_SIZE_SENSITIVITY", 1.0, float)
 REBALANCE_MAX_SIZE_MULT: float = _env("REBALANCE_MAX_SIZE_MULT", 1.5, float)
+
+# ---------------------------------------------------------------------------
+# Bayesian intelligence stack (phased rollout)
+# ---------------------------------------------------------------------------
+
+# Phase 0: instrumentation only (no behavior change).
+BELIEF_STATE_LOGGING_ENABLED: bool = _env("BELIEF_STATE_LOGGING_ENABLED", True, bool)
+BELIEF_STATE_IN_STATUS: bool = _env("BELIEF_STATE_IN_STATUS", True, bool)
+
+# Phase 1: BOCPD structural break detector.
+BOCPD_ENABLED: bool = _env("BOCPD_ENABLED", False, bool)
+BOCPD_EXPECTED_RUN_LENGTH: int = _env("BOCPD_EXPECTED_RUN_LENGTH", 200, int)
+BOCPD_ALERT_THRESHOLD: float = _env("BOCPD_ALERT_THRESHOLD", 0.30, float)
+BOCPD_URGENT_THRESHOLD: float = _env("BOCPD_URGENT_THRESHOLD", 0.50, float)
+BOCPD_MAX_RUN_LENGTH: int = _env("BOCPD_MAX_RUN_LENGTH", 500, int)
+
+# Phase 2: enriched private microstructure features for HMM/BOCPD/survival.
+ENRICHED_FEATURES_ENABLED: bool = _env("ENRICHED_FEATURES_ENABLED", False, bool)
+FILL_IMBALANCE_WINDOW_SEC: int = _env("FILL_IMBALANCE_WINDOW_SEC", 300, int)
+FILL_TIME_DERIVATIVE_SHORT_SEC: int = _env("FILL_TIME_DERIVATIVE_SHORT_SEC", 300, int)
+FILL_TIME_DERIVATIVE_LONG_SEC: int = _env("FILL_TIME_DERIVATIVE_LONG_SEC", 1800, int)
+
+# Phase 3: survival model.
+SURVIVAL_MODEL_ENABLED: bool = _env("SURVIVAL_MODEL_ENABLED", False, bool)
+SURVIVAL_MODEL_TIER: str = _env("SURVIVAL_MODEL_TIER", "kaplan_meier", str)
+if SURVIVAL_MODEL_TIER not in {"kaplan_meier", "cox"}:
+    SURVIVAL_MODEL_TIER = "kaplan_meier"
+# Survival retrain cadence (spec default: 6 hours).
+SURVIVAL_RETRAIN_INTERVAL_SEC: float = _env("SURVIVAL_RETRAIN_INTERVAL_SEC", 21600.0, float)
+SURVIVAL_MIN_OBSERVATIONS: int = _env("SURVIVAL_MIN_OBSERVATIONS", 50, int)
+SURVIVAL_MIN_PER_STRATUM: int = _env("SURVIVAL_MIN_PER_STRATUM", 10, int)
+SURVIVAL_SYNTHETIC_ENABLED: bool = _env("SURVIVAL_SYNTHETIC_ENABLED", False, bool)
+SURVIVAL_SYNTHETIC_WEIGHT: float = _env("SURVIVAL_SYNTHETIC_WEIGHT", 0.30, float)
+SURVIVAL_SYNTHETIC_PATHS: int = _env("SURVIVAL_SYNTHETIC_PATHS", 5000, int)
+_SURVIVAL_HORIZONS_RAW: str = _env("SURVIVAL_HORIZONS", "1800,3600,14400", str)
+SURVIVAL_HORIZONS: list[int] = []
+for _tok in _SURVIVAL_HORIZONS_RAW.split(","):
+    _tok = _tok.strip()
+    if not _tok:
+        continue
+    try:
+        _v = int(_tok)
+    except (TypeError, ValueError):
+        continue
+    if _v > 0:
+        SURVIVAL_HORIZONS.append(_v)
+if not SURVIVAL_HORIZONS:
+    SURVIVAL_HORIZONS = [1800, 3600, 14400]
+SURVIVAL_HORIZONS = sorted(set(SURVIVAL_HORIZONS))
+SURVIVAL_LOG_PREDICTIONS: bool = _env("SURVIVAL_LOG_PREDICTIONS", True, bool)
+
+# Phase 4: per-trade belief tracker.
+BELIEF_TRACKER_ENABLED: bool = _env("BELIEF_TRACKER_ENABLED", False, bool)
+BELIEF_UPDATE_INTERVAL_SEC: float = _env("BELIEF_UPDATE_INTERVAL_SEC", 60.0, float)
+BELIEF_OPPORTUNITY_COST_PER_HOUR: float = _env("BELIEF_OPPORTUNITY_COST_PER_HOUR", 0.001, float)
+BELIEF_TIGHTEN_THRESHOLD_PFILL: float = _env("BELIEF_TIGHTEN_THRESHOLD_PFILL", 0.10, float)
+BELIEF_TIGHTEN_THRESHOLD_EV: float = _env("BELIEF_TIGHTEN_THRESHOLD_EV", 0.0, float)
+BELIEF_IMMEDIATE_REPRICE_AGREEMENT: float = _env("BELIEF_IMMEDIATE_REPRICE_AGREEMENT", 0.30, float)
+BELIEF_IMMEDIATE_REPRICE_CONFIDENCE: float = _env("BELIEF_IMMEDIATE_REPRICE_CONFIDENCE", 0.60, float)
+BELIEF_WIDEN_ENABLED: bool = _env("BELIEF_WIDEN_ENABLED", False, bool)
+BELIEF_WIDEN_STEP_PCT: float = _env("BELIEF_WIDEN_STEP_PCT", 0.001, float)
+BELIEF_MAX_WIDEN_COUNT: int = _env("BELIEF_MAX_WIDEN_COUNT", 2, int)
+BELIEF_MAX_WIDEN_TOTAL_PCT: float = _env("BELIEF_MAX_WIDEN_TOTAL_PCT", 0.005, float)
+BELIEF_TIMER_OVERRIDE_MAX_SEC: float = _env("BELIEF_TIMER_OVERRIDE_MAX_SEC", 3600.0, float)
+BELIEF_EV_TREND_WINDOW: int = _env("BELIEF_EV_TREND_WINDOW", 3, int)
+BELIEF_LOG_ACTIONS: bool = _env("BELIEF_LOG_ACTIONS", True, bool)
+
+# Phase 5: continuous action knobs.
+KNOB_MODE_ENABLED: bool = _env("KNOB_MODE_ENABLED", False, bool)
+KNOB_AGGRESSION_DIRECTION: float = _env("KNOB_AGGRESSION_DIRECTION", 0.5, float)
+KNOB_AGGRESSION_BOUNDARY: float = _env("KNOB_AGGRESSION_BOUNDARY", 0.3, float)
+KNOB_AGGRESSION_CONGESTION: float = _env("KNOB_AGGRESSION_CONGESTION", 0.5, float)
+KNOB_AGGRESSION_FLOOR: float = _env("KNOB_AGGRESSION_FLOOR", 0.5, float)
+KNOB_AGGRESSION_CEILING: float = _env("KNOB_AGGRESSION_CEILING", 1.5, float)
+KNOB_SPACING_VOLATILITY: float = _env("KNOB_SPACING_VOLATILITY", 0.3, float)
+KNOB_SPACING_BOUNDARY: float = _env("KNOB_SPACING_BOUNDARY", 0.2, float)
+KNOB_SPACING_FLOOR: float = _env("KNOB_SPACING_FLOOR", 0.8, float)
+KNOB_SPACING_CEILING: float = _env("KNOB_SPACING_CEILING", 1.5, float)
+KNOB_ASYMMETRY: float = _env("KNOB_ASYMMETRY", 0.3, float)
+KNOB_CADENCE_BOUNDARY: float = _env("KNOB_CADENCE_BOUNDARY", 0.5, float)
+KNOB_CADENCE_ENTROPY: float = _env("KNOB_CADENCE_ENTROPY", 0.3, float)
+KNOB_CADENCE_FLOOR: float = _env("KNOB_CADENCE_FLOOR", 0.3, float)
+KNOB_SUPPRESS_DIRECTION_FLOOR: float = _env("KNOB_SUPPRESS_DIRECTION_FLOOR", 0.3, float)
+KNOB_SUPPRESS_SCALE: float = _env("KNOB_SUPPRESS_SCALE", 0.5, float)
 
 # ---------------------------------------------------------------------------
 # USD dust sweep (balance-aware B-side sizing bump)

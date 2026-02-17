@@ -61,6 +61,16 @@ create table if not exists public.exit_outcomes (
   regime_bias_signal numeric,
   against_trend boolean,
   regime_tier integer,
+  posterior_1m jsonb,
+  posterior_15m jsonb,
+  posterior_1h jsonb,
+  entropy_at_entry double precision,
+  p_switch_at_entry double precision,
+  posterior_at_exit_1m jsonb,
+  posterior_at_exit_15m jsonb,
+  posterior_at_exit_1h jsonb,
+  entropy_at_exit double precision,
+  p_switch_at_exit double precision,
   created_at timestamptz not null default now()
 );
 
@@ -140,7 +150,59 @@ create table if not exists public.bot_events (
 create index if not exists idx_bot_events_pair_slot_ts
   on public.bot_events(pair, slot_id, "timestamp" desc);
 
--- 8) Optional helper view for latest runtime snapshot
+-- 8) Self-healing position ledger (open/closed position state)
+create table if not exists public.position_ledger (
+  position_id bigint primary key,
+  slot_id integer not null,
+  trade_id text not null,
+  slot_mode text not null,
+  cycle integer not null default 0,
+
+  entry_price double precision not null default 0,
+  entry_cost double precision not null default 0,
+  entry_fee double precision not null default 0,
+  entry_volume double precision not null default 0,
+  entry_time double precision not null default 0,
+  entry_regime text,
+  entry_volatility double precision not null default 0,
+
+  current_exit_price double precision not null default 0,
+  original_exit_price double precision not null default 0,
+  target_profit_pct double precision not null default 0,
+  exit_txid text,
+
+  exit_price double precision,
+  exit_cost double precision,
+  exit_fee double precision,
+  exit_time double precision,
+  exit_regime text,
+  net_profit double precision,
+  close_reason text,
+
+  status text not null default 'open',
+  times_repriced integer not null default 0,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists idx_position_ledger_slot_status
+  on public.position_ledger(slot_id, status);
+
+-- 9) Self-healing append-only journal
+create table if not exists public.position_journal (
+  journal_id bigint primary key,
+  position_id bigint not null references public.position_ledger(position_id),
+  timestamp double precision not null,
+  event_type text not null,
+  details jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists idx_position_journal_position_time
+  on public.position_journal(position_id, timestamp desc);
+create index if not exists idx_position_journal_type
+  on public.position_journal(event_type);
+
+-- 10) Optional helper view for latest runtime snapshot
 create or replace view public.v1_runtime as
 select
   bs.key,

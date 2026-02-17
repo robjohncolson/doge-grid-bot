@@ -30,6 +30,7 @@ import logging
 import time
 import threading
 import collections
+import re
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -45,6 +46,8 @@ def _note_missing_column(err_body: str):
     """Detect missing columns from Supabase error responses."""
     global _pair_column_supported, _identity_columns_supported
     global _ohlcv_table_supported, _exit_outcomes_table_supported, _regime_tier_transitions_supported
+    global _position_ledger_table_supported, _position_journal_table_supported
+    global _exit_outcomes_unsupported_columns
     if "does not exist" in err_body:
         if "pair" in err_body and _pair_column_supported is not False:
             _pair_column_supported = False
@@ -56,6 +59,36 @@ def _note_missing_column(err_body: str):
             _exit_outcomes_table_supported = False
         if "regime_tier_transitions" in err_body:
             _regime_tier_transitions_supported = False
+        if "position_ledger" in err_body:
+            _position_ledger_table_supported = False
+        if "position_journal" in err_body:
+            _position_journal_table_supported = False
+
+    # Column-level autodetection for additive exit_outcomes schema.
+    # Example errors:
+    # - column "posterior_1m" of relation "exit_outcomes" does not exist
+    # - Could not find the 'posterior_1m' column of 'exit_outcomes' in the schema cache
+    rel_match = re.search(
+        r'column\s+"?([a-zA-Z0-9_]+)"?\s+of\s+relation\s+"?([a-zA-Z0-9_]+)"?\s+does not exist',
+        err_body,
+        re.IGNORECASE,
+    )
+    if rel_match:
+        col = str(rel_match.group(1) or "").strip()
+        rel = str(rel_match.group(2) or "").strip().lower()
+        if rel == "exit_outcomes" and col:
+            _exit_outcomes_unsupported_columns.add(col)
+
+    cache_match = re.search(
+        r"Could not find the '([a-zA-Z0-9_]+)' column of '([a-zA-Z0-9_]+)'",
+        err_body,
+        re.IGNORECASE,
+    )
+    if cache_match:
+        col = str(cache_match.group(1) or "").strip()
+        rel = str(cache_match.group(2) or "").strip().lower()
+        if rel == "exit_outcomes" and col:
+            _exit_outcomes_unsupported_columns.add(col)
 
 
 def _strip_unsupported_columns(row: dict) -> dict:
@@ -68,6 +101,20 @@ def _strip_unsupported_columns(row: dict) -> dict:
         row.pop("trade_id", None)
         row.pop("cycle", None)
     return row
+
+
+def _strip_unsupported_exit_outcomes_columns(row: dict) -> dict:
+    """
+    Drop exit_outcomes columns that the remote schema does not support.
+    """
+    if not isinstance(row, dict):
+        return {}
+    if not _exit_outcomes_unsupported_columns:
+        return row
+    clean = dict(row)
+    for col in list(_exit_outcomes_unsupported_columns):
+        clean.pop(col, None)
+    return clean
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +137,9 @@ _identity_columns_supported = None  # trade_id, cycle columns
 _ohlcv_table_supported = None       # ohlcv_candles table availability
 _exit_outcomes_table_supported = None  # exit_outcomes table availability
 _regime_tier_transitions_supported = None  # regime_tier_transitions table availability
+_position_ledger_table_supported = None  # position_ledger table availability
+_position_journal_table_supported = None  # position_journal table availability
+_exit_outcomes_unsupported_columns: set[str] = set()
 
 # Writer thread state
 _writer_thread: threading.Thread = None
@@ -206,7 +256,10 @@ def save_exit_outcome(row: dict):
         return
     if not isinstance(row, dict) or not row:
         return
-    _write_queue.append(("exit_outcomes", dict(row)))
+    sanitized = _strip_unsupported_exit_outcomes_columns(dict(row))
+    if not sanitized:
+        return
+    _write_queue.append(("exit_outcomes", sanitized))
 
 
 def save_regime_tier_transition(row: dict):
@@ -220,6 +273,32 @@ def save_regime_tier_transition(row: dict):
     if not isinstance(row, dict) or not row:
         return
     _write_queue.append(("regime_tier_transitions", dict(row)))
+
+
+def save_position_ledger(row: dict):
+    """
+    Queue a position_ledger row.
+
+    Expected table: position_ledger (upsert on position_id).
+    """
+    if not _enabled() or _position_ledger_table_supported is False:
+        return
+    if not isinstance(row, dict) or not row:
+        return
+    _write_queue.append(("position_ledger", dict(row)))
+
+
+def save_position_journal(row: dict):
+    """
+    Queue a position_journal row (append-only).
+
+    Expected table: position_journal.
+    """
+    if not _enabled() or _position_journal_table_supported is False:
+        return
+    if not isinstance(row, dict) or not row:
+        return
+    _write_queue.append(("position_journal", dict(row)))
 
 
 def save_trade(order, net_profit: float, fees: float, pair: str = "XDGUSD"):
@@ -676,6 +755,71 @@ def _flush_queue():
                 logger.debug("Supabase: bot_events upsert failed (%d rows)", len(rows))
             else:
                 logger.debug("Supabase: upserted %d rows into bot_events", len(rows))
+        elif table == "position_ledger":
+            if _position_ledger_table_supported is False:
+                continue
+            # Keep latest row per position_id for this flush batch.
+            by_position: dict[int, dict] = {}
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    pid = int(row.get("position_id"))
+                except (TypeError, ValueError):
+                    continue
+                if pid <= 0:
+                    continue
+                by_position[pid] = row
+            payload = list(by_position.values())
+            if not payload:
+                continue
+            result = _request(
+                "POST",
+                "/rest/v1/position_ledger",
+                body=payload,
+                params={"on_conflict": "position_id"},
+                upsert=True,
+            )
+            if result is None:
+                logger.debug("Supabase: position_ledger upsert failed (%d rows)", len(payload))
+            else:
+                logger.debug("Supabase: upserted %d rows into position_ledger", len(payload))
+        elif table == "position_journal":
+            if _position_journal_table_supported is False:
+                continue
+            payload = [row for row in rows if isinstance(row, dict)]
+            if not payload:
+                continue
+            result = _request("POST", "/rest/v1/position_journal", body=payload)
+            if result is None:
+                logger.debug("Supabase: position_journal insert failed (%d rows)", len(payload))
+            else:
+                logger.debug("Supabase: inserted %d rows into position_journal", len(payload))
+        elif table == "exit_outcomes":
+            if _exit_outcomes_table_supported is False:
+                continue
+            payload = [
+                _strip_unsupported_exit_outcomes_columns(dict(row))
+                for row in rows
+                if isinstance(row, dict) and row
+            ]
+            payload = [row for row in payload if row]
+            if not payload:
+                continue
+            result = _request("POST", "/rest/v1/exit_outcomes", body=payload)
+            if result is None and _exit_outcomes_unsupported_columns:
+                # Retry once after the failed request potentially updated unsupported columns.
+                retry_payload = [
+                    _strip_unsupported_exit_outcomes_columns(dict(row))
+                    for row in payload
+                ]
+                retry_payload = [row for row in retry_payload if row]
+                if retry_payload and retry_payload != payload:
+                    result = _request("POST", "/rest/v1/exit_outcomes", body=retry_payload)
+            if result is None:
+                logger.debug("Supabase: exit_outcomes batch insert failed (%d rows)", len(payload))
+            else:
+                logger.debug("Supabase: inserted %d rows into exit_outcomes", len(payload))
         else:
             # Bulk insert
             result = _request("POST", f"/rest/v1/{table}", body=rows)

@@ -263,20 +263,22 @@ class ThroughputSizer:
         base_order_usd: float,
         regime_label: str | None = None,
         trade_id: str | None = None,
+        aggression_mult: float = 1.0,
     ) -> tuple[float, str]:
         base = max(0.0, float(base_order_usd))
+        aggression = _clamp(_safe_float(aggression_mult, 1.0), 0.0, 3.0)
         result = self._result_for(regime_label=regime_label, trade_id=trade_id)
 
         if result.reason == "tp_disabled":
-            return base, "tp_disabled"
+            return (base * aggression), "tp_disabled"
         if not result.sufficient_data:
-            return base, f"tp_{result.reason}"
+            return (base * aggression), f"tp_{result.reason}"
 
-        adjusted = base * result.final_mult
+        adjusted = base * result.final_mult * aggression
         reason = (
             f"tp_{result.bucket_key}"
             f"(t={result.throughput_mult:.3f},age={result.age_pressure:.3f},"
-            f"util={result.util_penalty:.3f},m={result.final_mult:.3f})"
+            f"util={result.util_penalty:.3f},m={result.final_mult:.3f},agg={aggression:.3f})"
         )
         if result.reason != "ok":
             reason = f"{reason}:{result.reason}"

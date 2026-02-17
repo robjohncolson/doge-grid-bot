@@ -21,7 +21,7 @@ import time
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from math import ceil, exp, floor, isfinite
+from math import ceil, exp, floor, isfinite, log
 from socketserver import ThreadingMixIn
 from statistics import median
 from types import SimpleNamespace
@@ -37,8 +37,628 @@ import ai_advisor
 import state_machine as sm
 import supabase_store
 
+try:
+    import bayesian_engine as _bayesian_engine
+except Exception as exc:  # pragma: no cover - environment dependent
+    _bayesian_engine = None
+    _bayesian_import_error = exc
+else:
+    _bayesian_import_error = None
+
+try:
+    import bocpd as _bocpd
+except Exception as exc:  # pragma: no cover - environment dependent
+    _bocpd = None
+    _bocpd_import_error = exc
+else:
+    _bocpd_import_error = None
+
+try:
+    import survival_model as _survival_model
+except Exception as exc:  # pragma: no cover - environment dependent
+    _survival_model = None
+    _survival_import_error = exc
+else:
+    _survival_import_error = None
+
 
 logger = logging.getLogger(__name__)
+
+
+if _bayesian_engine is None:  # pragma: no cover - fallback path for minimal runtimes
+    @dataclass
+    class _FallbackBeliefState:
+        enabled: bool = False
+        posterior_1m: list[float] = None
+        posterior_15m: list[float] = None
+        posterior_1h: list[float] = None
+        entropy_1m: float = 0.0
+        entropy_15m: float = 0.0
+        entropy_1h: float = 0.0
+        entropy_consensus: float = 0.0
+        confidence_score: float = 1.0
+        p_switch_1m: float = 0.0
+        p_switch_15m: float = 0.0
+        p_switch_1h: float = 0.0
+        p_switch_consensus: float = 0.0
+        direction_score: float = 0.0
+        boundary_risk: str = "low"
+        posterior_consensus: list[float] = None
+
+        def __post_init__(self) -> None:
+            if self.posterior_1m is None:
+                self.posterior_1m = [0.0, 1.0, 0.0]
+            if self.posterior_15m is None:
+                self.posterior_15m = [0.0, 1.0, 0.0]
+            if self.posterior_1h is None:
+                self.posterior_1h = [0.0, 1.0, 0.0]
+            if self.posterior_consensus is None:
+                self.posterior_consensus = [0.0, 1.0, 0.0]
+
+        def to_status_dict(self) -> dict[str, Any]:
+            return {
+                "enabled": bool(self.enabled),
+                "posterior_1m": [float(x) for x in self.posterior_1m],
+                "posterior_15m": [float(x) for x in self.posterior_15m],
+                "posterior_1h": [float(x) for x in self.posterior_1h],
+                "entropy_1m": float(self.entropy_1m),
+                "entropy_15m": float(self.entropy_15m),
+                "entropy_1h": float(self.entropy_1h),
+                "entropy_consensus": float(self.entropy_consensus),
+                "confidence_score": float(self.confidence_score),
+                "p_switch_1m": float(self.p_switch_1m),
+                "p_switch_15m": float(self.p_switch_15m),
+                "p_switch_1h": float(self.p_switch_1h),
+                "p_switch_consensus": float(self.p_switch_consensus),
+                "direction_score": float(self.direction_score),
+                "boundary_risk": str(self.boundary_risk),
+            }
+
+    @dataclass
+    class _FallbackActionKnobs:
+        enabled: bool = False
+        aggression: float = 1.0
+        spacing_mult: float = 1.0
+        spacing_a: float = 1.0
+        spacing_b: float = 1.0
+        cadence_mult: float = 1.0
+        suppression_strength: float = 0.0
+        derived_tier: int = 0
+        derived_tier_label: str = "symmetric"
+
+        def to_status_dict(self) -> dict[str, Any]:
+            return {
+                "enabled": bool(self.enabled),
+                "aggression": float(self.aggression),
+                "spacing_mult": float(self.spacing_mult),
+                "spacing_a": float(self.spacing_a),
+                "spacing_b": float(self.spacing_b),
+                "cadence_mult": float(self.cadence_mult),
+                "suppression_strength": float(self.suppression_strength),
+                "derived_tier": int(self.derived_tier),
+                "derived_tier_label": str(self.derived_tier_label),
+            }
+
+    @dataclass
+    class _FallbackTradeBeliefState:
+        position_id: int
+        slot_id: int
+        trade_id: str
+        cycle: int
+        entry_regime_posterior: list[float] = None
+        entry_entropy: float = 0.0
+        entry_p_switch: float = 0.0
+        entry_price: float = 0.0
+        exit_price: float = 0.0
+        entry_ts: float = 0.0
+        side: str = ""
+        current_regime_posterior: list[float] = None
+        current_entropy: float = 0.0
+        current_p_switch: float = 0.0
+        elapsed_sec: float = 0.0
+        distance_from_market_pct: float = 0.0
+        p_fill_30m: float = 0.5
+        p_fill_1h: float = 0.5
+        p_fill_4h: float = 0.5
+        median_remaining_sec: float = 0.0
+        regime_agreement: float = 1.0
+        expected_value: float = 0.0
+        ev_trend: str = "stable"
+        recommended_action: str = "hold"
+        action_confidence: float = 0.0
+
+        def __post_init__(self) -> None:
+            if self.entry_regime_posterior is None:
+                self.entry_regime_posterior = [0.0] * 9
+            if self.current_regime_posterior is None:
+                self.current_regime_posterior = [0.0] * 9
+
+        def to_badge_dict(self) -> dict[str, Any]:
+            return {
+                "position_id": int(self.position_id),
+                "slot_id": int(self.slot_id),
+                "trade_id": str(self.trade_id),
+                "cycle": int(self.cycle),
+                "p_fill_1h": float(self.p_fill_1h),
+                "expected_value": float(self.expected_value),
+                "regime_agreement": float(self.regime_agreement),
+                "recommended_action": str(self.recommended_action),
+                "action_confidence": float(self.action_confidence),
+                "elapsed_sec": float(self.elapsed_sec),
+                "distance_from_market_pct": float(self.distance_from_market_pct),
+            }
+
+    def _fallback_triplet(raw: Any) -> list[float]:
+        if isinstance(raw, dict):
+            values = [
+                float(raw.get("bearish", 0.0) or 0.0),
+                float(raw.get("ranging", 0.0) or 0.0),
+                float(raw.get("bullish", 0.0) or 0.0),
+            ]
+        elif isinstance(raw, (list, tuple)) and len(raw) >= 3:
+            values = [float(raw[0] or 0.0), float(raw[1] or 0.0), float(raw[2] or 0.0)]
+        else:
+            values = [0.0, 1.0, 0.0]
+        values = [max(0.0, min(1.0, v)) for v in values]
+        total = sum(values)
+        if total <= 1e-12:
+            return [0.0, 1.0, 0.0]
+        return [v / total for v in values]
+
+    def _fallback_entropy(p: list[float]) -> float:
+        nz = [x for x in p if x > 0.0]
+        if not nz:
+            return 0.0
+        h = -sum(x * log(x) for x in nz)
+        hmax = log(3.0)
+        return max(0.0, min(1.0, h / hmax))
+
+    class _FallbackBayesianModule:
+        BeliefState = _FallbackBeliefState
+        ActionKnobs = _FallbackActionKnobs
+        TradeBeliefState = _FallbackTradeBeliefState
+
+        @staticmethod
+        def posterior9_from_timeframes(p1: Any, p15: Any, p60: Any) -> list[float]:
+            return _fallback_triplet(p1) + _fallback_triplet(p15) + _fallback_triplet(p60)
+
+        @staticmethod
+        def cosine_similarity(entry_vec: Any, current_vec: Any) -> float:
+            try:
+                v1 = [float(x) for x in list(entry_vec or [])]
+                v2 = [float(x) for x in list(current_vec or [])]
+            except Exception:
+                return 0.0
+            n = min(len(v1), len(v2))
+            if n <= 0:
+                return 0.0
+            v1 = v1[:n]
+            v2 = v2[:n]
+            dot = sum(a * b for a, b in zip(v1, v2))
+            n1 = sum(a * a for a in v1) ** 0.5
+            n2 = sum(b * b for b in v2) ** 0.5
+            if n1 <= 1e-12 or n2 <= 1e-12:
+                return 0.0
+            value = dot / (n1 * n2)
+            return max(-1.0, min(1.0, value))
+
+        @staticmethod
+        def expected_value(
+            *,
+            p_fill: float,
+            profit_if_fill: float,
+            opportunity_cost_per_hour: float,
+            elapsed_sec: float,
+        ) -> float:
+            p = max(0.0, min(1.0, float(p_fill)))
+            elapsed_h = max(0.0, float(elapsed_sec) / 3600.0)
+            opp = max(0.0, float(opportunity_cost_per_hour)) * elapsed_h
+            return (p * float(profit_if_fill)) - ((1.0 - p) * opp)
+
+        @staticmethod
+        def ev_trend(ev_history: list[float], window: int = 3) -> str:
+            n = max(2, int(window))
+            if len(ev_history) < n:
+                return "stable"
+            tail = [float(x) for x in ev_history[-n:]]
+            if all(tail[i] < tail[i + 1] for i in range(len(tail) - 1)):
+                return "rising"
+            if all(tail[i] > tail[i + 1] for i in range(len(tail) - 1)):
+                return "falling"
+            return "stable"
+
+        @staticmethod
+        def build_belief_state(
+            *,
+            posterior_1m: Any,
+            posterior_15m: Any,
+            posterior_1h: Any,
+            transmat_1m: Any = None,
+            transmat_15m: Any = None,
+            transmat_1h: Any = None,
+            weight_1m: float = 0.3,
+            weight_15m: float = 0.4,
+            weight_1h: float = 0.3,
+            enabled: bool = True,
+        ) -> _FallbackBeliefState:
+            p1 = _fallback_triplet(posterior_1m)
+            p15 = _fallback_triplet(posterior_15m)
+            p60 = _fallback_triplet(posterior_1h)
+            w1 = max(0.0, float(weight_1m))
+            w15 = max(0.0, float(weight_15m))
+            w60 = max(0.0, float(weight_1h))
+            ws = w1 + w15 + w60
+            if ws <= 1e-12:
+                w1, w15, w60 = 0.3, 0.4, 0.3
+                ws = 1.0
+            w1 /= ws
+            w15 /= ws
+            w60 /= ws
+            consensus = [
+                w1 * p1[0] + w15 * p15[0] + w60 * p60[0],
+                w1 * p1[1] + w15 * p15[1] + w60 * p60[1],
+                w1 * p1[2] + w15 * p15[2] + w60 * p60[2],
+            ]
+            direction = max(-1.0, min(1.0, consensus[2] - consensus[0]))
+            entropy_cons = _fallback_entropy(consensus)
+            confidence = max(0.0, min(1.0, 1.0 - entropy_cons))
+            return _FallbackBeliefState(
+                enabled=bool(enabled),
+                posterior_1m=p1,
+                posterior_15m=p15,
+                posterior_1h=p60,
+                entropy_1m=_fallback_entropy(p1),
+                entropy_15m=_fallback_entropy(p15),
+                entropy_1h=_fallback_entropy(p60),
+                entropy_consensus=entropy_cons,
+                confidence_score=confidence,
+                p_switch_1m=0.0,
+                p_switch_15m=0.0,
+                p_switch_1h=0.0,
+                p_switch_consensus=0.0,
+                direction_score=direction,
+                boundary_risk="low",
+                posterior_consensus=consensus,
+            )
+
+        @staticmethod
+        def compute_action_knobs(
+            *,
+            belief_state: _FallbackBeliefState,
+            volatility_score: float,
+            congestion_score: float,
+            capacity_band: str,
+            cfg: dict[str, Any],
+            enabled: bool,
+        ) -> _FallbackActionKnobs:
+            if not bool(enabled):
+                return _FallbackActionKnobs(enabled=False)
+            suppression = 0.0 if str(capacity_band or "").strip().lower() == "stop" else 0.0
+            return _FallbackActionKnobs(
+                enabled=True,
+                aggression=1.0,
+                spacing_mult=1.0,
+                spacing_a=1.0,
+                spacing_b=1.0,
+                cadence_mult=1.0,
+                suppression_strength=suppression,
+                derived_tier=0,
+                derived_tier_label="symmetric",
+            )
+
+        @staticmethod
+        def recommend_trade_action(
+            *,
+            regime_agreement: float,
+            confidence_score: float,
+            p_fill_30m: float,
+            p_fill_1h: float,
+            p_fill_4h: float,
+            expected_value_usd: float,
+            ev_trend_label: str,
+            is_s2: bool,
+            widen_enabled: bool,
+            immediate_reprice_agreement: float,
+            immediate_reprice_confidence: float,
+            tighten_threshold_pfill: float,
+            tighten_threshold_ev: float,
+        ) -> tuple[str, float]:
+            if (
+                float(regime_agreement) < float(immediate_reprice_agreement)
+                and float(confidence_score) >= float(immediate_reprice_confidence)
+            ):
+                return "reprice_breakeven", max(0.7, float(confidence_score))
+            if float(p_fill_1h) < float(tighten_threshold_pfill) and float(expected_value_usd) < float(
+                tighten_threshold_ev
+            ):
+                return "tighten", 0.6
+            return "hold", 0.5
+
+    bayesian_engine = _FallbackBayesianModule()
+else:
+    bayesian_engine = _bayesian_engine
+
+if _bocpd is None:  # pragma: no cover - fallback path for minimal runtimes
+    @dataclass
+    class _FallbackBOCPDState:
+        change_prob: float = 0.0
+        run_length_mode: int = 0
+        run_length_mode_prob: float = 1.0
+        last_update_ts: float = 0.0
+        observation_count: int = 0
+        alert_active: bool = False
+        alert_triggered_at: float = 0.0
+        run_length_map: dict[int, float] = None
+
+        def __post_init__(self) -> None:
+            if self.run_length_map is None:
+                self.run_length_map = {}
+
+        def to_status_dict(self) -> dict[str, Any]:
+            return {
+                "change_prob": float(self.change_prob),
+                "run_length_mode": int(self.run_length_mode),
+                "run_length_mode_prob": float(self.run_length_mode_prob),
+                "last_update_ts": float(self.last_update_ts),
+                "observation_count": int(self.observation_count),
+                "alert_active": bool(self.alert_active),
+                "alert_triggered_at": float(self.alert_triggered_at),
+                "run_length_map": {int(k): float(v) for k, v in (self.run_length_map or {}).items()},
+            }
+
+    class _FallbackBOCPD:
+        def __init__(
+            self,
+            *,
+            expected_run_length: int = 200,
+            max_run_length: int = 500,
+            alert_threshold: float = 0.30,
+            urgent_threshold: float = 0.50,
+            prior_mu: float = 0.0,
+            prior_kappa: float = 1.0,
+            prior_alpha: float = 1.0,
+            prior_beta: float = 1.0,
+        ) -> None:
+            self.expected_run_length = int(expected_run_length)
+            self.max_run_length = int(max_run_length)
+            self.alert_threshold = float(alert_threshold)
+            self.urgent_threshold = float(urgent_threshold)
+            self.state = _FallbackBOCPDState()
+
+        def update(self, observation: Any, now_ts: float | None = None) -> _FallbackBOCPDState:
+            ts = float(now_ts if now_ts is not None else _now())
+            self.state.last_update_ts = ts
+            self.state.observation_count = int(self.state.observation_count) + 1
+            self.state.change_prob = 0.0
+            self.state.alert_active = False
+            self.state.alert_triggered_at = 0.0
+            self.state.run_length_mode = min(self.state.observation_count, self.max_run_length)
+            self.state.run_length_mode_prob = 1.0
+            self.state.run_length_map = {int(self.state.run_length_mode): 1.0}
+            return self.state
+
+        def snapshot_state(self) -> dict[str, Any]:
+            return {"state": self.state.to_status_dict()}
+
+        def restore_state(self, payload: dict[str, Any]) -> None:
+            if not isinstance(payload, dict):
+                return
+            raw = payload.get("state", payload)
+            if not isinstance(raw, dict):
+                return
+            self.state = _FallbackBOCPDState(
+                change_prob=float(raw.get("change_prob", 0.0) or 0.0),
+                run_length_mode=max(0, int(raw.get("run_length_mode", 0) or 0)),
+                run_length_mode_prob=float(raw.get("run_length_mode_prob", 1.0) or 1.0),
+                last_update_ts=float(raw.get("last_update_ts", 0.0) or 0.0),
+                observation_count=max(0, int(raw.get("observation_count", 0) or 0)),
+                alert_active=bool(raw.get("alert_active", False)),
+                alert_triggered_at=float(raw.get("alert_triggered_at", 0.0) or 0.0),
+                run_length_map={
+                    int(k): float(v)
+                    for k, v in (raw.get("run_length_map", {}) or {}).items()
+                    if float(v) > 0.0
+                },
+            )
+
+    class _FallbackBOCPDModule:
+        BOCPD = _FallbackBOCPD
+        BOCPDState = _FallbackBOCPDState
+
+    bocpd = _FallbackBOCPDModule()
+else:
+    bocpd = _bocpd
+
+if _survival_model is None:  # pragma: no cover - fallback path for minimal runtimes
+    @dataclass
+    class _FallbackFillObservation:
+        duration_sec: float
+        censored: bool
+        regime_at_entry: int
+        regime_at_exit: int | None
+        side: str
+        distance_pct: float
+        posterior_1m: list[float]
+        posterior_15m: list[float]
+        posterior_1h: list[float]
+        entropy_at_entry: float
+        p_switch_at_entry: float
+        fill_imbalance: float
+        congestion_ratio: float
+        weight: float = 1.0
+        synthetic: bool = False
+
+        def normalized(self) -> "_FallbackFillObservation":
+            return self
+
+    @dataclass
+    class _FallbackSurvivalConfig:
+        min_observations: int = 50
+        min_per_stratum: int = 10
+        synthetic_weight: float = 0.3
+        horizons: list[int] = None
+
+        def __post_init__(self) -> None:
+            if self.horizons is None:
+                self.horizons = [1800, 3600, 14400]
+
+    @dataclass
+    class _FallbackSurvivalPrediction:
+        p_fill_30m: float
+        p_fill_1h: float
+        p_fill_4h: float
+        median_remaining: float
+        hazard_ratio: float
+        model_tier: str
+        confidence: float
+
+        def to_dict(self) -> dict[str, Any]:
+            return {
+                "p_fill_30m": float(self.p_fill_30m),
+                "p_fill_1h": float(self.p_fill_1h),
+                "p_fill_4h": float(self.p_fill_4h),
+                "median_remaining": float(self.median_remaining),
+                "hazard_ratio": float(self.hazard_ratio),
+                "model_tier": str(self.model_tier),
+                "confidence": float(self.confidence),
+            }
+
+    class _FallbackSurvivalModel:
+        def __init__(self, cfg: _FallbackSurvivalConfig, model_tier: str = "kaplan_meier") -> None:
+            self.cfg = cfg
+            self.model_tier = str(model_tier or "kaplan_meier")
+            self.active_tier = "kaplan_meier"
+            self.last_retrain_ts: float = 0.0
+            self.n_observations: int = 0
+            self.n_censored: int = 0
+            self.synthetic_observations: int = 0
+            self.fitted: bool = False
+
+        def fit(
+            self,
+            observations: list[_FallbackFillObservation],
+            synthetic_observations: list[_FallbackFillObservation] | None = None,
+        ) -> bool:
+            real = list(observations or [])
+            synth = list(synthetic_observations or [])
+            self.n_observations = len(real)
+            self.n_censored = int(sum(1 for row in real if bool(row.censored)))
+            self.synthetic_observations = len(synth)
+            self.last_retrain_ts = _now()
+            self.fitted = len(real) >= max(1, int(self.cfg.min_observations))
+            return bool(self.fitted)
+
+        def predict(self, obs: _FallbackFillObservation) -> _FallbackSurvivalPrediction:
+            if not self.fitted:
+                return _FallbackSurvivalPrediction(
+                    p_fill_30m=0.5,
+                    p_fill_1h=0.5,
+                    p_fill_4h=0.5,
+                    median_remaining=float("inf"),
+                    hazard_ratio=1.0,
+                    model_tier="kaplan_meier",
+                    confidence=0.0,
+                )
+            dist = max(0.0, float(getattr(obs, "distance_pct", 0.0) or 0.0))
+            p1h = max(0.05, min(0.95, exp(-dist)))
+            p30 = max(0.02, min(0.98, p1h * 0.8))
+            p4h = max(0.05, min(0.995, min(1.0, p1h + 0.2)))
+            confidence = max(0.0, min(1.0, self.n_observations / max(1.0, float(self.cfg.min_observations * 2))))
+            return _FallbackSurvivalPrediction(
+                p_fill_30m=p30,
+                p_fill_1h=p1h,
+                p_fill_4h=p4h,
+                median_remaining=3600.0,
+                hazard_ratio=1.0,
+                model_tier="kaplan_meier",
+                confidence=confidence,
+            )
+
+        def status_payload(self, enabled: bool) -> dict[str, Any]:
+            return {
+                "enabled": bool(enabled),
+                "model_tier": str(self.active_tier),
+                "n_observations": int(self.n_observations),
+                "n_censored": int(self.n_censored),
+                "last_retrain_ts": float(self.last_retrain_ts),
+                "strata_counts": {},
+                "synthetic_observations": int(self.synthetic_observations),
+                "cox_coefficients": {},
+            }
+
+        def snapshot_state(self) -> dict[str, Any]:
+            return {
+                "model_tier": str(self.model_tier),
+                "active_tier": str(self.active_tier),
+                "last_retrain_ts": float(self.last_retrain_ts),
+                "n_observations": int(self.n_observations),
+                "n_censored": int(self.n_censored),
+                "synthetic_observations": int(self.synthetic_observations),
+                "fitted": bool(self.fitted),
+            }
+
+        def restore_state(self, payload: dict[str, Any]) -> None:
+            if not isinstance(payload, dict):
+                return
+            self.model_tier = str(payload.get("model_tier", self.model_tier) or self.model_tier)
+            self.active_tier = str(payload.get("active_tier", self.active_tier) or self.active_tier)
+            self.last_retrain_ts = float(payload.get("last_retrain_ts", self.last_retrain_ts) or 0.0)
+            self.n_observations = max(0, int(payload.get("n_observations", self.n_observations) or 0))
+            self.n_censored = max(0, int(payload.get("n_censored", self.n_censored) or 0))
+            self.synthetic_observations = max(
+                0, int(payload.get("synthetic_observations", self.synthetic_observations) or 0)
+            )
+            self.fitted = bool(payload.get("fitted", self.fitted))
+
+        @staticmethod
+        def generate_synthetic_observations(
+            *,
+            n_paths: int = 5000,
+            weight: float = 0.3,
+        ) -> list[_FallbackFillObservation]:
+            rows: list[_FallbackFillObservation] = []
+            strata = [(0, "A"), (0, "B"), (1, "A"), (1, "B"), (2, "A"), (2, "B")]
+            per = max(1, int(n_paths) // len(strata))
+            for regime, side in strata:
+                for _ in range(per):
+                    rows.append(
+                        _FallbackFillObservation(
+                            duration_sec=3600.0,
+                            censored=False,
+                            regime_at_entry=regime,
+                            regime_at_exit=regime,
+                            side=side,
+                            distance_pct=0.3,
+                            posterior_1m=[0.0, 1.0, 0.0],
+                            posterior_15m=[0.0, 1.0, 0.0],
+                            posterior_1h=[0.0, 1.0, 0.0],
+                            entropy_at_entry=0.5,
+                            p_switch_at_entry=0.05,
+                            fill_imbalance=0.0,
+                            congestion_ratio=0.0,
+                            weight=max(1e-6, float(weight)),
+                            synthetic=True,
+                        )
+                    )
+            return rows
+
+    class _FallbackSurvivalModule:
+        FillObservation = _FallbackFillObservation
+        SurvivalConfig = _FallbackSurvivalConfig
+        SurvivalPrediction = _FallbackSurvivalPrediction
+        SurvivalModel = _FallbackSurvivalModel
+
+    survival_model = _FallbackSurvivalModule()
+else:
+    survival_model = _survival_model
+
+if _bayesian_import_error is not None:
+    logger.warning("Bayesian module unavailable; using neutral fallback: %s", _bayesian_import_error)
+if _bocpd_import_error is not None:
+    logger.warning("BOCPD module unavailable; using neutral fallback: %s", _bocpd_import_error)
+if _survival_import_error is not None:
+    logger.warning("Survival module unavailable; using neutral fallback: %s", _survival_import_error)
+
 _BOT_RUNTIME_STATE_FILE = os.path.join(config.LOG_DIR, "bot_runtime.json")
 _EQUITY_TS_FILE = os.path.join(config.LOG_DIR, "equity_ts.json")
 
@@ -454,6 +1074,54 @@ class BotRuntime:
             "confirmation_count": 0,
             "changed_at": 0.0,
         }
+        self._belief_state: bayesian_engine.BeliefState = bayesian_engine.BeliefState(enabled=False)
+        self._belief_state_last_ts: float = 0.0
+        self._belief_cycle_metadata: dict[tuple[int, str, int], dict[str, Any]] = {}
+        self._action_knobs: bayesian_engine.ActionKnobs = bayesian_engine.ActionKnobs(enabled=False)
+        self._micro_features: dict[str, float] = {
+            "fill_imbalance": 0.0,
+            "spread_realization": 1.0,
+            "fill_time_derivative": 0.0,
+            "congestion_ratio": 0.0,
+        }
+        self._fill_events_recent: deque[tuple[float, str]] = deque()
+        self._fill_duration_events: deque[tuple[float, float]] = deque()
+        self._spread_realization_events: deque[tuple[float, float]] = deque()
+        self._bocpd: bocpd.BOCPD | None = None
+        self._bocpd_state: bocpd.BOCPDState = bocpd.BOCPDState()
+        self._bocpd_last_price: float = 0.0
+        if bool(getattr(config, "BOCPD_ENABLED", False)):
+            self._bocpd = bocpd.BOCPD(
+                expected_run_length=max(2, int(getattr(config, "BOCPD_EXPECTED_RUN_LENGTH", 200))),
+                max_run_length=max(10, int(getattr(config, "BOCPD_MAX_RUN_LENGTH", 500))),
+                alert_threshold=float(getattr(config, "BOCPD_ALERT_THRESHOLD", 0.30)),
+                urgent_threshold=float(getattr(config, "BOCPD_URGENT_THRESHOLD", 0.50)),
+            )
+        self._survival_model: survival_model.SurvivalModel | None = None
+        self._survival_last_retrain_ts: float = 0.0
+        if bool(getattr(config, "SURVIVAL_MODEL_ENABLED", False)):
+            self._survival_model = survival_model.SurvivalModel(
+                survival_model.SurvivalConfig(
+                    min_observations=max(1, int(getattr(config, "SURVIVAL_MIN_OBSERVATIONS", 50))),
+                    min_per_stratum=max(1, int(getattr(config, "SURVIVAL_MIN_PER_STRATUM", 10))),
+                    synthetic_weight=max(0.0, min(1.0, float(getattr(config, "SURVIVAL_SYNTHETIC_WEIGHT", 0.30)))),
+                    horizons=list(getattr(config, "SURVIVAL_HORIZONS", [1800, 3600, 14400])),
+                ),
+                model_tier=str(getattr(config, "SURVIVAL_MODEL_TIER", "kaplan_meier")),
+            )
+        self._trade_beliefs: dict[int, bayesian_engine.TradeBeliefState] = {}
+        self._trade_belief_ev_history: dict[int, list[float]] = {}
+        self._trade_belief_widen_count: dict[int, int] = {}
+        self._trade_belief_widen_total_pct: dict[int, float] = {}
+        self._trade_belief_action_counts: dict[str, int] = {
+            "hold": 0,
+            "tighten": 0,
+            "widen": 0,
+            "reprice_breakeven": 0,
+        }
+        self._trade_belief_last_update_ts: float = 0.0
+        self._belief_timer_overrides: dict[int, float] = {}
+        self._belief_slot_override_until: dict[int, float] = {}
         self._regime_tier: int = 0
         self._regime_tier_entered_at: float = 0.0
         self._regime_tier2_grace_start: float = 0.0
@@ -592,6 +1260,12 @@ class BotRuntime:
 
         Returns A/B entry spacing multipliers. Shadow mode must remain non-actuating.
         """
+        if bool(getattr(config, "KNOB_MODE_ENABLED", False)) and bool(getattr(self._action_knobs, "enabled", False)):
+            return (
+                max(0.10, min(3.0, float(self._action_knobs.spacing_a))),
+                max(0.10, min(3.0, float(self._action_knobs.spacing_b))),
+            )
+
         if not bool(getattr(config, "REGIME_DIRECTIONAL_ENABLED", False)):
             return 1.0, 1.0
         if int(self._regime_tier) < 1:
@@ -632,16 +1306,22 @@ class BotRuntime:
         spacing_mult_a, spacing_mult_b = self._regime_entry_spacing_multipliers()
         base_entry_pct = float(self.entry_pct)
         recovery_orders_enabled = self._recovery_orders_enabled()
+        knob_cadence = 1.0
+        if bool(getattr(config, "KNOB_MODE_ENABLED", False)) and bool(getattr(self._action_knobs, "enabled", False)):
+            knob_cadence = max(0.05, float(getattr(self._action_knobs, "cadence_mult", 1.0) or 1.0))
         s1_orphan_after_sec = (
-            float(config.S1_ORPHAN_AFTER_SEC)
+            float(config.S1_ORPHAN_AFTER_SEC) * knob_cadence
             if recovery_orders_enabled
             else float("inf")
         )
         s2_orphan_after_sec = (
-            float(config.S2_ORPHAN_AFTER_SEC)
+            float(config.S2_ORPHAN_AFTER_SEC) * knob_cadence
             if recovery_orders_enabled
             else float("inf")
         )
+        if self._slot_has_active_belief_override(int(slot.slot_id), now=_now()):
+            s1_orphan_after_sec = float("inf")
+            s2_orphan_after_sec = float("inf")
         return sm.EngineConfig(
             entry_pct=base_entry_pct,
             entry_pct_a=base_entry_pct * spacing_mult_a,
@@ -1071,13 +1751,37 @@ class BotRuntime:
         if include_dust and trade_id == "B" and not bool(getattr(config, "QUOTE_FIRST_ALLOCATION", False)):
             dust_bump = self._dust_bump_usd(slot, trade_id=trade_id)
             base_with_layers = max(0.0, base_with_layers + dust_bump)
+        knobs_active = bool(getattr(config, "KNOB_MODE_ENABLED", False)) and bool(
+            getattr(self._action_knobs, "enabled", False)
+        )
+        aggression_mult = 1.0
+        suppression_mult = 1.0
+        if knobs_active:
+            aggression_mult = max(0.0, float(getattr(self._action_knobs, "aggression", 1.0) or 1.0))
+            direction = float(getattr(self._belief_state, "direction_score", 0.0) or 0.0)
+            suppress = max(0.0, min(1.0, float(getattr(self._action_knobs, "suppression_strength", 0.0) or 0.0)))
+            t = str(trade_id or "").strip().upper()
+            against_trend = (direction > 1e-9 and t == "A") or (direction < -1e-9 and t == "B")
+            if against_trend:
+                suppression_mult = max(0.0, 1.0 - suppress)
         if self._throughput is not None:
-            throughput_usd, _ = self._throughput.size_for_slot(
-                base_with_layers,
-                regime_label=self._regime_label(self._current_regime_id()),
-                trade_id=trade_id,
-            )
+            if knobs_active:
+                throughput_usd, _ = self._throughput.size_for_slot(
+                    base_with_layers,
+                    regime_label=self._regime_label(self._current_regime_id()),
+                    trade_id=trade_id,
+                    aggression_mult=aggression_mult,
+                )
+            else:
+                throughput_usd, _ = self._throughput.size_for_slot(
+                    base_with_layers,
+                    regime_label=self._regime_label(self._current_regime_id()),
+                    trade_id=trade_id,
+                )
             base_with_layers = max(0.0, float(throughput_usd))
+        elif knobs_active:
+            base_with_layers *= aggression_mult
+        base_with_layers *= suppression_mult
         if trade_id is None or not bool(config.REBALANCE_ENABLED):
             return base_with_layers
 
@@ -1345,6 +2049,28 @@ class BotRuntime:
             self._partial_fill_cancel_events.popleft()
         while self._fill_durations_1d and self._fill_durations_1d[0][0] < cutoff:
             self._fill_durations_1d.popleft()
+        fill_window = max(30.0, float(getattr(config, "FILL_IMBALANCE_WINDOW_SEC", 300)))
+        fill_cutoff = now - fill_window
+        while self._fill_events_recent and self._fill_events_recent[0][0] < fill_cutoff:
+            self._fill_events_recent.popleft()
+        deriv_long = max(
+            60.0,
+            float(
+                getattr(
+                    config,
+                    "FILL_TIME_DERIVATIVE_LONG_SEC",
+                    1800,
+                )
+            ),
+        )
+        deriv_cutoff = now - deriv_long
+        while self._fill_duration_events and self._fill_duration_events[0][0] < deriv_cutoff:
+            self._fill_duration_events.popleft()
+        spread_cutoff = now - 86400.0
+        while self._spread_realization_events and self._spread_realization_events[0][0] < spread_cutoff:
+            self._spread_realization_events.popleft()
+        while len(self._spread_realization_events) > 200:
+            self._spread_realization_events.popleft()
         while self._doge_eq_snapshots and self._doge_eq_snapshots[0][0] < cutoff:
             self._doge_eq_snapshots.popleft()
 
@@ -1360,7 +2086,9 @@ class BotRuntime:
 
     def _record_fill_duration(self, duration_sec: float, ts: float | None = None) -> None:
         ts = ts or _now()
-        self._fill_durations_1d.append((ts, max(0.0, float(duration_sec))))
+        dur = max(0.0, float(duration_sec))
+        self._fill_durations_1d.append((ts, dur))
+        self._fill_duration_events.append((ts, dur))
         self._trim_rolling_telemetry(ts)
 
     def _fill_duration_stats_1d(self) -> tuple[float | None, float | None]:
@@ -1371,6 +2099,885 @@ class BotRuntime:
         ordered = sorted(vals)
         idx = max(0, min(len(ordered) - 1, ceil(0.95 * len(ordered)) - 1))
         return med, float(ordered[idx])
+
+    @staticmethod
+    def _normalize_prob_triplet(raw: Any) -> list[float]:
+        vals: list[Any]
+        if isinstance(raw, dict):
+            vals = [
+                raw.get("bearish", 0.0),
+                raw.get("ranging", 0.0),
+                raw.get("bullish", 0.0),
+            ]
+        elif isinstance(raw, (list, tuple)) and len(raw) >= 3:
+            vals = [raw[0], raw[1], raw[2]]
+        else:
+            vals = [0.0, 1.0, 0.0]
+        clean: list[float] = []
+        for value in vals:
+            try:
+                vv = float(value or 0.0)
+            except (TypeError, ValueError):
+                vv = 0.0
+            if not isfinite(vv):
+                vv = 0.0
+            clean.append(max(0.0, vv))
+        total = float(sum(clean))
+        if total <= 1e-12:
+            return [0.0, 1.0, 0.0]
+        return [clean[0] / total, clean[1] / total, clean[2] / total]
+
+    def _record_fill_event(self, trade_id: str | None, ts: float | None = None) -> None:
+        side = str(trade_id or "").strip().upper()
+        if side not in {"A", "B"}:
+            return
+        when = float(ts if ts is not None else _now())
+        self._fill_events_recent.append((when, side))
+        self._trim_rolling_telemetry(when)
+
+    def _record_spread_realization(self, value: float, ts: float | None = None) -> None:
+        when = float(ts if ts is not None else _now())
+        val = float(value)
+        if not isfinite(val) or val <= 0.0:
+            return
+        self._spread_realization_events.append((when, val))
+        self._trim_rolling_telemetry(when)
+
+    def _update_micro_features(self, now: float | None = None) -> dict[str, float]:
+        now_ts = float(now if now is not None else _now())
+        self._trim_rolling_telemetry(now_ts)
+
+        # fill_imbalance in [-1, 1]
+        a_fills = 0
+        b_fills = 0
+        for _ts, side in self._fill_events_recent:
+            if side == "A":
+                a_fills += 1
+            elif side == "B":
+                b_fills += 1
+        denom = max(1, a_fills + b_fills)
+        fill_imbalance = max(-1.0, min(1.0, float(a_fills - b_fills) / float(denom)))
+
+        # spread_realization as rolling mean of recent cycle realizations.
+        if self._spread_realization_events:
+            vals = [float(v) for _, v in list(self._spread_realization_events)[-20:] if float(v) > 0.0]
+            spread_realization = float(sum(vals) / len(vals)) if vals else 1.0
+        else:
+            spread_realization = 1.0
+        spread_realization = max(0.0, spread_realization)
+
+        # fill_time_derivative compares short-window vs long-window median fill time.
+        short_sec = max(60.0, float(getattr(config, "FILL_TIME_DERIVATIVE_SHORT_SEC", 300)))
+        long_sec = max(
+            short_sec,
+            float(getattr(config, "FILL_TIME_DERIVATIVE_LONG_SEC", 1800)),
+        )
+        short_vals = [d for ts, d in self._fill_duration_events if (now_ts - ts) <= short_sec and d >= 0.0]
+        long_vals = [d for ts, d in self._fill_duration_events if (now_ts - ts) <= long_sec and d >= 0.0]
+        fill_time_derivative = 0.0
+        if short_vals and long_vals:
+            med_short = float(median(short_vals))
+            med_long = float(median(long_vals))
+            if med_long > 1e-9:
+                fill_time_derivative = (med_short - med_long) / med_long
+        fill_time_derivative = max(-1.0, min(1.0, float(fill_time_derivative)))
+
+        # congestion_ratio = fraction of open exits older than p75 fill duration.
+        open_exits = self._collect_open_exits(now_ts=now_ts)
+        ages = [max(0.0, float(row.get("age_sec", 0.0) or 0.0)) for row in open_exits]
+        congestion_ratio = 0.0
+        if ages:
+            hist = [d for _, d in self._fill_durations_1d if d >= 0.0]
+            if hist:
+                ordered = sorted(hist)
+                idx = max(0, min(len(ordered) - 1, ceil(0.75 * len(ordered)) - 1))
+                p75 = max(1.0, float(ordered[idx]))
+            else:
+                p75 = max(1.0, float(median(ages)))
+            old_count = sum(1 for age in ages if age >= p75)
+            congestion_ratio = float(old_count) / float(max(1, len(ages)))
+        congestion_ratio = max(0.0, min(1.0, float(congestion_ratio)))
+
+        self._micro_features = {
+            "fill_imbalance": float(fill_imbalance),
+            "spread_realization": float(spread_realization),
+            "fill_time_derivative": float(fill_time_derivative),
+            "congestion_ratio": float(congestion_ratio),
+        }
+        self._push_private_features_to_hmm_detectors()
+        return dict(self._micro_features)
+
+    def _push_private_features_to_hmm_detectors(self) -> None:
+        metrics = dict(self._micro_features or {})
+        for detector in (self._hmm_detector, self._hmm_detector_secondary, self._hmm_detector_tertiary):
+            if detector is None:
+                continue
+            if hasattr(detector, "set_private_features"):
+                try:
+                    detector.set_private_features(metrics)
+                except Exception:
+                    continue
+
+    @staticmethod
+    def _detector_transmat(detector: Any) -> Any:
+        if detector is None:
+            return None
+        model = getattr(detector, "model", None)
+        if model is None:
+            return None
+        matrix = getattr(model, "transmat_", None)
+        if matrix is None:
+            return None
+        return matrix
+
+    def _build_belief_state(self, now: float | None = None) -> bayesian_engine.BeliefState:
+        should_compute = bool(
+            bool(getattr(config, "BELIEF_STATE_LOGGING_ENABLED", True))
+            or bool(getattr(config, "BELIEF_STATE_IN_STATUS", True))
+            or bool(getattr(config, "BELIEF_TRACKER_ENABLED", False))
+            or bool(getattr(config, "KNOB_MODE_ENABLED", False))
+        )
+        if not should_compute:
+            self._belief_state = bayesian_engine.BeliefState(enabled=False)
+            return self._belief_state
+
+        primary = dict(self._hmm_state or {})
+        secondary = dict(self._hmm_state_secondary or {})
+        tertiary = dict(self._hmm_state_tertiary or {})
+        primary_ready = bool(primary.get("available")) and bool(primary.get("trained"))
+        if not primary_ready:
+            self._belief_state = bayesian_engine.BeliefState(enabled=False)
+            return self._belief_state
+
+        p1 = self._normalize_prob_triplet(self._hmm_prob_triplet(primary))
+        secondary_ready = bool(secondary.get("available")) and bool(secondary.get("trained"))
+        tertiary_ready = bool(tertiary.get("available")) and bool(tertiary.get("trained"))
+        p15 = self._normalize_prob_triplet(self._hmm_prob_triplet(secondary if secondary_ready else primary))
+        p1h = self._normalize_prob_triplet(self._hmm_prob_triplet(tertiary if tertiary_ready else secondary if secondary_ready else primary))
+
+        if secondary_ready:
+            w1, w15 = self._normalize_consensus_weights(
+                getattr(config, "CONSENSUS_1M_WEIGHT", 0.3),
+                getattr(config, "CONSENSUS_15M_WEIGHT", 0.7),
+            )
+        else:
+            w1, w15 = 1.0, 0.0
+        w1h = 0.0
+        if tertiary_ready:
+            w1h = max(0.0, 1.0 - (w1 + w15))
+            if w1h <= 1e-9:
+                w1 *= 0.7
+                w15 *= 0.7
+                w1h = 0.3
+
+        belief = bayesian_engine.build_belief_state(
+            posterior_1m=p1,
+            posterior_15m=p15,
+            posterior_1h=p1h,
+            transmat_1m=self._detector_transmat(self._hmm_detector),
+            transmat_15m=self._detector_transmat(self._hmm_detector_secondary),
+            transmat_1h=self._detector_transmat(self._hmm_detector_tertiary),
+            weight_1m=float(w1),
+            weight_15m=float(w15),
+            weight_1h=float(w1h),
+            enabled=True,
+        )
+        self._belief_state = belief
+        self._belief_state_last_ts = float(now if now is not None else _now())
+        return belief
+
+    def _update_bocpd_state(self, now: float | None = None) -> bocpd.BOCPDState:
+        now_ts = float(now if now is not None else _now())
+        if self._bocpd is None:
+            self._bocpd_state = bocpd.BOCPDState()
+            return self._bocpd_state
+
+        price_now = float(self.last_price if self.last_price > 0 else 0.0)
+        ret = 0.0
+        if price_now > 0.0 and self._bocpd_last_price > 0.0:
+            ret = (price_now - float(self._bocpd_last_price)) / max(1e-12, float(self._bocpd_last_price))
+        if price_now > 0.0:
+            self._bocpd_last_price = float(price_now)
+
+        obs = [
+            float(ret),
+            float((self._micro_features or {}).get("fill_imbalance", 0.0)),
+            float((self._micro_features or {}).get("spread_realization", 1.0)) - 1.0,
+            float((self._micro_features or {}).get("fill_time_derivative", 0.0)),
+            float((self._micro_features or {}).get("congestion_ratio", 0.0)),
+            float(getattr(self._belief_state, "direction_score", 0.0)),
+            float(getattr(self._belief_state, "entropy_consensus", 0.0)),
+        ]
+        try:
+            self._bocpd_state = self._bocpd.update(obs, now_ts=now_ts)
+        except Exception as e:
+            logger.debug("BOCPD update failed: %s", e)
+        return self._bocpd_state
+
+    def _effective_regime_eval_interval(self, base_interval_sec: float) -> float:
+        interval = max(1.0, float(base_interval_sec))
+        if self._bocpd is None:
+            return interval
+        change_prob = max(0.0, min(1.0, float(self._bocpd_state.change_prob)))
+        alert = max(0.0, min(1.0, float(getattr(config, "BOCPD_ALERT_THRESHOLD", 0.30))))
+        urgent = max(alert, min(1.0, float(getattr(config, "BOCPD_URGENT_THRESHOLD", 0.50))))
+        fast = max(1.0, float(getattr(config, "REGIME_EVAL_INTERVAL_FAST", 60.0)))
+        if change_prob > urgent:
+            return fast
+        if change_prob > alert:
+            return max(fast, interval * 0.5)
+        return interval
+
+    def _estimate_volatility_score(self) -> float:
+        interval_min = max(1, int(getattr(config, "HMM_OHLCV_INTERVAL_MIN", 1)))
+        closes, volumes = self._fetch_recent_candles(count=40, interval_min=interval_min)
+        if not closes or not volumes:
+            return 1.0
+        vols = [max(0.0, float(v)) for v in volumes]
+        if not vols:
+            return 1.0
+        alpha = 2.0 / (20.0 + 1.0)
+        ema = vols[0]
+        for value in vols[1:]:
+            ema = alpha * value + (1.0 - alpha) * ema
+        if ema <= 1e-12:
+            return 1.0
+        return max(0.0, float(vols[-1]) / float(ema))
+
+    @staticmethod
+    def _cycle_meta_key(slot_id: int, trade_id: str, cycle: int) -> tuple[int, str, int]:
+        return int(slot_id), str(trade_id or "").strip().upper(), int(cycle)
+
+    def _prune_belief_timer_overrides(self, now: float | None = None) -> None:
+        now_ts = float(now if now is not None else _now())
+        for pid, until_ts in list(self._belief_timer_overrides.items()):
+            if float(until_ts) <= now_ts:
+                self._belief_timer_overrides.pop(int(pid), None)
+
+    def _refresh_belief_slot_overrides(self) -> None:
+        slot_until: dict[int, float] = {}
+        for pid, until_ts in self._belief_timer_overrides.items():
+            pos = self._position_ledger.get_position(int(pid))
+            if not isinstance(pos, dict):
+                continue
+            if str(pos.get("status") or "") != "open":
+                continue
+            try:
+                sid = int(pos.get("slot_id", -1))
+            except (TypeError, ValueError):
+                continue
+            if sid < 0:
+                continue
+            cur = float(slot_until.get(sid, 0.0) or 0.0)
+            if float(until_ts) > cur:
+                slot_until[sid] = float(until_ts)
+        self._belief_slot_override_until = slot_until
+
+    def _slot_has_active_belief_override(self, slot_id: int, now: float | None = None) -> bool:
+        now_ts = float(now if now is not None else _now())
+        self._prune_belief_timer_overrides(now_ts)
+        self._refresh_belief_slot_overrides()
+        return float(self._belief_slot_override_until.get(int(slot_id), 0.0) or 0.0) > now_ts
+
+    def _belief_knob_cfg(self) -> dict[str, Any]:
+        return {
+            "KNOB_AGGRESSION_DIRECTION": float(getattr(config, "KNOB_AGGRESSION_DIRECTION", 0.5)),
+            "KNOB_AGGRESSION_BOUNDARY": float(getattr(config, "KNOB_AGGRESSION_BOUNDARY", 0.3)),
+            "KNOB_AGGRESSION_CONGESTION": float(getattr(config, "KNOB_AGGRESSION_CONGESTION", 0.5)),
+            "KNOB_AGGRESSION_FLOOR": float(getattr(config, "KNOB_AGGRESSION_FLOOR", 0.5)),
+            "KNOB_AGGRESSION_CEILING": float(getattr(config, "KNOB_AGGRESSION_CEILING", 1.5)),
+            "KNOB_SPACING_VOLATILITY": float(getattr(config, "KNOB_SPACING_VOLATILITY", 0.3)),
+            "KNOB_SPACING_BOUNDARY": float(getattr(config, "KNOB_SPACING_BOUNDARY", 0.2)),
+            "KNOB_SPACING_FLOOR": float(getattr(config, "KNOB_SPACING_FLOOR", 0.8)),
+            "KNOB_SPACING_CEILING": float(getattr(config, "KNOB_SPACING_CEILING", 1.5)),
+            "KNOB_ASYMMETRY": float(getattr(config, "KNOB_ASYMMETRY", 0.3)),
+            "KNOB_CADENCE_BOUNDARY": float(getattr(config, "KNOB_CADENCE_BOUNDARY", 0.5)),
+            "KNOB_CADENCE_ENTROPY": float(getattr(config, "KNOB_CADENCE_ENTROPY", 0.3)),
+            "KNOB_CADENCE_FLOOR": float(getattr(config, "KNOB_CADENCE_FLOOR", 0.3)),
+            "KNOB_SUPPRESS_DIRECTION_FLOOR": float(getattr(config, "KNOB_SUPPRESS_DIRECTION_FLOOR", 0.3)),
+            "KNOB_SUPPRESS_SCALE": float(getattr(config, "KNOB_SUPPRESS_SCALE", 0.5)),
+        }
+
+    @staticmethod
+    def _survival_regime_to_id(raw: Any) -> int:
+        if isinstance(raw, int) and raw in (0, 1, 2):
+            return int(raw)
+        text = str(raw or "").strip().upper()
+        return {"BEARISH": 0, "RANGING": 1, "BULLISH": 2}.get(text, 1)
+
+    def _stamp_belief_entry_metadata(
+        self,
+        *,
+        slot_id: int,
+        trade_id: str,
+        cycle: int,
+        entry_price: float,
+        exit_price: float,
+        entry_ts: float,
+    ) -> None:
+        belief = self._build_belief_state(entry_ts)
+        key = self._cycle_meta_key(slot_id, trade_id, cycle)
+        self._belief_cycle_metadata[key] = {
+            "posterior_1m": list(belief.posterior_1m),
+            "posterior_15m": list(belief.posterior_15m),
+            "posterior_1h": list(belief.posterior_1h),
+            "entropy_at_entry": float(belief.entropy_consensus),
+            "p_switch_at_entry": float(belief.p_switch_consensus),
+            "confidence_at_entry": float(belief.confidence_score),
+            "fill_imbalance": float((self._micro_features or {}).get("fill_imbalance", 0.0)),
+            "spread_realization": float((self._micro_features or {}).get("spread_realization", 1.0)),
+            "fill_time_derivative": float((self._micro_features or {}).get("fill_time_derivative", 0.0)),
+            "congestion_ratio": float((self._micro_features or {}).get("congestion_ratio", 0.0)),
+            "entry_price": float(entry_price),
+            "exit_price": float(exit_price),
+            "entry_ts": float(entry_ts),
+        }
+        while len(self._belief_cycle_metadata) > 5000:
+            oldest = next(iter(self._belief_cycle_metadata.keys()), None)
+            if oldest is None:
+                break
+            self._belief_cycle_metadata.pop(oldest, None)
+
+    def _apply_cycle_belief_snapshot(
+        self,
+        *,
+        slot_id: int,
+        cycle_record: Any,
+        now_ts: float | None = None,
+    ) -> dict[str, Any]:
+        now = float(now_ts if now_ts is not None else _now())
+        key = self._cycle_meta_key(slot_id, str(cycle_record.trade_id), int(cycle_record.cycle))
+        meta = dict(self._belief_cycle_metadata.get(key) or {})
+        belief_exit = self._build_belief_state(now)
+
+        entry_p1 = self._normalize_prob_triplet(
+            meta.get("posterior_1m", getattr(cycle_record, "posterior_1m", None))
+        )
+        entry_p15 = self._normalize_prob_triplet(
+            meta.get("posterior_15m", getattr(cycle_record, "posterior_15m", None))
+        )
+        entry_p1h = self._normalize_prob_triplet(
+            meta.get("posterior_1h", getattr(cycle_record, "posterior_1h", None))
+        )
+        entry_entropy = float(
+            meta.get("entropy_at_entry", getattr(cycle_record, "entropy_at_entry", 0.0) or 0.0)
+        )
+        entry_p_switch = float(
+            meta.get("p_switch_at_entry", getattr(cycle_record, "p_switch_at_entry", 0.0) or 0.0)
+        )
+        entry_confidence = float(
+            meta.get("confidence_at_entry", getattr(cycle_record, "confidence_at_entry", 0.0) or 0.0)
+        )
+        realized_pct = 0.0
+        entry_price = float(getattr(cycle_record, "entry_price", 0.0) or 0.0)
+        exit_price = float(getattr(cycle_record, "exit_price", 0.0) or 0.0)
+        if entry_price > 0.0:
+            realized_pct = abs(exit_price - entry_price) / entry_price * 100.0
+        target_pct = max(1e-9, float(self.profit_pct))
+        spread_realization = max(0.0, realized_pct / target_pct)
+        snapshot = {
+            "posterior_1m": list(entry_p1),
+            "posterior_15m": list(entry_p15),
+            "posterior_1h": list(entry_p1h),
+            "entropy_at_entry": float(entry_entropy),
+            "p_switch_at_entry": float(entry_p_switch),
+            "confidence_at_entry": float(entry_confidence),
+            "posterior_at_exit_1m": list(belief_exit.posterior_1m),
+            "posterior_at_exit_15m": list(belief_exit.posterior_15m),
+            "posterior_at_exit_1h": list(belief_exit.posterior_1h),
+            "entropy_at_exit": float(belief_exit.entropy_consensus),
+            "p_switch_at_exit": float(belief_exit.p_switch_consensus),
+            "fill_imbalance": float((self._micro_features or {}).get("fill_imbalance", 0.0)),
+            "fill_time_derivative": float((self._micro_features or {}).get("fill_time_derivative", 0.0)),
+            "congestion_ratio": float((self._micro_features or {}).get("congestion_ratio", 0.0)),
+            "spread_realization": float(spread_realization),
+        }
+        for field_name, field_value in snapshot.items():
+            try:
+                setattr(cycle_record, field_name, field_value)
+            except Exception:
+                continue
+
+        self._record_spread_realization(
+            spread_realization,
+            ts=float(getattr(cycle_record, "exit_time", 0.0) or now),
+        )
+        self._belief_cycle_metadata.pop(key, None)
+        return snapshot
+
+    def _build_survival_observations(
+        self,
+        *,
+        now_ts: float | None = None,
+        include_censored: bool = True,
+    ) -> list[survival_model.FillObservation]:
+        now = float(now_ts if now_ts is not None else _now())
+        rows: list[survival_model.FillObservation] = []
+
+        for slot in self.slots.values():
+            for cycle in slot.state.completed_cycles:
+                entry_time = float(cycle.entry_time or 0.0)
+                exit_time = float(cycle.exit_time or 0.0)
+                if entry_time <= 0.0 or exit_time <= 0.0:
+                    continue
+                duration = max(1.0, exit_time - entry_time)
+                entry_price = float(cycle.entry_price or 0.0)
+                exit_price = float(cycle.exit_price or 0.0)
+                if entry_price > 0.0 and exit_price > 0.0:
+                    distance_pct = abs(exit_price - entry_price) / entry_price * 100.0
+                else:
+                    distance_pct = 0.0
+                p1 = self._normalize_prob_triplet(getattr(cycle, "posterior_1m", None))
+                p15 = self._normalize_prob_triplet(getattr(cycle, "posterior_15m", None))
+                p1h = self._normalize_prob_triplet(getattr(cycle, "posterior_1h", None))
+                rows.append(
+                    survival_model.FillObservation(
+                        duration_sec=float(duration),
+                        censored=False,
+                        regime_at_entry=self._survival_regime_to_id(getattr(cycle, "regime_at_entry", 1)),
+                        regime_at_exit=self._survival_regime_to_id(self._current_regime_id()),
+                        side=str(getattr(cycle, "trade_id", "A") or "A"),
+                        distance_pct=float(max(0.0, distance_pct)),
+                        posterior_1m=list(p1),
+                        posterior_15m=list(p15),
+                        posterior_1h=list(p1h),
+                        entropy_at_entry=float(getattr(cycle, "entropy_at_entry", 0.0) or 0.0),
+                        p_switch_at_entry=float(getattr(cycle, "p_switch_at_entry", 0.0) or 0.0),
+                        fill_imbalance=float(getattr(cycle, "fill_imbalance", 0.0) or 0.0),
+                        congestion_ratio=float(getattr(cycle, "congestion_ratio", 0.0) or 0.0),
+                    ).normalized()
+                )
+
+        if include_censored and self._position_ledger_enabled():
+            for pos in self._position_ledger.get_open_positions():
+                try:
+                    pid = int(pos.get("position_id", 0) or 0)
+                    sid = int(pos.get("slot_id", -1))
+                    cycle = int(pos.get("cycle", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if pid <= 0 or sid < 0:
+                    continue
+                slot = self.slots.get(sid)
+                live = self._find_live_exit_for_position(pos)
+                if slot is None or live is None:
+                    continue
+                _local_id, order = live
+                entry_time = float(pos.get("entry_time", 0.0) or 0.0)
+                if entry_time <= 0.0:
+                    continue
+                duration = max(1.0, now - entry_time)
+                market = float(slot.state.market_price if slot.state.market_price > 0 else self.last_price)
+                exit_price = float(pos.get("current_exit_price", order.price) or order.price)
+                if market > 0.0 and exit_price > 0.0:
+                    distance_pct = abs(exit_price - market) / market * 100.0
+                else:
+                    entry_price = float(pos.get("entry_price", 0.0) or 0.0)
+                    distance_pct = abs(exit_price - entry_price) / max(entry_price, 1e-12) * 100.0
+
+                key = self._cycle_meta_key(sid, str(pos.get("trade_id") or ""), cycle)
+                meta = dict(self._belief_cycle_metadata.get(key) or {})
+                rows.append(
+                    survival_model.FillObservation(
+                        duration_sec=float(duration),
+                        censored=True,
+                        regime_at_entry=self._survival_regime_to_id(pos.get("entry_regime")),
+                        regime_at_exit=None,
+                        side=str(pos.get("trade_id") or "A"),
+                        distance_pct=float(max(0.0, distance_pct)),
+                        posterior_1m=self._normalize_prob_triplet(meta.get("posterior_1m")),
+                        posterior_15m=self._normalize_prob_triplet(meta.get("posterior_15m")),
+                        posterior_1h=self._normalize_prob_triplet(meta.get("posterior_1h")),
+                        entropy_at_entry=float(meta.get("entropy_at_entry", 0.0) or 0.0),
+                        p_switch_at_entry=float(meta.get("p_switch_at_entry", 0.0) or 0.0),
+                        fill_imbalance=float(meta.get("fill_imbalance", (self._micro_features or {}).get("fill_imbalance", 0.0)) or 0.0),
+                        congestion_ratio=float(meta.get("congestion_ratio", (self._micro_features or {}).get("congestion_ratio", 0.0)) or 0.0),
+                    ).normalized()
+                )
+
+        return rows
+
+    def _maybe_retrain_survival_model(self, now: float | None = None, *, force: bool = False) -> None:
+        now_ts = float(now if now is not None else _now())
+        if self._survival_model is None:
+            return
+        if not bool(getattr(config, "SURVIVAL_MODEL_ENABLED", False)):
+            return
+
+        interval = max(300.0, float(getattr(config, "SURVIVAL_RETRAIN_INTERVAL_SEC", 21600.0)))
+        if (not force) and self._survival_last_retrain_ts > 0.0 and (now_ts - self._survival_last_retrain_ts) < interval:
+            return
+
+        observations = self._build_survival_observations(now_ts=now_ts, include_censored=True)
+        synthetic_rows: list[survival_model.FillObservation] = []
+        if bool(getattr(config, "SURVIVAL_SYNTHETIC_ENABLED", False)):
+            n_paths = max(6, int(getattr(config, "SURVIVAL_SYNTHETIC_PATHS", 5000)))
+            synth_w = max(0.0, min(1.0, float(getattr(config, "SURVIVAL_SYNTHETIC_WEIGHT", 0.30))))
+            synthetic_rows = self._survival_model.generate_synthetic_observations(
+                n_paths=n_paths,
+                weight=synth_w,
+            )
+
+        try:
+            self._survival_model.fit(observations, synthetic_observations=synthetic_rows)
+            self._survival_last_retrain_ts = float(now_ts)
+        except Exception as e:
+            logger.debug("Survival retrain failed: %s", e)
+            self._survival_last_retrain_ts = float(now_ts)
+
+    def _predict_survival_for_position(
+        self,
+        position: dict[str, Any],
+        order: sm.OrderState,
+        *,
+        now_ts: float | None = None,
+    ) -> survival_model.SurvivalPrediction:
+        now = float(now_ts if now_ts is not None else _now())
+        if self._survival_model is None or not bool(getattr(config, "SURVIVAL_MODEL_ENABLED", False)):
+            return survival_model.SurvivalPrediction(
+                p_fill_30m=0.5,
+                p_fill_1h=0.5,
+                p_fill_4h=0.5,
+                median_remaining=float("inf"),
+                hazard_ratio=1.0,
+                model_tier="kaplan_meier",
+                confidence=0.0,
+            )
+
+        try:
+            sid = int(position.get("slot_id", -1))
+            cycle = int(position.get("cycle", 0) or 0)
+        except (TypeError, ValueError):
+            sid = -1
+            cycle = 0
+        slot = self.slots.get(sid)
+        market = float(slot.state.market_price if slot and slot.state.market_price > 0 else self.last_price)
+        current_exit = float(position.get("current_exit_price", order.price) or order.price)
+        if market > 0.0 and current_exit > 0.0:
+            distance_pct = abs(current_exit - market) / market * 100.0
+        else:
+            entry_price = float(position.get("entry_price", 0.0) or 0.0)
+            distance_pct = abs(current_exit - entry_price) / max(entry_price, 1e-12) * 100.0
+
+        key = self._cycle_meta_key(sid, str(position.get("trade_id") or ""), cycle)
+        meta = dict(self._belief_cycle_metadata.get(key) or {})
+        obs = survival_model.FillObservation(
+            duration_sec=max(1.0, now - float(position.get("entry_time", now) or now)),
+            censored=True,
+            regime_at_entry=self._survival_regime_to_id(position.get("entry_regime")),
+            regime_at_exit=None,
+            side=str(position.get("trade_id") or "A"),
+            distance_pct=float(max(0.0, distance_pct)),
+            posterior_1m=self._normalize_prob_triplet(meta.get("posterior_1m")),
+            posterior_15m=self._normalize_prob_triplet(meta.get("posterior_15m")),
+            posterior_1h=self._normalize_prob_triplet(meta.get("posterior_1h")),
+            entropy_at_entry=float(meta.get("entropy_at_entry", 0.0) or 0.0),
+            p_switch_at_entry=float(meta.get("p_switch_at_entry", 0.0) or 0.0),
+            fill_imbalance=float(meta.get("fill_imbalance", (self._micro_features or {}).get("fill_imbalance", 0.0)) or 0.0),
+            congestion_ratio=float(meta.get("congestion_ratio", (self._micro_features or {}).get("congestion_ratio", 0.0)) or 0.0),
+        ).normalized()
+        try:
+            return self._survival_model.predict(obs)
+        except Exception as e:
+            logger.debug("Survival predict failed for position=%s: %s", position.get("position_id"), e)
+            return survival_model.SurvivalPrediction(
+                p_fill_30m=0.5,
+                p_fill_1h=0.5,
+                p_fill_4h=0.5,
+                median_remaining=float("inf"),
+                hazard_ratio=1.0,
+                model_tier="kaplan_meier",
+                confidence=0.0,
+            )
+
+    def _belief_tighten_position(self, position_id: int, *, now_ts: float | None = None) -> tuple[bool, str]:
+        now = float(now_ts if now_ts is not None else _now())
+        position = self._position_ledger.get_position(int(position_id))
+        if not isinstance(position, dict) or str(position.get("status") or "") != "open":
+            return False, "position_not_open"
+        slot_id = int(position.get("slot_id", -1))
+        slot = self.slots.get(slot_id)
+        if slot is None:
+            return False, "slot_missing"
+        live = self._find_live_exit_for_position(position)
+        if live is None:
+            return False, "live_exit_missing"
+        _local_id, order = live
+        market = float(slot.state.market_price if slot.state.market_price > 0 else self.last_price)
+        if market <= 0.0:
+            return False, "market_unavailable"
+        new_price, _tighten_pct = self._self_heal_tighten_target_price(
+            position=position,
+            slot=slot,
+            side=str(order.side),
+            market=float(market),
+        )
+        current_exit = float(position.get("current_exit_price", order.price) or order.price)
+        if str(order.side) == "sell" and new_price >= current_exit:
+            return False, "no_tighten_delta"
+        if str(order.side) == "buy" and new_price <= current_exit:
+            return False, "no_tighten_delta"
+        return self._execute_self_heal_reprice(
+            position_id=int(position_id),
+            slot_id=int(slot_id),
+            order=order,
+            new_price=float(new_price),
+            reason="tighten",
+            subsidy_consumed=0.0,
+            now_ts=float(now),
+        )
+
+    def _belief_widen_position(self, position_id: int, *, now_ts: float | None = None) -> tuple[bool, str]:
+        now = float(now_ts if now_ts is not None else _now())
+        position = self._position_ledger.get_position(int(position_id))
+        if not isinstance(position, dict) or str(position.get("status") or "") != "open":
+            return False, "position_not_open"
+        slot_id = int(position.get("slot_id", -1))
+        slot = self.slots.get(slot_id)
+        if slot is None:
+            return False, "slot_missing"
+        if sm.derive_phase(slot.state) == "S2":
+            return False, "widen_blocked_s2"
+        live = self._find_live_exit_for_position(position)
+        if live is None:
+            return False, "live_exit_missing"
+        _local_id, order = live
+
+        step_pct = max(0.0, float(getattr(config, "BELIEF_WIDEN_STEP_PCT", 0.001)))
+        max_count = max(0, int(getattr(config, "BELIEF_MAX_WIDEN_COUNT", 2)))
+        max_total = max(0.0, float(getattr(config, "BELIEF_MAX_WIDEN_TOTAL_PCT", 0.005)))
+        current_count = int(self._trade_belief_widen_count.get(int(position_id), 0) or 0)
+        current_total = float(self._trade_belief_widen_total_pct.get(int(position_id), 0.0) or 0.0)
+        if step_pct <= 0.0:
+            return False, "widen_disabled"
+        if current_count >= max_count:
+            return False, "widen_count_limit"
+        if (current_total + step_pct) > (max_total + 1e-12):
+            return False, "widen_total_limit"
+
+        decimals = max(0, int(self.constraints.get("price_decimals", 6)))
+        current_exit = float(position.get("current_exit_price", order.price) or order.price)
+        if str(order.side) == "sell":
+            new_price = float(round(current_exit * (1.0 + step_pct), decimals))
+            if new_price <= current_exit:
+                return False, "no_widen_delta"
+        else:
+            new_price = float(round(current_exit * (1.0 - step_pct), decimals))
+            if new_price >= current_exit or new_price <= 0.0:
+                return False, "no_widen_delta"
+
+        ok, reason = self._execute_self_heal_reprice(
+            position_id=int(position_id),
+            slot_id=int(slot_id),
+            order=order,
+            new_price=float(new_price),
+            reason="operator",
+            subsidy_consumed=0.0,
+            now_ts=float(now),
+        )
+        if ok:
+            self._trade_belief_widen_count[int(position_id)] = current_count + 1
+            self._trade_belief_widen_total_pct[int(position_id)] = current_total + step_pct
+        return ok, reason
+
+    def _update_trade_beliefs(self, now: float | None = None) -> None:
+        now_ts = float(now if now is not None else _now())
+        self._prune_belief_timer_overrides(now_ts)
+
+        if not bool(getattr(config, "BELIEF_TRACKER_ENABLED", False)) or not self._position_ledger_enabled():
+            self._trade_beliefs = {}
+            self._refresh_belief_slot_overrides()
+            return
+
+        interval = max(5.0, float(getattr(config, "BELIEF_UPDATE_INTERVAL_SEC", 60.0)))
+        if self._trade_belief_last_update_ts > 0.0 and (now_ts - self._trade_belief_last_update_ts) < interval:
+            self._refresh_belief_slot_overrides()
+            return
+        self._trade_belief_last_update_ts = now_ts
+        self._build_belief_state(now_ts)
+
+        tracked: dict[int, bayesian_engine.TradeBeliefState] = {}
+        open_positions = self._position_ledger.get_open_positions()
+        current_vec9 = bayesian_engine.posterior9_from_timeframes(
+            self._belief_state.posterior_1m,
+            self._belief_state.posterior_15m,
+            self._belief_state.posterior_1h,
+        )
+
+        for pos in open_positions:
+            try:
+                pid = int(pos.get("position_id", 0) or 0)
+                sid = int(pos.get("slot_id", -1))
+                cycle = int(pos.get("cycle", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if pid <= 0 or sid < 0:
+                continue
+            slot = self.slots.get(sid)
+            if slot is None:
+                continue
+            live = self._find_live_exit_for_position(pos)
+            if live is None:
+                continue
+            _local_id, order = live
+
+            trade_id = str(pos.get("trade_id") or "")
+            key = self._cycle_meta_key(sid, trade_id, cycle)
+            meta = dict(self._belief_cycle_metadata.get(key) or {})
+            entry_p1 = self._normalize_prob_triplet(meta.get("posterior_1m"))
+            entry_p15 = self._normalize_prob_triplet(meta.get("posterior_15m"))
+            entry_p1h = self._normalize_prob_triplet(meta.get("posterior_1h"))
+            entry_vec9 = bayesian_engine.posterior9_from_timeframes(entry_p1, entry_p15, entry_p1h)
+
+            entry_time = float(pos.get("entry_time", 0.0) or 0.0)
+            elapsed_sec = max(0.0, now_ts - entry_time) if entry_time > 0.0 else 0.0
+            market = float(slot.state.market_price if slot.state.market_price > 0 else self.last_price)
+            exit_price = float(pos.get("current_exit_price", order.price) or order.price)
+            if market > 0.0 and exit_price > 0.0:
+                distance_pct = abs(exit_price - market) / market * 100.0
+            else:
+                entry_price_fallback = float(pos.get("entry_price", 0.0) or 0.0)
+                distance_pct = abs(exit_price - entry_price_fallback) / max(1e-12, entry_price_fallback) * 100.0
+
+            prediction = self._predict_survival_for_position(pos, order, now_ts=now_ts)
+            regime_agreement = bayesian_engine.cosine_similarity(entry_vec9, current_vec9)
+            volume = max(0.0, float(pos.get("entry_volume", 0.0) or 0.0))
+            entry_price = float(pos.get("entry_price", 0.0) or 0.0)
+            if trade_id == "B":
+                profit_if_fill = (exit_price - entry_price) * volume
+            else:
+                profit_if_fill = (entry_price - exit_price) * volume
+            expected_value = bayesian_engine.expected_value(
+                p_fill=float(prediction.p_fill_1h),
+                profit_if_fill=float(profit_if_fill),
+                opportunity_cost_per_hour=float(getattr(config, "BELIEF_OPPORTUNITY_COST_PER_HOUR", 0.001)),
+                elapsed_sec=float(elapsed_sec),
+            )
+            ev_hist = list(self._trade_belief_ev_history.get(pid, []))
+            ev_hist.append(float(expected_value))
+            ev_hist = ev_hist[-20:]
+            self._trade_belief_ev_history[pid] = ev_hist
+            trend = bayesian_engine.ev_trend(ev_hist, window=max(2, int(getattr(config, "BELIEF_EV_TREND_WINDOW", 3))))
+
+            is_s2 = sm.derive_phase(slot.state) == "S2"
+            rec_action, rec_conf = bayesian_engine.recommend_trade_action(
+                regime_agreement=float(regime_agreement),
+                confidence_score=float(self._belief_state.confidence_score),
+                p_fill_30m=float(prediction.p_fill_30m),
+                p_fill_1h=float(prediction.p_fill_1h),
+                p_fill_4h=float(prediction.p_fill_4h),
+                expected_value_usd=float(expected_value),
+                ev_trend_label=str(trend),
+                is_s2=bool(is_s2),
+                widen_enabled=bool(getattr(config, "BELIEF_WIDEN_ENABLED", False)),
+                immediate_reprice_agreement=float(getattr(config, "BELIEF_IMMEDIATE_REPRICE_AGREEMENT", 0.30)),
+                immediate_reprice_confidence=float(getattr(config, "BELIEF_IMMEDIATE_REPRICE_CONFIDENCE", 0.60)),
+                tighten_threshold_pfill=float(getattr(config, "BELIEF_TIGHTEN_THRESHOLD_PFILL", 0.10)),
+                tighten_threshold_ev=float(getattr(config, "BELIEF_TIGHTEN_THRESHOLD_EV", 0.0)),
+            )
+            if float(prediction.confidence) <= 0.0 and rec_action != "hold":
+                rec_action = "hold"
+                rec_conf = min(float(rec_conf), 0.2)
+
+            belief = bayesian_engine.TradeBeliefState(
+                position_id=int(pid),
+                slot_id=int(sid),
+                trade_id=str(trade_id),
+                cycle=int(cycle),
+                entry_regime_posterior=list(entry_vec9),
+                entry_entropy=float(meta.get("entropy_at_entry", 0.0) or 0.0),
+                entry_p_switch=float(meta.get("p_switch_at_entry", 0.0) or 0.0),
+                entry_price=float(entry_price),
+                exit_price=float(exit_price),
+                entry_ts=float(entry_time),
+                side=str(order.side),
+                current_regime_posterior=list(current_vec9),
+                current_entropy=float(self._belief_state.entropy_consensus),
+                current_p_switch=float(self._belief_state.p_switch_consensus),
+                elapsed_sec=float(elapsed_sec),
+                distance_from_market_pct=float(distance_pct),
+                p_fill_30m=float(prediction.p_fill_30m),
+                p_fill_1h=float(prediction.p_fill_1h),
+                p_fill_4h=float(prediction.p_fill_4h),
+                median_remaining_sec=float(prediction.median_remaining),
+                regime_agreement=float(regime_agreement),
+                expected_value=float(expected_value),
+                ev_trend=str(trend),
+                recommended_action=str(rec_action),
+                action_confidence=float(rec_conf),
+            )
+            tracked[pid] = belief
+
+            previous = self._trade_beliefs.get(pid)
+            prev_action = str(previous.recommended_action) if previous is not None else ""
+            action_changed = prev_action != str(rec_action)
+            if action_changed:
+                self._trade_belief_action_counts[str(rec_action)] = int(
+                    self._trade_belief_action_counts.get(str(rec_action), 0) or 0
+                ) + 1
+
+            if rec_action == "hold":
+                max_override = max(60.0, float(getattr(config, "BELIEF_TIMER_OVERRIDE_MAX_SEC", 3600.0)))
+                self._belief_timer_overrides.setdefault(pid, now_ts + max_override)
+                continue
+
+            self._belief_timer_overrides.pop(pid, None)
+            if not action_changed:
+                continue
+
+            ok = False
+            reason = "skipped"
+            if rec_action == "reprice_breakeven":
+                ok, reason = self.self_heal_reprice_breakeven(pid, operator_reason="belief_tracker")
+            elif rec_action == "tighten":
+                ok, reason = self._belief_tighten_position(pid, now_ts=now_ts)
+            elif rec_action == "widen":
+                ok, reason = self._belief_widen_position(pid, now_ts=now_ts)
+            if bool(getattr(config, "BELIEF_LOG_ACTIONS", True)):
+                logger.info(
+                    "belief_tracker action position=%s slot=%s action=%s ok=%s reason=%s p_fill_1h=%.3f ev=%.6f agree=%.3f",
+                    pid,
+                    sid,
+                    rec_action,
+                    ok,
+                    reason,
+                    float(prediction.p_fill_1h),
+                    float(expected_value),
+                    float(regime_agreement),
+                )
+
+        tracked_ids = set(tracked.keys())
+        for pid in list(self._trade_beliefs.keys()):
+            if pid not in tracked_ids:
+                self._trade_beliefs.pop(pid, None)
+                self._trade_belief_ev_history.pop(pid, None)
+                self._trade_belief_widen_count.pop(pid, None)
+                self._trade_belief_widen_total_pct.pop(pid, None)
+                self._belief_timer_overrides.pop(pid, None)
+        self._trade_beliefs = tracked
+        self._prune_belief_timer_overrides(now_ts)
+        self._refresh_belief_slot_overrides()
+
+    def _trade_beliefs_status_payload(self) -> dict[str, Any]:
+        enabled = bool(getattr(config, "BELIEF_TRACKER_ENABLED", False)) and self._position_ledger_enabled()
+        beliefs = list(self._trade_beliefs.values())
+        tracked = len(beliefs)
+        avg_agree = (sum(float(b.regime_agreement) for b in beliefs) / tracked) if tracked else 0.0
+        avg_ev = (sum(float(b.expected_value) for b in beliefs) / tracked) if tracked else 0.0
+        neg_ev = sum(1 for b in beliefs if float(b.expected_value) < 0.0)
+        timer_overrides = sum(1 for until in self._belief_timer_overrides.values() if float(until) > _now())
+        badges = [b.to_badge_dict() for b in sorted(beliefs, key=lambda row: (row.slot_id, row.position_id))]
+        return {
+            "enabled": bool(enabled),
+            "tracked_exits": int(tracked),
+            "actions_this_session": dict(self._trade_belief_action_counts or {}),
+            "avg_regime_agreement": float(avg_agree),
+            "avg_expected_value": float(avg_ev),
+            "exits_with_negative_ev": int(neg_ev),
+            "timer_overrides_active": int(timer_overrides),
+            "last_update_ts": float(self._trade_belief_last_update_ts),
+            "positions": badges,
+        }
 
     def _internal_open_order_count(self) -> int:
         count = sum(len(slot.state.orders) + len(slot.state.recovery_orders) for slot in self.slots.values())
@@ -1540,6 +3147,62 @@ class BotRuntime:
             "hmm_backfill_last_message_tertiary": self._hmm_backfill_last_message_tertiary,
             "hmm_backfill_stall_count_tertiary": self._hmm_backfill_stall_count_tertiary,
             "hmm_tertiary_transition": dict(self._hmm_tertiary_transition or {}),
+            "belief_state": self._belief_state.to_status_dict(),
+            "belief_state_last_ts": float(self._belief_state_last_ts),
+            "belief_cycle_metadata": [
+                {
+                    "slot_id": int(slot_id),
+                    "trade_id": str(trade_id),
+                    "cycle": int(cycle),
+                    "data": dict(data),
+                }
+                for (slot_id, trade_id, cycle), data in self._belief_cycle_metadata.items()
+            ],
+            "action_knobs": self._action_knobs.to_status_dict(),
+            "micro_features": dict(self._micro_features or {}),
+            "fill_events_recent": [
+                [float(ts), str(side)]
+                for ts, side in list(self._fill_events_recent)[-2000:]
+            ],
+            "fill_duration_events": [
+                [float(ts), float(duration)]
+                for ts, duration in list(self._fill_duration_events)[-2000:]
+            ],
+            "spread_realization_events": [
+                [float(ts), float(value)]
+                for ts, value in list(self._spread_realization_events)[-2000:]
+            ],
+            "bocpd_state": self._bocpd_state.to_status_dict(),
+            "bocpd_snapshot": self._bocpd.snapshot_state() if self._bocpd is not None else {},
+            "bocpd_last_price": float(self._bocpd_last_price),
+            "survival_last_retrain_ts": float(self._survival_last_retrain_ts),
+            "survival_snapshot": (
+                self._survival_model.snapshot_state()
+                if self._survival_model is not None
+                else {}
+            ),
+            "trade_beliefs": [
+                asdict(belief)
+                for belief in self._trade_beliefs.values()
+            ],
+            "trade_belief_action_counts": dict(self._trade_belief_action_counts or {}),
+            "trade_belief_last_update_ts": float(self._trade_belief_last_update_ts),
+            "trade_belief_ev_history": {
+                str(position_id): [float(v) for v in values[-20:]]
+                for position_id, values in self._trade_belief_ev_history.items()
+            },
+            "trade_belief_widen_count": {
+                str(position_id): int(count)
+                for position_id, count in self._trade_belief_widen_count.items()
+            },
+            "trade_belief_widen_total_pct": {
+                str(position_id): float(total_pct)
+                for position_id, total_pct in self._trade_belief_widen_total_pct.items()
+            },
+            "belief_timer_overrides": {
+                str(position_id): float(until_ts)
+                for position_id, until_ts in self._belief_timer_overrides.items()
+            },
             "regime_tier": int(self._regime_tier),
             "regime_tier_entered_at": float(self._regime_tier_entered_at),
             "regime_tier2_grace_start": float(self._regime_tier2_grace_start),
@@ -1967,6 +3630,216 @@ class BotRuntime:
             raw_tertiary_transition = snap.get("hmm_tertiary_transition", self._hmm_tertiary_transition)
             if isinstance(raw_tertiary_transition, dict):
                 self._hmm_tertiary_transition = dict(raw_tertiary_transition)
+            raw_belief_state = snap.get("belief_state", {})
+            if isinstance(raw_belief_state, dict):
+                self._belief_state = bayesian_engine.BeliefState(
+                    enabled=bool(raw_belief_state.get("enabled", False)),
+                    posterior_1m=list(raw_belief_state.get("posterior_1m", [0.0, 1.0, 0.0])),
+                    posterior_15m=list(raw_belief_state.get("posterior_15m", [0.0, 1.0, 0.0])),
+                    posterior_1h=list(raw_belief_state.get("posterior_1h", [0.0, 1.0, 0.0])),
+                    entropy_1m=float(raw_belief_state.get("entropy_1m", 0.0) or 0.0),
+                    entropy_15m=float(raw_belief_state.get("entropy_15m", 0.0) or 0.0),
+                    entropy_1h=float(raw_belief_state.get("entropy_1h", 0.0) or 0.0),
+                    entropy_consensus=float(raw_belief_state.get("entropy_consensus", 0.0) or 0.0),
+                    confidence_score=float(raw_belief_state.get("confidence_score", 1.0) or 1.0),
+                    p_switch_1m=float(raw_belief_state.get("p_switch_1m", 0.0) or 0.0),
+                    p_switch_15m=float(raw_belief_state.get("p_switch_15m", 0.0) or 0.0),
+                    p_switch_1h=float(raw_belief_state.get("p_switch_1h", 0.0) or 0.0),
+                    p_switch_consensus=float(raw_belief_state.get("p_switch_consensus", 0.0) or 0.0),
+                    direction_score=float(raw_belief_state.get("direction_score", 0.0) or 0.0),
+                    boundary_risk=str(raw_belief_state.get("boundary_risk", "low") or "low"),
+                    posterior_consensus=list(
+                        raw_belief_state.get("posterior_consensus", [0.0, 1.0, 0.0])
+                    ),
+                )
+            self._belief_state_last_ts = float(snap.get("belief_state_last_ts", self._belief_state_last_ts) or 0.0)
+            self._belief_cycle_metadata = {}
+            raw_cycle_meta = snap.get("belief_cycle_metadata", [])
+            if isinstance(raw_cycle_meta, list):
+                for row in raw_cycle_meta:
+                    if not isinstance(row, dict):
+                        continue
+                    try:
+                        key = (
+                            int(row.get("slot_id")),
+                            str(row.get("trade_id") or ""),
+                            int(row.get("cycle")),
+                        )
+                    except (TypeError, ValueError):
+                        continue
+                    if not key[1]:
+                        continue
+                    self._belief_cycle_metadata[key] = dict(row.get("data") or {})
+            raw_knobs = snap.get("action_knobs", {})
+            if isinstance(raw_knobs, dict):
+                self._action_knobs = bayesian_engine.ActionKnobs(
+                    enabled=bool(raw_knobs.get("enabled", False)),
+                    aggression=float(raw_knobs.get("aggression", 1.0) or 1.0),
+                    spacing_mult=float(raw_knobs.get("spacing_mult", 1.0) or 1.0),
+                    spacing_a=float(raw_knobs.get("spacing_a", 1.0) or 1.0),
+                    spacing_b=float(raw_knobs.get("spacing_b", 1.0) or 1.0),
+                    cadence_mult=float(raw_knobs.get("cadence_mult", 1.0) or 1.0),
+                    suppression_strength=float(raw_knobs.get("suppression_strength", 0.0) or 0.0),
+                    derived_tier=max(0, min(2, int(raw_knobs.get("derived_tier", 0) or 0))),
+                    derived_tier_label=str(raw_knobs.get("derived_tier_label", "symmetric") or "symmetric"),
+                )
+            raw_micro = snap.get("micro_features", {})
+            if isinstance(raw_micro, dict):
+                self._micro_features = {
+                    "fill_imbalance": float(raw_micro.get("fill_imbalance", 0.0) or 0.0),
+                    "spread_realization": float(raw_micro.get("spread_realization", 1.0) or 1.0),
+                    "fill_time_derivative": float(raw_micro.get("fill_time_derivative", 0.0) or 0.0),
+                    "congestion_ratio": float(raw_micro.get("congestion_ratio", 0.0) or 0.0),
+                }
+            self._fill_events_recent = deque()
+            for row in list(snap.get("fill_events_recent", []) or []):
+                if isinstance(row, (list, tuple)) and len(row) >= 2:
+                    try:
+                        self._fill_events_recent.append((float(row[0]), str(row[1])))
+                    except (TypeError, ValueError):
+                        continue
+            self._fill_duration_events = deque()
+            for row in list(snap.get("fill_duration_events", []) or []):
+                if isinstance(row, (list, tuple)) and len(row) >= 2:
+                    try:
+                        self._fill_duration_events.append((float(row[0]), float(row[1])))
+                    except (TypeError, ValueError):
+                        continue
+            self._spread_realization_events = deque()
+            for row in list(snap.get("spread_realization_events", []) or []):
+                if isinstance(row, (list, tuple)) and len(row) >= 2:
+                    try:
+                        self._spread_realization_events.append((float(row[0]), float(row[1])))
+                    except (TypeError, ValueError):
+                        continue
+            raw_bocpd_state = snap.get("bocpd_state", {})
+            if isinstance(raw_bocpd_state, dict):
+                self._bocpd_state = bocpd.BOCPDState(
+                    change_prob=float(raw_bocpd_state.get("change_prob", 0.0) or 0.0),
+                    run_length_mode=max(0, int(raw_bocpd_state.get("run_length_mode", 0) or 0)),
+                    run_length_mode_prob=float(raw_bocpd_state.get("run_length_mode_prob", 1.0) or 1.0),
+                    last_update_ts=float(raw_bocpd_state.get("last_update_ts", 0.0) or 0.0),
+                    observation_count=max(0, int(raw_bocpd_state.get("observation_count", 0) or 0)),
+                    alert_active=bool(raw_bocpd_state.get("alert_active", False)),
+                    alert_triggered_at=float(raw_bocpd_state.get("alert_triggered_at", 0.0) or 0.0),
+                    run_length_map={
+                        int(k): float(v)
+                        for k, v in (raw_bocpd_state.get("run_length_map", {}) or {}).items()
+                    },
+                )
+            if self._bocpd is not None:
+                raw_bocpd_snapshot = snap.get("bocpd_snapshot", {})
+                if isinstance(raw_bocpd_snapshot, dict):
+                    self._bocpd.restore_state(raw_bocpd_snapshot)
+                    self._bocpd_state = self._bocpd.state
+            self._bocpd_last_price = float(snap.get("bocpd_last_price", self._bocpd_last_price) or 0.0)
+            self._survival_last_retrain_ts = float(
+                snap.get("survival_last_retrain_ts", self._survival_last_retrain_ts) or 0.0
+            )
+            if self._survival_model is not None:
+                raw_survival_snapshot = snap.get("survival_snapshot", {})
+                if isinstance(raw_survival_snapshot, dict):
+                    self._survival_model.restore_state(raw_survival_snapshot)
+            self._trade_beliefs = {}
+            raw_trade_beliefs = snap.get("trade_beliefs", [])
+            if isinstance(raw_trade_beliefs, list):
+                for row in raw_trade_beliefs:
+                    if not isinstance(row, dict):
+                        continue
+                    try:
+                        pid = int(row.get("position_id", 0) or 0)
+                        sid = int(row.get("slot_id", -1) or -1)
+                        cycle = int(row.get("cycle", 0) or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    if pid <= 0 or sid < 0:
+                        continue
+                    self._trade_beliefs[pid] = bayesian_engine.TradeBeliefState(
+                        position_id=pid,
+                        slot_id=sid,
+                        trade_id=str(row.get("trade_id") or ""),
+                        cycle=cycle,
+                        entry_regime_posterior=list(row.get("entry_regime_posterior", []) or []),
+                        entry_entropy=float(row.get("entry_entropy", 0.0) or 0.0),
+                        entry_p_switch=float(row.get("entry_p_switch", 0.0) or 0.0),
+                        entry_price=float(row.get("entry_price", 0.0) or 0.0),
+                        exit_price=float(row.get("exit_price", 0.0) or 0.0),
+                        entry_ts=float(row.get("entry_ts", 0.0) or 0.0),
+                        side=str(row.get("side") or ""),
+                        current_regime_posterior=list(row.get("current_regime_posterior", []) or []),
+                        current_entropy=float(row.get("current_entropy", 0.0) or 0.0),
+                        current_p_switch=float(row.get("current_p_switch", 0.0) or 0.0),
+                        elapsed_sec=float(row.get("elapsed_sec", 0.0) or 0.0),
+                        distance_from_market_pct=float(row.get("distance_from_market_pct", 0.0) or 0.0),
+                        p_fill_30m=float(row.get("p_fill_30m", 0.5) or 0.5),
+                        p_fill_1h=float(row.get("p_fill_1h", 0.5) or 0.5),
+                        p_fill_4h=float(row.get("p_fill_4h", 0.5) or 0.5),
+                        median_remaining_sec=float(row.get("median_remaining_sec", 0.0) or 0.0),
+                        regime_agreement=float(row.get("regime_agreement", 1.0) or 1.0),
+                        expected_value=float(row.get("expected_value", 0.0) or 0.0),
+                        ev_trend=str(row.get("ev_trend", "stable") or "stable"),
+                        recommended_action=str(row.get("recommended_action", "hold") or "hold"),
+                        action_confidence=float(row.get("action_confidence", 0.0) or 0.0),
+                    )
+            raw_trade_counts = snap.get("trade_belief_action_counts", {})
+            if isinstance(raw_trade_counts, dict):
+                for key in ("hold", "tighten", "widen", "reprice_breakeven"):
+                    self._trade_belief_action_counts[key] = max(0, int(raw_trade_counts.get(key, 0) or 0))
+            self._trade_belief_last_update_ts = float(
+                snap.get("trade_belief_last_update_ts", self._trade_belief_last_update_ts) or 0.0
+            )
+            self._trade_belief_ev_history = {}
+            raw_ev_hist = snap.get("trade_belief_ev_history", {})
+            if isinstance(raw_ev_hist, dict):
+                for pid_txt, vals in raw_ev_hist.items():
+                    try:
+                        pid = int(pid_txt)
+                    except (TypeError, ValueError):
+                        continue
+                    if pid <= 0 or not isinstance(vals, list):
+                        continue
+                    clean_vals = []
+                    for v in vals:
+                        try:
+                            clean_vals.append(float(v))
+                        except (TypeError, ValueError):
+                            continue
+                    if clean_vals:
+                        self._trade_belief_ev_history[pid] = clean_vals[-20:]
+            self._trade_belief_widen_count = {}
+            raw_widen_count = snap.get("trade_belief_widen_count", {})
+            if isinstance(raw_widen_count, dict):
+                for pid_txt, count in raw_widen_count.items():
+                    try:
+                        pid = int(pid_txt)
+                        c = int(count)
+                    except (TypeError, ValueError):
+                        continue
+                    if pid > 0 and c > 0:
+                        self._trade_belief_widen_count[pid] = c
+            self._trade_belief_widen_total_pct = {}
+            raw_widen_total = snap.get("trade_belief_widen_total_pct", {})
+            if isinstance(raw_widen_total, dict):
+                for pid_txt, total_pct in raw_widen_total.items():
+                    try:
+                        pid = int(pid_txt)
+                        pct = float(total_pct)
+                    except (TypeError, ValueError):
+                        continue
+                    if pid > 0 and pct > 0.0:
+                        self._trade_belief_widen_total_pct[pid] = pct
+            self._belief_timer_overrides = {}
+            raw_timer_overrides = snap.get("belief_timer_overrides", {})
+            if isinstance(raw_timer_overrides, dict):
+                for pid_txt, until_ts in raw_timer_overrides.items():
+                    try:
+                        pid = int(pid_txt)
+                        until = float(until_ts)
+                    except (TypeError, ValueError):
+                        continue
+                    if pid > 0 and until > 0.0:
+                        self._belief_timer_overrides[pid] = until
+            self._refresh_belief_slot_overrides()
             self._regime_tier = int(snap.get("regime_tier", self._regime_tier))
             self._regime_tier = max(0, min(2, self._regime_tier))
             self._regime_tier_entered_at = float(snap.get("regime_tier_entered_at", self._regime_tier_entered_at))
@@ -2540,7 +4413,10 @@ class BotRuntime:
         self._hmm_readiness_cache = {}
         self._hmm_readiness_last_ts = {}
         startup_now = _now()
+        self._update_micro_features(startup_now)
         self._update_hmm(startup_now)
+        self._build_belief_state(startup_now)
+        self._maybe_retrain_survival_model(startup_now, force=True)
         self._update_regime_tier(startup_now)
 
         # Push price into all slots.
@@ -2563,6 +4439,7 @@ class BotRuntime:
 
         # Initialize/reconcile self-healing position ledger bindings.
         self._migrate_open_exits_to_position_ledger()
+        self._update_trade_beliefs(_now())
 
         self._recompute_effective_layers()
 
@@ -3115,6 +4992,14 @@ class BotRuntime:
             self._bind_position_for_exit(int(slot_id), chosen, int(position_id))
             self._persist_position_ledger_row(int(position_id))
             self._persist_position_journal_tail(int(position_id), count=1)
+            self._stamp_belief_entry_metadata(
+                slot_id=int(slot_id),
+                trade_id=str(entry_order.trade_id),
+                cycle=int(entry_order.cycle),
+                entry_price=float(fill_price),
+                exit_price=float(chosen.price),
+                entry_ts=float(fill_timestamp),
+            )
         except Exception as e:
             logger.warning(
                 "position_ledger open failed slot=%s trade=%s cycle=%s: %s",
@@ -3253,6 +5138,7 @@ class BotRuntime:
 
         self._unbind_position_for_exit(int(slot_id), int(exit_order.local_id), str(txid or ""))
         self._self_heal_hold_until_by_position.pop(int(position_id), None)
+        self._belief_timer_overrides.pop(int(position_id), None)
 
     def _migrate_open_exits_to_position_ledger(self) -> None:
         if not self._position_ledger_enabled():
@@ -5400,6 +7286,7 @@ class BotRuntime:
             "HMM_BLEND_WITH_TREND": max(
                 0.0, min(1.0, float(getattr(config, "HMM_BLEND_WITH_TREND", 0.5)))
             ),
+            "ENRICHED_FEATURES_ENABLED": bool(getattr(config, "ENRICHED_FEATURES_ENABLED", False)),
         }
 
     def _refresh_hmm_state_from_detector(
@@ -5596,6 +7483,7 @@ class BotRuntime:
                         "Tertiary HMM runtime unavailable, continuing without 1h detector: %s",
                         e,
                     )
+            self._push_private_features_to_hmm_detectors()
             logger.info("HMM runtime initialized (advisory mode enabled)")
         except Exception as e:
             self._hmm_state["available"] = False
@@ -5689,6 +7577,7 @@ class BotRuntime:
     def _train_hmm(self, *, now: float | None = None, reason: str = "scheduled") -> bool:
         if not self._hmm_detector or self._hmm_numpy is None:
             return False
+        self._push_private_features_to_hmm_detectors()
 
         now_ts = float(now if now is not None else _now())
         retry_sec = max(60.0, float(getattr(config, "HMM_OHLCV_SYNC_INTERVAL_SEC", 300.0)))
@@ -5738,6 +7627,7 @@ class BotRuntime:
     def _train_hmm_secondary(self, *, now: float | None = None, reason: str = "scheduled") -> bool:
         if not self._hmm_detector_secondary or self._hmm_numpy is None:
             return False
+        self._push_private_features_to_hmm_detectors()
 
         now_ts = float(now if now is not None else _now())
         retry_sec = max(
@@ -5803,6 +7693,7 @@ class BotRuntime:
         if not self._hmm_detector_secondary or self._hmm_numpy is None:
             self._refresh_hmm_state_from_detector(secondary=True)
             return
+        self._push_private_features_to_hmm_detectors()
 
         trained = bool(getattr(self._hmm_detector_secondary, "_trained", False))
         if not trained:
@@ -5844,6 +7735,7 @@ class BotRuntime:
             return False
         if not self._hmm_detector_tertiary or self._hmm_numpy is None:
             return False
+        self._push_private_features_to_hmm_detectors()
 
         now_ts = float(now if now is not None else _now())
         retry_sec = max(
@@ -5923,6 +7815,7 @@ class BotRuntime:
             self._refresh_hmm_state_from_detector(tertiary=True)
             self._update_hmm_tertiary_transition(now)
             return
+        self._push_private_features_to_hmm_detectors()
 
         trained = bool(getattr(self._hmm_detector_tertiary, "_trained", False))
         if not trained:
@@ -6159,6 +8052,7 @@ class BotRuntime:
     def _update_hmm(self, now: float) -> None:
         multi_enabled = bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False))
         tertiary_enabled = bool(getattr(config, "HMM_TERTIARY_ENABLED", False))
+        self._push_private_features_to_hmm_detectors()
 
         if not bool(getattr(config, "HMM_ENABLED", False)):
             if tertiary_enabled:
@@ -6328,6 +8222,8 @@ class BotRuntime:
             "training_depth_tertiary": training_depth_tertiary,
             "regime_history_30m": list(self._regime_history_30m),
         }
+        if bool(getattr(config, "BELIEF_STATE_IN_STATUS", True)):
+            out["belief_state"] = self._belief_state.to_status_dict()
         return out
 
     def _manual_regime_override(self) -> tuple[str | None, float]:
@@ -6683,6 +8579,13 @@ class BotRuntime:
                 "effective_regime": str(consensus.get("effective_regime", consensus.get("regime", "RANGING"))),
                 "effective_confidence": float(consensus.get("effective_confidence", consensus.get("confidence", 0.0)) or 0.0),
                 "effective_bias": float(consensus.get("effective_bias", consensus.get("bias_signal", 0.0)) or 0.0),
+            },
+            "bocpd": {
+                "enabled": bool(self._bocpd is not None),
+                "change_prob": float(self._bocpd_state.change_prob),
+                "run_length_mode": int(self._bocpd_state.run_length_mode),
+                "run_length_mode_prob": float(self._bocpd_state.run_length_mode_prob),
+                "alert_active": bool(self._bocpd_state.alert_active),
             },
             "consensus_1h_weight": float(getattr(config, "CONSENSUS_1H_WEIGHT", 0.30)),
             "transition_matrix_1m": transmat,
@@ -7604,7 +9507,10 @@ class BotRuntime:
         return (float(now) - started_at) >= grace_sec
 
     def _update_regime_tier(self, now: float) -> None:
-        interval_sec = max(1.0, float(getattr(config, "REGIME_EVAL_INTERVAL_SEC", 300.0)))
+        base_interval_sec = max(1.0, float(getattr(config, "REGIME_EVAL_INTERVAL_SEC", 300.0)))
+        self._build_belief_state(now)
+        self._update_bocpd_state(now)
+        interval_sec = self._effective_regime_eval_interval(base_interval_sec)
         if self._regime_last_eval_ts > 0 and (now - self._regime_last_eval_ts) < interval_sec:
             return
         self._regime_last_eval_ts = now
@@ -7636,8 +9542,15 @@ class BotRuntime:
             last_hmm_update_ts = float(pre_source.get("last_update_ts", 0.0) or 0.0)
             if (now - last_hmm_update_ts) >= interval_sec:
                 self._update_hmm(now)
+                self._build_belief_state(now)
+                self._update_bocpd_state(now)
 
         regime, confidence_raw, bias, hmm_ready, policy_source = self._policy_hmm_signal()
+        use_entropy_confidence = bool(getattr(config, "BOCPD_ENABLED", False)) or bool(
+            getattr(config, "KNOB_MODE_ENABLED", False)
+        )
+        if use_entropy_confidence and bool(self._belief_state.enabled):
+            confidence_raw = float(self._belief_state.confidence_score)
         confidence_modifier, confidence_modifier_source = self._hmm_confidence_modifier_for_source(
             policy_source
         )
@@ -7938,9 +9851,30 @@ class BotRuntime:
             "mechanical_direction": str(self._regime_mechanical_direction),
             "override_active": bool(reason == "ai_override"),
         }
+        if bool(getattr(config, "KNOB_MODE_ENABLED", False)):
+            try:
+                cap_band = str(self._compute_capacity_health(now).get("status_band") or "normal")
+            except Exception:
+                cap_band = "normal"
+            try:
+                vol_score = float(self._estimate_volatility_score())
+            except Exception:
+                vol_score = 1.0
+            self._action_knobs = bayesian_engine.compute_action_knobs(
+                belief_state=self._belief_state,
+                volatility_score=float(vol_score),
+                congestion_score=float((self._micro_features or {}).get("congestion_ratio", 0.0)),
+                capacity_band=cap_band,
+                cfg=self._belief_knob_cfg(),
+                enabled=True,
+            )
+        else:
+            self._action_knobs = bayesian_engine.ActionKnobs(enabled=False)
         self._update_throughput()
 
     def _apply_tier2_suppression(self, now: float) -> None:
+        if bool(getattr(config, "KNOB_MODE_ENABLED", False)):
+            return
         if not bool(getattr(config, "REGIME_DIRECTIONAL_ENABLED", False)):
             return
         if int(self._regime_tier) != 2:
@@ -9824,6 +11758,12 @@ class BotRuntime:
             )
             return
 
+        belief_snapshot = self._apply_cycle_belief_snapshot(
+            slot_id=int(slot_id),
+            cycle_record=cycle_record,
+            now_ts=_now(),
+        )
+
         regime_name, regime_confidence, regime_bias, _, _ = self._policy_hmm_signal()
 
         against_trend = False
@@ -9860,6 +11800,48 @@ class BotRuntime:
             "regime_bias_signal": float(regime_bias),
             "against_trend": bool(against_trend),
             "regime_tier": int(self._regime_tier),
+            "posterior_1m": list(
+                belief_snapshot.get("posterior_1m")
+                or getattr(cycle_record, "posterior_1m", None)
+                or [0.0, 1.0, 0.0]
+            ),
+            "posterior_15m": list(
+                belief_snapshot.get("posterior_15m")
+                or getattr(cycle_record, "posterior_15m", None)
+                or [0.0, 1.0, 0.0]
+            ),
+            "posterior_1h": list(
+                belief_snapshot.get("posterior_1h")
+                or getattr(cycle_record, "posterior_1h", None)
+                or [0.0, 1.0, 0.0]
+            ),
+            "entropy_at_entry": float(
+                belief_snapshot.get("entropy_at_entry", getattr(cycle_record, "entropy_at_entry", 0.0) or 0.0)
+            ),
+            "p_switch_at_entry": float(
+                belief_snapshot.get("p_switch_at_entry", getattr(cycle_record, "p_switch_at_entry", 0.0) or 0.0)
+            ),
+            "posterior_at_exit_1m": list(
+                belief_snapshot.get("posterior_at_exit_1m")
+                or getattr(cycle_record, "posterior_at_exit_1m", None)
+                or [0.0, 1.0, 0.0]
+            ),
+            "posterior_at_exit_15m": list(
+                belief_snapshot.get("posterior_at_exit_15m")
+                or getattr(cycle_record, "posterior_at_exit_15m", None)
+                or [0.0, 1.0, 0.0]
+            ),
+            "posterior_at_exit_1h": list(
+                belief_snapshot.get("posterior_at_exit_1h")
+                or getattr(cycle_record, "posterior_at_exit_1h", None)
+                or [0.0, 1.0, 0.0]
+            ),
+            "entropy_at_exit": float(
+                belief_snapshot.get("entropy_at_exit", getattr(cycle_record, "entropy_at_exit", 0.0) or 0.0)
+            ),
+            "p_switch_at_exit": float(
+                belief_snapshot.get("p_switch_at_exit", getattr(cycle_record, "p_switch_at_exit", 0.0) or 0.0)
+            ),
         }
         supabase_store.save_exit_outcome(row)
 
@@ -9977,8 +11959,32 @@ class BotRuntime:
                         fee=fee,
                         timestamp=closed_ts,
                     )
+                    self._record_fill_event(str(o.trade_id), closed_ts)
                     self._apply_event(sid, ev, "fill", {"txid": txid, "price": price, "volume": volume})
                     if o.role == "entry":
+                        slot_after = self.slots.get(int(sid))
+                        mapped_exit_price = 0.0
+                        if slot_after is not None:
+                            mapped_exit = next(
+                                (
+                                    candidate
+                                    for candidate in slot_after.state.orders
+                                    if candidate.role == "exit"
+                                    and str(candidate.trade_id) == str(o.trade_id)
+                                    and int(candidate.cycle) == int(o.cycle)
+                                ),
+                                None,
+                            )
+                            if mapped_exit is not None:
+                                mapped_exit_price = float(mapped_exit.price or 0.0)
+                        self._stamp_belief_entry_metadata(
+                            slot_id=int(sid),
+                            trade_id=str(o.trade_id),
+                            cycle=int(o.cycle),
+                            entry_price=float(price),
+                            exit_price=float(mapped_exit_price),
+                            entry_ts=float(closed_ts),
+                        )
                         self._record_position_open_for_entry_fill(
                             slot_id=int(sid),
                             entry_order=o,
@@ -10013,6 +12019,7 @@ class BotRuntime:
                         fee=fee,
                         timestamp=_now(),
                     )
+                    self._record_fill_event(str(r.trade_id), _now())
                     self._apply_event(sid, ev, "recovery_fill", {"txid": txid, "price": price, "volume": volume})
                     self.seen_fill_txids.add(txid)
                 elif kind == "churner_entry":
@@ -11284,6 +13291,9 @@ class BotRuntime:
             self._sync_ohlcv_candles(loop_now)
             self._update_daily_loss_lock(loop_now)
             self._update_rebalancer(loop_now)
+            self._update_micro_features(loop_now)
+            self._build_belief_state(loop_now)
+            self._maybe_retrain_survival_model(loop_now)
             self._update_regime_tier(loop_now)
             self._maybe_schedule_ai_regime(loop_now)
             self._update_accumulation(loop_now)
@@ -11327,6 +13337,8 @@ class BotRuntime:
             self._drain_pending_entry_orders("entry_scheduler_post_tick", skip_stale=False)
 
             self._poll_order_status()
+            self._update_micro_features(_now())
+            self._update_trade_beliefs(_now())
             self._run_self_healing_reprice(loop_now)
             self._run_churner_engine(loop_now)
             self._update_daily_loss_lock(_now())
@@ -12314,6 +14326,11 @@ class BotRuntime:
                         "distance_pct": dist,
                     })
                 cycles = list(st.completed_cycles[-20:])
+                belief_badges = [
+                    belief.to_badge_dict()
+                    for belief in self._trade_beliefs.values()
+                    if int(belief.slot_id) == int(sid)
+                ]
                 slot_realized_doge = st.total_profit / st.market_price if st.market_price > 0 else 0.0
                 slot_unrealized_doge = slot_unrealized_profit / st.market_price if st.market_price > 0 else 0.0
                 slots.append({
@@ -12337,6 +14354,7 @@ class BotRuntime:
                     "total_round_trips": st.total_round_trips,
                     "order_size_usd": self._slot_order_size_usd(self.slots[sid]),
                     "profit_pct_runtime": st.profit_pct_runtime,
+                    "belief_badges": belief_badges,
                     "open_orders": open_orders,
                     "recovery_orders": recs,
                     "recent_cycles": [c.__dict__ for c in reversed(cycles)],
@@ -12483,6 +14501,33 @@ class BotRuntime:
                 dust_available_usd = float(self.ledger.available_usd)
             elif self._last_balance_snapshot:
                 dust_available_usd = float(_usd_balance(self._last_balance_snapshot))
+            belief_state_payload = self._belief_state.to_status_dict()
+            if not bool(getattr(config, "BELIEF_STATE_IN_STATUS", True)):
+                belief_state_payload = {"enabled": False}
+            bocpd_payload = {
+                "enabled": bool(self._bocpd is not None),
+                **self._bocpd_state.to_status_dict(),
+            }
+            if self._survival_model is not None:
+                survival_payload = self._survival_model.status_payload(
+                    enabled=bool(getattr(config, "SURVIVAL_MODEL_ENABLED", False))
+                )
+                survival_payload["last_retrain_ts"] = float(self._survival_last_retrain_ts)
+            else:
+                survival_payload = {
+                    "enabled": False,
+                    "model_tier": "kaplan_meier",
+                    "n_observations": 0,
+                    "n_censored": 0,
+                    "last_retrain_ts": float(self._survival_last_retrain_ts),
+                    "strata_counts": {},
+                    "synthetic_observations": 0,
+                    "cox_coefficients": {},
+                }
+            trade_beliefs_payload = self._trade_beliefs_status_payload()
+            action_knobs_payload = self._action_knobs.to_status_dict()
+            if not bool(getattr(config, "KNOB_MODE_ENABLED", False)):
+                action_knobs_payload = bayesian_engine.ActionKnobs(enabled=False).to_status_dict()
 
             return {
                 "mode": self.mode,
@@ -12597,6 +14642,11 @@ class BotRuntime:
                 "hmm_data_pipeline_tertiary": hmm_data_pipeline_tertiary,
                 "hmm_regime": hmm_regime,
                 "hmm_consensus": hmm_consensus,
+                "belief_state": belief_state_payload,
+                "bocpd": bocpd_payload,
+                "survival_model": survival_payload,
+                "trade_beliefs": trade_beliefs_payload,
+                "action_knobs": action_knobs_payload,
                 "regime_history_30m": list(self._regime_history_30m),
                 "throughput_sizer": (
                     self._throughput.status_payload() if self._throughput is not None else {"enabled": False}

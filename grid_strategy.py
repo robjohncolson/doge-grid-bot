@@ -67,6 +67,29 @@ def _normalize_regime_id(raw) -> int | None:
     return None
 
 
+def _normalize_prob_triplet(raw):
+    if raw is None:
+        return None
+    vals = None
+    if isinstance(raw, dict):
+        vals = [raw.get("bearish"), raw.get("ranging"), raw.get("bullish")]
+    elif isinstance(raw, (list, tuple)) and len(raw) >= 3:
+        vals = [raw[0], raw[1], raw[2]]
+    if vals is None:
+        return None
+    out = []
+    for v in vals:
+        try:
+            out.append(float(v))
+        except (TypeError, ValueError):
+            out.append(0.0)
+    total = sum(x for x in out if x >= 0)
+    if total <= 0:
+        return [0.0, 1.0, 0.0]
+    norm = [max(0.0, x) / total for x in out]
+    return norm
+
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -98,7 +121,14 @@ class CompletedCycle:
                  entry_fee_actual: float = 0.0, exit_fee_actual: float = 0.0,
                  entry_cost_actual: float = 0.0, exit_cost_actual: float = 0.0,
                  entry_time: float = 0.0, exit_time: float = 0.0,
-                 regime_at_entry: int | None = None):
+                 regime_at_entry: int | None = None,
+                 posterior_1m=None, posterior_15m=None, posterior_1h=None,
+                 entropy_at_entry: float = 0.0, p_switch_at_entry: float = 0.0,
+                 confidence_at_entry: float = 0.0,
+                 posterior_at_exit_1m=None, posterior_at_exit_15m=None, posterior_at_exit_1h=None,
+                 entropy_at_exit: float = 0.0, p_switch_at_exit: float = 0.0,
+                 fill_imbalance: float = 0.0, spread_realization: float = 1.0,
+                 fill_time_derivative: float = 0.0, congestion_ratio: float = 0.0):
         self.trade_id = trade_id
         self.cycle = cycle
         self.entry_side = entry_side
@@ -115,6 +145,21 @@ class CompletedCycle:
         self.entry_time = entry_time
         self.exit_time = exit_time
         self.regime_at_entry = _normalize_regime_id(regime_at_entry)
+        self.posterior_1m = _normalize_prob_triplet(posterior_1m)
+        self.posterior_15m = _normalize_prob_triplet(posterior_15m)
+        self.posterior_1h = _normalize_prob_triplet(posterior_1h)
+        self.entropy_at_entry = float(entropy_at_entry or 0.0)
+        self.p_switch_at_entry = float(p_switch_at_entry or 0.0)
+        self.confidence_at_entry = float(confidence_at_entry or 0.0)
+        self.posterior_at_exit_1m = _normalize_prob_triplet(posterior_at_exit_1m)
+        self.posterior_at_exit_15m = _normalize_prob_triplet(posterior_at_exit_15m)
+        self.posterior_at_exit_1h = _normalize_prob_triplet(posterior_at_exit_1h)
+        self.entropy_at_exit = float(entropy_at_exit or 0.0)
+        self.p_switch_at_exit = float(p_switch_at_exit or 0.0)
+        self.fill_imbalance = float(fill_imbalance or 0.0)
+        self.spread_realization = float(spread_realization or 1.0)
+        self.fill_time_derivative = float(fill_time_derivative or 0.0)
+        self.congestion_ratio = float(congestion_ratio or 0.0)
 
     def to_dict(self) -> dict:
         return {
@@ -134,6 +179,21 @@ class CompletedCycle:
             "entry_time": self.entry_time,
             "exit_time": self.exit_time,
             "regime_at_entry": self.regime_at_entry,
+            "posterior_1m": self.posterior_1m,
+            "posterior_15m": self.posterior_15m,
+            "posterior_1h": self.posterior_1h,
+            "entropy_at_entry": round(self.entropy_at_entry, 8),
+            "p_switch_at_entry": round(self.p_switch_at_entry, 8),
+            "confidence_at_entry": round(self.confidence_at_entry, 8),
+            "posterior_at_exit_1m": self.posterior_at_exit_1m,
+            "posterior_at_exit_15m": self.posterior_at_exit_15m,
+            "posterior_at_exit_1h": self.posterior_at_exit_1h,
+            "entropy_at_exit": round(self.entropy_at_exit, 8),
+            "p_switch_at_exit": round(self.p_switch_at_exit, 8),
+            "fill_imbalance": round(self.fill_imbalance, 8),
+            "spread_realization": round(self.spread_realization, 8),
+            "fill_time_derivative": round(self.fill_time_derivative, 8),
+            "congestion_ratio": round(self.congestion_ratio, 8),
         }
 
     @staticmethod
@@ -155,6 +215,21 @@ class CompletedCycle:
             entry_time=d.get("entry_time", 0.0),
             exit_time=d.get("exit_time", 0.0),
             regime_at_entry=_normalize_regime_id(d.get("regime_at_entry")),
+            posterior_1m=d.get("posterior_1m"),
+            posterior_15m=d.get("posterior_15m"),
+            posterior_1h=d.get("posterior_1h"),
+            entropy_at_entry=d.get("entropy_at_entry", 0.0),
+            p_switch_at_entry=d.get("p_switch_at_entry", 0.0),
+            confidence_at_entry=d.get("confidence_at_entry", 0.0),
+            posterior_at_exit_1m=d.get("posterior_at_exit_1m"),
+            posterior_at_exit_15m=d.get("posterior_at_exit_15m"),
+            posterior_at_exit_1h=d.get("posterior_at_exit_1h"),
+            entropy_at_exit=d.get("entropy_at_exit", 0.0),
+            p_switch_at_exit=d.get("p_switch_at_exit", 0.0),
+            fill_imbalance=d.get("fill_imbalance", 0.0),
+            spread_realization=d.get("spread_realization", 1.0),
+            fill_time_derivative=d.get("fill_time_derivative", 0.0),
+            congestion_ratio=d.get("congestion_ratio", 0.0),
         )
 
     def __repr__(self):

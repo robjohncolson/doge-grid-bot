@@ -486,6 +486,40 @@ DASHBOARD_HTML = """<!doctype html>
         <div class=\"row\"><span class=\"k\">Training ETA</span><span id=\"hmmTrainingEta\" class=\"v\"></span></div>
         <div id=\"hmmHints\" class=\"tiny\"></div>
 
+        <h3 style=\"margin-top:14px\">Belief State</h3>
+        <div class=\"row\"><span class=\"k\">Direction</span><span id=\"beliefDirection\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Confidence</span><span id=\"beliefConfidence\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Boundary Risk</span><span id=\"beliefBoundary\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Entropy (1m/15m/1h)</span><span id=\"beliefEntropy\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">p_switch (1m/15m/1h)</span><span id=\"beliefPSwitch\" class=\"v\"></span></div>
+
+        <h3 style=\"margin-top:14px\">BOCPD</h3>
+        <div class=\"row\"><span class=\"k\">Status</span><span id=\"bocpdStatus\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Change Prob</span><span id=\"bocpdChange\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Run Length</span><span id=\"bocpdRun\" class=\"v\"></span></div>
+
+        <h3 style=\"margin-top:14px\">Survival Model</h3>
+        <div class=\"row\"><span class=\"k\">Status</span><span id=\"survivalStatus\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Observations</span><span id=\"survivalObs\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Strata</span><span id=\"survivalStrata\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Top Coeffs</span><span id=\"survivalCoeffs\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Retrained</span><span id=\"survivalRetrain\" class=\"v\"></span></div>
+
+        <h3 style=\"margin-top:14px\">Trade Beliefs</h3>
+        <div class=\"row\"><span class=\"k\">Status</span><span id=\"tbStatus\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Tracked Exits</span><span id=\"tbTracked\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Avg Agree / EV</span><span id=\"tbAverages\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Negative EV</span><span id=\"tbNegEv\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Timer Overrides</span><span id=\"tbOverrides\" class=\"v\"></span></div>
+
+        <h3 style=\"margin-top:14px\">Action Knobs</h3>
+        <div class=\"row\"><span class=\"k\">Status</span><span id=\"knobStatus\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Aggression</span><span id=\"knobAggression\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Spacing</span><span id=\"knobSpacing\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Cadence</span><span id=\"knobCadence\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Suppression</span><span id=\"knobSuppress\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Derived Tier</span><span id=\"knobTier\" class=\"v\"></span></div>
+
         <h3 style=\"margin-top:14px\">AI Regime Advisor</h3>
         <div id=\"aiRegimeCard\" class=\"ai-regime-card disabled\">
           <div class=\"row\"><span class=\"k\">Status</span><span id=\"aiRegimeStatus\" class=\"v\">OFF</span></div>
@@ -586,6 +620,7 @@ DASHBOARD_HTML = """<!doctype html>
         <h3>Slots</h3>
         <div id=\"slots\" class=\"slots\"></div>
         <div id=\"stateBar\" class=\"statebar\"></div>
+        <div id=\"slotBeliefs\" class=\"tiny\"></div>
 
         <div class=\"row\"><span class=\"k\">Order Size USD</span><span id=\"orderUsd\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Runtime Profit %</span><span id=\"runtimeProfit\" class=\"v\"></span></div>
@@ -2003,6 +2038,103 @@ DASHBOARD_HTML = """<!doctype html>
       document.getElementById('hmmHints').textContent =
         hmmHints.length ? `Hints: ${hmmHints.join(' | ')}` : '';
 
+      // --- Belief / BOCPD / Survival / Trade Beliefs / Knobs ---
+      const belief = s.belief_state || hmm.belief_state || { enabled: false };
+      const beliefEnabled = Boolean(belief.enabled);
+      const beliefDir = Number(belief.direction_score || 0.0);
+      const beliefConf = Number(belief.confidence_score || 0.0);
+      const beliefBoundary = Number(belief.p_switch_consensus || 0.0);
+      const beliefRisk = String(belief.boundary_risk || 'low').toLowerCase();
+      const beliefDirEl = document.getElementById('beliefDirection');
+      beliefDirEl.textContent = beliefEnabled ? `${beliefDir >= 0 ? '+' : ''}${fmt(beliefDir, 3)}` : 'OFF';
+      beliefDirEl.style.color = beliefDir > 0.3 ? 'var(--good)' : beliefDir < -0.3 ? 'var(--bad)' : '';
+      document.getElementById('beliefConfidence').textContent = beliefEnabled ? `${fmt(beliefConf * 100, 1)}%` : '-';
+      const boundaryEl = document.getElementById('beliefBoundary');
+      boundaryEl.textContent = beliefEnabled ? `${beliefRisk.toUpperCase()} (${fmt(beliefBoundary * 100, 1)}%)` : '-';
+      boundaryEl.style.color = beliefRisk === 'high' ? 'var(--bad)' : beliefRisk === 'medium' ? 'var(--warn)' : 'var(--good)';
+      document.getElementById('beliefEntropy').textContent = beliefEnabled
+        ? `${fmt(Number(belief.entropy_1m || 0), 2)} / ${fmt(Number(belief.entropy_15m || 0), 2)} / ${fmt(Number(belief.entropy_1h || 0), 2)}`
+        : '-';
+      document.getElementById('beliefPSwitch').textContent = beliefEnabled
+        ? `${fmt(Number(belief.p_switch_1m || 0) * 100, 1)}% / ${fmt(Number(belief.p_switch_15m || 0) * 100, 1)}% / ${fmt(Number(belief.p_switch_1h || 0) * 100, 1)}%`
+        : '-';
+
+      const bocpd = s.bocpd || { enabled: false };
+      const bocpdEnabled = Boolean(bocpd.enabled);
+      const bocpdAlert = Boolean(bocpd.alert_active);
+      const changeProb = Number(bocpd.change_prob || 0.0);
+      const runMode = Number(bocpd.run_length_mode || 0);
+      const runProb = Number(bocpd.run_length_mode_prob || 0.0);
+      const bocpdStatusEl = document.getElementById('bocpdStatus');
+      if (!bocpdEnabled) {
+        bocpdStatusEl.textContent = 'OFF';
+        bocpdStatusEl.style.color = '';
+      } else if (bocpdAlert) {
+        bocpdStatusEl.textContent = 'ALERT';
+        bocpdStatusEl.style.color = 'var(--bad)';
+      } else {
+        bocpdStatusEl.textContent = 'ACTIVE';
+        bocpdStatusEl.style.color = 'var(--good)';
+      }
+      document.getElementById('bocpdChange').textContent = bocpdEnabled ? `${fmt(changeProb * 100, 1)}%` : '-';
+      document.getElementById('bocpdRun').textContent = bocpdEnabled ? `${runMode} (${fmt(runProb * 100, 1)}%)` : '-';
+
+      const survival = s.survival_model || { enabled: false };
+      const survivalEnabled = Boolean(survival.enabled);
+      const survivalTier = String(survival.model_tier || 'kaplan_meier');
+      const survivalObs = Number(survival.n_observations || 0);
+      const survivalSynth = Number(survival.synthetic_observations || 0);
+      const survivalStatusEl = document.getElementById('survivalStatus');
+      survivalStatusEl.textContent = survivalEnabled ? survivalTier.toUpperCase() : 'OFF';
+      survivalStatusEl.style.color = survivalEnabled ? (survivalObs > 0 ? 'var(--good)' : 'var(--warn)') : '';
+      document.getElementById('survivalObs').textContent = survivalEnabled
+        ? `${survivalObs} real + ${survivalSynth} synth`
+        : '-';
+      const strata = (survival && typeof survival.strata_counts === 'object') ? survival.strata_counts : {};
+      const activeStrata = Object.keys(strata).filter(k => Number(strata[k] || 0) > 0).length;
+      document.getElementById('survivalStrata').textContent = survivalEnabled ? `${activeStrata}/6` : '-';
+      const coefs = (survival && typeof survival.cox_coefficients === 'object') ? survival.cox_coefficients : {};
+      const topCoef = Object.entries(coefs)
+        .sort((a, b) => Math.abs(Number(b[1] || 0)) - Math.abs(Number(a[1] || 0)))
+        .slice(0, 2)
+        .map(([k, v]) => `${k}:${fmt(Number(v || 0), 2)}`)
+        .join(' | ');
+      document.getElementById('survivalCoeffs').textContent = survivalEnabled ? (topCoef || '-') : '-';
+      const survRetrainTs = Number(survival.last_retrain_ts || 0);
+      document.getElementById('survivalRetrain').textContent =
+        survivalEnabled && survRetrainTs > 0 ? `${fmtAgeSeconds(nowSec - survRetrainTs)} ago` : '-';
+
+      const tradeBeliefs = s.trade_beliefs || { enabled: false };
+      const tbEnabled = Boolean(tradeBeliefs.enabled);
+      const tbStatusEl = document.getElementById('tbStatus');
+      tbStatusEl.textContent = tbEnabled ? 'ACTIVE' : 'OFF';
+      tbStatusEl.style.color = tbEnabled ? 'var(--good)' : '';
+      document.getElementById('tbTracked').textContent = tbEnabled ? String(Number(tradeBeliefs.tracked_exits || 0)) : '-';
+      const avgAgree = Number(tradeBeliefs.avg_regime_agreement || 0.0);
+      const avgEv = Number(tradeBeliefs.avg_expected_value || 0.0);
+      document.getElementById('tbAverages').textContent = tbEnabled
+        ? `${fmt(avgAgree, 2)} / $${fmt(avgEv, 6)}`
+        : '-';
+      document.getElementById('tbNegEv').textContent = tbEnabled ? String(Number(tradeBeliefs.exits_with_negative_ev || 0)) : '-';
+      document.getElementById('tbOverrides').textContent = tbEnabled
+        ? String(Number(tradeBeliefs.timer_overrides_active || 0))
+        : '-';
+
+      const knobs = s.action_knobs || { enabled: false };
+      const knobsEnabled = Boolean(knobs.enabled);
+      const knobStatusEl = document.getElementById('knobStatus');
+      knobStatusEl.textContent = knobsEnabled ? 'ACTIVE' : 'OFF';
+      knobStatusEl.style.color = knobsEnabled ? 'var(--good)' : '';
+      document.getElementById('knobAggression').textContent = knobsEnabled ? `${fmt(Number(knobs.aggression || 1.0), 3)}x` : '-';
+      document.getElementById('knobSpacing').textContent = knobsEnabled
+        ? `${fmt(Number(knobs.spacing_mult || 1.0), 3)}x (A ${fmt(Number(knobs.spacing_a || 1.0), 3)}, B ${fmt(Number(knobs.spacing_b || 1.0), 3)})`
+        : '-';
+      document.getElementById('knobCadence').textContent = knobsEnabled ? `${fmt(Number(knobs.cadence_mult || 1.0), 3)}x` : '-';
+      document.getElementById('knobSuppress').textContent = knobsEnabled ? `${fmt(Number(knobs.suppression_strength || 0.0) * 100, 1)}%` : '-';
+      document.getElementById('knobTier').textContent = knobsEnabled
+        ? `Tier ${Number(knobs.derived_tier || 0)} (${String(knobs.derived_tier_label || 'symmetric')})`
+        : '-';
+
       // --- AI Regime Advisor ---
       const ai = s.ai_regime_advisor || {};
       const aiOpinion = (ai && typeof ai.opinion === 'object') ? ai.opinion : {};
@@ -2740,6 +2872,22 @@ DASHBOARD_HTML = """<!doctype html>
         <span class=\"tiny\">A.${slot.cycle_a} / B.${slot.cycle_b}</span>
         <span class=\"tiny\">open ${slot.open_orders.length}</span>
       `;
+      const slotBeliefsEl = document.getElementById('slotBeliefs');
+      const beliefBadges = Array.isArray(slot.belief_badges) ? slot.belief_badges : [];
+      if (beliefBadges.length) {
+        const bits = beliefBadges.slice(0, 4).map((b) => {
+          const trade = String(b.trade_id || '?');
+          const cycle = Number(b.cycle || 0);
+          const p1h = Number(b.p_fill_1h || 0) * 100;
+          const ev = Number(b.expected_value || 0);
+          const agree = Number(b.regime_agreement || 0);
+          const action = String(b.recommended_action || 'hold').toUpperCase();
+          return `${trade}.${cycle} p1h=${fmt(p1h, 0)}% ev=$${fmt(ev, 5)} agr=${fmt(agree, 2)} -> ${action}`;
+        });
+        slotBeliefsEl.textContent = `Belief: ${bits.join(' | ')}`;
+      } else {
+        slotBeliefsEl.textContent = '';
+      }
 
       document.getElementById('orderUsd').textContent = `$${fmt(slot.order_size_usd, 4)}`;
       document.getElementById('runtimeProfit').textContent = `${fmt(slot.profit_pct_runtime, 3)}%`;

@@ -82,6 +82,7 @@ class FeatureExtractor:
         macd_signal: int = 9,
         rsi_period: int = 14,
         volume_avg_period: int = 20,
+        enriched_features_enabled: bool = False,
     ):
         self.fast_ema_periods = fast_ema_periods
         self.slow_ema_periods = slow_ema_periods
@@ -90,6 +91,35 @@ class FeatureExtractor:
         self.macd_signal = macd_signal
         self.rsi_period = rsi_period
         self.volume_avg_period = volume_avg_period
+        self.enriched_features_enabled = bool(enriched_features_enabled)
+        # Runtime private features (cold-start neutral defaults).
+        self._fill_imbalance = 0.0
+        self._spread_realization = 1.0
+        self._fill_time_derivative = 0.0
+        self._congestion_ratio = 0.0
+
+    def set_private_features(self, metrics: dict | None) -> None:
+        metrics = metrics or {}
+        try:
+            self._fill_imbalance = float(metrics.get("fill_imbalance", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            self._fill_imbalance = 0.0
+        try:
+            self._spread_realization = float(metrics.get("spread_realization", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            self._spread_realization = 1.0
+        try:
+            self._fill_time_derivative = float(metrics.get("fill_time_derivative", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            self._fill_time_derivative = 0.0
+        try:
+            self._congestion_ratio = float(metrics.get("congestion_ratio", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            self._congestion_ratio = 0.0
+
+        self._fill_imbalance = max(-1.0, min(1.0, self._fill_imbalance))
+        self._spread_realization = max(0.0, self._spread_realization)
+        self._congestion_ratio = max(0.0, min(1.0, self._congestion_ratio))
 
     @staticmethod
     def _ema(series: np.ndarray, span: int) -> np.ndarray:
@@ -173,6 +203,18 @@ class FeatureExtractor:
             volume_ratio,
         ])
 
+        if self.enriched_features_enabled:
+            n = len(obs)
+            enriched = np.column_stack(
+                [
+                    np.full(n, float(self._fill_imbalance), dtype=float),
+                    np.full(n, float(self._spread_realization), dtype=float),
+                    np.full(n, float(self._fill_time_derivative), dtype=float),
+                    np.full(n, float(self._congestion_ratio), dtype=float),
+                ]
+            )
+            obs = np.concatenate([obs, enriched], axis=1)
+
         valid_mask = ~np.any(np.isnan(obs), axis=1)
         return obs[valid_mask]
 
@@ -226,6 +268,7 @@ class RegimeDetector:
         "HMM_MIN_TRAIN_SAMPLES": 500,         # ~42 hours of 5-min candles
         "HMM_BIAS_GAIN": 1.0,                 # scales bias_signal magnitude
         "HMM_BLEND_WITH_TREND": 0.5,          # 0=pure HMM, 1=pure §15 trend_score
+        "ENRICHED_FEATURES_ENABLED": False,
     }
 
     def __init__(self, config: Optional[dict] = None):
@@ -236,11 +279,83 @@ class RegimeDetector:
 
         self.cfg = {**self.DEFAULT_CONFIG, **(config or {})}
         self.model: Optional[GaussianHMM] = None
-        self.extractor = FeatureExtractor()
+        self.extractor = FeatureExtractor(
+            enriched_features_enabled=bool(self.cfg.get("ENRICHED_FEATURES_ENABLED", False))
+        )
         self.state = RegimeState()
         self._state_label_map: dict[int, Regime] = {}
         self._last_train_ts: float = 0.0
         self._trained = False
+
+    def set_private_features(self, metrics: dict | None) -> None:
+        """
+        Update private runtime feature snapshot for enriched observation mode.
+        """
+        self.extractor.set_private_features(metrics)
+
+    @staticmethod
+    def compute_entropy(posterior: list[float] | tuple[float, ...] | np.ndarray) -> float:
+        """
+        Normalized Shannon entropy in [0, 1].
+        """
+        try:
+            p = np.asarray(posterior, dtype=float).reshape(-1)
+        except Exception:
+            p = np.asarray([0.0, 1.0, 0.0], dtype=float)
+        if p.size == 0:
+            p = np.asarray([0.0, 1.0, 0.0], dtype=float)
+        p = np.where(np.isfinite(p), p, 0.0)
+        p = np.clip(p, 0.0, 1.0)
+        total = float(p.sum())
+        if total <= 1e-12:
+            return 0.0
+        p = p / total
+        nz = p[p > 0.0]
+        if nz.size == 0:
+            return 0.0
+        h = -float(np.sum(nz * np.log(nz)))
+        hmax = np.log(float(len(p))) if len(p) > 1 else 1.0
+        if hmax <= 0.0:
+            return 0.0
+        return max(0.0, min(1.0, h / float(hmax)))
+
+    @staticmethod
+    def compute_p_switch(
+        posterior: list[float] | tuple[float, ...] | np.ndarray,
+        transmat: list[list[float]] | np.ndarray | None,
+    ) -> float:
+        """
+        p_switch = 1 - Σ π(i) * A[i,i]
+        """
+        try:
+            p = np.asarray(posterior, dtype=float).reshape(-1)
+        except Exception:
+            p = np.asarray([0.0, 1.0, 0.0], dtype=float)
+        if p.size == 0:
+            p = np.asarray([0.0, 1.0, 0.0], dtype=float)
+        p = np.where(np.isfinite(p), p, 0.0)
+        p = np.clip(p, 0.0, 1.0)
+        total = float(p.sum())
+        if total <= 1e-12:
+            return 0.0
+        p = p / total
+
+        if transmat is None:
+            return 0.0
+        try:
+            a = np.asarray(transmat, dtype=float)
+        except Exception:
+            return 0.0
+        if a.ndim != 2:
+            return 0.0
+        n = min(int(p.size), int(a.shape[0]), int(a.shape[1]))
+        if n <= 0:
+            return 0.0
+        diag = np.diag(a[:n, :n])
+        diag = np.where(np.isfinite(diag), diag, 0.0)
+        diag = np.clip(diag, 0.0, 1.0)
+        stay_prob = float(np.dot(p[:n], diag))
+        return max(0.0, min(1.0, 1.0 - stay_prob))
 
     # --- Training -----------------------------------------------------------
 
