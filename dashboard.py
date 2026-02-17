@@ -539,7 +539,8 @@ DASHBOARD_HTML = """<!doctype html>
         <div class=\"row\"><span class=\"k\">1h Change</span><span id=\"biasChange1h\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">24h Change</span><span id=\"biasChange24h\" class=\"v\"></span></div>
         <div id=\"biasSparkline\" style=\"height:24px;margin:4px 0\"></div>
-        <div class=\"row\"><span class=\"k\">Idle USD</span><span id=\"biasIdleUsd\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Free USD (Kraken/Ledger)</span><span id=\"biasFreeUsd\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Idle USD (Above Runway)</span><span id=\"biasIdleUsd\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Runway Floor</span><span id=\"biasRunway\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Opp. Cost (B-side)</span><span id=\"biasOppCost\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Open Gap</span><span id=\"biasOpenGap\" class=\"v\"></span></div>
@@ -2160,6 +2161,7 @@ DASHBOARD_HTML = """<!doctype html>
       const b1h = document.getElementById('biasChange1h');
       const b24h = document.getElementById('biasChange24h');
       const bSpark = document.getElementById('biasSparkline');
+      const bFree = document.getElementById('biasFreeUsd');
       const bIdle = document.getElementById('biasIdleUsd');
       const bRunway = document.getElementById('biasRunway');
       const bOpp = document.getElementById('biasOppCost');
@@ -2172,6 +2174,33 @@ DASHBOARD_HTML = """<!doctype html>
       const govEl = document.getElementById('rebalGov');
       const sizesEl = document.getElementById('rebalSizes');
       const trend = s.trend || null;
+      const balanceHealth = s.balance_health || null;
+      const balanceLedger = balanceHealth ? (balanceHealth.ledger || null) : null;
+      const toFiniteNumber = (value) => {
+        if (value === null || value === undefined) return null;
+        const n = Number(value);
+        return Number.isFinite(n) ? n : null;
+      };
+      let freeUsd = toFiniteNumber(balanceLedger ? balanceLedger.available_usd : null);
+      if (freeUsd === null) freeUsd = toFiniteNumber(balanceHealth ? balanceHealth.loop_available_usd : null);
+      if (freeUsd === null) {
+        const observedUsd = toFiniteNumber(balanceHealth ? balanceHealth.usd_observed : null);
+        const committedUsd = toFiniteNumber(balanceHealth ? balanceHealth.usd_committed_internal : null);
+        if (observedUsd !== null && committedUsd !== null) {
+          freeUsd = Math.max(0, observedUsd - committedUsd);
+        }
+      }
+      const observedUsd = toFiniteNumber(balanceHealth ? balanceHealth.usd_observed : null);
+      if (freeUsd === null) {
+        bFree.textContent = '-';
+        bFree.style.color = '';
+      } else {
+        const freePct = (observedUsd !== null && observedUsd > 0) ? (freeUsd / observedUsd * 100.0) : null;
+        bFree.textContent = freePct === null
+          ? `$${fmt(freeUsd, 2)}`
+          : `$${fmt(freeUsd, 2)} (${fmt(freePct, 1)}%)`;
+        bFree.style.color = freeUsd <= 0.25 ? 'var(--good)' : freeUsd > 2.0 ? 'var(--warn)' : '';
+      }
       if (!bias) {
         [bEq, b1h, b24h, bIdle, bRunway, bOpp, bGap, bLagM, bLagC].forEach(e => { e.textContent = '-'; e.style.color = ''; });
         bSpark.innerHTML = '';
