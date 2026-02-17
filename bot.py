@@ -9706,8 +9706,10 @@ def run() -> None:
 
     server = None
     try:
-        rt.initialize()
+        # Start health/dashboard server before heavy startup initialization so
+        # platform health checks can succeed while we warm up.
         server = start_http_server()
+        rt.initialize()
 
         poll = max(5, int(config.POLL_INTERVAL_SECONDS))
         logger.info("Entering main loop (every %ss)", poll)
