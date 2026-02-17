@@ -530,15 +530,20 @@ DASHBOARD_HTML = """<!doctype html>
         <div class=\"row\"><span class=\"k\">Account Value</span><span id=\"reconCurrent\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Baseline</span><span id=\"reconBaseline\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Growth</span><span id=\"reconGrowth\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">External Flows</span><span id=\"reconFlows\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Bot P&amp;L</span><span id=\"reconBotPnl\" class=\"v\"></span></div>
-        <div class=\"row\"><span class=\"k\">Drift</span><span id=\"reconDrift\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Unexplained</span><span id=\"reconDrift\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Last Flow</span><span id=\"reconLastFlow\" class=\"v\"></span></div>
         <div id=\"reconDetails\" class=\"tiny\"></div>
+        <div id=\"flowHistory\" class=\"tiny\"></div>
 
         <h3 style=\"margin-top:14px\">DOGE Bias Scoreboard</h3>
         <div class=\"row\"><span class=\"k\">DOGE Equity</span><span id=\"biasDogeEq\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">1h Change</span><span id=\"biasChange1h\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">24h Change</span><span id=\"biasChange24h\" class=\"v\"></span></div>
-        <div id=\"biasSparkline\" style=\"height:24px;margin:4px 0\"></div>
+        <div class=\"row\"><span class=\"k\">Equity View</span><span class=\"v\"><button id=\"equityView24\">24h</button> <button id=\"equityView7d\">7d</button></span></div>
+        <div id=\"biasSparkline\" style=\"height:140px;margin:6px 0\"></div>
+        <div id=\"equityChartMeta\" class=\"tiny\"></div>
         <div class=\"row\"><span class=\"k\">Free USD (Kraken/Ledger)</span><span id=\"biasFreeUsd\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Idle USD (Above Runway)</span><span id=\"biasIdleUsd\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Runway Floor</span><span id=\"biasRunway\" class=\"v\"></span></div>
@@ -652,6 +657,7 @@ DASHBOARD_HTML = """<!doctype html>
     let suggestionIndex = -1;
     let historyIndex = 0;
     let lastRefreshError = '';
+    let equityChartRange = '24h';
     const commandHistory = [];
     const COMMAND_COMPLETIONS = [
       'pause', 'resume', 'add', 'remove', 'close', 'release', 'release_eligible', 'audit', 'drift', 'stale',
@@ -671,6 +677,82 @@ DASHBOARD_HTML = """<!doctype html>
       if (seconds >= 3600) return `${(seconds / 3600).toFixed(1)}h`;
       if (seconds >= 60) return `${(seconds / 60).toFixed(1)}m`;
       return `${Math.round(seconds)}s`;
+    }
+
+    function fmtAgo(rawSeconds) {
+      const seconds = Number(rawSeconds || 0);
+      if (!Number.isFinite(seconds) || seconds <= 0) return 'now';
+      if (seconds >= 86400) return `${(seconds / 86400).toFixed(1)}d ago`;
+      if (seconds >= 3600) return `${(seconds / 3600).toFixed(1)}h ago`;
+      if (seconds >= 60) return `${(seconds / 60).toFixed(1)}m ago`;
+      return `${Math.round(seconds)}s ago`;
+    }
+
+    function renderEquityChart(equityHistory, externalFlows) {
+      const host = document.getElementById('biasSparkline');
+      const meta = document.getElementById('equityChartMeta');
+      if (!host || !meta) return;
+      const series = (equityChartRange === '7d')
+        ? (equityHistory && Array.isArray(equityHistory.sparkline_7d) ? equityHistory.sparkline_7d : [])
+        : (equityHistory && Array.isArray(equityHistory.sparkline_24h) ? equityHistory.sparkline_24h : []);
+      if (series.length < 2) {
+        host.innerHTML = '';
+        meta.textContent = '';
+        return;
+      }
+
+      const w = 280;
+      const h = 120;
+      const pad = 6;
+      const nums = series.map((v) => Number(v)).filter((v) => Number.isFinite(v));
+      if (nums.length < 2) {
+        host.innerHTML = '';
+        meta.textContent = '';
+        return;
+      }
+      const mn = Math.min(...nums);
+      const mx = Math.max(...nums);
+      const range = (mx - mn) || 1;
+      const points = nums.map((v, i) => {
+        const x = (i / Math.max(1, nums.length - 1)) * (w - pad * 2) + pad;
+        const y = (h - pad) - ((v - mn) / range) * (h - pad * 2);
+        return `${x.toFixed(1)},${y.toFixed(1)}`;
+      }).join(' ');
+
+      let seriesStartTs = null;
+      let seriesEndTs = null;
+      if (equityChartRange === '7d') {
+        seriesStartTs = Number(equityHistory && equityHistory.oldest_persisted_ts);
+        seriesEndTs = Number(equityHistory && equityHistory.newest_persisted_ts);
+      } else {
+        seriesEndTs = Date.now() / 1000;
+        seriesStartTs = seriesEndTs - Math.max(0, nums.length - 1) * 300;
+      }
+      if (!Number.isFinite(seriesStartTs) || !Number.isFinite(seriesEndTs) || seriesEndTs <= seriesStartTs) {
+        seriesStartTs = null;
+        seriesEndTs = null;
+      }
+
+      let markersSvg = '';
+      let markerCount = 0;
+      const flows = externalFlows && Array.isArray(externalFlows.recent_flows) ? externalFlows.recent_flows : [];
+      if (seriesStartTs !== null && seriesEndTs !== null && flows.length > 0) {
+        const span = seriesEndTs - seriesStartTs;
+        for (const flow of flows) {
+          const ts = Number(flow && flow.ts);
+          if (!Number.isFinite(ts) || ts < seriesStartTs || ts > seriesEndTs) continue;
+          const x = ((ts - seriesStartTs) / span) * (w - pad * 2) + pad;
+          const type = String(flow && flow.type || '').toLowerCase();
+          const color = type === 'withdrawal' ? 'var(--bad)' : 'var(--good)';
+          markersSvg += `<line x1=\"${x.toFixed(1)}\" y1=\"${pad}\" x2=\"${x.toFixed(1)}\" y2=\"${(h - pad).toFixed(1)}\" stroke=\"${color}\" stroke-width=\"1\" stroke-dasharray=\"3,3\" />`;
+          markerCount += 1;
+        }
+      }
+
+      host.innerHTML = `<svg width=\"${w}\" height=\"${h}\" viewBox=\"0 0 ${w} ${h}\"><polyline points=\"${points}\" fill=\"none\" stroke=\"var(--accent)\" stroke-width=\"1.8\"/>${markersSvg}</svg>`;
+      const spanHours = Number(equityHistory && equityHistory.span_hours);
+      const spanLabel = Number.isFinite(spanHours) ? `${fmt(spanHours, 1)}h` : (equityChartRange === '7d' ? '7d' : '24h');
+      meta.textContent = `${equityChartRange.toUpperCase()} ${nums.length} points | span ${spanLabel} | flow markers ${markerCount}`;
     }
 
     function isStickyModeEnabled() {
@@ -2119,40 +2201,81 @@ DASHBOARD_HTML = """<!doctype html>
       const reconCurrentEl = document.getElementById('reconCurrent');
       const reconBaselineEl = document.getElementById('reconBaseline');
       const reconGrowthEl = document.getElementById('reconGrowth');
+      const reconFlowsEl = document.getElementById('reconFlows');
       const reconBotPnlEl = document.getElementById('reconBotPnl');
       const reconDriftEl = document.getElementById('reconDrift');
+      const reconLastFlowEl = document.getElementById('reconLastFlow');
       const reconDetailsEl = document.getElementById('reconDetails');
+      const flowHistoryEl = document.getElementById('flowHistory');
       if (!recon) {
         reconStatusEl.textContent = 'Baseline pending...';
         reconStatusEl.style.color = '';
         reconCurrentEl.textContent = '-';
         reconBaselineEl.textContent = '-';
         reconGrowthEl.textContent = '-';
+        reconFlowsEl.textContent = '-';
         reconBotPnlEl.textContent = '-';
         reconDriftEl.textContent = '-';
+        reconLastFlowEl.textContent = '-';
         reconDetailsEl.textContent = '';
+        flowHistoryEl.textContent = '';
       } else if (recon.status === 'NO_PRICE' || recon.status === 'NO_BALANCE') {
         reconStatusEl.textContent = recon.status;
         reconStatusEl.style.color = '';
         reconCurrentEl.textContent = '-';
         reconBaselineEl.textContent = '-';
         reconGrowthEl.textContent = '-';
+        reconFlowsEl.textContent = '-';
         reconBotPnlEl.textContent = '-';
         reconDriftEl.textContent = '-';
+        reconLastFlowEl.textContent = '-';
         reconDetailsEl.textContent = '';
+        flowHistoryEl.textContent = '';
       } else {
         const sim = recon.simulated ? ' (sim)' : '';
-        reconStatusEl.textContent = recon.status + sim;
-        reconStatusEl.style.color = recon.status === 'OK' ? 'var(--good)' : 'var(--bad)';
+        const adjustedStatus = String(recon.adjusted_status || recon.status || '');
+        reconStatusEl.textContent = adjustedStatus + sim;
+        reconStatusEl.style.color = adjustedStatus === 'OK' ? 'var(--good)' : 'var(--bad)';
         reconCurrentEl.textContent = `${fmt(recon.current_doge_eq, 1)} DOGE`;
         reconBaselineEl.textContent = `${fmt(recon.baseline_doge_eq, 1)} DOGE`;
         reconGrowthEl.textContent = `${fmt(recon.account_growth_doge, 2)} DOGE`;
+        const flowNet = Number(recon.external_flows_doge_eq || 0);
+        const flowSign = flowNet >= 0 ? '+' : '';
+        const flowCount = Number(recon.external_flow_count || 0);
+        reconFlowsEl.textContent = `${flowSign}${fmt(flowNet, 2)} DOGE (${flowCount} flow${flowCount === 1 ? '' : 's'})`;
         reconBotPnlEl.textContent = `${fmt(recon.bot_pnl_doge, 2)} DOGE`;
-        const driftSign = recon.drift_doge >= 0 ? '+' : '';
-        reconDriftEl.textContent = `${driftSign}${fmt(recon.drift_doge, 2)} DOGE (${driftSign}${fmt(recon.drift_pct, 2)}%)`;
-        reconDriftEl.style.color = recon.status === 'OK' ? '' : 'var(--bad)';
+        const unexplained = Number(recon.adjusted_drift_doge != null ? recon.adjusted_drift_doge : recon.drift_doge);
+        const unexplainedPct = Number(recon.adjusted_drift_pct != null ? recon.adjusted_drift_pct : recon.drift_pct);
+        const driftSign = unexplained >= 0 ? '+' : '';
+        reconDriftEl.textContent = `${driftSign}${fmt(unexplained, 2)} DOGE (${driftSign}${fmt(unexplainedPct, 3)}%)`;
+        reconDriftEl.style.color = adjustedStatus === 'OK' ? '' : 'var(--bad)';
+        if (recon.last_flow_ts) {
+          const ageSec = Math.max(0, Date.now() / 1000 - Number(recon.last_flow_ts));
+          const flowType = String(recon.last_flow_type || 'flow');
+          const flowAsset = String(recon.last_flow_asset || '');
+          const flowAmount = Number(recon.last_flow_amount || 0);
+          reconLastFlowEl.textContent = `${flowType} ${fmt(flowAmount, 2)} ${flowAsset} (${fmtAgo(ageSec)})`;
+        } else {
+          reconLastFlowEl.textContent = '-';
+        }
         const ageHrs = recon.baseline_ts ? ((Date.now() / 1000 - recon.baseline_ts) / 3600).toFixed(1) : '?';
-        reconDetailsEl.textContent = `baseline age: ${ageHrs}h | threshold: \\u00b1${fmt(recon.threshold_pct, 1)}% | price: $${fmt(recon.price, 5)}`;
+        const adjCount = Number(recon.baseline_adjustments_count || 0);
+        const pollAge = Number(recon.flow_poll_age_sec || 0);
+        reconDetailsEl.textContent = `baseline age: ${ageHrs}h | adjustments: ${adjCount} | poll age: ${fmtAgeSeconds(pollAge)} | threshold: \\u00b1${fmt(recon.threshold_pct, 1)}% | price: $${fmt(recon.price, 5)}`;
+        const flowsPayload = s.external_flows || {};
+        const recentFlows = Array.isArray(flowsPayload.recent_flows) ? flowsPayload.recent_flows.slice(0, 4) : [];
+        if (recentFlows.length > 0) {
+          flowHistoryEl.textContent = recentFlows.map((f) => {
+            const type = String(f.type || '');
+            const amount = Number(f.amount || 0);
+            const asset = String(f.asset || '');
+            const ts = Number(f.ts || 0);
+            const ago = ts > 0 ? fmtAgo(Date.now() / 1000 - ts) : '';
+            return `${type} ${fmt(amount, 2)} ${asset} ${ago}`.trim();
+          }).join(' | ');
+        } else {
+          flowHistoryEl.textContent = '';
+        }
       }
 
       // DOGE Bias Scoreboard card
@@ -2173,6 +2296,14 @@ DASHBOARD_HTML = """<!doctype html>
       const trendIdleEl = document.getElementById('trendIdleTarget');
       const govEl = document.getElementById('rebalGov');
       const sizesEl = document.getElementById('rebalSizes');
+      const eq24Btn = document.getElementById('equityView24');
+      const eq7Btn = document.getElementById('equityView7d');
+      const equityHistory = s.equity_history || null;
+      const externalFlows = s.external_flows || null;
+      if (eq24Btn && eq7Btn) {
+        eq24Btn.disabled = (equityChartRange === '24h');
+        eq7Btn.disabled = (equityChartRange === '7d');
+      }
       const trend = s.trend || null;
       const balanceHealth = s.balance_health || null;
       const balanceLedger = balanceHealth ? (balanceHealth.ledger || null) : null;
@@ -2203,7 +2334,6 @@ DASHBOARD_HTML = """<!doctype html>
       }
       if (!bias) {
         [bEq, b1h, b24h, bIdle, bRunway, bOpp, bGap, bLagM, bLagC].forEach(e => { e.textContent = '-'; e.style.color = ''; });
-        bSpark.innerHTML = '';
         bDet.textContent = '';
         govEl.textContent = '-';
         govEl.style.color = '';
@@ -2219,17 +2349,6 @@ DASHBOARD_HTML = """<!doctype html>
         };
         fmtDelta(bias.doge_eq_change_1h, b1h);
         fmtDelta(bias.doge_eq_change_24h, b24h);
-        // Sparkline SVG
-        const pts = bias.doge_eq_sparkline || [];
-        if (pts.length >= 2) {
-          const mn = Math.min(...pts), mx = Math.max(...pts);
-          const range = mx - mn || 1;
-          const w = 280, h = 24;
-          const coords = pts.map((v, i) => `${(i / (pts.length - 1) * w).toFixed(1)},${(h - (v - mn) / range * h).toFixed(1)}`).join(' ');
-          bSpark.innerHTML = `<svg width=\"${w}\" height=\"${h}\" viewBox=\"0 0 ${w} ${h}\"><polyline points=\"${coords}\" fill=\"none\" stroke=\"var(--accent)\" stroke-width=\"1.5\"/></svg>`;
-        } else {
-          bSpark.innerHTML = '';
-        }
         // Idle USD
         bIdle.textContent = `$${fmt(bias.idle_usd, 2)} (${fmt(bias.idle_usd_pct, 1)}%)`;
         bIdle.style.color = bias.idle_usd_pct > 50 ? 'var(--warn)' : '';
@@ -2284,6 +2403,7 @@ DASHBOARD_HTML = """<!doctype html>
           sizesEl.style.color = damped ? 'var(--warn)' : '';
         }
       }
+      renderEquityChart(equityHistory, externalFlows);
       if (!trend) {
         trendScoreEl.textContent = '-';
         trendScoreEl.style.color = '';
@@ -2632,6 +2752,14 @@ DASHBOARD_HTML = """<!doctype html>
       const value = readAndValidatePctInput('profitInput', 'profit');
       if (value === null) return;
       requestSetMetric('profit', value);
+    };
+    document.getElementById('equityView24').onclick = () => {
+      equityChartRange = '24h';
+      if (state) renderAll(state);
+    };
+    document.getElementById('equityView7d').onclick = () => {
+      equityChartRange = '7d';
+      if (state) renderAll(state);
     };
     document.getElementById('aiApplyOverrideBtn').onclick = () => {
       const ai = state && state.ai_regime_advisor ? state.ai_regime_advisor : {};

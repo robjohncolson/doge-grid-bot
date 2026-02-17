@@ -436,6 +436,17 @@ OPEN_ORDER_DRIFT_ALERT_COOLDOWN_SEC: int = _env("OPEN_ORDER_DRIFT_ALERT_COOLDOWN
 # Balance reconciliation: max acceptable drift between account growth and bot P&L.
 BALANCE_RECON_DRIFT_PCT: float = _env("BALANCE_RECON_DRIFT_PCT", 2.0, float)
 
+# Balance intelligence: external flow detection + persistent equity history.
+FLOW_DETECTION_ENABLED: bool = _env("FLOW_DETECTION_ENABLED", True, bool)
+FLOW_POLL_INTERVAL_SEC: float = _env("FLOW_POLL_INTERVAL_SEC", 300.0, float)
+FLOW_BASELINE_AUTO_ADJUST: bool = _env("FLOW_BASELINE_AUTO_ADJUST", True, bool)
+
+EQUITY_TS_ENABLED: bool = _env("EQUITY_TS_ENABLED", True, bool)
+EQUITY_SNAPSHOT_INTERVAL_SEC: float = _env("EQUITY_SNAPSHOT_INTERVAL_SEC", 300.0, float)
+EQUITY_SNAPSHOT_FLUSH_SEC: float = _env("EQUITY_SNAPSHOT_FLUSH_SEC", 300.0, float)
+EQUITY_TS_RETENTION_DAYS: int = _env("EQUITY_TS_RETENTION_DAYS", 7, int)
+EQUITY_TS_SPARKLINE_7D_STEP: int = _env("EQUITY_TS_SPARKLINE_7D_STEP", 6, int)
+
 # ---------------------------------------------------------------------------
 # AI council settings
 # ---------------------------------------------------------------------------

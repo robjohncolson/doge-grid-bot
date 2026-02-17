@@ -18,7 +18,7 @@ import os
 import signal
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from math import ceil, exp, floor, isfinite
@@ -39,6 +39,7 @@ import supabase_store
 
 logger = logging.getLogger(__name__)
 _BOT_RUNTIME_STATE_FILE = os.path.join(config.LOG_DIR, "bot_runtime.json")
+_EQUITY_TS_FILE = os.path.join(config.LOG_DIR, "equity_ts.json")
 
 
 def _recovery_orders_enabled_flag() -> bool:
@@ -110,6 +111,18 @@ class SlotRuntime:
     slot_id: int
     state: sm.PairState
     alias: str = ""
+
+
+@dataclass(frozen=True)
+class ExternalFlow:
+    ledger_id: str
+    flow_type: str
+    asset: str
+    amount: float
+    fee: float
+    timestamp: float
+    doge_eq: float
+    price_at_detect: float
 
 
 class CapitalLedger:
@@ -282,6 +295,22 @@ class BotRuntime:
 
         # Balance reconciliation baseline {usd, doge, ts}.
         self._recon_baseline: dict | None = None
+        self._flow_detection_active: bool = bool(getattr(config, "FLOW_DETECTION_ENABLED", True))
+        self._flow_poll_interval: float = max(30.0, float(getattr(config, "FLOW_POLL_INTERVAL_SEC", 300.0)))
+        self._flow_last_poll_ts: float = 0.0
+        self._flow_ledger_cursor: float = 0.0
+        self._flow_seen_ids: set[str] = set()
+        self._external_flows: list[ExternalFlow] = []
+        self._baseline_adjustments: list[dict] = []
+        self._flow_total_deposits_doge_eq: float = 0.0
+        self._flow_total_withdrawals_doge_eq: float = 0.0
+        self._flow_total_count: int = 0
+        self._flow_last_error: str = ""
+        self._flow_last_ok: bool = True
+        self._flow_disabled_reason: str = ""
+        self._flow_history_cap: int = 1000
+        self._baseline_adjustments_cap: int = 1000
+        self._flow_recent_status_limit: int = 25
 
         # Rolling 24h fill/partial telemetry.
         self._partial_fill_open_events: deque[float] = deque()
@@ -291,8 +320,23 @@ class BotRuntime:
 
         # Rolling 24h DOGE-equivalent equity snapshots (5-min interval).
         self._doge_eq_snapshots: deque[tuple[float, float]] = deque()  # (ts, doge_eq)
-        self._doge_eq_snapshot_interval: float = 300.0  # 5 min
+        self._doge_eq_snapshot_interval: float = max(
+            30.0,
+            float(getattr(config, "EQUITY_SNAPSHOT_INTERVAL_SEC", 300.0)),
+        )
         self._doge_eq_last_snapshot_ts: float = 0.0
+        self._equity_ts_enabled: bool = bool(getattr(config, "EQUITY_TS_ENABLED", True))
+        self._equity_ts_flush_interval: float = max(
+            30.0,
+            float(getattr(config, "EQUITY_SNAPSHOT_FLUSH_SEC", 300.0)),
+        )
+        self._equity_ts_retention_days: int = max(1, int(getattr(config, "EQUITY_TS_RETENTION_DAYS", 7)))
+        self._equity_ts_sparkline_7d_step: int = max(1, int(getattr(config, "EQUITY_TS_SPARKLINE_7D_STEP", 6)))
+        self._equity_ts_records: list[dict] = []
+        self._equity_ts_last_flush_ts: float = 0.0
+        self._equity_ts_last_flush_ok: bool = True
+        self._equity_ts_last_flush_error: str = ""
+        self._equity_ts_dirty: bool = False
 
         # Inventory rebalancer state.
         self._rebalancer_idle_ratio: float = 0.0
@@ -1382,6 +1426,18 @@ class BotRuntime:
             "slots": {str(sid): sm.to_dict(slot.state) for sid, slot in self.slots.items()},
             "slot_aliases": {str(sid): str(slot.alias or "").strip().lower() for sid, slot in self.slots.items()},
             "recon_baseline": self._recon_baseline,
+            "flow_detection_active": bool(self._flow_detection_active),
+            "flow_last_poll_ts": float(self._flow_last_poll_ts),
+            "flow_ledger_cursor": float(self._flow_ledger_cursor),
+            "flow_seen_ids": list(self._flow_seen_ids),
+            "external_flows": [asdict(flow) for flow in self._external_flows[-self._flow_history_cap:]],
+            "baseline_adjustments": list(self._baseline_adjustments[-self._baseline_adjustments_cap:]),
+            "flow_total_deposits_doge_eq": float(self._flow_total_deposits_doge_eq),
+            "flow_total_withdrawals_doge_eq": float(self._flow_total_withdrawals_doge_eq),
+            "flow_total_count": int(self._flow_total_count),
+            "flow_last_error": str(self._flow_last_error or ""),
+            "flow_last_ok": bool(self._flow_last_ok),
+            "flow_disabled_reason": str(self._flow_disabled_reason or ""),
             "rebalancer_idle_ratio": self._rebalancer_idle_ratio,
             "rebalancer_smoothed_error": self._rebalancer_smoothed_error,
             "rebalancer_smoothed_velocity": self._rebalancer_smoothed_velocity,
@@ -1500,6 +1556,117 @@ class BotRuntime:
         except Exception:
             return {}
 
+    def _save_local_equity_ts(self, payload: dict) -> None:
+        try:
+            os.makedirs(config.LOG_DIR, exist_ok=True)
+            tmp_path = _EQUITY_TS_FILE + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=True, separators=(",", ":"))
+            os.replace(tmp_path, _EQUITY_TS_FILE)
+        except Exception as e:
+            logger.warning("Local equity_ts write failed: %s", e)
+
+    def _load_local_equity_ts(self) -> dict:
+        try:
+            with open(_EQUITY_TS_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            return raw if isinstance(raw, dict) else {}
+        except Exception:
+            return {}
+
+    def _deserialize_external_flows(self, raw_flows: Any) -> list[ExternalFlow]:
+        out: list[ExternalFlow] = []
+        if not isinstance(raw_flows, list):
+            return out
+        for row in raw_flows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                flow = ExternalFlow(
+                    ledger_id=str(row.get("ledger_id") or ""),
+                    flow_type=str(row.get("flow_type") or ""),
+                    asset=str(row.get("asset") or ""),
+                    amount=float(row.get("amount") or 0.0),
+                    fee=float(row.get("fee") or 0.0),
+                    timestamp=float(row.get("timestamp") or 0.0),
+                    doge_eq=float(row.get("doge_eq") or 0.0),
+                    price_at_detect=float(row.get("price_at_detect") or 0.0),
+                )
+            except (TypeError, ValueError):
+                continue
+            if not flow.ledger_id:
+                continue
+            out.append(flow)
+        return out
+
+    def _trim_flow_buffers(self) -> None:
+        if len(self._external_flows) > self._flow_history_cap:
+            self._external_flows = self._external_flows[-self._flow_history_cap:]
+        if len(self._baseline_adjustments) > self._baseline_adjustments_cap:
+            self._baseline_adjustments = self._baseline_adjustments[-self._baseline_adjustments_cap:]
+        max_seen = self._flow_history_cap * 2
+        if len(self._flow_seen_ids) > max_seen:
+            self._flow_seen_ids = {flow.ledger_id for flow in self._external_flows}
+
+    def _trim_equity_ts_records(self, now: float | None = None) -> None:
+        if not self._equity_ts_records:
+            return
+        now_ts = float(now if now is not None else _now())
+        cutoff = now_ts - float(self._equity_ts_retention_days) * 86400.0
+        self._equity_ts_records = [
+            row for row in self._equity_ts_records
+            if isinstance(row, dict) and float(row.get("ts", 0.0) or 0.0) >= cutoff
+        ]
+
+    def _load_equity_ts_history(self) -> None:
+        if not self._equity_ts_enabled:
+            self._equity_ts_records = []
+            self._equity_ts_dirty = False
+            return
+
+        payload: dict = {}
+        try:
+            payload = supabase_store.load_state(pair="__equity_ts__") or {}
+        except Exception as e:
+            logger.warning("Supabase equity_ts load failed: %s", e)
+            payload = {}
+        if not payload:
+            payload = self._load_local_equity_ts()
+
+        rows = payload.get("snapshots", []) if isinstance(payload, dict) else []
+        records: list[dict] = []
+        if isinstance(rows, list):
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    ts = float(row.get("ts") or 0.0)
+                    doge_eq = float(row.get("doge_eq") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if ts <= 0:
+                    continue
+                def _f(value: Any) -> float:
+                    try:
+                        return float(value or 0.0)
+                    except (TypeError, ValueError):
+                        return 0.0
+                records.append({
+                    "ts": ts,
+                    "doge_eq": doge_eq,
+                    "usd": _f(row.get("usd")),
+                    "doge": _f(row.get("doge")),
+                    "price": _f(row.get("price")),
+                    "bot_pnl_usd": _f(row.get("bot_pnl_usd")),
+                    "flows_cumulative_doge_eq": _f(row.get("flows_cumulative_doge_eq")),
+                })
+        records.sort(key=lambda x: float(x.get("ts", 0.0)))
+        self._equity_ts_records = records
+        self._trim_equity_ts_records()
+        newest_ts = float(self._equity_ts_records[-1].get("ts", 0.0)) if self._equity_ts_records else 0.0
+        self._equity_ts_last_flush_ts = max(float(payload.get("cursor", 0.0) or 0.0), newest_ts)
+        self._equity_ts_dirty = False
+
     def _save_snapshot(self) -> None:
         snap = self._global_snapshot()
         supabase_store.save_state(snap, pair="__v1__")
@@ -1543,6 +1710,48 @@ class BotRuntime:
                     if norm:
                         self.slot_alias_recycle_queue.append(norm)
             self._recon_baseline = snap.get("recon_baseline", None)
+            self._flow_detection_active = bool(
+                snap.get("flow_detection_active", self._flow_detection_active)
+            ) and bool(getattr(config, "FLOW_DETECTION_ENABLED", True))
+            self._flow_last_poll_ts = float(snap.get("flow_last_poll_ts", self._flow_last_poll_ts))
+            self._flow_ledger_cursor = float(snap.get("flow_ledger_cursor", self._flow_ledger_cursor))
+            raw_seen_ids = snap.get("flow_seen_ids", [])
+            seen_ids: set[str] = set()
+            if isinstance(raw_seen_ids, list):
+                for row in raw_seen_ids:
+                    val = str(row or "").strip()
+                    if val:
+                        seen_ids.add(val)
+            self._external_flows = self._deserialize_external_flows(snap.get("external_flows", []))
+            if not seen_ids and self._external_flows:
+                seen_ids = {flow.ledger_id for flow in self._external_flows}
+            self._flow_seen_ids = seen_ids
+            raw_adjustments = snap.get("baseline_adjustments", [])
+            adjustments: list[dict] = []
+            if isinstance(raw_adjustments, list):
+                for row in raw_adjustments:
+                    if isinstance(row, dict):
+                        adjustments.append(dict(row))
+            self._baseline_adjustments = adjustments
+            self._flow_last_error = str(snap.get("flow_last_error", self._flow_last_error) or "")
+            self._flow_last_ok = bool(snap.get("flow_last_ok", self._flow_last_ok))
+            self._flow_disabled_reason = str(snap.get("flow_disabled_reason", self._flow_disabled_reason) or "")
+            self._flow_total_deposits_doge_eq = float(
+                snap.get("flow_total_deposits_doge_eq", self._flow_total_deposits_doge_eq)
+            )
+            self._flow_total_withdrawals_doge_eq = float(
+                snap.get("flow_total_withdrawals_doge_eq", self._flow_total_withdrawals_doge_eq)
+            )
+            self._flow_total_count = int(snap.get("flow_total_count", self._flow_total_count))
+            if self._flow_total_count <= 0 and self._external_flows:
+                self._flow_total_count = len(self._external_flows)
+                self._flow_total_deposits_doge_eq = sum(
+                    max(0.0, float(flow.doge_eq)) for flow in self._external_flows
+                )
+                self._flow_total_withdrawals_doge_eq = sum(
+                    min(0.0, float(flow.doge_eq)) for flow in self._external_flows
+                )
+            self._trim_flow_buffers()
             self._rebalancer_idle_ratio = float(snap.get("rebalancer_idle_ratio", self._rebalancer_idle_ratio))
             self._rebalancer_smoothed_error = float(
                 snap.get("rebalancer_smoothed_error", self._rebalancer_smoothed_error)
@@ -2052,6 +2261,7 @@ class BotRuntime:
 
         # Restore runtime snapshot.
         self._load_snapshot()
+        self._load_equity_ts_history()
         self._sanitize_slot_alias_state()
         self._cleanup_recovery_orders_on_startup()
 
@@ -2117,6 +2327,10 @@ class BotRuntime:
             self.running = False
             self.mode = "HALTED"
             self.pause_reason = reason
+            now = _now()
+            self._update_doge_eq_snapshot(now)
+            if self._equity_ts_enabled and self._equity_ts_dirty:
+                self._flush_equity_ts(now)
             self._save_snapshot()
         notifier._send_message(f"<b>DOGE v1 stopped</b>\nreason: {reason}")
 
@@ -8379,6 +8593,9 @@ class BotRuntime:
                 logger.info("Balance recon baseline captured: $%.2f + %.1f DOGE",
                             self._recon_baseline["usd"], self._recon_baseline["doge"])
 
+            if self._should_poll_flows(loop_now):
+                self._poll_external_flows(loop_now)
+
             runtime_profit = self._volatility_profit_pct()
 
             # Tick slots with latest price and timer.
@@ -8417,6 +8634,10 @@ class BotRuntime:
             total_orphans = sum(len(s.state.recovery_orders) for s in self.slots.values())
             if total_orphans and total_orphans % int(config.ORPHAN_PRESSURE_WARN_AT) == 0:
                 notifier._send_message(f"<b>Orphan pressure</b>\n{total_orphans} recovery orders on book")
+
+            self._update_doge_eq_snapshot(loop_now)
+            if self._should_flush_equity_ts(loop_now):
+                self._flush_equity_ts(loop_now)
 
             self._save_snapshot()
 
@@ -8590,9 +8811,56 @@ class BotRuntime:
         price = self.last_price
         if not bal or price <= 0:
             return
-        doge_eq = _doge_balance(bal) + _usd_balance(bal) / price
+        usd = _usd_balance(bal)
+        doge = _doge_balance(bal)
+        doge_eq = doge + usd / price
         self._doge_eq_snapshots.append((now, doge_eq))
         self._doge_eq_last_snapshot_ts = now
+        if not self._equity_ts_enabled:
+            return
+
+        total_profit = sum(slot.state.total_profit for slot in self.slots.values())
+        total_unrealized = self._total_unrealized_profit_locked()
+        self._equity_ts_records.append({
+            "ts": float(now),
+            "doge_eq": float(doge_eq),
+            "usd": float(usd),
+            "doge": float(doge),
+            "price": float(price),
+            "bot_pnl_usd": float(total_profit + total_unrealized),
+            "flows_cumulative_doge_eq": float(self._flow_total_deposits_doge_eq + self._flow_total_withdrawals_doge_eq),
+        })
+        self._trim_equity_ts_records(now)
+        self._equity_ts_dirty = True
+
+    def _should_flush_equity_ts(self, now: float) -> bool:
+        if not self._equity_ts_enabled:
+            return False
+        if not self._equity_ts_dirty:
+            return False
+        return (now - self._equity_ts_last_flush_ts) >= self._equity_ts_flush_interval
+
+    def _flush_equity_ts(self, now: float) -> None:
+        if not self._equity_ts_enabled:
+            return
+        self._trim_equity_ts_records(now)
+        payload = {
+            "version": 1,
+            "cursor": float(self._equity_ts_records[-1]["ts"]) if self._equity_ts_records else float(now),
+            "snapshots": list(self._equity_ts_records),
+        }
+        try:
+            supabase_store.save_state(payload, pair="__equity_ts__")
+            self._save_local_equity_ts(payload)
+            self._equity_ts_last_flush_ts = float(now)
+            self._equity_ts_last_flush_ok = True
+            self._equity_ts_last_flush_error = ""
+            self._equity_ts_dirty = False
+        except Exception as e:
+            self._equity_ts_last_flush_ts = float(now)
+            self._equity_ts_last_flush_ok = False
+            self._equity_ts_last_flush_error = str(e)
+            logger.warning("equity_ts flush failed: %s", e)
 
     def _extract_b_side_gaps(self) -> list[dict]:
         """Extract gaps between consecutive B-side cycles for opportunity PnL and re-entry lag."""
@@ -8936,6 +9204,268 @@ class BotRuntime:
             sign_flips_1h,
         )
 
+    # ------------------ Balance intelligence ------------------
+
+    @staticmethod
+    def _flow_asset_kind(asset: str) -> str | None:
+        symbol = str(asset or "").strip().upper()
+        if symbol in {"XXDG", "XDG", "DOGE"}:
+            return "doge"
+        if symbol in {"ZUSD", "USD"}:
+            return "usd"
+        return None
+
+    def _last_external_flow(self) -> ExternalFlow | None:
+        if not self._external_flows:
+            return None
+        return self._external_flows[-1]
+
+    def _should_poll_flows(self, now: float) -> bool:
+        if not bool(getattr(config, "FLOW_DETECTION_ENABLED", True)):
+            return False
+        if not self._flow_detection_active:
+            return False
+        if self.last_price <= 0:
+            return False
+        if self._recon_baseline is None:
+            return False
+        return (now - self._flow_last_poll_ts) >= self._flow_poll_interval
+
+    def _apply_flow_baseline_adjustment(self, flow: ExternalFlow, now: float) -> None:
+        if not isinstance(self._recon_baseline, dict):
+            return
+        kind = self._flow_asset_kind(flow.asset)
+        old_usd = float(self._recon_baseline.get("usd", 0.0) or 0.0)
+        old_doge = float(self._recon_baseline.get("doge", 0.0) or 0.0)
+        new_usd = old_usd
+        new_doge = old_doge
+
+        # Preserve baseline semantics by adjusting the field that matches the flow asset.
+        if kind == "usd":
+            new_usd = old_usd + float(flow.amount)
+        elif kind == "doge":
+            new_doge = old_doge + float(flow.amount)
+        else:
+            new_doge = old_doge + float(flow.doge_eq)
+
+        self._recon_baseline["usd"] = float(new_usd)
+        self._recon_baseline["doge"] = float(new_doge)
+        self._baseline_adjustments.append({
+            "ts": float(now),
+            "ledger_id": str(flow.ledger_id),
+            "flow_type": str(flow.flow_type),
+            "asset": str(flow.asset),
+            "amount": float(flow.amount),
+            "doge_eq_adjustment": float(flow.doge_eq),
+            "baseline_before": {"usd": float(old_usd), "doge": float(old_doge)},
+            "baseline_after": {"usd": float(new_usd), "doge": float(new_doge)},
+            "price": float(self.last_price),
+        })
+        self._trim_flow_buffers()
+
+    def _poll_external_flows(self, now: float) -> None:
+        if not bool(getattr(config, "FLOW_DETECTION_ENABLED", True)):
+            return
+        if not self._flow_detection_active:
+            return
+        if not self._consume_private_budget(1, "get_ledgers"):
+            return
+
+        if self._flow_ledger_cursor <= 0.0:
+            baseline_ts = 0.0
+            if isinstance(self._recon_baseline, dict):
+                baseline_ts = float(self._recon_baseline.get("ts", 0.0) or 0.0)
+            self._flow_ledger_cursor = max(baseline_ts, now - self._flow_poll_interval)
+
+        try:
+            result = kraken_client.get_ledgers(
+                type_="all",
+                start=self._flow_ledger_cursor if self._flow_ledger_cursor > 0 else None,
+            )
+            ledger_rows = result.get("ledger", {}) if isinstance(result, dict) else {}
+            if not isinstance(ledger_rows, dict):
+                ledger_rows = {}
+
+            max_seen_ts = float(self._flow_ledger_cursor)
+            discovered: list[ExternalFlow] = []
+            for ledger_id, row in ledger_rows.items():
+                if not isinstance(row, dict):
+                    continue
+                lid = str(ledger_id or "").strip()
+                if not lid or lid in self._flow_seen_ids:
+                    continue
+
+                try:
+                    flow_ts = float(row.get("time") or 0.0)
+                except (TypeError, ValueError):
+                    flow_ts = 0.0
+                if flow_ts > max_seen_ts:
+                    max_seen_ts = flow_ts
+
+                flow_type = str(row.get("type") or "").strip().lower()
+                if flow_type not in {"deposit", "withdrawal"}:
+                    continue
+                asset = str(row.get("asset") or "").strip().upper()
+                kind = self._flow_asset_kind(asset)
+                if kind is None:
+                    continue
+
+                try:
+                    raw_amount = float(row.get("amount") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                signed_amount = abs(raw_amount) if flow_type == "deposit" else -abs(raw_amount)
+                if abs(signed_amount) <= 1e-12:
+                    continue
+
+                doge_eq = signed_amount if kind == "doge" else (signed_amount / self.last_price)
+                try:
+                    fee = float(row.get("fee") or 0.0)
+                except (TypeError, ValueError):
+                    fee = 0.0
+                discovered.append(ExternalFlow(
+                    ledger_id=lid,
+                    flow_type=flow_type,
+                    asset=asset,
+                    amount=float(signed_amount),
+                    fee=float(fee),
+                    timestamp=float(flow_ts if flow_ts > 0 else now),
+                    doge_eq=float(doge_eq),
+                    price_at_detect=float(self.last_price),
+                ))
+
+            discovered.sort(key=lambda f: (float(f.timestamp), str(f.ledger_id)))
+            auto_adjust = bool(getattr(config, "FLOW_BASELINE_AUTO_ADJUST", True))
+            for flow in discovered:
+                self._external_flows.append(flow)
+                self._flow_seen_ids.add(flow.ledger_id)
+                self._flow_total_count += 1
+                if flow.doge_eq >= 0.0:
+                    self._flow_total_deposits_doge_eq += float(flow.doge_eq)
+                else:
+                    self._flow_total_withdrawals_doge_eq += float(flow.doge_eq)
+                if auto_adjust:
+                    self._apply_flow_baseline_adjustment(flow, now)
+
+            self._trim_flow_buffers()
+            if max_seen_ts > self._flow_ledger_cursor:
+                self._flow_ledger_cursor = max_seen_ts + 1.0
+            self._flow_last_poll_ts = float(now)
+            self._flow_last_ok = True
+            self._flow_last_error = ""
+        except Exception as e:
+            msg = str(e)
+            self._flow_last_poll_ts = float(now)
+            self._flow_last_ok = False
+            self._flow_last_error = msg
+            if "permission" in msg.lower():
+                self._flow_detection_active = False
+                self._flow_disabled_reason = "Kraken API key lacks ledger-query permission"
+                logger.warning("Flow polling disabled: %s", self._flow_disabled_reason)
+            else:
+                logger.warning("Flow polling failed: %s", msg)
+
+    def _equity_delta_from_series(self, series: list[tuple[float, float]], now: float, lookback_sec: float) -> float | None:
+        if len(series) < 2:
+            return None
+        latest_ts, latest_val = series[-1]
+        target = now - lookback_sec
+        ref_val: float | None = None
+        for ts, val in reversed(series):
+            if ts <= target:
+                ref_val = val
+                break
+        if ref_val is None:
+            ref_val = series[0][1]
+        return float(latest_val - ref_val)
+
+    def _equity_history_status_payload(self, now: float) -> dict:
+        if not self._equity_ts_enabled:
+            return {"enabled": False}
+
+        in_mem = list(self._doge_eq_snapshots)
+        persisted_pairs = [
+            (float(row.get("ts", 0.0) or 0.0), float(row.get("doge_eq", 0.0) or 0.0))
+            for row in self._equity_ts_records
+            if isinstance(row, dict)
+        ]
+        persisted_pairs = [row for row in persisted_pairs if row[0] > 0]
+        persisted_pairs.sort(key=lambda x: x[0])
+
+        spark_24h = [float(v) for _, v in in_mem]
+        spark_7d = [float(v) for _, v in persisted_pairs[::self._equity_ts_sparkline_7d_step]]
+        if persisted_pairs and (not spark_7d or spark_7d[-1] != persisted_pairs[-1][1]):
+            spark_7d.append(float(persisted_pairs[-1][1]))
+
+        change_series = persisted_pairs if persisted_pairs else in_mem
+        oldest_ts = float(persisted_pairs[0][0]) if persisted_pairs else None
+        newest_ts = float(persisted_pairs[-1][0]) if persisted_pairs else None
+        span_hours = None
+        if oldest_ts is not None and newest_ts is not None and newest_ts >= oldest_ts:
+            span_hours = (newest_ts - oldest_ts) / 3600.0
+
+        flush_age = None
+        if self._equity_ts_last_flush_ts > 0:
+            flush_age = max(0.0, now - self._equity_ts_last_flush_ts)
+
+        return {
+            "enabled": True,
+            "snapshots_in_memory": len(in_mem),
+            "snapshots_persisted": len(persisted_pairs),
+            "oldest_persisted_ts": oldest_ts,
+            "newest_persisted_ts": newest_ts,
+            "span_hours": span_hours,
+            "flush_age_sec": flush_age,
+            "flush_interval_sec": float(self._equity_ts_flush_interval),
+            "flush_ok": bool(self._equity_ts_last_flush_ok),
+            "flush_error": str(self._equity_ts_last_flush_error or ""),
+            "sparkline_24h": spark_24h,
+            "sparkline_7d": spark_7d,
+            "doge_eq_change_1h": self._equity_delta_from_series(change_series, now, 3600.0),
+            "doge_eq_change_24h": self._equity_delta_from_series(change_series, now, 86400.0),
+            "doge_eq_change_7d": self._equity_delta_from_series(change_series, now, 7.0 * 86400.0),
+        }
+
+    def _external_flows_status_payload(self, now: float) -> dict:
+        if not bool(getattr(config, "FLOW_DETECTION_ENABLED", True)):
+            return {"enabled": False}
+        deposits = max(0.0, float(self._flow_total_deposits_doge_eq))
+        withdrawals = abs(min(0.0, float(self._flow_total_withdrawals_doge_eq)))
+        net = deposits - withdrawals
+        poll_age = None
+        if self._flow_last_poll_ts > 0:
+            poll_age = max(0.0, now - self._flow_last_poll_ts)
+
+        recent: list[dict] = []
+        for flow in self._external_flows[-self._flow_recent_status_limit:]:
+            recent.append({
+                "ledger_id": str(flow.ledger_id),
+                "type": str(flow.flow_type),
+                "asset": str(flow.asset),
+                "amount": float(abs(flow.amount)),
+                "doge_eq": float(flow.doge_eq),
+                "fee": float(flow.fee),
+                "ts": float(flow.timestamp),
+                "baseline_adjusted": bool(getattr(config, "FLOW_BASELINE_AUTO_ADJUST", True)),
+            })
+        recent.reverse()
+
+        return {
+            "enabled": True,
+            "active": bool(self._flow_detection_active),
+            "poll_interval_sec": float(self._flow_poll_interval),
+            "last_poll_ts": (float(self._flow_last_poll_ts) if self._flow_last_poll_ts > 0 else None),
+            "last_poll_age_sec": poll_age,
+            "flow_poll_ok": bool(self._flow_last_ok and self._flow_detection_active),
+            "disabled_reason": str(self._flow_disabled_reason or ""),
+            "last_error": str(self._flow_last_error or ""),
+            "total_deposits_doge_eq": deposits,
+            "total_withdrawals_doge_eq": withdrawals,
+            "net_flows_doge_eq": net,
+            "flow_count": int(self._flow_total_count),
+            "recent_flows": recent,
+        }
+
     # ------------------ Balance reconciliation ------------------
 
     def _compute_balance_recon(self, total_profit: float, total_unrealized: float) -> dict | None:
@@ -8960,6 +9490,16 @@ class BotRuntime:
         drift_pct = (drift / baseline_doge_eq * 100.0) if baseline_doge_eq > 0 else 0.0
         threshold = float(config.BALANCE_RECON_DRIFT_PCT)
         status = "OK" if abs(drift_pct) <= threshold else "DRIFT"
+        net_flows_doge_eq = float(self._flow_total_deposits_doge_eq + self._flow_total_withdrawals_doge_eq)
+        auto_adjust = bool(getattr(config, "FLOW_BASELINE_AUTO_ADJUST", True))
+        adjusted_drift = drift if auto_adjust else (drift - net_flows_doge_eq)
+        adjusted_drift_pct = (adjusted_drift / baseline_doge_eq * 100.0) if baseline_doge_eq > 0 else 0.0
+        adjusted_status = "OK" if abs(adjusted_drift_pct) <= threshold else "DRIFT"
+        now = _now()
+        poll_age = None
+        if self._flow_last_poll_ts > 0:
+            poll_age = max(0.0, now - self._flow_last_poll_ts)
+        last_flow = self._last_external_flow()
 
         return {
             "status": status,
@@ -8973,6 +9513,18 @@ class BotRuntime:
             "baseline_ts": baseline["ts"],
             "price": price,
             "simulated": config.DRY_RUN,
+            "external_flows_doge_eq": net_flows_doge_eq,
+            "external_flow_count": int(self._flow_total_count),
+            "adjusted_drift_doge": adjusted_drift,
+            "adjusted_drift_pct": adjusted_drift_pct,
+            "adjusted_status": adjusted_status,
+            "baseline_adjustments_count": len(self._baseline_adjustments),
+            "last_flow_ts": (float(last_flow.timestamp) if last_flow else None),
+            "last_flow_type": (str(last_flow.flow_type) if last_flow else None),
+            "last_flow_amount": (float(abs(last_flow.amount)) if last_flow else None),
+            "last_flow_asset": (str(last_flow.asset) if last_flow else None),
+            "flow_poll_age_sec": poll_age,
+            "flow_poll_ok": bool(self._flow_last_ok and self._flow_detection_active),
         }
 
     # ------------------ API status ------------------
@@ -9319,6 +9871,8 @@ class BotRuntime:
                     "ledger": self.ledger.snapshot(),
                 },
                 "balance_recon": self._compute_balance_recon(total_profit, total_unrealized_profit),
+                "external_flows": self._external_flows_status_payload(now),
+                "equity_history": self._equity_history_status_payload(now),
                 "sticky_mode": {
                     "enabled": bool(config.STICKY_MODE_ENABLED),
                     "target_slots": int(config.STICKY_TARGET_SLOTS),

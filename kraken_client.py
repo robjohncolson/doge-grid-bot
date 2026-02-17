@@ -50,6 +50,7 @@ BALANCE_PATH = "/0/private/Balance"
 TRADE_BALANCE_PATH = "/0/private/TradeBalance"
 TRADES_HISTORY_PATH = "/0/private/TradesHistory"
 TRADE_VOLUME_PATH = "/0/private/TradeVolume"
+LEDGER_PATH = "/0/private/Ledgers"
 
 # ---------------------------------------------------------------------------
 # Rate-limit tracking (thread-safe with circuit breaker)
@@ -773,6 +774,52 @@ def get_trades_history(start: float = None) -> dict:
         params["start"] = str(int(start))
     result = _private_request(TRADES_HISTORY_PATH, params)
     return result.get("trades", {})
+
+
+def get_ledgers(
+    type_: str = "all",
+    asset: str = "all",
+    start: float | None = None,
+    end: float | None = None,
+    ofs: int | None = None,
+) -> dict:
+    """
+    Query Kraken ledger entries.
+
+    Returns:
+        {
+            "count": int,
+            "ledger": {ledger_id: entry, ...}
+        }
+    """
+    if config.DRY_RUN:
+        return {"count": 0, "ledger": {}}
+
+    params: dict[str, str] = {}
+    if type_:
+        params["type"] = str(type_)
+    if asset:
+        params["asset"] = str(asset)
+    if start is not None:
+        params["start"] = str(int(float(start)))
+    if end is not None:
+        params["end"] = str(int(float(end)))
+    if ofs is not None:
+        params["ofs"] = str(int(ofs))
+
+    result = _private_request(LEDGER_PATH, params)
+    if not isinstance(result, dict):
+        return {"count": 0, "ledger": {}}
+
+    ledger = result.get("ledger")
+    if not isinstance(ledger, dict):
+        ledger = {}
+    raw_count = result.get("count", len(ledger))
+    try:
+        count = int(raw_count)
+    except (TypeError, ValueError):
+        count = len(ledger)
+    return {"count": count, "ledger": ledger}
 
 
 def get_fee_rates(pair: str = None) -> tuple[float, float]:

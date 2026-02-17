@@ -124,6 +124,10 @@ class CycleRecord:
     gross_profit: float
     fees: float
     net_profit: float
+    entry_fee: float = 0.0
+    exit_fee: float = 0.0
+    quote_fee: float = 0.0
+    settled_usd: float = 0.0
     entry_time: float = 0.0
     exit_time: float = 0.0
     from_recovery: bool = False
@@ -142,6 +146,7 @@ class PairState:
     next_order_id: int = 1
     next_recovery_id: int = 1
     total_profit: float = 0.0
+    total_settled_usd: float = 0.0
     total_fees: float = 0.0
     today_realized_loss: float = 0.0
     total_round_trips: int = 0
@@ -249,6 +254,7 @@ class BookCycleAction:
     net_profit: float
     gross_profit: float
     fees: float
+    settled_usd: float = 0.0
     from_recovery: bool = False
 
 
@@ -551,6 +557,7 @@ def to_dict(state: PairState) -> dict:
         "next_order_id": state.next_order_id,
         "next_recovery_id": state.next_recovery_id,
         "total_profit": state.total_profit,
+        "total_settled_usd": state.total_settled_usd,
         "total_fees": state.total_fees,
         "today_realized_loss": state.today_realized_loss,
         "total_round_trips": state.total_round_trips,
@@ -619,6 +626,10 @@ def _cycle_from_dict(data: dict) -> CycleRecord:
         gross_profit=float(data.get("gross_profit", 0.0)),
         fees=float(data.get("fees", 0.0)),
         net_profit=float(data.get("net_profit", 0.0)),
+        entry_fee=float(data.get("entry_fee", 0.0)),
+        exit_fee=float(data.get("exit_fee", 0.0)),
+        quote_fee=float(data.get("quote_fee", 0.0)),
+        settled_usd=float(data.get("settled_usd", 0.0)),
         entry_time=float(data.get("entry_time", 0.0)),
         exit_time=float(data.get("exit_time", 0.0)),
         from_recovery=bool(data.get("from_recovery", False)),
@@ -644,6 +655,7 @@ def from_dict(data: dict) -> PairState:
         next_order_id=int(data.get("next_order_id", 1)),
         next_recovery_id=int(data.get("next_recovery_id", 1)),
         total_profit=float(data.get("total_profit", 0.0)),
+        total_settled_usd=float(data.get("total_settled_usd", data.get("total_profit", 0.0))),
         total_fees=float(data.get("total_fees", 0.0)),
         today_realized_loss=float(data.get("today_realized_loss", 0.0)),
         total_round_trips=int(data.get("total_round_trips", 0)),
@@ -682,8 +694,15 @@ def _book_cycle(
         gross = (order.entry_price - fill_price) * volume
     else:
         gross = (fill_price - order.entry_price) * volume
-    fees = order.entry_fee + fill_fee
+    entry_fee = float(order.entry_fee)
+    exit_fee = float(fill_fee)
+    fees = entry_fee + exit_fee
     net = gross - fees
+    # Quote-settlement estimate:
+    # - A (sell->buy): entry fee is the quote-side fee.
+    # - B (buy->sell): exit fee is the quote-side fee.
+    quote_fee = entry_fee if order.trade_id == "A" else exit_fee
+    settled_usd = gross - quote_fee
     rec = CycleRecord(
         trade_id=order.trade_id,
         cycle=order.cycle,
@@ -693,6 +712,10 @@ def _book_cycle(
         gross_profit=gross,
         fees=fees,
         net_profit=net,
+        entry_fee=entry_fee,
+        exit_fee=exit_fee,
+        quote_fee=quote_fee,
+        settled_usd=settled_usd,
         entry_time=order.entry_filled_at,
         exit_time=timestamp,
         from_recovery=from_recovery,
@@ -702,6 +725,7 @@ def _book_cycle(
     st = replace(
         state,
         total_profit=state.total_profit + net,
+        total_settled_usd=state.total_settled_usd + settled_usd,
         total_fees=state.total_fees + fill_fee,
         today_realized_loss=total_loss,
         total_round_trips=state.total_round_trips + 1,
@@ -713,6 +737,7 @@ def _book_cycle(
         net_profit=net,
         gross_profit=gross,
         fees=fees,
+        settled_usd=settled_usd,
         from_recovery=from_recovery,
     )
     return st, rec, act
