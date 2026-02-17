@@ -343,6 +343,16 @@ DASHBOARD_HTML = """<!doctype html>
       margin-top: 4px;
     }
     .vintage-seg { height: 100%; }
+    .cleanup-actions {
+      display: flex;
+      gap: 4px;
+      flex-wrap: wrap;
+    }
+    .btn-mini {
+      padding: 4px 6px;
+      font-size: 11px;
+      border-radius: 6px;
+    }
   </style>
 </head>
 <body>
@@ -443,6 +453,20 @@ DASHBOARD_HTML = """<!doctype html>
         <div class=\"row\"><span class=\"k\">Release Gate</span><span id=\"releaseGateStatus\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Releases</span><span id=\"releaseTotals\" class=\"v\"></span></div>
         <div id=\"releaseGateReason\" class=\"tiny\"></div>
+
+        <h3 style=\"margin-top:14px\">Self-Healing</h3>
+        <div class=\"row\"><span class=\"k\">Status</span><span id=\"shStatus\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Open Positions</span><span id=\"shOpenPositions\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Age Heatmap</span><span id=\"shAgeHeat\" class=\"v\"></span></div>
+        <div id=\"shAgeBands\" class=\"tiny\"></div>
+        <div class=\"row\"><span class=\"k\">Subsidy Pool</span><span id=\"shSubsidyPool\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Lifetime Earn/Spend</span><span id=\"shSubsidyLifetime\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Pending Need</span><span id=\"shSubsidyPending\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Heal ETA</span><span id=\"shSubsidyEta\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Churner Activity</span><span id=\"shChurner\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Churner P/L</span><span id=\"shChurnerPerf\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Churner Pause</span><span id=\"shChurnerPause\" class=\"v\"></span></div>
+        <div id=\"shMigration\" class=\"tiny\"></div>
 
         <h3 style=\"margin-top:14px\">HMM Regime</h3>
         <div class=\"row\"><span class=\"k\">Status</span><span id=\"hmmStatus\" class=\"v\"></span></div>
@@ -583,6 +607,14 @@ DASHBOARD_HTML = """<!doctype html>
             <tr><th>ID</th><th>Trade</th><th>Side</th><th>Age</th><th>Dist%</th><th>Price</th><th></th></tr>
           </thead>
           <tbody id=\"orphansBody\"></tbody>
+        </table>
+
+        <h3 id=\"cleanupTitle\" style=\"margin-top:12px\">Cleanup Queue</h3>
+        <table>
+          <thead>
+            <tr><th>Slot</th><th>Position</th><th>Age</th><th>Dist%</th><th>Subsidy</th><th>Need</th><th>OppCost</th><th>Actions</th></tr>
+          </thead>
+          <tbody id=\"cleanupBody\"></tbody>
         </table>
 
         <h3 style=\"margin-top:12px\">Recent Cycles</h3>
@@ -1214,6 +1246,48 @@ DASHBOARD_HTML = """<!doctype html>
       });
     }
 
+    function requestSelfHealRepriceBreakeven(positionId) {
+      const pid = Number(positionId || 0);
+      if (!Number.isFinite(pid) || pid <= 0) {
+        showToast('invalid position id', 'error');
+        return;
+      }
+      openConfirmDialog(`Reprice position #${pid} toward breakeven using subsidy?`, async () => {
+        await dispatchAction('self_heal_reprice_breakeven', {
+          position_id: Math.round(pid),
+          reason: 'dashboard_cleanup',
+        });
+      });
+    }
+
+    function requestSelfHealCloseMarket(positionId) {
+      const pid = Number(positionId || 0);
+      if (!Number.isFinite(pid) || pid <= 0) {
+        showToast('invalid position id', 'error');
+        return;
+      }
+      openConfirmDialog(`Close position #${pid} at market now? This realizes the write-off immediately.`, async () => {
+        await dispatchAction('self_heal_close_market', {
+          position_id: Math.round(pid),
+          reason: 'dashboard_write_off',
+        });
+      });
+    }
+
+    function requestSelfHealKeepHolding(positionId) {
+      const pid = Number(positionId || 0);
+      if (!Number.isFinite(pid) || pid <= 0) {
+        showToast('invalid position id', 'error');
+        return;
+      }
+      openConfirmDialog(`Keep holding position #${pid} and reset its cleanup timer?`, async () => {
+        await dispatchAction('self_heal_keep_holding', {
+          position_id: Math.round(pid),
+          reason: 'dashboard_hold',
+        });
+      });
+    }
+
     function requestSetMetric(metric, value) {
       const oldValue = Number(metric === 'entry' ? state && state.entry_pct : state && state.profit_pct);
       const action = metric === 'entry' ? 'set_entry_pct' : 'set_profit_pct';
@@ -1391,6 +1465,206 @@ DASHBOARD_HTML = """<!doctype html>
       await dispatchAction(parsed.action, parsed.payload);
     }
 
+    function renderSelfHealing(s, nowSec) {
+      const sh = s && typeof s.self_healing === 'object' ? s.self_healing : {};
+      const enabled = Boolean(sh.enabled);
+      const subsidy = sh && typeof sh.subsidy === 'object' ? sh.subsidy : {};
+      const churner = sh && typeof sh.churner === 'object' ? sh.churner : {};
+      const migration = sh && typeof sh.migration === 'object' ? sh.migration : {};
+
+      const shStatusEl = document.getElementById('shStatus');
+      const shOpenEl = document.getElementById('shOpenPositions');
+      const shHeatEl = document.getElementById('shAgeHeat');
+      const shBandsEl = document.getElementById('shAgeBands');
+      const shPoolEl = document.getElementById('shSubsidyPool');
+      const shLifetimeEl = document.getElementById('shSubsidyLifetime');
+      const shPendingEl = document.getElementById('shSubsidyPending');
+      const shEtaEl = document.getElementById('shSubsidyEta');
+      const shChurnerEl = document.getElementById('shChurner');
+      const shChurnerPerfEl = document.getElementById('shChurnerPerf');
+      const shChurnerPauseEl = document.getElementById('shChurnerPause');
+      const shMigrationEl = document.getElementById('shMigration');
+
+      const cleanupTitleEl = document.getElementById('cleanupTitle');
+      const cleanupBodyEl = document.getElementById('cleanupBody');
+      if (!cleanupTitleEl || !cleanupBodyEl) return;
+
+      if (!enabled) {
+        if (shStatusEl) { shStatusEl.textContent = 'OFF'; shStatusEl.style.color = ''; }
+        if (shOpenEl) shOpenEl.textContent = '-';
+        if (shHeatEl) shHeatEl.textContent = '-';
+        if (shBandsEl) shBandsEl.textContent = '';
+        if (shPoolEl) shPoolEl.textContent = '-';
+        if (shLifetimeEl) shLifetimeEl.textContent = '-';
+        if (shPendingEl) shPendingEl.textContent = '-';
+        if (shEtaEl) shEtaEl.textContent = '-';
+        if (shChurnerEl) shChurnerEl.textContent = '-';
+        if (shChurnerPerfEl) shChurnerPerfEl.textContent = '-';
+        if (shChurnerPauseEl) shChurnerPauseEl.textContent = '-';
+        if (shMigrationEl) shMigrationEl.textContent = '';
+
+        cleanupTitleEl.textContent = 'Cleanup Queue (0)';
+        cleanupBodyEl.innerHTML = '<tr><td colspan="8" class="tiny">Self-healing is disabled.</td></tr>';
+        return;
+      }
+
+      if (shStatusEl) {
+        shStatusEl.textContent = 'ON';
+        shStatusEl.style.color = 'var(--good)';
+      }
+      if (shOpenEl) shOpenEl.textContent = String(Number(sh.open_positions || 0));
+
+      const heatmap = sh && typeof sh.age_heatmap === 'object' ? sh.age_heatmap : {};
+      const heatRows = Array.isArray(heatmap.bands) ? heatmap.bands : [];
+      const fallbackBands = sh && typeof sh.age_bands === 'object' ? sh.age_bands : {};
+      const canonicalBands = ['fresh', 'aging', 'stale', 'stuck', 'write_off'];
+      const rows = heatRows.length
+        ? heatRows
+        : canonicalBands.map((band) => ({ band, count: Number(fallbackBands[band] || 0) }));
+      const totalOpen = Number(heatmap.total_open || sh.open_positions || 0);
+      const summaryBits = [];
+      const detailBits = [];
+      for (const row of rows) {
+        const band = String((row && row.band) || '').toLowerCase();
+        if (!canonicalBands.includes(band)) continue;
+        const count = Number(row && row.count || 0);
+        const pctRaw = row && row.pct;
+        const pct = Number.isFinite(Number(pctRaw))
+          ? Number(pctRaw)
+          : (totalOpen > 0 ? (count / totalOpen * 100.0) : 0.0);
+        summaryBits.push(`${band}:${count}`);
+        detailBits.push(`${band} ${fmt(pct, 1)}%`);
+      }
+      if (shHeatEl) shHeatEl.textContent = summaryBits.length ? summaryBits.join(' | ') : '-';
+      if (shBandsEl) shBandsEl.textContent = detailBits.length ? detailBits.join(' | ') : '';
+
+      const poolUsd = Number(subsidy.pool_usd != null ? subsidy.pool_usd : subsidy.balance || 0);
+      const earnedUsd = Number(subsidy.lifetime_earned != null ? subsidy.lifetime_earned : subsidy.earned || 0);
+      const spentUsd = Number(subsidy.lifetime_spent != null ? subsidy.lifetime_spent : subsidy.consumed || 0);
+      const pendingUsd = Number(subsidy.pending_needed_usd != null ? subsidy.pending_needed_usd : subsidy.pending_needed || 0);
+      const pendingPositions = Number(subsidy.pending_positions || 0);
+      const etaHoursRaw = subsidy.eta_hours;
+      const etaHours = Number(etaHoursRaw);
+
+      if (shPoolEl) shPoolEl.textContent = `$${fmt(poolUsd, 3)}`;
+      if (shLifetimeEl) shLifetimeEl.textContent = `$${fmt(earnedUsd, 3)} / $${fmt(spentUsd, 3)}`;
+      if (shPendingEl) shPendingEl.textContent = `$${fmt(pendingUsd, 3)} (${pendingPositions})`;
+      if (shEtaEl) {
+        let etaText = '-';
+        if (pendingUsd <= 1e-12) {
+          etaText = 'clear';
+        } else if (Number.isFinite(etaHours) && etaHours >= 0) {
+          etaText = `${fmt(etaHours, 1)}h`;
+        } else {
+          etaText = 'n/a';
+        }
+        shEtaEl.textContent = etaText;
+      }
+
+      const churnerEnabled = Boolean(churner.enabled);
+      const activeSlots = Number(churner.active_slots || 0);
+      const reserveUsd = Number(churner.reserve_available_usd || 0);
+      const cyclesToday = Number(churner.cycles_today || 0);
+      const profitToday = Number(churner.profit_today || 0);
+      const cyclesTotal = Number(churner.cycles_total || 0);
+      const profitTotal = Number(churner.profit_total || 0);
+      const pauseReason = String(churner.paused_reason || '');
+
+      if (shChurnerEl) {
+        shChurnerEl.textContent = churnerEnabled
+          ? `${activeSlots} active | reserve $${fmt(reserveUsd, 3)}`
+          : 'OFF';
+        shChurnerEl.style.color = churnerEnabled ? '' : 'var(--muted)';
+      }
+      if (shChurnerPerfEl) {
+        shChurnerPerfEl.textContent =
+          `${cyclesToday} / $${fmt(profitToday, 3)} today | ${cyclesTotal} / $${fmt(profitTotal, 3)} total`;
+      }
+      if (shChurnerPauseEl) {
+        shChurnerPauseEl.textContent = pauseReason || '-';
+      }
+
+      if (shMigrationEl) {
+        const done = Boolean(migration.done);
+        const lastAt = Number(migration.last_at || 0);
+        const created = Number(migration.last_created || 0);
+        const scanned = Number(migration.last_scanned || 0);
+        const ago = (lastAt > 0 && Number.isFinite(lastAt)) ? fmtAgo(nowSec - lastAt) : 'n/a';
+        shMigrationEl.textContent =
+          `Migration: ${done ? 'done' : 'pending'} | created=${created} scanned=${scanned} | ${ago}`;
+      }
+
+      const queue = Array.isArray(sh.cleanup_queue) ? sh.cleanup_queue : [];
+      const queueSummary = sh && typeof sh.cleanup_queue_summary === 'object' ? sh.cleanup_queue_summary : {};
+      const hiddenByHold = Number(queueSummary.hidden_by_hold || 0);
+      cleanupTitleEl.textContent = `Cleanup Queue (${queue.length})`;
+      cleanupBodyEl.innerHTML = '';
+
+      if (!queue.length) {
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 8;
+        td.className = 'tiny';
+        td.textContent = hiddenByHold > 0
+          ? `No queue items (hidden by keep-holding timer: ${hiddenByHold}).`
+          : 'No write-off positions in queue.';
+        tr.appendChild(td);
+        cleanupBodyEl.appendChild(tr);
+        return;
+      }
+
+      for (const row of queue) {
+        const pid = Number(row && row.position_id || 0);
+        const slotId = Number(row && row.slot_id || 0);
+        const tradeId = String(row && row.trade_id || '-');
+        const cycle = Number(row && row.cycle || 0);
+        const ageSec = Number(row && row.age_sec || 0);
+        const distPct = Number(row && row.distance_pct || 0);
+        const subsidyBal = Number(row && row.subsidy_balance || 0);
+        const subsidyNeed = Number(row && row.subsidy_needed || 0);
+        const oppCost = Number(row && row.opportunity_cost_usd || 0);
+
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${slotId}</td>
+          <td class="mono">#${pid} ${tradeId}.${cycle}</td>
+          <td>${fmtAgeSeconds(ageSec)}</td>
+          <td>${fmt(distPct, 2)}</td>
+          <td>$${fmt(subsidyBal, 3)}</td>
+          <td>$${fmt(subsidyNeed, 3)}</td>
+          <td>$${fmt(oppCost, 3)}</td>
+        `;
+
+        const actionTd = document.createElement('td');
+        actionTd.className = 'cleanup-actions';
+
+        const repriceBtn = document.createElement('button');
+        repriceBtn.className = 'btn-mini';
+        repriceBtn.textContent = 'Breakeven';
+        repriceBtn.disabled = !Number.isFinite(pid) || pid <= 0 || subsidyBal <= 1e-12;
+        repriceBtn.onclick = () => requestSelfHealRepriceBreakeven(pid);
+        actionTd.appendChild(repriceBtn);
+
+        const closeBtn = document.createElement('button');
+        closeBtn.className = 'btn-mini';
+        closeBtn.textContent = 'Close Mkt';
+        closeBtn.style.background = '#8f3a2f';
+        closeBtn.disabled = !Number.isFinite(pid) || pid <= 0;
+        closeBtn.onclick = () => requestSelfHealCloseMarket(pid);
+        actionTd.appendChild(closeBtn);
+
+        const holdBtn = document.createElement('button');
+        holdBtn.className = 'btn-mini';
+        holdBtn.textContent = 'Keep';
+        holdBtn.disabled = !Number.isFinite(pid) || pid <= 0;
+        holdBtn.onclick = () => requestSelfHealKeepHolding(pid);
+        actionTd.appendChild(holdBtn);
+
+        tr.appendChild(actionTd);
+        cleanupBodyEl.appendChild(tr);
+      }
+    }
+
     function renderTop(s) {
       const nowSec = Date.now() / 1000;
       const mode = document.getElementById('mode');
@@ -1523,6 +1797,8 @@ DASHBOARD_HTML = """<!doctype html>
           : `${Number(release.sticky_release_total || 0)} total`;
       document.getElementById('releaseGateReason').textContent =
         releaseGateBlocked ? String(release.recon_hard_gate_reason || '') : '';
+
+      renderSelfHealing(s, nowSec);
 
       const hmm = s.hmm_regime || {};
       const hmmConsensus = s.hmm_consensus || {};

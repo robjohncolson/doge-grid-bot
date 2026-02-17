@@ -30,6 +30,7 @@ from typing import Any
 import config
 import dashboard
 import kraken_client
+from position_ledger import PositionLedger
 from throughput_sizer import ThroughputConfig, ThroughputSizer
 import notifier
 import ai_advisor
@@ -111,6 +112,32 @@ class SlotRuntime:
     slot_id: int
     state: sm.PairState
     alias: str = ""
+
+
+@dataclass
+class ChurnerRuntimeState:
+    active: bool = False
+    stage: str = "idle"  # idle | entry_open | exit_open
+    parent_position_id: int = 0
+    parent_trade_id: str = ""
+    cycle_id: int = 0
+    order_size_usd: float = 0.0
+    compound_usd: float = 0.0
+    reserve_allocated_usd: float = 0.0
+    entry_side: str = ""
+    entry_txid: str = ""
+    entry_price: float = 0.0
+    entry_volume: float = 0.0
+    entry_placed_at: float = 0.0
+    entry_fill_price: float = 0.0
+    entry_fill_fee: float = 0.0
+    entry_fill_time: float = 0.0
+    exit_txid: str = ""
+    exit_price: float = 0.0
+    exit_placed_at: float = 0.0
+    churner_position_id: int = 0
+    last_error: str = ""
+    last_state_change_at: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -506,6 +533,33 @@ class BotRuntime:
         self._sticky_release_last_at: float = 0.0
         self._release_recon_blocked: bool = False
         self._release_recon_blocked_reason: str = ""
+        self._self_heal_reprice_total: int = 0
+        self._self_heal_reprice_last_at: float = 0.0
+        self._self_heal_reprice_last_summary: dict[str, Any] = {}
+        self._self_heal_hold_until_by_position: dict[int, float] = {}
+        self._position_ledger_migration_done: bool = False
+        self._position_ledger_migration_last_at: float = 0.0
+        self._position_ledger_migration_last_created: int = 0
+        self._position_ledger_migration_last_scanned: int = 0
+        self._position_ledger = PositionLedger(
+            enabled=bool(getattr(config, "POSITION_LEDGER_ENABLED", True)),
+            journal_local_limit=max(50, int(getattr(config, "POSITION_JOURNAL_LOCAL_LIMIT", 500))),
+        )
+        # Active exit identity -> position mappings (runtime convenience index).
+        self._position_by_exit_local: dict[tuple[int, int], int] = {}
+        self._position_by_exit_txid: dict[str, int] = {}
+        # Optional cycle classification hook for throughput exclusion.
+        self._cycle_slot_mode: dict[tuple[int, str, int], str] = {}
+        self._churner_by_slot: dict[int, ChurnerRuntimeState] = {}
+        self._churner_next_cycle_id: int = 1
+        self._churner_reserve_available_usd: float = max(
+            0.0, float(getattr(config, "CHURNER_RESERVE_USD", 0.0))
+        )
+        self._churner_day_key: str = self._utc_day_key()
+        self._churner_cycles_today: int = 0
+        self._churner_profit_today: float = 0.0
+        self._churner_cycles_total: int = 0
+        self._churner_profit_total: float = 0.0
         self._throughput: ThroughputSizer | None = None
         if bool(getattr(config, "TP_ENABLED", False)):
             self._throughput = ThroughputSizer(
@@ -1319,7 +1373,13 @@ class BotRuntime:
         return med, float(ordered[idx])
 
     def _internal_open_order_count(self) -> int:
-        return sum(len(slot.state.orders) + len(slot.state.recovery_orders) for slot in self.slots.values())
+        count = sum(len(slot.state.orders) + len(slot.state.recovery_orders) for slot in self.slots.values())
+        for state in self._churner_by_slot.values():
+            if str(state.entry_txid or "").strip():
+                count += 1
+            if str(state.exit_txid or "").strip():
+                count += 1
+        return count
 
     def _open_order_drift_is_persistent(
         self,
@@ -1529,9 +1589,47 @@ class BotRuntime:
             "sticky_release_last_at": float(self._sticky_release_last_at),
             "release_recon_blocked": bool(self._release_recon_blocked),
             "release_recon_blocked_reason": str(self._release_recon_blocked_reason or ""),
+            "self_heal_reprice_total": int(self._self_heal_reprice_total),
+            "self_heal_reprice_last_at": float(self._self_heal_reprice_last_at),
+            "self_heal_reprice_last_summary": dict(self._self_heal_reprice_last_summary or {}),
+            "self_heal_hold_until_by_position": {
+                str(position_id): float(until_ts)
+                for position_id, until_ts in self._self_heal_hold_until_by_position.items()
+                if int(position_id) > 0 and float(until_ts) > 0.0
+            },
+            "position_ledger_migration_done": bool(self._position_ledger_migration_done),
+            "position_ledger_migration_last_at": float(self._position_ledger_migration_last_at),
+            "position_ledger_migration_last_created": int(self._position_ledger_migration_last_created),
+            "position_ledger_migration_last_scanned": int(self._position_ledger_migration_last_scanned),
             "dust_last_absorbed_usd": float(self._dust_last_absorbed_usd),
             "dust_last_dividend_usd": float(self._dust_last_dividend_usd),
             "quote_first_carry_usd": float(self._quote_first_carry_usd),
+            "position_ledger_state": self._position_ledger.snapshot_state(),
+            "position_by_exit_local": [
+                {"slot_id": int(slot_id), "local_id": int(local_id), "position_id": int(position_id)}
+                for (slot_id, local_id), position_id in self._position_by_exit_local.items()
+            ],
+            "position_by_exit_txid": {str(k): int(v) for k, v in self._position_by_exit_txid.items()},
+            "cycle_slot_mode": [
+                {
+                    "slot_id": int(slot_id),
+                    "trade_id": str(trade_id),
+                    "cycle": int(cycle),
+                    "slot_mode": str(slot_mode),
+                }
+                for (slot_id, trade_id, cycle), slot_mode in self._cycle_slot_mode.items()
+            ],
+            "churner_next_cycle_id": int(self._churner_next_cycle_id),
+            "churner_reserve_available_usd": float(self._churner_reserve_available_usd),
+            "churner_day_key": str(self._churner_day_key or ""),
+            "churner_cycles_today": int(self._churner_cycles_today),
+            "churner_profit_today": float(self._churner_profit_today),
+            "churner_cycles_total": int(self._churner_cycles_total),
+            "churner_profit_total": float(self._churner_profit_total),
+            "churner_by_slot": {
+                str(sid): asdict(state)
+                for sid, state in self._churner_by_slot.items()
+            },
         }
         if self._throughput is not None:
             snap["throughput_sizer_state"] = self._throughput.snapshot_state()
@@ -2021,6 +2119,53 @@ class BotRuntime:
             self._release_recon_blocked_reason = str(
                 snap.get("release_recon_blocked_reason", self._release_recon_blocked_reason) or ""
             )
+            self._self_heal_reprice_total = int(
+                snap.get("self_heal_reprice_total", self._self_heal_reprice_total)
+            )
+            self._self_heal_reprice_last_at = float(
+                snap.get("self_heal_reprice_last_at", self._self_heal_reprice_last_at)
+            )
+            raw_self_heal_summary = snap.get("self_heal_reprice_last_summary", self._self_heal_reprice_last_summary)
+            self._self_heal_reprice_last_summary = (
+                dict(raw_self_heal_summary) if isinstance(raw_self_heal_summary, dict) else {}
+            )
+            self._self_heal_hold_until_by_position = {}
+            raw_hold_until = snap.get("self_heal_hold_until_by_position", {})
+            if isinstance(raw_hold_until, dict):
+                for position_id_raw, until_raw in raw_hold_until.items():
+                    try:
+                        position_id = int(position_id_raw)
+                        until_ts = float(until_raw)
+                    except (TypeError, ValueError):
+                        continue
+                    if position_id > 0 and until_ts > 0.0:
+                        self._self_heal_hold_until_by_position[position_id] = until_ts
+            self._position_ledger_migration_done = bool(
+                snap.get("position_ledger_migration_done", self._position_ledger_migration_done)
+            )
+            self._position_ledger_migration_last_at = float(
+                snap.get("position_ledger_migration_last_at", self._position_ledger_migration_last_at) or 0.0
+            )
+            self._position_ledger_migration_last_created = max(
+                0,
+                int(
+                    snap.get(
+                        "position_ledger_migration_last_created",
+                        self._position_ledger_migration_last_created,
+                    )
+                    or 0
+                ),
+            )
+            self._position_ledger_migration_last_scanned = max(
+                0,
+                int(
+                    snap.get(
+                        "position_ledger_migration_last_scanned",
+                        self._position_ledger_migration_last_scanned,
+                    )
+                    or 0
+                ),
+            )
             self._dust_last_absorbed_usd = max(
                 0.0,
                 float(snap.get("dust_last_absorbed_usd", self._dust_last_absorbed_usd)),
@@ -2046,6 +2191,98 @@ class BotRuntime:
             self._hmm_consensus = self._compute_hmm_consensus()
             if self._throughput is not None:
                 self._throughput.restore_state(snap.get("throughput_sizer_state", {}))
+            self._position_ledger.restore_state(snap.get("position_ledger_state", {}))
+            self._position_by_exit_local = {}
+            raw_pos_local = snap.get("position_by_exit_local", [])
+            if isinstance(raw_pos_local, list):
+                for row in raw_pos_local:
+                    if not isinstance(row, dict):
+                        continue
+                    try:
+                        key = (int(row.get("slot_id")), int(row.get("local_id")))
+                        self._position_by_exit_local[key] = int(row.get("position_id"))
+                    except (TypeError, ValueError):
+                        continue
+            self._position_by_exit_txid = {}
+            raw_pos_txid = snap.get("position_by_exit_txid", {})
+            if isinstance(raw_pos_txid, dict):
+                for txid, pid in raw_pos_txid.items():
+                    try:
+                        pid_int = int(pid)
+                    except (TypeError, ValueError):
+                        continue
+                    txid_norm = str(txid or "").strip()
+                    if txid_norm and pid_int > 0:
+                        self._position_by_exit_txid[txid_norm] = pid_int
+            self._cycle_slot_mode = {}
+            raw_cycle_modes = snap.get("cycle_slot_mode", [])
+            if isinstance(raw_cycle_modes, list):
+                for row in raw_cycle_modes:
+                    if not isinstance(row, dict):
+                        continue
+                    try:
+                        key = (
+                            int(row.get("slot_id")),
+                            str(row.get("trade_id") or ""),
+                            int(row.get("cycle")),
+                        )
+                        self._cycle_slot_mode[key] = str(row.get("slot_mode") or "legacy")
+                    except (TypeError, ValueError):
+                        continue
+            self._churner_next_cycle_id = max(1, int(snap.get("churner_next_cycle_id", self._churner_next_cycle_id)))
+            self._churner_reserve_available_usd = max(
+                0.0,
+                float(snap.get("churner_reserve_available_usd", self._churner_reserve_available_usd) or 0.0),
+            )
+            self._churner_day_key = str(snap.get("churner_day_key", self._churner_day_key) or self._utc_day_key())
+            self._churner_cycles_today = max(0, int(snap.get("churner_cycles_today", self._churner_cycles_today) or 0))
+            self._churner_profit_today = float(snap.get("churner_profit_today", self._churner_profit_today) or 0.0)
+            self._churner_cycles_total = max(0, int(snap.get("churner_cycles_total", self._churner_cycles_total) or 0))
+            self._churner_profit_total = float(snap.get("churner_profit_total", self._churner_profit_total) or 0.0)
+            self._churner_by_slot = {}
+            raw_churner_by_slot = snap.get("churner_by_slot", {})
+            if isinstance(raw_churner_by_slot, dict):
+                for sid_txt, row in raw_churner_by_slot.items():
+                    if not isinstance(row, dict):
+                        continue
+                    try:
+                        sid = int(sid_txt)
+                    except (TypeError, ValueError):
+                        continue
+                    try:
+                        state = ChurnerRuntimeState(
+                            active=bool(row.get("active", False)),
+                            stage=str(row.get("stage") or "idle"),
+                            parent_position_id=max(0, int(row.get("parent_position_id", 0) or 0)),
+                            parent_trade_id=str(row.get("parent_trade_id") or ""),
+                            cycle_id=max(0, int(row.get("cycle_id", 0) or 0)),
+                            order_size_usd=max(0.0, float(row.get("order_size_usd", 0.0) or 0.0)),
+                            compound_usd=max(0.0, float(row.get("compound_usd", 0.0) or 0.0)),
+                            reserve_allocated_usd=max(
+                                0.0, float(row.get("reserve_allocated_usd", 0.0) or 0.0)
+                            ),
+                            entry_side=str(row.get("entry_side") or ""),
+                            entry_txid=str(row.get("entry_txid") or ""),
+                            entry_price=max(0.0, float(row.get("entry_price", 0.0) or 0.0)),
+                            entry_volume=max(0.0, float(row.get("entry_volume", 0.0) or 0.0)),
+                            entry_placed_at=max(0.0, float(row.get("entry_placed_at", 0.0) or 0.0)),
+                            entry_fill_price=max(0.0, float(row.get("entry_fill_price", 0.0) or 0.0)),
+                            entry_fill_fee=max(0.0, float(row.get("entry_fill_fee", 0.0) or 0.0)),
+                            entry_fill_time=max(0.0, float(row.get("entry_fill_time", 0.0) or 0.0)),
+                            exit_txid=str(row.get("exit_txid") or ""),
+                            exit_price=max(0.0, float(row.get("exit_price", 0.0) or 0.0)),
+                            exit_placed_at=max(0.0, float(row.get("exit_placed_at", 0.0) or 0.0)),
+                            churner_position_id=max(0, int(row.get("churner_position_id", 0) or 0)),
+                            last_error=str(row.get("last_error") or ""),
+                            last_state_change_at=max(
+                                0.0, float(row.get("last_state_change_at", 0.0) or 0.0)
+                            ),
+                        )
+                    except (TypeError, ValueError):
+                        continue
+                    if state.stage not in {"idle", "entry_open", "exit_open"}:
+                        state.stage = "idle"
+                    self._churner_by_slot[sid] = state
 
             self.slots = {}
             slot_aliases = snap.get("slot_aliases", {})
@@ -2056,6 +2293,8 @@ class BotRuntime:
                 self.slots[sid] = SlotRuntime(slot_id=sid, state=sm.from_dict(raw_state), alias=alias)
 
             self._sanitize_slot_alias_state()
+            self._reconcile_churner_state()
+            self._rebuild_position_bindings_from_open_orders()
             self._recompute_effective_layers()
 
         # Startup rebase: if snapshot lagged behind queued event writes before a
@@ -2183,6 +2422,20 @@ class BotRuntime:
             userref=userref,
         )
 
+    def _place_market_order(self, *, side: str, volume: float, userref: int) -> str | None:
+        if not self._consume_private_budget(1, "place_market_order"):
+            return None
+        mark = float(self.last_price if self.last_price > 0 else 0.0)
+        return kraken_client.place_order(
+            side=side,
+            volume=volume,
+            price=mark,
+            pair=self.pair,
+            ordertype="market",
+            post_only=False,
+            userref=userref,
+        )
+
     def _cancel_order(self, txid: str) -> bool:
         if not txid:
             return False
@@ -2307,6 +2560,9 @@ class BotRuntime:
         # Ensure each slot has active entries/exits after reconciliation/replay.
         for sid in sorted(self.slots.keys()):
             self._ensure_slot_bootstrapped(sid)
+
+        # Initialize/reconcile self-healing position ledger bindings.
+        self._migrate_open_exits_to_position_ledger()
 
         self._recompute_effective_layers()
 
@@ -2690,10 +2946,2376 @@ class BotRuntime:
     def _regime_label(regime_id: int | None) -> str:
         return {0: "bearish", 1: "ranging", 2: "bullish"}.get(regime_id, "ranging")
 
+    def _position_ledger_enabled(self) -> bool:
+        return bool(getattr(config, "POSITION_LEDGER_ENABLED", True)) and bool(
+            self._position_ledger.enabled
+        )
+
+    def _slot_mode_for_position(self, *, churner: bool = False) -> str:
+        if churner:
+            return "churner"
+        if bool(getattr(config, "STICKY_MODE_ENABLED", False)):
+            return "sticky"
+        return "legacy"
+
+    def _bind_position_for_exit(self, slot_id: int, order: sm.OrderState, position_id: int) -> None:
+        key = (int(slot_id), int(order.local_id))
+        self._position_by_exit_local[key] = int(position_id)
+        txid = str(order.txid or "").strip()
+        if txid:
+            self._position_by_exit_txid[txid] = int(position_id)
+            self._position_ledger.bind_exit_txid(int(position_id), txid)
+
+    def _bind_position_txid_for_exit(self, slot_id: int, local_id: int, txid: str) -> None:
+        key = (int(slot_id), int(local_id))
+        position_id = self._position_by_exit_local.get(key)
+        if not position_id:
+            return
+        txid_norm = str(txid or "").strip()
+        if not txid_norm:
+            return
+        self._position_by_exit_txid[txid_norm] = int(position_id)
+        self._position_ledger.bind_exit_txid(int(position_id), txid_norm)
+        self._persist_position_ledger_row(int(position_id))
+
+    def _unbind_position_for_exit(self, slot_id: int, local_id: int, txid: str = "") -> int | None:
+        key = (int(slot_id), int(local_id))
+        position_id = self._position_by_exit_local.pop(key, None)
+        txid_norm = str(txid or "").strip()
+        if txid_norm:
+            self._position_by_exit_txid.pop(txid_norm, None)
+        if position_id is None:
+            return None
+        if not txid_norm:
+            for k, v in list(self._position_by_exit_txid.items()):
+                if int(v) == int(position_id):
+                    self._position_by_exit_txid.pop(k, None)
+        return int(position_id)
+
+    def _find_position_for_exit(
+        self,
+        slot_id: int,
+        local_id: int,
+        *,
+        txid: str | None = None,
+    ) -> int | None:
+        pid = self._position_by_exit_local.get((int(slot_id), int(local_id)))
+        if pid is not None:
+            return int(pid)
+        txid_norm = str(txid or "").strip()
+        if txid_norm and txid_norm in self._position_by_exit_txid:
+            return int(self._position_by_exit_txid[txid_norm])
+        return None
+
+    def _rebuild_position_bindings_from_open_orders(self) -> int:
+        self._position_by_exit_local = {}
+        self._position_by_exit_txid = {}
+        if not self._position_ledger_enabled():
+            return 0
+
+        bound = 0
+        for pos in self._position_ledger.get_open_positions():
+            sid = int(pos.get("slot_id", -1))
+            slot = self.slots.get(sid)
+            if slot is None:
+                continue
+            trade_id = str(pos.get("trade_id", ""))
+            cycle = int(pos.get("cycle", 0))
+            entry_time = float(pos.get("entry_time", 0.0) or 0.0)
+            candidates = [
+                o
+                for o in slot.state.orders
+                if o.role == "exit"
+                and str(o.trade_id) == trade_id
+                and int(o.cycle) == cycle
+            ]
+            if not candidates:
+                continue
+            if len(candidates) == 1:
+                chosen = candidates[0]
+            else:
+                chosen = min(
+                    candidates,
+                    key=lambda o: abs(float(o.entry_filled_at or o.placed_at or 0.0) - entry_time),
+                )
+            position_id = int(pos.get("position_id", 0) or 0)
+            if position_id <= 0:
+                continue
+            self._bind_position_for_exit(sid, chosen, position_id)
+            bound += 1
+        return bound
+
+    def _record_position_open_for_entry_fill(
+        self,
+        *,
+        slot_id: int,
+        entry_order: sm.OrderState,
+        fill_price: float,
+        fill_volume: float,
+        fill_fee: float,
+        fill_cost: float,
+        fill_timestamp: float,
+    ) -> None:
+        if not self._position_ledger_enabled():
+            return
+        slot = self.slots.get(int(slot_id))
+        if slot is None:
+            return
+
+        candidates = [
+            o
+            for o in slot.state.orders
+            if o.role == "exit"
+            and str(o.trade_id) == str(entry_order.trade_id)
+            and int(o.cycle) == int(entry_order.cycle)
+        ]
+        if not candidates:
+            return
+
+        expected_entry_ts = float(fill_timestamp)
+        chosen = min(
+            candidates,
+            key=lambda o: abs(float(o.entry_filled_at or o.placed_at or 0.0) - expected_entry_ts),
+        )
+
+        try:
+            regime_label = self._regime_label(chosen.regime_at_entry)
+            position_id = self._position_ledger.open_position(
+                slot_id=int(slot_id),
+                trade_id=str(entry_order.trade_id),
+                slot_mode=self._slot_mode_for_position(churner=False),
+                cycle=int(entry_order.cycle),
+                entry_data={
+                    "entry_price": float(fill_price),
+                    "entry_cost": float(fill_cost if fill_cost > 0 else fill_price * fill_volume),
+                    "entry_fee": float(fill_fee),
+                    "entry_volume": float(fill_volume),
+                    "entry_time": float(fill_timestamp),
+                    "entry_regime": regime_label,
+                    "entry_volatility": 0.0,
+                },
+                exit_data={
+                    "current_exit_price": float(chosen.price),
+                    "original_exit_price": float(chosen.price),
+                    "target_profit_pct": float(self.profit_pct),
+                    "exit_txid": str(chosen.txid or ""),
+                },
+            )
+            self._position_ledger.journal_event(
+                position_id,
+                "created",
+                {
+                    "entry_price": float(fill_price),
+                    "exit_price": float(chosen.price),
+                    "regime": regime_label,
+                    "slot_mode": self._slot_mode_for_position(churner=False),
+                },
+                timestamp=float(fill_timestamp),
+            )
+            self._bind_position_for_exit(int(slot_id), chosen, int(position_id))
+            self._persist_position_ledger_row(int(position_id))
+            self._persist_position_journal_tail(int(position_id), count=1)
+        except Exception as e:
+            logger.warning(
+                "position_ledger open failed slot=%s trade=%s cycle=%s: %s",
+                int(slot_id),
+                str(entry_order.trade_id),
+                int(entry_order.cycle),
+                e,
+            )
+
+    def _record_position_close_for_exit_fill(
+        self,
+        *,
+        slot_id: int,
+        exit_order: sm.OrderState,
+        fill_price: float,
+        fill_fee: float,
+        fill_cost: float,
+        fill_timestamp: float,
+        txid: str,
+    ) -> None:
+        if not self._position_ledger_enabled():
+            return
+
+        position_id = self._find_position_for_exit(
+            int(slot_id),
+            int(exit_order.local_id),
+            txid=str(txid or ""),
+        )
+        if position_id is None:
+            return
+
+        pos = self._position_ledger.get_position(int(position_id))
+        if not isinstance(pos, dict):
+            self._unbind_position_for_exit(int(slot_id), int(exit_order.local_id), str(txid or ""))
+            return
+
+        slot = self.slots.get(int(slot_id))
+        cycle_row = None
+        if slot is not None:
+            cycle_row = next(
+                (
+                    c
+                    for c in reversed(slot.state.completed_cycles)
+                    if str(c.trade_id) == str(exit_order.trade_id)
+                    and int(c.cycle) == int(exit_order.cycle)
+                ),
+                None,
+            )
+
+        if cycle_row is not None:
+            net_profit = float(cycle_row.net_profit)
+        else:
+            entry_price = float(pos.get("entry_price", 0.0) or 0.0)
+            volume = float(exit_order.volume or 0.0)
+            gross = (
+                (fill_price - entry_price) * volume
+                if exit_order.side == "sell"
+                else (entry_price - fill_price) * volume
+            )
+            net_profit = gross - (float(pos.get("entry_fee", 0.0) or 0.0) + float(fill_fee))
+
+        exit_regime = self._regime_label(self._current_regime_id())
+        try:
+            self._position_ledger.close_position(
+                int(position_id),
+                {
+                    "exit_price": float(fill_price),
+                    "exit_cost": float(fill_cost if fill_cost > 0 else fill_price * float(exit_order.volume)),
+                    "exit_fee": float(fill_fee),
+                    "exit_time": float(fill_timestamp),
+                    "exit_regime": str(exit_regime),
+                    "net_profit": float(net_profit),
+                    "close_reason": "filled",
+                },
+            )
+            self._persist_position_ledger_row(int(position_id))
+            self._persist_position_journal_tail(int(position_id), count=1)
+        except Exception as e:
+            logger.warning(
+                "position_ledger close failed slot=%s local=%s pos=%s: %s",
+                int(slot_id),
+                int(exit_order.local_id),
+                int(position_id),
+                e,
+            )
+            self._unbind_position_for_exit(int(slot_id), int(exit_order.local_id), str(txid or ""))
+            return
+
+        # Track cycle mode so throughput can explicitly ignore churner cycles.
+        self._cycle_slot_mode[(int(slot_id), str(exit_order.trade_id), int(exit_order.cycle))] = str(
+            pos.get("slot_mode") or "legacy"
+        )
+
+        # Over-performance credit: favorable fill vs target exit price.
+        try:
+            target_exit = float(pos.get("current_exit_price", 0.0) or 0.0)
+            volume = float(exit_order.volume or 0.0)
+            favorable = (exit_order.side == "sell" and fill_price > target_exit) or (
+                exit_order.side == "buy" and fill_price < target_exit
+            )
+            if target_exit > 0 and volume > 0 and favorable:
+                excess = abs(float(fill_price) - target_exit) * volume
+                entry_price = float(pos.get("entry_price", 0.0) or 0.0)
+                entry_fee = float(pos.get("entry_fee", 0.0) or 0.0)
+                expected_gross = (
+                    (target_exit - entry_price) * volume
+                    if exit_order.side == "sell"
+                    else (entry_price - target_exit) * volume
+                )
+                actual_gross = (
+                    (fill_price - entry_price) * volume
+                    if exit_order.side == "sell"
+                    else (entry_price - fill_price) * volume
+                )
+                expected_profit = expected_gross - (entry_fee + float(fill_fee))
+                actual_profit = actual_gross - (entry_fee + float(fill_fee))
+                self._position_ledger.journal_event(
+                    int(position_id),
+                    "over_performance",
+                    {
+                        "expected_profit": float(expected_profit),
+                        "actual_profit": float(actual_profit),
+                        "excess": max(0.0, float(excess)),
+                    },
+                    timestamp=float(fill_timestamp),
+                )
+                self._persist_position_journal_tail(int(position_id), count=1)
+        except Exception as e:
+            logger.warning(
+                "position_ledger over_performance failed slot=%s local=%s pos=%s: %s",
+                int(slot_id),
+                int(exit_order.local_id),
+                int(position_id),
+                e,
+            )
+
+        self._unbind_position_for_exit(int(slot_id), int(exit_order.local_id), str(txid or ""))
+        self._self_heal_hold_until_by_position.pop(int(position_id), None)
+
+    def _migrate_open_exits_to_position_ledger(self) -> None:
+        if not self._position_ledger_enabled():
+            return
+
+        now_ts = _now()
+        scanned = 0
+        for sid in sorted(self.slots.keys()):
+            slot = self.slots[sid]
+            scanned += sum(1 for o in slot.state.orders if o.role == "exit")
+        self._position_ledger_migration_last_scanned = int(scanned)
+
+        open_positions = self._position_ledger.get_open_positions()
+        if bool(self._position_ledger_migration_done):
+            if open_positions or int(scanned) == 0:
+                bound = self._rebuild_position_bindings_from_open_orders()
+                logger.info(
+                    "position_ledger startup migration: sentinel complete (scanned=%d bound=%d)",
+                    int(scanned),
+                    int(bound),
+                )
+                return
+            logger.warning(
+                "position_ledger startup migration: sentinel set but no ledger positions with %d live exits; rerunning import",
+                int(scanned),
+            )
+            self._position_ledger_migration_done = False
+
+        if open_positions:
+            bound = self._rebuild_position_bindings_from_open_orders()
+            self._position_ledger_migration_done = True
+            self._position_ledger_migration_last_at = float(now_ts)
+            self._position_ledger_migration_last_created = 0
+            logger.info(
+                "position_ledger startup migration: restored %d open positions (bound %d active exits; scanned=%d)",
+                len(open_positions),
+                bound,
+                int(scanned),
+            )
+            return
+
+        created = 0
+        for sid in sorted(self.slots.keys()):
+            slot = self.slots[sid]
+            for o in slot.state.orders:
+                if o.role != "exit":
+                    continue
+                entry_ts = float(o.entry_filled_at or o.placed_at or _now())
+                try:
+                    regime_label = self._regime_label(o.regime_at_entry)
+                    position_id = self._position_ledger.open_position(
+                        slot_id=int(sid),
+                        trade_id=str(o.trade_id),
+                        slot_mode="legacy",
+                        cycle=int(o.cycle),
+                        entry_data={
+                            "entry_price": float(o.entry_price),
+                            "entry_cost": float(o.entry_price) * float(o.volume),
+                            "entry_fee": float(o.entry_fee),
+                            "entry_volume": float(o.volume),
+                            "entry_time": entry_ts,
+                            "entry_regime": regime_label,
+                            "entry_volatility": 0.0,
+                        },
+                        exit_data={
+                            "current_exit_price": float(o.price),
+                            "original_exit_price": float(o.price),
+                            "target_profit_pct": float(self.profit_pct),
+                            "exit_txid": str(o.txid or ""),
+                        },
+                    )
+                    self._position_ledger.journal_event(
+                        int(position_id),
+                        "created",
+                        {
+                            "entry_price": float(o.entry_price),
+                            "exit_price": float(o.price),
+                            "regime": regime_label,
+                            "slot_mode": "legacy",
+                            "migration": True,
+                        },
+                        timestamp=entry_ts,
+                    )
+                    self._bind_position_for_exit(int(sid), o, int(position_id))
+                    self._persist_position_ledger_row(int(position_id))
+                    self._persist_position_journal_tail(int(position_id), count=1)
+                    created += 1
+                except Exception as e:
+                    logger.warning(
+                        "position_ledger migration failed slot=%s local=%s trade=%s.%s: %s",
+                        int(sid),
+                        int(o.local_id),
+                        str(o.trade_id),
+                        int(o.cycle),
+                        e,
+                    )
+        self._position_ledger_migration_done = True
+        self._position_ledger_migration_last_at = float(now_ts)
+        self._position_ledger_migration_last_created = int(created)
+        if created > 0:
+            logger.info(
+                "position_ledger startup migration: created %d legacy open positions (scanned=%d)",
+                int(created),
+                int(scanned),
+            )
+        else:
+            logger.info(
+                "position_ledger startup migration: no open exits to import (scanned=%d)",
+                int(scanned),
+            )
+
+    def _effective_age_seconds(self, age_sec: float, distance_pct: float) -> float:
+        weight = max(1e-9, float(getattr(config, "AGE_DISTANCE_WEIGHT", 5.0)))
+        return max(0.0, float(age_sec)) * (1.0 + max(0.0, float(distance_pct)) / weight)
+
+    def _age_band_for_effective_age(self, effective_age_sec: float) -> str:
+        age = max(0.0, float(effective_age_sec))
+        fresh = float(getattr(config, "AGE_BAND_FRESH_SEC", 21600))
+        aging = float(getattr(config, "AGE_BAND_AGING_SEC", 86400))
+        stale = float(getattr(config, "AGE_BAND_STALE_SEC", 259200))
+        stuck = float(getattr(config, "AGE_BAND_STUCK_SEC", 604800))
+        if age < fresh:
+            return "fresh"
+        if age < aging:
+            return "aging"
+        if age < stale:
+            return "stale"
+        if age < stuck:
+            return "stuck"
+        return "write_off"
+
+    def _persist_position_ledger_row(self, position_id: int) -> None:
+        row = self._position_ledger.get_position(int(position_id))
+        if isinstance(row, dict) and row:
+            supabase_store.save_position_ledger(row)
+
+    def _persist_position_journal_tail(self, position_id: int, count: int = 1) -> None:
+        if count <= 0:
+            return
+        rows = self._position_ledger.get_journal(int(position_id))
+        if not rows:
+            return
+        for row in rows[-int(count):]:
+            if isinstance(row, dict) and row:
+                supabase_store.save_position_journal(row)
+
+    @staticmethod
+    def _self_heal_band_rank(band: str) -> int:
+        return {
+            "fresh": 0,
+            "aging": 1,
+            "stale": 2,
+            "stuck": 3,
+            "write_off": 4,
+        }.get(str(band or "").strip().lower(), 0)
+
+    def _self_heal_auto_reprice_min_rank(self) -> int:
+        raw = str(getattr(config, "SUBSIDY_AUTO_REPRICE_BAND", "stuck") or "stuck").strip().lower()
+        if raw not in {"stale", "stuck", "write_off"}:
+            raw = "stuck"
+        return self._self_heal_band_rank(raw)
+
+    def _entry_pct_for_trade_runtime(self, slot: SlotRuntime, trade_id: str) -> float:
+        cfg = self._engine_cfg(slot)
+        t = str(trade_id or "").strip().upper()
+        if t == "A" and cfg.entry_pct_a is not None and float(cfg.entry_pct_a) > 0:
+            return float(cfg.entry_pct_a)
+        if t == "B" and cfg.entry_pct_b is not None and float(cfg.entry_pct_b) > 0:
+            return float(cfg.entry_pct_b)
+        return max(0.0, float(cfg.entry_pct))
+
+    def _compute_fillable_exit_price(
+        self,
+        *,
+        slot: SlotRuntime,
+        trade_id: str,
+        side: str,
+        market: float,
+        entry_price: float,
+    ) -> float:
+        if market <= 0 or entry_price <= 0:
+            return 0.0
+        entry_pct = self._entry_pct_for_trade_runtime(slot, trade_id) / 100.0
+        fee_floor = max(0.0, float(config.ROUND_TRIP_FEE_PCT)) / 100.0
+        if str(side or "").lower() == "sell":
+            return max(market * (1.0 + entry_pct), entry_price * (1.0 + fee_floor))
+        return min(market * (1.0 - entry_pct), entry_price * (1.0 - fee_floor))
+
+    def _subsidy_needed_for_position(
+        self,
+        position: dict[str, Any],
+        *,
+        slot: SlotRuntime,
+        side: str,
+        market: float,
+        volume_override: float | None = None,
+    ) -> tuple[float, float]:
+        current_exit = float(position.get("current_exit_price", 0.0) or 0.0)
+        entry_price = float(position.get("entry_price", 0.0) or 0.0)
+        volume = max(
+            0.0,
+            float(
+                volume_override
+                if volume_override is not None
+                else position.get("entry_volume", 0.0) or 0.0
+            ),
+        )
+        if current_exit <= 0 or entry_price <= 0 or volume <= 0 or market <= 0:
+            return 0.0, 0.0
+        fillable = self._compute_fillable_exit_price(
+            slot=slot,
+            trade_id=str(position.get("trade_id") or ""),
+            side=str(side or ""),
+            market=float(market),
+            entry_price=float(entry_price),
+        )
+        if fillable <= 0:
+            return 0.0, 0.0
+
+        if str(side or "").lower() == "sell":
+            if current_exit <= fillable:
+                return 0.0, float(fillable)
+            return max(0.0, (current_exit - fillable) * volume), float(fillable)
+
+        if current_exit >= fillable:
+            return 0.0, float(fillable)
+        return max(0.0, (fillable - current_exit) * volume), float(fillable)
+
+    def _find_live_exit_for_position(
+        self,
+        position: dict[str, Any],
+    ) -> tuple[int, sm.OrderState] | None:
+        try:
+            slot_id = int(position.get("slot_id", -1))
+            position_id = int(position.get("position_id", 0))
+        except (TypeError, ValueError):
+            return None
+        if slot_id < 0 or position_id <= 0:
+            return None
+        slot = self.slots.get(slot_id)
+        if slot is None:
+            return None
+
+        for (sid, local_id), pid in self._position_by_exit_local.items():
+            if int(sid) != int(slot_id) or int(pid) != int(position_id):
+                continue
+            order = sm.find_order(slot.state, int(local_id))
+            if order and order.role == "exit":
+                return int(local_id), order
+
+        txid_norm = str(position.get("exit_txid") or "").strip()
+        if txid_norm:
+            for order in slot.state.orders:
+                if order.role != "exit":
+                    continue
+                if str(order.txid or "").strip() == txid_norm:
+                    self._position_by_exit_local[(int(slot_id), int(order.local_id))] = int(position_id)
+                    self._position_by_exit_txid[txid_norm] = int(position_id)
+                    return int(order.local_id), order
+
+        trade_id = str(position.get("trade_id") or "")
+        cycle = int(position.get("cycle", 0) or 0)
+        candidates = [
+            o
+            for o in slot.state.orders
+            if o.role == "exit" and str(o.trade_id) == trade_id and int(o.cycle) == cycle
+        ]
+        if len(candidates) == 1:
+            chosen = candidates[0]
+            self._position_by_exit_local[(int(slot_id), int(chosen.local_id))] = int(position_id)
+            txid = str(chosen.txid or "").strip()
+            if txid:
+                self._position_by_exit_txid[txid] = int(position_id)
+            return int(chosen.local_id), chosen
+        return None
+
+    def _last_position_reprice_ts(self, position_id: int, *, reason: str | None = None) -> float:
+        rows = self._position_ledger.get_journal(int(position_id))
+        wanted = str(reason or "").strip().lower()
+        for row in reversed(rows):
+            if str(row.get("event_type") or "") != "repriced":
+                continue
+            details = row.get("details") if isinstance(row.get("details"), dict) else {}
+            if wanted and str(details.get("reason") or "").strip().lower() != wanted:
+                continue
+            try:
+                return float(row.get("timestamp") or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+        return 0.0
+
+    def _has_position_reprice_reason(self, position_id: int, reason: str) -> bool:
+        return self._last_position_reprice_ts(int(position_id), reason=reason) > 0.0
+
+    def _patch_live_exit_order(
+        self,
+        *,
+        slot_id: int,
+        local_id: int,
+        price: float,
+        txid: str,
+        placed_at: float,
+    ) -> None:
+        slot = self.slots.get(int(slot_id))
+        if slot is None:
+            return
+        patched: list[sm.OrderState] = []
+        for order in slot.state.orders:
+            if int(order.local_id) == int(local_id) and order.role == "exit":
+                patched.append(
+                    replace(
+                        order,
+                        price=float(price),
+                        txid=str(txid or ""),
+                        placed_at=float(placed_at),
+                    )
+                )
+            else:
+                patched.append(order)
+        slot.state = replace(slot.state, orders=tuple(patched))
+
+    def _execute_self_heal_reprice(
+        self,
+        *,
+        position_id: int,
+        slot_id: int,
+        order: sm.OrderState,
+        new_price: float,
+        reason: str,
+        subsidy_consumed: float,
+        now_ts: float,
+    ) -> tuple[bool, str]:
+        pid = int(position_id)
+        sid = int(slot_id)
+        local_id = int(order.local_id)
+        old_price = float(order.price)
+        old_txid = str(order.txid or "").strip()
+        target_price = max(0.0, float(new_price))
+        if old_txid == "":
+            return False, "missing_txid"
+        if target_price <= 0:
+            return False, "invalid_target"
+        if abs(target_price - old_price) <= 1e-12:
+            return False, "no_fillable_delta"
+
+        try:
+            cancelled = self._cancel_order(old_txid)
+        except Exception:
+            cancelled = False
+        if not cancelled:
+            return False, "cancel_failed"
+
+        replacement_txid: str | None = None
+        try:
+            replacement_txid = self._place_order(
+                side=order.side,
+                volume=float(order.volume),
+                price=float(target_price),
+                userref=(sid * 1_000_000 + local_id),
+            )
+        except Exception:
+            replacement_txid = None
+
+        if not replacement_txid:
+            # Best-effort restore at old price if replacement at new price fails.
+            restore_txid: str | None = None
+            try:
+                restore_txid = self._place_order(
+                    side=order.side,
+                    volume=float(order.volume),
+                    price=float(old_price),
+                    userref=(sid * 1_000_000 + local_id),
+                )
+            except Exception:
+                restore_txid = None
+            self._position_by_exit_txid.pop(old_txid, None)
+            if restore_txid:
+                self._patch_live_exit_order(
+                    slot_id=sid,
+                    local_id=local_id,
+                    price=float(old_price),
+                    txid=str(restore_txid),
+                    placed_at=float(now_ts),
+                )
+                self._position_by_exit_local[(sid, local_id)] = pid
+                self._position_by_exit_txid[str(restore_txid)] = pid
+                self._position_ledger.bind_exit_txid(pid, str(restore_txid))
+                self._persist_position_ledger_row(pid)
+                return False, "place_failed_restored"
+
+            self._patch_live_exit_order(
+                slot_id=sid,
+                local_id=local_id,
+                price=float(old_price),
+                txid="",
+                placed_at=float(now_ts),
+            )
+            self.pause(f"self-heal reprice failed: slot={sid} local={local_id} replacement placement failed")
+            return False, "place_failed"
+
+        new_txid = str(replacement_txid).strip()
+        self._patch_live_exit_order(
+            slot_id=sid,
+            local_id=local_id,
+            price=float(target_price),
+            txid=new_txid,
+            placed_at=float(now_ts),
+        )
+        self._position_by_exit_local[(sid, local_id)] = pid
+        self._position_by_exit_txid.pop(old_txid, None)
+        if new_txid:
+            self._position_by_exit_txid[new_txid] = pid
+
+        try:
+            self._position_ledger.reprice_position(
+                pid,
+                new_exit_price=float(target_price),
+                new_exit_txid=new_txid,
+                reason=str(reason),
+                subsidy_consumed=max(0.0, float(subsidy_consumed)),
+                timestamp=float(now_ts),
+                old_txid_override=old_txid,
+            )
+            self._persist_position_ledger_row(pid)
+            self._persist_position_journal_tail(pid, count=1)
+        except Exception as e:
+            logger.warning(
+                "position_ledger reprice failed slot=%s local=%s position=%s: %s",
+                sid,
+                local_id,
+                pid,
+                e,
+            )
+            return False, "ledger_reprice_failed"
+        return True, "repriced"
+
+    def _self_heal_tighten_target_price(
+        self,
+        *,
+        position: dict[str, Any],
+        slot: SlotRuntime,
+        side: str,
+        market: float,
+    ) -> tuple[float, float]:
+        entry_price = float(position.get("entry_price", 0.0) or 0.0)
+        if entry_price <= 0 or market <= 0:
+            return 0.0, 0.0
+        tighten_profit_pct = max(float(self.profit_pct), float(self._volatility_profit_pct()))
+        entry_pct = self._entry_pct_for_trade_runtime(slot, str(position.get("trade_id") or "")) / 100.0
+        p = tighten_profit_pct / 100.0
+        if str(side or "").lower() == "sell":
+            raw = max(entry_price * (1.0 + p), market * (1.0 + entry_pct))
+        else:
+            raw = min(entry_price * (1.0 - p), market * (1.0 - entry_pct))
+        decimals = max(0, int(self.constraints.get("price_decimals", 6)))
+        return float(round(raw, decimals)), float(tighten_profit_pct)
+
+    def _self_heal_cleanup_hold_window_sec(self) -> float:
+        stale = max(60.0, float(getattr(config, "AGE_BAND_STALE_SEC", 259200)))
+        stuck = max(stale + 60.0, float(getattr(config, "AGE_BAND_STUCK_SEC", 604800)))
+        return max(3600.0, stuck - stale)
+
+    def _prune_self_heal_hold_overrides(self, now_ts: float | None = None) -> None:
+        now = float(now_ts if now_ts is not None else _now())
+        for position_id, hold_until in list(self._self_heal_hold_until_by_position.items()):
+            if float(hold_until) <= now:
+                self._self_heal_hold_until_by_position.pop(int(position_id), None)
+
+    def _self_heal_throughput_hourly_profit_estimate(self) -> float:
+        if self._throughput is None:
+            return 0.0
+        try:
+            payload = self._throughput.status_payload()
+        except Exception:
+            return 0.0
+        aggregate = payload.get("aggregate") if isinstance(payload, dict) else {}
+        if not isinstance(aggregate, dict):
+            return 0.0
+        try:
+            mean_profit_per_sec = float(aggregate.get("mean_profit_per_sec", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            mean_profit_per_sec = 0.0
+        return max(0.0, mean_profit_per_sec * 3600.0)
+
+    def _self_heal_total_capital_usd(self) -> float:
+        mark = float(self.last_price if self.last_price > 0 else 0.0)
+        if mark <= 0.0 and self.slots:
+            mark = max(0.0, max(float(slot.state.market_price or 0.0) for slot in self.slots.values()))
+        if self._last_balance_snapshot and mark > 0.0:
+            return max(
+                0.0,
+                _usd_balance(self._last_balance_snapshot) + _doge_balance(self._last_balance_snapshot) * mark,
+            )
+        open_positions = self._position_ledger.get_open_positions()
+        total_entry_cost = sum(max(0.0, float(pos.get("entry_cost", 0.0) or 0.0)) for pos in open_positions)
+        if total_entry_cost > 0.0:
+            return float(total_entry_cost)
+        return max(0.0, float(getattr(config, "ORDER_SIZE_USD", 0.0)) * max(1, len(self.slots)))
+
+    def _self_heal_opportunity_cost_usd(
+        self,
+        *,
+        age_sec: float,
+        entry_cost: float,
+        total_capital_usd: float,
+        hourly_throughput_usd: float,
+    ) -> float:
+        if age_sec <= 0.0 or entry_cost <= 0.0 or total_capital_usd <= 0.0 or hourly_throughput_usd <= 0.0:
+            return 0.0
+        return max(
+            0.0,
+            (float(age_sec) / 3600.0)
+            * float(hourly_throughput_usd)
+            * (float(entry_cost) / float(total_capital_usd)),
+        )
+
+    def _self_heal_cleanup_queue_rows(
+        self,
+        now_ts: float | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        now = float(now_ts if now_ts is not None else _now())
+        self._prune_self_heal_hold_overrides(now)
+
+        rows: list[dict[str, Any]] = []
+        hidden_by_hold = 0
+        open_positions = self._position_ledger.get_open_positions()
+        total_capital_usd = self._self_heal_total_capital_usd()
+        hourly_throughput_usd = self._self_heal_throughput_hourly_profit_estimate()
+
+        for position in open_positions:
+            try:
+                position_id = int(position.get("position_id", 0) or 0)
+                slot_id = int(position.get("slot_id", -1))
+            except (TypeError, ValueError):
+                continue
+            if position_id <= 0 or slot_id < 0:
+                continue
+            slot = self.slots.get(slot_id)
+            if slot is None:
+                continue
+            live = self._find_live_exit_for_position(position)
+            if live is None:
+                continue
+            _local_id, order = live
+
+            market = float(slot.state.market_price if slot.state.market_price > 0 else self.last_price)
+            if market <= 0.0:
+                continue
+
+            exit_px = float(position.get("current_exit_price", order.price) or order.price)
+            entry_px = float(position.get("entry_price", 0.0) or 0.0)
+            entry_cost = max(0.0, float(position.get("entry_cost", 0.0) or 0.0))
+            age_sec = max(0.0, now - float(position.get("entry_time", now) or now))
+            distance_pct = abs(exit_px - market) / market * 100.0 if market > 0 else 0.0
+            effective_age_sec = self._effective_age_seconds(age_sec, distance_pct)
+            band = self._age_band_for_effective_age(effective_age_sec)
+            if band != "write_off":
+                continue
+
+            hold_until = float(self._self_heal_hold_until_by_position.get(position_id, 0.0) or 0.0)
+            hold_remaining_sec = max(0.0, hold_until - now)
+            if hold_remaining_sec > 0.0:
+                hidden_by_hold += 1
+                continue
+
+            subsidy_balance = max(0.0, float(self._position_ledger.get_subsidy_balance(slot_id)))
+            subsidy_needed, fillable_price = self._subsidy_needed_for_position(
+                position,
+                slot=slot,
+                side=order.side,
+                market=market,
+                volume_override=float(order.volume),
+            )
+            opportunity_cost_usd = self._self_heal_opportunity_cost_usd(
+                age_sec=age_sec,
+                entry_cost=entry_cost,
+                total_capital_usd=total_capital_usd,
+                hourly_throughput_usd=hourly_throughput_usd,
+            )
+            rows.append(
+                {
+                    "position_id": position_id,
+                    "slot_id": slot_id,
+                    "trade_id": str(position.get("trade_id") or ""),
+                    "cycle": int(position.get("cycle", 0) or 0),
+                    "side": str(order.side or ""),
+                    "entry_time": float(position.get("entry_time", 0.0) or 0.0),
+                    "entry_price": float(entry_px),
+                    "entry_volume": max(0.0, float(order.volume)),
+                    "entry_cost": float(entry_cost),
+                    "current_exit_price": float(exit_px),
+                    "market_price": float(market),
+                    "age_sec": float(age_sec),
+                    "distance_pct": float(distance_pct),
+                    "effective_age_sec": float(effective_age_sec),
+                    "age_band": str(band),
+                    "fillable_price": float(fillable_price),
+                    "subsidy_balance": float(subsidy_balance),
+                    "subsidy_needed": float(max(0.0, subsidy_needed)),
+                    "opportunity_cost_usd": float(opportunity_cost_usd),
+                    "hold_remaining_sec": float(hold_remaining_sec),
+                    "target_profit_pct": float(position.get("target_profit_pct", self.profit_pct) or self.profit_pct),
+                }
+            )
+
+        rows.sort(
+            key=lambda row: (
+                -float(row.get("effective_age_sec", 0.0) or 0.0),
+                -float(row.get("age_sec", 0.0) or 0.0),
+                -int(row.get("position_id", 0) or 0),
+            )
+        )
+        return rows, int(hidden_by_hold)
+
+    def _self_heal_operator_journal(
+        self,
+        *,
+        position_id: int,
+        event_type: str,
+        details: dict[str, Any],
+        now_ts: float | None = None,
+    ) -> None:
+        pid = int(position_id)
+        if pid <= 0:
+            return
+        try:
+            self._position_ledger.journal_event(
+                pid,
+                str(event_type or "operator_action"),
+                dict(details or {}),
+                timestamp=float(now_ts if now_ts is not None else _now()),
+            )
+            self._persist_position_journal_tail(pid, count=1)
+        except Exception as e:
+            logger.warning("self-heal operator journal failed position=%s event=%s: %s", pid, event_type, e)
+
+    def self_heal_reprice_breakeven(
+        self,
+        position_id: int,
+        *,
+        operator_reason: str = "",
+    ) -> tuple[bool, str]:
+        if not self._position_ledger_enabled():
+            return False, "self-healing ledger is disabled"
+
+        pid = int(position_id)
+        if pid <= 0:
+            return False, "invalid position_id"
+
+        position = self._position_ledger.get_position(pid)
+        if not isinstance(position, dict) or str(position.get("status") or "") != "open":
+            return False, f"position {pid} is not open"
+
+        slot_id = int(position.get("slot_id", -1))
+        slot = self.slots.get(slot_id)
+        if slot is None:
+            return False, f"slot {slot_id} not found"
+
+        live = self._find_live_exit_for_position(position)
+        if live is None:
+            return False, f"position {pid} has no live exit order"
+        _local_id, order = live
+
+        entry_price = float(position.get("entry_price", 0.0) or 0.0)
+        volume = max(0.0, float(order.volume))
+        current_exit = float(position.get("current_exit_price", order.price) or order.price)
+        if entry_price <= 0.0 or volume <= 0.0 or current_exit <= 0.0:
+            return False, "position has invalid price/volume context"
+
+        fee_floor = max(0.0, float(getattr(config, "ROUND_TRIP_FEE_PCT", 0.0))) / 100.0
+        breakeven_price = (
+            entry_price * (1.0 + fee_floor)
+            if str(order.side or "").lower() == "sell"
+            else entry_price * (1.0 - fee_floor)
+        )
+        decimals = max(0, int(self.constraints.get("price_decimals", 6)))
+        price_scale = float(10 ** decimals) if decimals >= 0 else 1.0
+        tick = 1.0 / price_scale if price_scale > 0 else 0.0
+
+        if order.side == "sell" and current_exit <= (breakeven_price + tick):
+            return False, "exit is already at or below breakeven"
+        if order.side == "buy" and current_exit >= (breakeven_price - tick):
+            return False, "exit is already at or above breakeven"
+
+        subsidy_balance = max(0.0, float(self._position_ledger.get_subsidy_balance(slot_id)))
+        if subsidy_balance <= 1e-12:
+            return False, "no subsidy balance available"
+
+        subsidy_needed = abs(current_exit - breakeven_price) * volume
+        affordable = min(subsidy_needed, subsidy_balance)
+        if affordable <= 1e-12:
+            return False, "no subsidy balance available"
+
+        delta_px = affordable / volume
+        partial = affordable + 1e-12 < subsidy_needed
+        if order.side == "sell":
+            raw_target = max(breakeven_price, current_exit - delta_px)
+            if partial:
+                raw_target = max(breakeven_price, ceil(raw_target * price_scale) / price_scale)
+        else:
+            raw_target = min(breakeven_price, current_exit + delta_px)
+            if partial:
+                raw_target = min(breakeven_price, floor(raw_target * price_scale) / price_scale)
+
+        target_price = float(round(raw_target, decimals))
+        if order.side == "sell":
+            target_price = max(breakeven_price, target_price)
+        else:
+            target_price = min(breakeven_price, target_price)
+
+        subsidy_consumed = max(0.0, abs(current_exit - target_price) * volume)
+        if subsidy_consumed <= 1e-12:
+            return False, "no reprice delta"
+        if subsidy_consumed > subsidy_balance + 1e-9:
+            return False, "insufficient subsidy balance"
+
+        now = _now()
+        ok, reason = self._execute_self_heal_reprice(
+            position_id=pid,
+            slot_id=slot_id,
+            order=order,
+            new_price=target_price,
+            reason="operator",
+            subsidy_consumed=subsidy_consumed,
+            now_ts=now,
+        )
+        if not ok:
+            return False, f"reprice failed: {reason}"
+
+        self._self_heal_hold_until_by_position.pop(pid, None)
+        self._self_heal_operator_journal(
+            position_id=pid,
+            event_type="operator_action",
+            details={
+                "action": "reprice_breakeven",
+                "operator_reason": str(operator_reason or "manual"),
+                "breakeven_price": float(round(breakeven_price, decimals)),
+                "new_exit_price": float(target_price),
+                "subsidy_consumed": float(subsidy_consumed),
+                "partial": bool(partial),
+            },
+            now_ts=now,
+        )
+
+        if partial:
+            return (
+                True,
+                (
+                    f"position {pid}: partial breakeven reprice to ${target_price:.6f} "
+                    f"(used ${subsidy_consumed:.4f}/${subsidy_needed:.4f})"
+                ),
+            )
+        return True, f"position {pid}: repriced to breakeven @ ${target_price:.6f}"
+
+    def self_heal_keep_holding(
+        self,
+        position_id: int,
+        *,
+        operator_reason: str = "",
+        hold_sec: float | None = None,
+    ) -> tuple[bool, str]:
+        if not self._position_ledger_enabled():
+            return False, "self-healing ledger is disabled"
+
+        pid = int(position_id)
+        if pid <= 0:
+            return False, "invalid position_id"
+
+        position = self._position_ledger.get_position(pid)
+        if not isinstance(position, dict) or str(position.get("status") or "") != "open":
+            return False, f"position {pid} is not open"
+
+        default_hold = self._self_heal_cleanup_hold_window_sec()
+        hold_window_sec = float(hold_sec if hold_sec is not None else default_hold)
+        hold_window_sec = max(60.0, min(30.0 * 86400.0, hold_window_sec))
+        now = _now()
+        hold_until = now + hold_window_sec
+        self._self_heal_hold_until_by_position[pid] = float(hold_until)
+        self._self_heal_operator_journal(
+            position_id=pid,
+            event_type="keep_holding",
+            details={
+                "action": "keep_holding",
+                "operator_reason": str(operator_reason or "manual"),
+                "hold_sec": float(hold_window_sec),
+                "hold_until": float(hold_until),
+            },
+            now_ts=now,
+        )
+        return True, f"position {pid}: cleanup timer reset for {hold_window_sec / 3600.0:.1f}h"
+
+    def self_heal_close_at_market(
+        self,
+        position_id: int,
+        *,
+        operator_reason: str = "",
+    ) -> tuple[bool, str]:
+        if not self._position_ledger_enabled():
+            return False, "self-healing ledger is disabled"
+
+        pid = int(position_id)
+        if pid <= 0:
+            return False, "invalid position_id"
+
+        position = self._position_ledger.get_position(pid)
+        if not isinstance(position, dict) or str(position.get("status") or "") != "open":
+            return False, f"position {pid} is not open"
+
+        slot_id = int(position.get("slot_id", -1))
+        slot = self.slots.get(slot_id)
+        if slot is None:
+            return False, f"slot {slot_id} not found"
+
+        live = self._find_live_exit_for_position(position)
+        if live is None:
+            return False, f"position {pid} has no live exit order"
+        local_id, order = live
+
+        old_txid = str(order.txid or "").strip()
+        if not old_txid:
+            return False, "position exit has no txid"
+
+        old_price = float(order.price)
+        now = _now()
+        try:
+            cancelled = self._cancel_order(old_txid)
+        except Exception:
+            cancelled = False
+        if not cancelled:
+            return False, "failed to cancel current exit"
+
+        market_txid: str | None = None
+        try:
+            market_txid = self._place_market_order(
+                side=str(order.side),
+                volume=float(order.volume),
+                userref=(int(slot_id) * 1_000_000 + 970_000 + int(local_id)),
+            )
+        except Exception:
+            market_txid = None
+
+        if not market_txid:
+            restore_txid: str | None = None
+            try:
+                restore_txid = self._place_order(
+                    side=str(order.side),
+                    volume=float(order.volume),
+                    price=float(old_price),
+                    userref=(int(slot_id) * 1_000_000 + 971_000 + int(local_id)),
+                )
+            except Exception:
+                restore_txid = None
+            self._position_by_exit_txid.pop(old_txid, None)
+            if restore_txid:
+                restore_norm = str(restore_txid).strip()
+                self._patch_live_exit_order(
+                    slot_id=int(slot_id),
+                    local_id=int(local_id),
+                    price=float(old_price),
+                    txid=restore_norm,
+                    placed_at=float(now),
+                )
+                self._position_by_exit_local[(int(slot_id), int(local_id))] = int(pid)
+                if restore_norm:
+                    self._position_by_exit_txid[restore_norm] = int(pid)
+                    self._position_ledger.bind_exit_txid(int(pid), restore_norm)
+                self._persist_position_ledger_row(int(pid))
+                return False, "market close failed; restored previous exit order"
+
+            self._patch_live_exit_order(
+                slot_id=int(slot_id),
+                local_id=int(local_id),
+                price=float(old_price),
+                txid="",
+                placed_at=float(now),
+            )
+            self.pause(
+                f"self-heal write-off failed: slot={slot_id} local={local_id} market close placement failed"
+            )
+            return False, "market close failed and restore failed; bot paused"
+
+        market_txid_norm = str(market_txid).strip()
+        volume = max(0.0, float(order.volume))
+        if volume <= 0.0:
+            return False, "invalid position volume"
+
+        fill_price = float(slot.state.market_price if slot.state.market_price > 0 else self.last_price)
+        if fill_price <= 0.0:
+            fill_price = max(
+                0.0,
+                float(position.get("current_exit_price", 0.0) or 0.0),
+                float(position.get("entry_price", 0.0) or 0.0),
+                float(old_price),
+            )
+        if fill_price <= 0.0:
+            return False, "market price unavailable"
+
+        fill_fee = max(0.0, fill_price * volume * (max(0.0, float(self.taker_fee_pct)) / 100.0))
+        fill_cost = fill_price * volume
+
+        try:
+            self._apply_event(
+                int(slot_id),
+                sm.FillEvent(
+                    order_local_id=int(local_id),
+                    txid=market_txid_norm,
+                    side=str(order.side),
+                    price=float(fill_price),
+                    volume=float(volume),
+                    fee=float(fill_fee),
+                    timestamp=float(now),
+                ),
+                "self_heal_write_off",
+                {
+                    "position_id": int(pid),
+                    "txid": market_txid_norm,
+                    "fill_price": float(fill_price),
+                    "fill_fee": float(fill_fee),
+                    "reason": str(operator_reason or "manual"),
+                },
+            )
+        except Exception as e:
+            logger.exception("self-heal write-off transition failed position=%s: %s", pid, e)
+            self.pause(f"self-heal write-off transition failed for position {pid}")
+            return False, f"market close placed but local transition failed: {e}"
+
+        slot_after = self.slots.get(int(slot_id))
+        cycle_row = None
+        if slot_after is not None:
+            cycle_row = next(
+                (
+                    c
+                    for c in reversed(slot_after.state.completed_cycles)
+                    if str(c.trade_id) == str(order.trade_id)
+                    and int(c.cycle) == int(order.cycle)
+                ),
+                None,
+            )
+        if cycle_row is not None:
+            net_profit = float(cycle_row.net_profit)
+        else:
+            entry_price = float(position.get("entry_price", 0.0) or 0.0)
+            entry_fee = float(position.get("entry_fee", 0.0) or 0.0)
+            gross = (fill_price - entry_price) * volume if order.side == "sell" else (entry_price - fill_price) * volume
+            net_profit = gross - (entry_fee + float(fill_fee))
+
+        try:
+            self._position_ledger.close_position(
+                int(pid),
+                {
+                    "exit_price": float(fill_price),
+                    "exit_cost": float(fill_cost),
+                    "exit_fee": float(fill_fee),
+                    "exit_time": float(now),
+                    "exit_regime": str(self._regime_label(self._current_regime_id())),
+                    "net_profit": float(net_profit),
+                    "close_reason": "write_off",
+                    "reason": str(operator_reason or "manual"),
+                },
+            )
+            self._persist_position_ledger_row(int(pid))
+            self._persist_position_journal_tail(int(pid), count=1)
+        except Exception as e:
+            logger.warning(
+                "self-heal write-off ledger close failed slot=%s local=%s position=%s: %s",
+                int(slot_id),
+                int(local_id),
+                int(pid),
+                e,
+            )
+            return False, f"market close executed but ledger close failed: {e}"
+
+        self._cycle_slot_mode[(int(slot_id), str(order.trade_id), int(order.cycle))] = str(
+            position.get("slot_mode") or "legacy"
+        )
+        self._self_heal_operator_journal(
+            position_id=int(pid),
+            event_type="operator_action",
+            details={
+                "action": "close_market_write_off",
+                "operator_reason": str(operator_reason or "manual"),
+                "txid": market_txid_norm,
+                "fill_price": float(fill_price),
+                "fill_fee": float(fill_fee),
+                "net_profit": float(net_profit),
+            },
+            now_ts=now,
+        )
+
+        self._self_heal_hold_until_by_position.pop(int(pid), None)
+        self._unbind_position_for_exit(int(slot_id), int(local_id), str(old_txid))
+        self.seen_fill_txids.add(market_txid_norm)
+        return True, f"position {pid}: closed at market @ ${fill_price:.6f}"
+
+    def _run_self_healing_reprice(self, now_ts: float | None = None) -> None:
+        now = float(now_ts if now_ts is not None else _now())
+        if not self._position_ledger_enabled():
+            return
+        if not bool(getattr(config, "SUBSIDY_ENABLED", False)):
+            return
+
+        open_positions = self._position_ledger.get_open_positions()
+        summary: dict[str, Any] = {
+            "timestamp": float(now),
+            "checked": 0,
+            "repriced": 0,
+            "tighten": 0,
+            "subsidy": 0,
+            "skipped": {},
+        }
+
+        def _skip(reason: str) -> None:
+            key = str(reason or "unknown")
+            skipped = summary["skipped"]
+            skipped[key] = int(skipped.get(key, 0)) + 1
+
+        min_subsidy_rank = self._self_heal_auto_reprice_min_rank()
+        cooldown_sec = max(0.0, float(getattr(config, "SUBSIDY_REPRICE_INTERVAL_SEC", 3600)))
+        decimals = max(0, int(self.constraints.get("price_decimals", 6)))
+        price_scale = float(10 ** decimals) if decimals >= 0 else 1.0
+
+        for position in open_positions:
+            summary["checked"] = int(summary["checked"]) + 1
+            try:
+                slot_id = int(position.get("slot_id", -1))
+                position_id = int(position.get("position_id", 0))
+            except (TypeError, ValueError):
+                _skip("invalid_position")
+                continue
+            if slot_id < 0 or position_id <= 0:
+                _skip("invalid_position")
+                continue
+            slot = self.slots.get(slot_id)
+            if slot is None:
+                _skip("slot_missing")
+                continue
+
+            live = self._find_live_exit_for_position(position)
+            if live is None:
+                _skip("live_exit_missing")
+                continue
+            local_id, order = live
+            del local_id  # local_id is represented in `order`; keep intent explicit.
+
+            market = float(slot.state.market_price if slot.state.market_price > 0 else self.last_price)
+            if market <= 0:
+                _skip("market_unavailable")
+                continue
+
+            exit_px = float(position.get("current_exit_price", 0.0) or 0.0)
+            age = max(0.0, now - float(position.get("entry_time", now) or now))
+            distance = abs(exit_px - market) / market * 100.0 if market > 0 else 0.0
+            band = self._age_band_for_effective_age(self._effective_age_seconds(age, distance))
+            band_rank = self._self_heal_band_rank(band)
+
+            # Stale-band tighten: one-time, no subsidy debit.
+            if band == "stale":
+                if not self._has_position_reprice_reason(position_id, "tighten"):
+                    target_pct = float(position.get("target_profit_pct", self.profit_pct) or self.profit_pct)
+                    tighten_price, tighten_target_pct = self._self_heal_tighten_target_price(
+                        position=position,
+                        slot=slot,
+                        side=order.side,
+                        market=market,
+                    )
+                    if tighten_price > 0 and target_pct > (tighten_target_pct + 0.1):
+                        old_price = float(position.get("current_exit_price", order.price) or order.price)
+                        tick = 1.0 / price_scale if price_scale > 0 else 0.0
+                        if (
+                            (order.side == "sell" and old_price - tighten_price >= tick)
+                            or (order.side == "buy" and tighten_price - old_price >= tick)
+                        ):
+                            ok, reason = self._execute_self_heal_reprice(
+                                position_id=position_id,
+                                slot_id=slot_id,
+                                order=order,
+                                new_price=float(tighten_price),
+                                reason="tighten",
+                                subsidy_consumed=0.0,
+                                now_ts=now,
+                            )
+                            if ok:
+                                summary["repriced"] = int(summary["repriced"]) + 1
+                                summary["tighten"] = int(summary["tighten"]) + 1
+                                continue
+                            _skip(reason)
+                        else:
+                            _skip("no_fillable_delta")
+                    else:
+                        _skip("tighten_not_needed")
+                else:
+                    _skip("tighten_done")
+
+            if band_rank < min_subsidy_rank:
+                _skip("band_not_eligible")
+                continue
+
+            needed, fillable = self._subsidy_needed_for_position(
+                position,
+                slot=slot,
+                side=order.side,
+                market=market,
+                volume_override=float(order.volume),
+            )
+            if needed <= 1e-12 or fillable <= 0.0:
+                _skip("no_fillable_delta")
+                continue
+
+            last_subsidy_ts = self._last_position_reprice_ts(position_id, reason="subsidy")
+            if last_subsidy_ts > 0 and cooldown_sec > 0 and (now - last_subsidy_ts) < cooldown_sec:
+                _skip("cooldown")
+                continue
+
+            subsidy_balance = max(0.0, float(self._position_ledger.get_subsidy_balance(slot_id)))
+            if subsidy_balance <= 1e-12:
+                _skip("insufficient_balance")
+                continue
+
+            current_exit = float(position.get("current_exit_price", order.price) or order.price)
+            volume = max(0.0, float(order.volume))
+            if volume <= 0.0:
+                _skip("invalid_volume")
+                continue
+
+            affordable = min(needed, subsidy_balance)
+            delta_px = affordable / volume
+            if delta_px <= 0:
+                _skip("insufficient_balance")
+                continue
+
+            if order.side == "sell":
+                raw_target = max(fillable, current_exit - delta_px)
+                if affordable + 1e-12 < needed:
+                    raw_target = max(fillable, ceil(raw_target * price_scale) / price_scale)
+            else:
+                raw_target = min(fillable, current_exit + delta_px)
+                if affordable + 1e-12 < needed:
+                    raw_target = min(fillable, floor(raw_target * price_scale) / price_scale)
+
+            target_price = float(round(raw_target, decimals))
+            if order.side == "sell":
+                target_price = max(fillable, target_price)
+            else:
+                target_price = min(fillable, target_price)
+
+            subsidy_consumed = max(0.0, abs(current_exit - target_price) * volume)
+            if subsidy_consumed <= 1e-12:
+                _skip("no_fillable_delta")
+                continue
+            if subsidy_consumed > subsidy_balance + 1e-9:
+                _skip("insufficient_balance")
+                continue
+
+            ok, reason = self._execute_self_heal_reprice(
+                position_id=position_id,
+                slot_id=slot_id,
+                order=order,
+                new_price=target_price,
+                reason="subsidy",
+                subsidy_consumed=subsidy_consumed,
+                now_ts=now,
+            )
+            if ok:
+                summary["repriced"] = int(summary["repriced"]) + 1
+                summary["subsidy"] = int(summary["subsidy"]) + 1
+            else:
+                _skip(reason)
+
+        if int(summary["repriced"]) > 0:
+            self._self_heal_reprice_total += int(summary["repriced"])
+            self._self_heal_reprice_last_at = float(now)
+        self._self_heal_reprice_last_summary = summary
+
+    def _churner_enabled(self) -> bool:
+        return bool(getattr(config, "CHURNER_ENABLED", False)) and self._position_ledger_enabled()
+
+    def _ensure_churner_state(self, slot_id: int) -> ChurnerRuntimeState:
+        sid = int(slot_id)
+        state = self._churner_by_slot.get(sid)
+        if state is None:
+            base_usd = max(
+                0.0,
+                float(getattr(config, "CHURNER_ORDER_SIZE_USD", getattr(config, "ORDER_SIZE_USD", 0.0))),
+            )
+            state = ChurnerRuntimeState(order_size_usd=base_usd)
+            self._churner_by_slot[sid] = state
+        return state
+
+    def _reconcile_churner_state(self) -> None:
+        valid_slots = {int(sid) for sid in self.slots.keys()}
+        for sid in list(self._churner_by_slot.keys()):
+            if int(sid) in valid_slots:
+                continue
+            state = self._churner_by_slot.pop(int(sid), None)
+            if state is not None:
+                self._churner_release_reserve(state)
+
+        max_reserve = max(0.0, float(getattr(config, "CHURNER_RESERVE_USD", 0.0)))
+        allocated = sum(max(0.0, float(state.reserve_allocated_usd)) for state in self._churner_by_slot.values())
+        self._churner_reserve_available_usd = max(0.0, min(max_reserve, max_reserve - allocated))
+
+    def _churner_release_reserve(self, state: ChurnerRuntimeState) -> None:
+        if float(state.reserve_allocated_usd) <= 0.0:
+            return
+        max_reserve = max(0.0, float(getattr(config, "CHURNER_RESERVE_USD", 0.0)))
+        self._churner_reserve_available_usd = min(
+            max_reserve,
+            float(self._churner_reserve_available_usd) + float(state.reserve_allocated_usd),
+        )
+        state.reserve_allocated_usd = 0.0
+
+    def _churner_reset_state(
+        self,
+        state: ChurnerRuntimeState,
+        *,
+        now_ts: float,
+        reason: str = "",
+        keep_compound: bool = True,
+    ) -> None:
+        self._churner_release_reserve(state)
+        compound = float(state.compound_usd) if keep_compound else 0.0
+        base_usd = max(
+            0.0,
+            float(getattr(config, "CHURNER_ORDER_SIZE_USD", getattr(config, "ORDER_SIZE_USD", 0.0))),
+        )
+        state.active = False
+        state.stage = "idle"
+        state.parent_position_id = 0
+        state.parent_trade_id = ""
+        state.cycle_id = 0
+        state.order_size_usd = max(base_usd, base_usd + compound)
+        state.compound_usd = max(0.0, compound)
+        state.entry_side = ""
+        state.entry_txid = ""
+        state.entry_price = 0.0
+        state.entry_volume = 0.0
+        state.entry_placed_at = 0.0
+        state.entry_fill_price = 0.0
+        state.entry_fill_fee = 0.0
+        state.entry_fill_time = 0.0
+        state.exit_txid = ""
+        state.exit_price = 0.0
+        state.exit_placed_at = 0.0
+        state.churner_position_id = 0
+        state.last_error = str(reason or "")
+        state.last_state_change_at = float(now_ts)
+
+    @staticmethod
+    def _churner_entry_side_for_trade(trade_id: str) -> str:
+        return "buy" if str(trade_id or "").strip().upper() == "B" else "sell"
+
+    def _churner_entry_target_price(self, *, side: str, market: float) -> float:
+        if market <= 0:
+            return 0.0
+        pct = max(0.0, float(getattr(config, "CHURNER_ENTRY_PCT", 0.15))) / 100.0
+        if str(side).lower() == "buy":
+            raw = market * (1.0 - pct)
+        else:
+            raw = market * (1.0 + pct)
+        return round(raw, max(0, int(self.constraints.get("price_decimals", 6))))
+
+    def _churner_exit_target_price(self, *, entry_side: str, entry_fill_price: float, market: float) -> float:
+        if entry_fill_price <= 0:
+            return 0.0
+        profit_pct = max(0.0, float(getattr(config, "CHURNER_PROFIT_PCT", 0.0))) / 100.0
+        entry_pct = max(0.0, float(getattr(config, "CHURNER_ENTRY_PCT", 0.15))) / 100.0
+        if str(entry_side).lower() == "buy":
+            raw = entry_fill_price * (1.0 + profit_pct)
+            if market > 0:
+                raw = max(raw, market * (1.0 + entry_pct))
+        else:
+            raw = entry_fill_price * (1.0 - profit_pct)
+            if market > 0:
+                raw = min(raw, market * (1.0 - entry_pct))
+        return round(raw, max(0, int(self.constraints.get("price_decimals", 6))))
+
+    def _churner_candidate_parent_position(
+        self,
+        slot_id: int,
+        *,
+        now_ts: float,
+    ) -> tuple[dict[str, Any], sm.OrderState, float, str] | None:
+        slot = self.slots.get(int(slot_id))
+        if slot is None:
+            return None
+        market = float(slot.state.market_price if slot.state.market_price > 0 else self.last_price)
+        if market <= 0:
+            return None
+
+        best: tuple[dict[str, Any], sm.OrderState, float, str] | None = None
+        best_key: tuple[float, float, int] | None = None
+        aging_rank = self._self_heal_band_rank("aging")
+        for pos in self._position_ledger.get_open_positions(slot_id=int(slot_id)):
+            if str(pos.get("slot_mode") or "") == "churner":
+                continue
+            live = self._find_live_exit_for_position(pos)
+            if live is None:
+                continue
+            _local_id, order = live
+            age = max(0.0, float(now_ts) - float(pos.get("entry_time", now_ts) or now_ts))
+            distance = abs(float(pos.get("current_exit_price", order.price) or order.price) - market) / market * 100.0
+            effective_age = self._effective_age_seconds(age, distance)
+            band = self._age_band_for_effective_age(effective_age)
+            if self._self_heal_band_rank(band) < aging_rank:
+                continue
+            key = (float(effective_age), float(age), int(pos.get("position_id", 0) or 0))
+            if best_key is None or key > best_key:
+                best_key = key
+                best = (pos, order, effective_age, band)
+        return best
+
+    def _churner_gate_check(
+        self,
+        *,
+        slot_id: int,
+        state: ChurnerRuntimeState,
+        parent: dict[str, Any],
+        parent_order: sm.OrderState,
+        now_ts: float,
+    ) -> tuple[bool, str, float, float, float]:
+        sid = int(slot_id)
+        slot = self.slots.get(sid)
+        if slot is None:
+            return False, "slot_missing", 0.0, 0.0, 0.0
+        regime_name, _confidence, _bias, _ready, _source = self._policy_hmm_signal()
+        if str(regime_name or "").strip().upper() != "RANGING":
+            return False, "regime_not_ranging", 0.0, 0.0, 0.0
+
+        capacity = self._compute_capacity_health(now_ts)
+        headroom = int(capacity.get("open_order_headroom") or 0)
+        min_headroom = max(0, int(getattr(config, "CHURNER_MIN_HEADROOM", 0)))
+        if headroom < min_headroom:
+            return False, "headroom_low", 0.0, 0.0, 0.0
+
+        market = float(slot.state.market_price if slot.state.market_price > 0 else self.last_price)
+        if market <= 0:
+            return False, "market_unavailable", 0.0, 0.0, 0.0
+
+        entry_side = self._churner_entry_side_for_trade(str(parent.get("trade_id") or parent_order.trade_id))
+        entry_price = self._churner_entry_target_price(side=entry_side, market=market)
+        if entry_price <= 0:
+            return False, "invalid_entry_price", 0.0, 0.0, 0.0
+
+        base_order_size_usd = max(
+            0.0,
+            float(getattr(config, "CHURNER_ORDER_SIZE_USD", getattr(config, "ORDER_SIZE_USD", 0.0))),
+        )
+        order_size_usd = max(base_order_size_usd, base_order_size_usd + float(state.compound_usd))
+        cfg = self._engine_cfg(slot)
+        volume = sm.compute_order_volume(float(entry_price), cfg, float(order_size_usd))
+        if volume is None:
+            return False, "below_min_size", 0.0, 0.0, 0.0
+        volume = float(volume)
+        required_usd = max(0.0, float(volume) * float(entry_price))
+
+        free_usd, free_doge = self._available_free_balances(prefer_fresh=False)
+        has_capital = (entry_side == "buy" and free_usd >= required_usd - 1e-12) or (
+            entry_side == "sell" and free_doge >= volume - 1e-12
+        )
+        if has_capital:
+            return True, "ok", float(entry_price), float(volume), float(required_usd)
+
+        # Reserve backstop: one-order-size cap per slot.
+        max_slot_reserve = max(base_order_size_usd, 0.0)
+        already_alloc = max(0.0, float(state.reserve_allocated_usd))
+        if already_alloc > max_slot_reserve + 1e-12:
+            already_alloc = max_slot_reserve
+        alloc_needed = min(max_slot_reserve - already_alloc, required_usd)
+        if alloc_needed <= 1e-12:
+            return False, "capital_unavailable", 0.0, 0.0, 0.0
+        if self._churner_reserve_available_usd + 1e-12 < alloc_needed:
+            return False, "reserve_exhausted", 0.0, 0.0, 0.0
+        state.reserve_allocated_usd = already_alloc + alloc_needed
+        self._churner_reserve_available_usd = max(0.0, self._churner_reserve_available_usd - alloc_needed)
+        return True, "ok_reserve", float(entry_price), float(volume), float(required_usd)
+
+    def _churner_open_position_on_entry_fill(
+        self,
+        *,
+        slot_id: int,
+        state: ChurnerRuntimeState,
+        fill_price: float,
+        fill_volume: float,
+        fill_fee: float,
+        fill_cost: float,
+        fill_ts: float,
+        exit_price_hint: float,
+    ) -> int:
+        if not self._position_ledger_enabled():
+            return 0
+        try:
+            pid = self._position_ledger.open_position(
+                slot_id=int(slot_id),
+                trade_id=str(state.parent_trade_id or "B"),
+                slot_mode="churner",
+                cycle=max(1, int(state.cycle_id or 1)),
+                entry_data={
+                    "entry_price": float(fill_price),
+                    "entry_cost": float(fill_cost if fill_cost > 0 else fill_price * fill_volume),
+                    "entry_fee": float(fill_fee),
+                    "entry_volume": float(fill_volume),
+                    "entry_time": float(fill_ts),
+                    "entry_regime": str(self._regime_label(self._current_regime_id())),
+                    "entry_volatility": 0.0,
+                },
+                exit_data={
+                    "current_exit_price": float(exit_price_hint),
+                    "original_exit_price": float(exit_price_hint),
+                    "target_profit_pct": float(getattr(config, "CHURNER_PROFIT_PCT", 0.0)),
+                    "exit_txid": "",
+                },
+            )
+            self._position_ledger.journal_event(
+                int(pid),
+                "created",
+                {
+                    "entry_price": float(fill_price),
+                    "exit_price": float(exit_price_hint),
+                    "regime": str(self._regime_label(self._current_regime_id())),
+                    "slot_mode": "churner",
+                },
+                timestamp=float(fill_ts),
+            )
+            self._persist_position_ledger_row(int(pid))
+            self._persist_position_journal_tail(int(pid), count=1)
+            return int(pid)
+        except Exception as e:
+            logger.warning("churner open position failed slot=%s cycle=%s: %s", int(slot_id), int(state.cycle_id), e)
+            return 0
+
+    def _churner_close_position_cancelled(
+        self,
+        *,
+        slot_id: int,
+        state: ChurnerRuntimeState,
+        now_ts: float,
+        reason: str,
+    ) -> None:
+        pid = int(state.churner_position_id or 0)
+        if pid <= 0:
+            return
+        try:
+            exit_price = float(state.exit_price if state.exit_price > 0 else state.entry_fill_price)
+            if exit_price <= 0:
+                slot = self.slots.get(int(slot_id))
+                exit_price = float(slot.state.market_price if slot and slot.state.market_price > 0 else self.last_price)
+            self._position_ledger.close_position(
+                pid,
+                {
+                    "exit_price": float(exit_price or 0.0),
+                    "exit_cost": 0.0,
+                    "exit_fee": 0.0,
+                    "exit_time": float(now_ts),
+                    "exit_regime": str(self._regime_label(self._current_regime_id())),
+                    "net_profit": 0.0,
+                    "close_reason": "cancelled",
+                    "reason": str(reason or "cancelled"),
+                    "age_seconds": max(0.0, float(now_ts) - float(state.entry_fill_time or now_ts)),
+                },
+            )
+            self._persist_position_ledger_row(pid)
+            self._persist_position_journal_tail(pid, count=1)
+        except Exception as e:
+            logger.warning("churner cancelled close failed slot=%s pid=%s: %s", int(slot_id), pid, e)
+
+    def _churner_route_profit(
+        self,
+        *,
+        slot_id: int,
+        state: ChurnerRuntimeState,
+        net_profit: float,
+        now_ts: float,
+    ) -> None:
+        gain = max(0.0, float(net_profit))
+        if gain <= 0.0:
+            return
+        parent_id = int(state.parent_position_id or 0)
+        if parent_id <= 0:
+            state.compound_usd += gain
+            return
+
+        parent = self._position_ledger.get_position(parent_id)
+        slot = self.slots.get(int(slot_id))
+        if not isinstance(parent, dict) or slot is None or str(parent.get("status") or "") != "open":
+            state.compound_usd += gain
+            return
+
+        live = self._find_live_exit_for_position(parent)
+        needed = 0.0
+        if live is not None:
+            _local_id, parent_order = live
+            market = float(slot.state.market_price if slot.state.market_price > 0 else self.last_price)
+            needed, _fillable = self._subsidy_needed_for_position(
+                parent,
+                slot=slot,
+                side=parent_order.side,
+                market=market,
+                volume_override=float(parent_order.volume),
+            )
+        balance = max(0.0, float(self._position_ledger.get_subsidy_balance(int(slot_id))))
+        if needed > 1e-12 and balance + 1e-12 < needed:
+            try:
+                self._position_ledger.journal_event(
+                    parent_id,
+                    "churner_profit",
+                    {
+                        "net_profit": float(gain),
+                        "churner_cycle_id": int(state.cycle_id or 0),
+                    },
+                    timestamp=float(now_ts),
+                )
+                self._persist_position_journal_tail(parent_id, count=1)
+            except Exception as e:
+                logger.warning(
+                    "churner profit journal failed slot=%s parent=%s cycle=%s: %s",
+                    int(slot_id),
+                    int(parent_id),
+                    int(state.cycle_id or 0),
+                    e,
+                )
+            return
+
+        state.compound_usd += gain
+
+    def _churner_on_entry_fill(
+        self,
+        *,
+        slot_id: int,
+        txid: str,
+        fill_price: float,
+        fill_volume: float,
+        fill_fee: float,
+        fill_cost: float,
+        fill_ts: float,
+    ) -> None:
+        state = self._churner_by_slot.get(int(slot_id))
+        if state is None:
+            return
+        txid_norm = str(txid or "").strip()
+        if str(state.stage) != "entry_open" or txid_norm != str(state.entry_txid or "").strip():
+            return
+        slot = self.slots.get(int(slot_id))
+        if slot is None:
+            self._churner_reset_state(state, now_ts=float(fill_ts), reason="slot_missing")
+            return
+
+        state.entry_fill_price = float(fill_price)
+        state.entry_fill_fee = max(0.0, float(fill_fee))
+        state.entry_fill_time = float(fill_ts)
+        state.entry_volume = max(0.0, float(fill_volume))
+        market = float(slot.state.market_price if slot.state.market_price > 0 else self.last_price)
+        exit_price = self._churner_exit_target_price(
+            entry_side=str(state.entry_side),
+            entry_fill_price=float(fill_price),
+            market=float(market),
+        )
+        if exit_price <= 0:
+            self._churner_reset_state(state, now_ts=float(fill_ts), reason="invalid_exit_price")
+            return
+
+        pid = self._churner_open_position_on_entry_fill(
+            slot_id=int(slot_id),
+            state=state,
+            fill_price=float(fill_price),
+            fill_volume=float(fill_volume),
+            fill_fee=float(fill_fee),
+            fill_cost=float(fill_cost),
+            fill_ts=float(fill_ts),
+            exit_price_hint=float(exit_price),
+        )
+        state.churner_position_id = int(pid)
+        exit_side = "sell" if str(state.entry_side) == "buy" else "buy"
+        txid_new: str | None = None
+        try:
+            txid_new = self._place_order(
+                side=exit_side,
+                volume=float(fill_volume),
+                price=float(exit_price),
+                userref=(int(slot_id) * 1_000_000 + 960_000 + int(state.cycle_id or 0)),
+            )
+        except Exception:
+            txid_new = None
+        if not txid_new:
+            self._churner_close_position_cancelled(
+                slot_id=int(slot_id),
+                state=state,
+                now_ts=float(fill_ts),
+                reason="exit_place_failed",
+            )
+            self._churner_reset_state(state, now_ts=float(fill_ts), reason="exit_place_failed")
+            return
+
+        state.exit_txid = str(txid_new)
+        state.exit_price = float(exit_price)
+        state.exit_placed_at = float(fill_ts)
+        state.stage = "exit_open"
+        state.last_state_change_at = float(fill_ts)
+        state.entry_txid = ""
+        self.ledger.commit_order(exit_side, float(exit_price), float(fill_volume))
+        if pid > 0:
+            self._position_ledger.bind_exit_txid(int(pid), str(txid_new))
+            self._persist_position_ledger_row(int(pid))
+
+    def _churner_on_exit_fill(
+        self,
+        *,
+        slot_id: int,
+        txid: str,
+        fill_price: float,
+        fill_volume: float,
+        fill_fee: float,
+        fill_cost: float,
+        fill_ts: float,
+    ) -> None:
+        state = self._churner_by_slot.get(int(slot_id))
+        if state is None:
+            return
+        txid_norm = str(txid or "").strip()
+        if str(state.stage) != "exit_open" or txid_norm != str(state.exit_txid or "").strip():
+            return
+
+        vol = max(0.0, float(fill_volume if fill_volume > 0 else state.entry_volume))
+        if vol <= 0:
+            vol = max(0.0, float(state.entry_volume))
+        if str(state.entry_side) == "buy":
+            gross = (float(fill_price) - float(state.entry_fill_price)) * vol
+        else:
+            gross = (float(state.entry_fill_price) - float(fill_price)) * vol
+        net_profit = float(gross) - (max(0.0, float(state.entry_fill_fee)) + max(0.0, float(fill_fee)))
+
+        pid = int(state.churner_position_id or 0)
+        if pid > 0:
+            try:
+                self._position_ledger.close_position(
+                    pid,
+                    {
+                        "exit_price": float(fill_price),
+                        "exit_cost": float(fill_cost if fill_cost > 0 else fill_price * vol),
+                        "exit_fee": max(0.0, float(fill_fee)),
+                        "exit_time": float(fill_ts),
+                        "exit_regime": str(self._regime_label(self._current_regime_id())),
+                        "net_profit": float(net_profit),
+                        "close_reason": "filled",
+                    },
+                )
+                row = self._position_ledger.get_position(pid)
+                if isinstance(row, dict):
+                    self._cycle_slot_mode[
+                        (int(slot_id), str(row.get("trade_id") or state.parent_trade_id), int(row.get("cycle", 0) or 0))
+                    ] = "churner"
+                self._persist_position_ledger_row(pid)
+                self._persist_position_journal_tail(pid, count=1)
+            except Exception as e:
+                logger.warning("churner close position failed slot=%s pid=%s: %s", int(slot_id), pid, e)
+
+        self._churner_route_profit(
+            slot_id=int(slot_id),
+            state=state,
+            net_profit=float(net_profit),
+            now_ts=float(fill_ts),
+        )
+        self._churner_cycles_total += 1
+        self._churner_profit_total += float(net_profit)
+        self._churner_cycles_today += 1
+        self._churner_profit_today += float(net_profit)
+        self._churner_reset_state(state, now_ts=float(fill_ts), reason="")
+
+    def _churner_on_order_canceled(
+        self,
+        *,
+        slot_id: int,
+        kind: str,
+        txid: str,
+        now_ts: float,
+    ) -> None:
+        state = self._churner_by_slot.get(int(slot_id))
+        if state is None:
+            return
+        txid_norm = str(txid or "").strip()
+        if kind == "churner_entry" and txid_norm == str(state.entry_txid or "").strip():
+            self._churner_reset_state(state, now_ts=float(now_ts), reason="entry_canceled")
+            return
+        if kind == "churner_exit" and txid_norm == str(state.exit_txid or "").strip():
+            self._churner_close_position_cancelled(
+                slot_id=int(slot_id),
+                state=state,
+                now_ts=float(now_ts),
+                reason="exit_canceled",
+            )
+            self._churner_reset_state(state, now_ts=float(now_ts), reason="exit_canceled")
+
+    def _churner_timeout_tick(self, *, slot_id: int, state: ChurnerRuntimeState, now_ts: float) -> None:
+        now = float(now_ts)
+        if str(state.stage) == "entry_open" and state.entry_placed_at > 0:
+            timeout_sec = max(60.0, float(getattr(config, "CHURNER_TIMEOUT_SEC", 300)))
+            if now - float(state.entry_placed_at) >= timeout_sec:
+                txid = str(state.entry_txid or "").strip()
+                if txid:
+                    try:
+                        ok = self._cancel_order(txid)
+                    except Exception:
+                        ok = False
+                    if not ok:
+                        state.last_error = "entry_timeout_cancel_failed"
+                        return
+                self._churner_reset_state(state, now_ts=now, reason="entry_timeout")
+            return
+
+        if str(state.stage) == "exit_open" and state.exit_placed_at > 0:
+            timeout_sec = max(
+                float(getattr(config, "CHURNER_TIMEOUT_SEC", 300)),
+                float(getattr(config, "CHURNER_EXIT_TIMEOUT_SEC", 600)),
+            )
+            if now - float(state.exit_placed_at) >= timeout_sec:
+                txid = str(state.exit_txid or "").strip()
+                if txid:
+                    try:
+                        ok = self._cancel_order(txid)
+                    except Exception:
+                        ok = False
+                    if not ok:
+                        state.last_error = "exit_timeout_cancel_failed"
+                        return
+                self._churner_close_position_cancelled(
+                    slot_id=int(slot_id),
+                    state=state,
+                    now_ts=now,
+                    reason="exit_timeout",
+                )
+                self._churner_reset_state(state, now_ts=now, reason="exit_timeout")
+
+    def _run_churner_engine(self, now_ts: float | None = None) -> None:
+        now = float(now_ts if now_ts is not None else _now())
+        if not self._churner_enabled():
+            for sid, state in list(self._churner_by_slot.items()):
+                txids = [str(state.entry_txid or "").strip(), str(state.exit_txid or "").strip()]
+                for txid in txids:
+                    if not txid:
+                        continue
+                    try:
+                        self._cancel_order(txid)
+                    except Exception:
+                        pass
+                if str(state.stage) == "exit_open":
+                    self._churner_close_position_cancelled(
+                        slot_id=int(sid),
+                        state=state,
+                        now_ts=now,
+                        reason="churner_disabled",
+                    )
+                self._churner_reset_state(state, now_ts=now, reason="churner_disabled")
+            return
+        self._reconcile_churner_state()
+        day_key = self._utc_day_key(now)
+        if day_key != str(self._churner_day_key or ""):
+            self._churner_day_key = day_key
+            self._churner_cycles_today = 0
+            self._churner_profit_today = 0.0
+
+        max_reserve = max(0.0, float(getattr(config, "CHURNER_RESERVE_USD", 0.0)))
+        if self._churner_reserve_available_usd > max_reserve:
+            self._churner_reserve_available_usd = max_reserve
+
+        for sid in sorted(self.slots.keys()):
+            state = self._ensure_churner_state(int(sid))
+            if state.active:
+                parent_id = int(state.parent_position_id or 0)
+                if parent_id <= 0:
+                    self._churner_reset_state(state, now_ts=now, reason="parent_missing")
+                    continue
+                parent = self._position_ledger.get_position(parent_id)
+                if not isinstance(parent, dict) or str(parent.get("status") or "") != "open":
+                    txids = [str(state.entry_txid or "").strip(), str(state.exit_txid or "").strip()]
+                    for txid in txids:
+                        if not txid:
+                            continue
+                        try:
+                            self._cancel_order(txid)
+                        except Exception:
+                            pass
+                    if str(state.stage) == "exit_open":
+                        self._churner_close_position_cancelled(
+                            slot_id=int(sid),
+                            state=state,
+                            now_ts=now,
+                            reason="parent_closed",
+                        )
+                    self._churner_reset_state(state, now_ts=now, reason="parent_closed")
+                    continue
+                capacity = self._compute_capacity_health(now)
+                headroom = int(capacity.get("open_order_headroom") or 0)
+                min_headroom = max(0, int(getattr(config, "CHURNER_MIN_HEADROOM", 0)))
+                if headroom < min_headroom:
+                    txids = [str(state.entry_txid or "").strip(), str(state.exit_txid or "").strip()]
+                    for txid in txids:
+                        if not txid:
+                            continue
+                        try:
+                            self._cancel_order(txid)
+                        except Exception:
+                            pass
+                    if str(state.stage) == "exit_open":
+                        self._churner_close_position_cancelled(
+                            slot_id=int(sid),
+                            state=state,
+                            now_ts=now,
+                            reason="headroom_low",
+                        )
+                    self._churner_reset_state(state, now_ts=now, reason="headroom_low")
+                    continue
+                regime_name, _conf, _bias, _ready, _source = self._policy_hmm_signal()
+                if str(regime_name or "").strip().upper() != "RANGING":
+                    txids = [str(state.entry_txid or "").strip(), str(state.exit_txid or "").strip()]
+                    for txid in txids:
+                        if not txid:
+                            continue
+                        try:
+                            self._cancel_order(txid)
+                        except Exception:
+                            pass
+                    if str(state.stage) == "exit_open":
+                        self._churner_close_position_cancelled(
+                            slot_id=int(sid),
+                            state=state,
+                            now_ts=now,
+                            reason="regime_shift",
+                        )
+                    self._churner_reset_state(state, now_ts=now, reason="regime_shift")
+                    continue
+                self._churner_timeout_tick(slot_id=int(sid), state=state, now_ts=now)
+                continue
+
+            candidate = self._churner_candidate_parent_position(int(sid), now_ts=now)
+            if candidate is None:
+                continue
+            parent, parent_order, _effective_age, _band = candidate
+            ok, gate_reason, entry_price, volume, _required_usd = self._churner_gate_check(
+                slot_id=int(sid),
+                state=state,
+                parent=parent,
+                parent_order=parent_order,
+                now_ts=now,
+            )
+            if not ok:
+                state.last_error = str(gate_reason)
+                continue
+
+            state.parent_position_id = int(parent.get("position_id", 0) or 0)
+            state.parent_trade_id = str(parent.get("trade_id") or parent_order.trade_id)
+            state.cycle_id = max(1, int(self._churner_next_cycle_id))
+            self._churner_next_cycle_id += 1
+            state.order_size_usd = max(
+                float(entry_price) * float(volume),
+                max(
+                    0.0,
+                    float(getattr(config, "CHURNER_ORDER_SIZE_USD", getattr(config, "ORDER_SIZE_USD", 0.0))),
+                )
+                + max(0.0, float(state.compound_usd)),
+            )
+            state.entry_side = self._churner_entry_side_for_trade(state.parent_trade_id)
+            reserved = self._try_reserve_loop_funds(
+                side=str(state.entry_side),
+                volume=float(volume),
+                price=float(entry_price),
+            )
+            txid_new: str | None = None
+            try:
+                txid_new = self._place_order(
+                    side=str(state.entry_side),
+                    volume=float(volume),
+                    price=float(entry_price),
+                    userref=(int(sid) * 1_000_000 + 960_000 + int(state.cycle_id)),
+                )
+            except Exception:
+                txid_new = None
+            if not txid_new:
+                if reserved:
+                    self._release_loop_reservation(
+                        side=str(state.entry_side),
+                        volume=float(volume),
+                        price=float(entry_price),
+                    )
+                state.last_error = "entry_place_failed"
+                self._churner_release_reserve(state)
+                continue
+
+            state.active = True
+            state.stage = "entry_open"
+            state.entry_txid = str(txid_new)
+            state.entry_price = float(entry_price)
+            state.entry_volume = float(volume)
+            state.entry_placed_at = float(now)
+            state.exit_txid = ""
+            state.exit_price = 0.0
+            state.exit_placed_at = 0.0
+            state.churner_position_id = 0
+            state.last_error = ""
+            state.last_state_change_at = float(now)
+            self.ledger.commit_order(str(state.entry_side), float(entry_price), float(volume))
+
+    def _self_healing_status_payload(self, now_ts: float | None = None) -> dict[str, Any]:
+        now = float(now_ts if now_ts is not None else _now())
+        if not self._position_ledger_enabled():
+            return {"enabled": False}
+
+        open_positions = self._position_ledger.get_open_positions()
+        totals = self._position_ledger.get_subsidy_totals()
+
+        bands = {"fresh": 0, "aging": 0, "stale": 0, "stuck": 0, "write_off": 0}
+        slot_subsidy: list[dict[str, Any]] = []
+        pending_needed = 0.0
+        pending_positions = 0
+        for sid in sorted(self.slots.keys()):
+            slot_totals = self._position_ledger.get_subsidy_totals(slot_id=sid)
+            slot_subsidy.append(
+                {
+                    "slot_id": int(sid),
+                    "balance": float(slot_totals.get("balance", 0.0)),
+                    "earned": float(slot_totals.get("earned", 0.0)),
+                    "consumed": float(slot_totals.get("consumed", 0.0)),
+                }
+            )
+
+        for pos in open_positions:
+            sid = int(pos.get("slot_id", -1))
+            slot = self.slots.get(sid)
+            market = (
+                float(slot.state.market_price if slot and slot.state.market_price > 0 else self.last_price)
+                if self.last_price > 0 or slot is not None
+                else 0.0
+            )
+            if market <= 0:
+                continue
+            exit_px = float(pos.get("current_exit_price", 0.0) or 0.0)
+            entry_px = float(pos.get("entry_price", 0.0) or 0.0)
+            vol = float(pos.get("entry_volume", 0.0) or 0.0)
+            age = max(0.0, now - float(pos.get("entry_time", now) or now))
+            distance = abs(exit_px - market) / market * 100.0 if market > 0 else 0.0
+            effective_age = self._effective_age_seconds(age, distance)
+            band = self._age_band_for_effective_age(effective_age)
+            if band in bands:
+                bands[band] += 1
+
+            entry_pct = max(0.0, float(self.entry_pct)) / 100.0
+            fee_floor = max(0.0, float(config.ROUND_TRIP_FEE_PCT)) / 100.0
+            trade_id = str(pos.get("trade_id") or "")
+            needed = 0.0
+            if vol > 0 and entry_px > 0:
+                if trade_id == "B":
+                    fillable = max(market * (1.0 + entry_pct), entry_px * (1.0 + fee_floor))
+                    if exit_px > fillable:
+                        needed = (exit_px - fillable) * vol
+                elif trade_id == "A":
+                    fillable = min(market * (1.0 - entry_pct), entry_px * (1.0 - fee_floor))
+                    if exit_px < fillable:
+                        needed = (fillable - exit_px) * vol
+            if needed > 1e-12:
+                pending_positions += 1
+                pending_needed += max(0.0, needed)
+
+        cleanup_queue, hidden_by_hold = self._self_heal_cleanup_queue_rows(now)
+
+        active_churners = sum(1 for state in self._churner_by_slot.values() if bool(state.active))
+        churner_paused_reason = ""
+        if not self._churner_enabled():
+            churner_paused_reason = "disabled"
+        elif active_churners <= 0:
+            regime_name, _confidence, _bias, _ready, _source = self._policy_hmm_signal()
+            if str(regime_name or "").strip().upper() != "RANGING":
+                churner_paused_reason = "regime_not_ranging"
+            elif (
+                int(bands.get("aging", 0))
+                + int(bands.get("stale", 0))
+                + int(bands.get("stuck", 0))
+                + int(bands.get("write_off", 0))
+            ) <= 0:
+                churner_paused_reason = "no_aging_positions"
+            else:
+                churner_paused_reason = "idle"
+
+        eta_hours: float | None
+        if pending_needed <= 1e-12:
+            eta_hours = 0.0
+        else:
+            day_dt = datetime.fromtimestamp(now, timezone.utc)
+            day_start = datetime(day_dt.year, day_dt.month, day_dt.day, tzinfo=timezone.utc).timestamp()
+            elapsed_hours = max(1e-6, (now - day_start) / 3600.0)
+            churner_hourly_rate = max(0.0, float(self._churner_profit_today)) / elapsed_hours
+            eta_hours = (pending_needed / churner_hourly_rate) if churner_hourly_rate > 1e-9 else None
+
+        total_open = max(0, len(open_positions))
+        age_heatmap_rows = []
+        for band_name in ("fresh", "aging", "stale", "stuck", "write_off"):
+            count = int(bands.get(band_name, 0))
+            pct = (float(count) / float(total_open) * 100.0) if total_open > 0 else 0.0
+            age_heatmap_rows.append({"band": band_name, "count": count, "pct": float(pct)})
+
+        subsidy_balance = float(totals.get("balance", 0.0))
+        subsidy_earned = float(totals.get("earned", 0.0))
+        subsidy_consumed = float(totals.get("consumed", 0.0))
+        return {
+            "enabled": True,
+            "open_positions": len(open_positions),
+            "journal_entries_local": len(self._position_ledger.get_journal()),
+            "subsidy": {
+                "balance": subsidy_balance,
+                "pool_usd": subsidy_balance,
+                "earned": subsidy_earned,
+                "lifetime_earned": subsidy_earned,
+                "consumed": subsidy_consumed,
+                "lifetime_spent": subsidy_consumed,
+                "pending_needed": float(pending_needed),
+                "pending_needed_usd": float(pending_needed),
+                "pending_positions": int(pending_positions),
+                "eta_hours": None if eta_hours is None else float(eta_hours),
+                "eta_source": "churner_profit_today",
+                "by_slot": slot_subsidy,
+            },
+            "age_bands": bands,
+            "age_heatmap": {
+                "total_open": int(total_open),
+                "bands": age_heatmap_rows,
+            },
+            "repricing": {
+                "enabled": bool(getattr(config, "SUBSIDY_ENABLED", False)),
+                "auto_band": str(getattr(config, "SUBSIDY_AUTO_REPRICE_BAND", "stuck")),
+                "lifetime_repriced": int(self._self_heal_reprice_total),
+                "last_reprice_at": self._self_heal_reprice_last_at or None,
+                "last_summary": dict(self._self_heal_reprice_last_summary or {}),
+            },
+            "churner": {
+                "enabled": self._churner_enabled(),
+                "active_slots": int(active_churners),
+                "reserve_available_usd": float(self._churner_reserve_available_usd),
+                "cycles_today": int(self._churner_cycles_today),
+                "profit_today": float(self._churner_profit_today),
+                "cycles_total": int(self._churner_cycles_total),
+                "profit_total": float(self._churner_profit_total),
+                "paused_reason": str(churner_paused_reason),
+            },
+            "cleanup_queue": cleanup_queue,
+            "cleanup_queue_summary": {
+                "count": int(len(cleanup_queue)),
+                "hidden_by_hold": int(hidden_by_hold),
+            },
+            "migration": {
+                "done": bool(self._position_ledger_migration_done),
+                "last_at": self._position_ledger_migration_last_at or None,
+                "last_created": int(self._position_ledger_migration_last_created),
+                "last_scanned": int(self._position_ledger_migration_last_scanned),
+            },
+        }
+
     def _collect_throughput_cycles(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for slot in self.slots.values():
             for c in slot.state.completed_cycles:
+                cycle_mode = self._cycle_slot_mode.get((int(slot.slot_id), str(c.trade_id), int(c.cycle)), "legacy")
+                regime_at_entry = c.regime_at_entry
+                if str(cycle_mode or "legacy") == "churner":
+                    # Churner cycles are bucketed as ranging-only so they do not
+                    # perturb sticky-slot regime-side stats.
+                    regime_at_entry = 1
                 rows.append(
                     {
                         "entry_time": float(c.entry_time or 0.0),
@@ -2701,7 +5323,7 @@ class BotRuntime:
                         "trade_id": str(c.trade_id or ""),
                         "net_profit": float(c.net_profit),
                         "volume": float(c.volume or 0.0),
-                        "regime_at_entry": c.regime_at_entry,
+                        "regime_at_entry": regime_at_entry,
                     }
                 )
         return rows
@@ -7111,6 +9733,12 @@ class BotRuntime:
                         self._normalize_slot_mode(slot_id)
                         continue
                     slot.state = sm.apply_order_txid(slot.state, action.local_id, txid)
+                    if action.role == "exit":
+                        self._bind_position_txid_for_exit(
+                            int(slot_id),
+                            int(action.local_id),
+                            str(txid),
+                        )
                     state_order = sm.find_order(slot.state, action.local_id)
                     if state_order and abs(float(state_order.volume) - float(action.volume)) > 1e-8:
                         logger.error(
@@ -7258,6 +9886,13 @@ class BotRuntime:
             for r in slot.state.recovery_orders:
                 if r.txid:
                     tx_map[r.txid] = (sid, "recovery", r.recovery_id)
+        for sid, state in self._churner_by_slot.items():
+            entry_txid = str(state.entry_txid or "").strip()
+            if entry_txid:
+                tx_map[entry_txid] = (int(sid), "churner_entry", 0)
+            exit_txid = str(state.exit_txid or "").strip()
+            if exit_txid:
+                tx_map[exit_txid] = (int(sid), "churner_exit", 0)
 
         if not tx_map:
             return
@@ -7292,6 +9927,9 @@ class BotRuntime:
                     cost = _to_float(row.get("cost"))
                     if cost > 0:
                         price = cost / volume
+                fill_cost = _to_float(row.get("cost"))
+                if fill_cost <= 0 and price > 0 and volume > 0:
+                    fill_cost = price * volume
                 fee = _to_float(row.get("fee"))
                 if volume <= 0 or price <= 0:
                     logger.warning(
@@ -7311,6 +9949,9 @@ class BotRuntime:
                     if not o:
                         logger.warning("closed order %s not found in slot %s local_id=%s", txid, sid, local_id)
                         continue
+                    position_id_for_exit = None
+                    if o.role == "exit":
+                        position_id_for_exit = self._find_position_for_exit(sid, local_id, txid=txid)
                     closed_ts = _now()
                     if o.placed_at > 0:
                         self._record_fill_duration(closed_ts - o.placed_at, closed_ts)
@@ -7337,8 +9978,28 @@ class BotRuntime:
                         timestamp=closed_ts,
                     )
                     self._apply_event(sid, ev, "fill", {"txid": txid, "price": price, "volume": volume})
+                    if o.role == "entry":
+                        self._record_position_open_for_entry_fill(
+                            slot_id=int(sid),
+                            entry_order=o,
+                            fill_price=float(price),
+                            fill_volume=float(volume),
+                            fill_fee=float(fee),
+                            fill_cost=float(fill_cost),
+                            fill_timestamp=float(closed_ts),
+                        )
+                    elif o.role == "exit" and position_id_for_exit is not None:
+                        self._record_position_close_for_exit_fill(
+                            slot_id=int(sid),
+                            exit_order=o,
+                            fill_price=float(price),
+                            fill_fee=float(fee),
+                            fill_cost=float(fill_cost),
+                            fill_timestamp=float(closed_ts),
+                            txid=str(txid),
+                        )
                     self.seen_fill_txids.add(txid)
-                else:
+                elif kind == "recovery":
                     r = next((x for x in self.slots[sid].state.recovery_orders if x.recovery_id == local_id), None)
                     if not r:
                         logger.warning("closed recovery %s not found in slot %s recovery_id=%s", txid, sid, local_id)
@@ -7353,6 +10014,28 @@ class BotRuntime:
                         timestamp=_now(),
                     )
                     self._apply_event(sid, ev, "recovery_fill", {"txid": txid, "price": price, "volume": volume})
+                    self.seen_fill_txids.add(txid)
+                elif kind == "churner_entry":
+                    self._churner_on_entry_fill(
+                        slot_id=int(sid),
+                        txid=str(txid),
+                        fill_price=float(price),
+                        fill_volume=float(volume),
+                        fill_fee=float(fee),
+                        fill_cost=float(fill_cost),
+                        fill_ts=float(_now()),
+                    )
+                    self.seen_fill_txids.add(txid)
+                elif kind == "churner_exit":
+                    self._churner_on_exit_fill(
+                        slot_id=int(sid),
+                        txid=str(txid),
+                        fill_price=float(price),
+                        fill_volume=float(volume),
+                        fill_fee=float(fee),
+                        fill_cost=float(fill_cost),
+                        fill_ts=float(_now()),
+                    )
                     self.seen_fill_txids.add(txid)
 
             elif status == "open":
@@ -7382,9 +10065,16 @@ class BotRuntime:
                     st = self.slots[sid].state
                     if sm.find_order(st, local_id):
                         self.slots[sid].state = sm.remove_order(st, local_id)
-                else:
+                elif kind == "recovery":
                     st = self.slots[sid].state
                     self.slots[sid].state = sm.remove_recovery(st, local_id)
+                elif kind in {"churner_entry", "churner_exit"}:
+                    self._churner_on_order_canceled(
+                        slot_id=int(sid),
+                        kind=str(kind),
+                        txid=str(txid),
+                        now_ts=float(_now()),
+                    )
 
     # ------------------ Invariants ------------------
 
@@ -7705,10 +10395,28 @@ class BotRuntime:
                     logger.warning("remove_slot: cancel recovery %s failed: %s", r.txid, e)
                     failed += 1
 
+        churner = self._churner_by_slot.get(int(slot_id))
+        if churner is not None:
+            for txid in (str(churner.entry_txid or "").strip(), str(churner.exit_txid or "").strip()):
+                if not txid:
+                    continue
+                try:
+                    ok = self._cancel_order(txid)
+                    if ok:
+                        cancelled += 1
+                    else:
+                        failed += 1
+                except Exception as e:
+                    logger.warning("remove_slot: cancel churner %s failed: %s", txid, e)
+                    failed += 1
+
         if failed > 0:
             return False, f"slot {slot_id}: {failed} cancel failures, not removed (retry)"
 
         self._release_slot_alias(slot.alias)
+        if churner is not None:
+            self._churner_release_reserve(churner)
+            self._churner_by_slot.pop(int(slot_id), None)
         del self.slots[slot_id]
         self._save_snapshot()
 
@@ -8619,6 +11327,8 @@ class BotRuntime:
             self._drain_pending_entry_orders("entry_scheduler_post_tick", skip_stale=False)
 
             self._poll_order_status()
+            self._run_self_healing_reprice(loop_now)
+            self._run_churner_engine(loop_now)
             self._update_daily_loss_lock(_now())
             # Refresh pair open-order telemetry (Kraken source of truth) when budget allows.
             self._refresh_open_order_telemetry()
@@ -9880,6 +12590,7 @@ class BotRuntime:
                     "compounding_mode": str(getattr(config, "STICKY_COMPOUNDING_MODE", "legacy_profit")),
                     "auto_release_enabled": bool(config.RELEASE_AUTO_ENABLED),
                 },
+                "self_healing": self._self_healing_status_payload(now),
                 "slot_vintage": slot_vintage,
                 "hmm_data_pipeline": hmm_data_pipeline,
                 "hmm_data_pipeline_secondary": hmm_data_pipeline_secondary,
@@ -10167,6 +12878,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     except (TypeError, ValueError):
                         self._send_json({"ok": False, "message": "invalid ttl_sec"}, 400)
                         return
+            elif action in ("self_heal_reprice_breakeven", "self_heal_close_market", "self_heal_keep_holding"):
+                try:
+                    parsed["position_id"] = int(body.get("position_id", 0))
+                except (TypeError, ValueError):
+                    self._send_json({"ok": False, "message": "invalid position_id"}, 400)
+                    return
+                if int(parsed.get("position_id", 0)) <= 0:
+                    self._send_json({"ok": False, "message": "invalid position_id"}, 400)
+                    return
+                reason = str(body.get("reason", body.get("operator_reason", "")) or "").strip()
+                if reason:
+                    parsed["reason"] = reason[:160]
+                if action == "self_heal_keep_holding":
+                    hold_raw = body.get("hold_sec", None)
+                    if hold_raw not in (None, ""):
+                        try:
+                            parsed["hold_sec"] = float(hold_raw)
+                        except (TypeError, ValueError):
+                            self._send_json({"ok": False, "message": "invalid hold_sec"}, 400)
+                            return
             elif action in ("ai_regime_revert", "ai_regime_dismiss", "accum_stop"):
                 pass
             elif action in ("pause", "resume", "add_slot", "soft_close_next", "reconcile_drift", "audit_pnl"):
@@ -10224,6 +12955,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     ok, msg = _RUNTIME.dismiss_ai_regime_opinion()
                 elif action == "accum_stop":
                     ok, msg = _RUNTIME.stop_accumulation()
+                elif action == "self_heal_reprice_breakeven":
+                    ok, msg = _RUNTIME.self_heal_reprice_breakeven(
+                        int(parsed.get("position_id", 0)),
+                        operator_reason=str(parsed.get("reason", "")),
+                    )
+                elif action == "self_heal_close_market":
+                    ok, msg = _RUNTIME.self_heal_close_at_market(
+                        int(parsed.get("position_id", 0)),
+                        operator_reason=str(parsed.get("reason", "")),
+                    )
+                elif action == "self_heal_keep_holding":
+                    hold_sec_raw = parsed.get("hold_sec", None)
+                    hold_sec = float(hold_sec_raw) if hold_sec_raw is not None else None
+                    ok, msg = _RUNTIME.self_heal_keep_holding(
+                        int(parsed.get("position_id", 0)),
+                        operator_reason=str(parsed.get("reason", "")),
+                        hold_sec=hold_sec,
+                    )
                 _RUNTIME._save_snapshot()
 
             self._send_json({"ok": bool(ok), "message": str(msg)}, 200 if ok else 400)

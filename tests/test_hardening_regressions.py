@@ -138,6 +138,60 @@ class DogeV1StateMachineTests(unittest.TestCase):
         self.assertTrue(st2.completed_cycles)
         self.assertEqual(st2.completed_cycles[-1].regime_at_entry, 0)
 
+    def test_cycle_records_include_settled_usd_fee_split(self):
+        st = sm.PairState(
+            market_price=0.1,
+            now=1000.0,
+            orders=(
+                sm.OrderState(
+                    local_id=1,
+                    side="buy",
+                    role="exit",
+                    price=0.1000,
+                    volume=13.0,
+                    trade_id="A",
+                    cycle=1,
+                    txid="TX-A-EXIT",
+                    placed_at=999.0,
+                    entry_price=0.1010,
+                    entry_fee=0.0020,
+                    entry_filled_at=950.0,
+                ),
+                sm.OrderState(
+                    local_id=2,
+                    side="buy",
+                    role="entry",
+                    price=0.0998,
+                    volume=13.0,
+                    trade_id="B",
+                    cycle=1,
+                    txid="TX-B-ENTRY",
+                    placed_at=999.0,
+                ),
+            ),
+        )
+        cfg = self._cfg()
+        fill = sm.FillEvent(
+            order_local_id=1,
+            txid="TX-A-EXIT",
+            side="buy",
+            price=0.1000,
+            volume=13.0,
+            fee=0.0030,
+            timestamp=1010.0,
+        )
+
+        st2, actions = sm.transition(st, fill, cfg, order_size_usd=2.0)
+        cycle = st2.completed_cycles[-1]
+        self.assertAlmostEqual(cycle.entry_fee, 0.0020, places=8)
+        self.assertAlmostEqual(cycle.exit_fee, 0.0030, places=8)
+        self.assertAlmostEqual(cycle.quote_fee, 0.0020, places=8)
+        self.assertAlmostEqual(cycle.settled_usd, 0.0110, places=8)
+        self.assertAlmostEqual(st2.total_settled_usd, 0.0110, places=8)
+
+        book = next(a for a in actions if isinstance(a, sm.BookCycleAction))
+        self.assertAlmostEqual(book.settled_usd, 0.0110, places=8)
+
     def test_exit_fill_applies_base_reentry_cooldown(self):
         st = sm.PairState(
             market_price=0.1,
@@ -817,11 +871,54 @@ class BotEventLogTests(unittest.TestCase):
     def test_dust_dividend_splits_across_slots(self):
         rt = bot.BotRuntime()
         rt.slots = {
-            sid: bot.SlotRuntime(
-                slot_id=sid,
+            0: bot.SlotRuntime(
+                slot_id=0,
                 state=sm.PairState(market_price=0.1, now=1000.0, total_profit=0.0),
-            )
-            for sid in range(4)
+            ),
+            1: bot.SlotRuntime(
+                slot_id=1,
+                state=sm.PairState(market_price=0.1, now=1000.0, total_profit=0.0),
+            ),
+            2: bot.SlotRuntime(
+                slot_id=2,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    total_profit=0.0,
+                    orders=(
+                        sm.OrderState(
+                            local_id=10,
+                            side="buy",
+                            role="entry",
+                            price=0.0998,
+                            volume=13.0,
+                            trade_id="B",
+                            cycle=1,
+                            txid="TX-B2",
+                        ),
+                    ),
+                ),
+            ),
+            3: bot.SlotRuntime(
+                slot_id=3,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    total_profit=0.0,
+                    orders=(
+                        sm.OrderState(
+                            local_id=11,
+                            side="buy",
+                            role="entry",
+                            price=0.0998,
+                            volume=13.0,
+                            trade_id="B",
+                            cycle=1,
+                            txid="TX-B3",
+                        ),
+                    ),
+                ),
+            ),
         }
         rt._loop_available_usd = 10.0
         rt._loop_dust_dividend = None
@@ -831,7 +928,50 @@ class BotEventLogTests(unittest.TestCase):
                 with mock.patch.object(rt, "_layer_mark_price", return_value=0.1):
                     out = rt._compute_dust_dividend()
 
-        self.assertAlmostEqual(out, 0.5, places=8)
+        # Base split across 4 slots = 2.5. Two slots are buy-ready, so reserve=5.0.
+        # Surplus=10.0-5.0 -> 5.0, dividend=2.5.
+        self.assertAlmostEqual(out, 2.5, places=8)
+
+    def test_b_side_sizing_allocates_surplus_to_buy_ready_slots(self):
+        rt = bot.BotRuntime()
+        ready = sm.PairState(market_price=0.1, now=1000.0, total_profit=0.0)
+        not_ready = sm.PairState(
+            market_price=0.1,
+            now=1000.0,
+            total_profit=0.0,
+            orders=(
+                sm.OrderState(
+                    local_id=10,
+                    side="buy",
+                    role="entry",
+                    price=0.0998,
+                    volume=13.0,
+                    trade_id="B",
+                    cycle=1,
+                    txid="TX-B",
+                ),
+            ),
+        )
+        rt.slots = {
+            0: bot.SlotRuntime(slot_id=0, state=ready),
+            1: bot.SlotRuntime(slot_id=1, state=ready),
+            2: bot.SlotRuntime(slot_id=2, state=not_ready),
+            3: bot.SlotRuntime(slot_id=3, state=not_ready),
+        }
+        rt._loop_available_usd = 10.0
+        rt._loop_dust_dividend = None
+        rt._loop_b_side_base = None
+
+        with mock.patch.object(config, "ORDER_SIZE_USD", 2.0):
+            with mock.patch.object(config, "REBALANCE_ENABLED", False):
+                with mock.patch.object(rt, "_recompute_effective_layers", return_value={"effective_layers": 0}):
+                    with mock.patch.object(rt, "_layer_mark_price", return_value=0.1):
+                        size_ready = rt._slot_order_size_usd(rt.slots[0], trade_id="B")
+                        size_not_ready = rt._slot_order_size_usd(rt.slots[2], trade_id="B")
+
+        # Base = 10/4 = 2.5. Surplus goes only to two buy-ready slots (+2.5 each).
+        self.assertAlmostEqual(size_ready, 5.0, places=8)
+        self.assertAlmostEqual(size_not_ready, 2.5, places=8)
 
     def test_b_side_account_aware_sizing(self):
         """B-side uses available_usd / slot_count instead of per-slot profit compounding."""
@@ -875,7 +1015,7 @@ class BotEventLogTests(unittest.TestCase):
         # B-side still uses account-aware base even with dust disabled.
         # max(2.0, 7.0/1) = 7.0
         self.assertAlmostEqual(out, 7.0, places=8)
-        self.assertGreater(dividend, 0.0)
+        self.assertAlmostEqual(dividend, 0.0, places=8)
 
     def test_dust_below_threshold(self):
         rt = bot.BotRuntime()
@@ -3776,7 +3916,7 @@ class BotEventLogTests(unittest.TestCase):
 
         dust = payload.get("dust_sweep", {})
         self.assertFalse(bool(dust.get("enabled")))
-        self.assertGreater(float(dust.get("current_dividend_usd") or 0.0), 0.0)
+        self.assertAlmostEqual(float(dust.get("current_dividend_usd") or 0.0), 0.0, places=8)
         self.assertAlmostEqual(float(dust.get("lifetime_absorbed_usd") or 0.0), 1.23, places=8)
         self.assertAlmostEqual(float(dust.get("available_usd") or 0.0), 7.0, places=8)
 
@@ -5058,6 +5198,9 @@ class DashboardApiHardeningTests(unittest.TestCase):
             self.ai_revert_calls = 0
             self.ai_dismiss_calls = 0
             self.accum_stop_calls = 0
+            self.self_heal_reprice_calls = []
+            self.self_heal_close_calls = []
+            self.self_heal_keep_calls = []
 
         def pause(self, _reason):
             if self.raise_on_pause:
@@ -5113,6 +5256,18 @@ class DashboardApiHardeningTests(unittest.TestCase):
         def stop_accumulation(self):
             self.accum_stop_calls += 1
             return True, "accumulation stopped"
+
+        def self_heal_reprice_breakeven(self, position_id, operator_reason=""):
+            self.self_heal_reprice_calls.append((position_id, operator_reason))
+            return True, "breakeven repriced"
+
+        def self_heal_close_at_market(self, position_id, operator_reason=""):
+            self.self_heal_close_calls.append((position_id, operator_reason))
+            return True, "closed at market"
+
+        def self_heal_keep_holding(self, position_id, operator_reason="", hold_sec=None):
+            self.self_heal_keep_calls.append((position_id, operator_reason, hold_sec))
+            return True, "hold timer reset"
 
         def _save_snapshot(self):
             return None
@@ -5290,6 +5445,60 @@ class DashboardApiHardeningTests(unittest.TestCase):
         code, payload = handler.sent[0]
         self.assertEqual(code, 200)
         self.assertEqual(payload, {"ok": True, "message": "accumulation stopped"})
+
+    def test_api_action_self_heal_reprice_routes_ok(self):
+        runtime = self._RuntimeStub()
+        bot._RUNTIME = runtime
+        handler = self._HandlerStub(
+            {"action": "self_heal_reprice_breakeven", "position_id": 47, "reason": "operator_test"}
+        )
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(runtime.self_heal_reprice_calls, [(47, "operator_test")])
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 200)
+        self.assertEqual(payload, {"ok": True, "message": "breakeven repriced"})
+
+    def test_api_action_self_heal_close_market_routes_ok(self):
+        runtime = self._RuntimeStub()
+        bot._RUNTIME = runtime
+        handler = self._HandlerStub({"action": "self_heal_close_market", "position_id": 51, "reason": "write_off"})
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(runtime.self_heal_close_calls, [(51, "write_off")])
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 200)
+        self.assertEqual(payload, {"ok": True, "message": "closed at market"})
+
+    def test_api_action_self_heal_keep_holding_routes_ok(self):
+        runtime = self._RuntimeStub()
+        bot._RUNTIME = runtime
+        handler = self._HandlerStub(
+            {"action": "self_heal_keep_holding", "position_id": 99, "reason": "hold", "hold_sec": 7200}
+        )
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(runtime.self_heal_keep_calls, [(99, "hold", 7200.0)])
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 200)
+        self.assertEqual(payload, {"ok": True, "message": "hold timer reset"})
+
+    def test_api_action_self_heal_invalid_position_id_returns_json_400(self):
+        bot._RUNTIME = self._RuntimeStub()
+        handler = self._HandlerStub({"action": "self_heal_reprice_breakeven", "position_id": "bad"})
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 400)
+        self.assertEqual(payload, {"ok": False, "message": "invalid position_id"})
 
     def test_api_action_release_slot_routes_ok(self):
         runtime = self._RuntimeStub()
