@@ -301,7 +301,7 @@ STOP_FLOOR: float = _env("STOP_FLOOR", 100.0, float)
 # If cumulative realized losses for the day exceed this, the bot pauses
 # until midnight UTC.
 # This prevents "death by a thousand cuts" in a sustained crash.
-DAILY_LOSS_LIMIT: float = _env("DAILY_LOSS_LIMIT", 3.0, float)
+DAILY_LOSS_LIMIT: float = _env("DAILY_LOSS_LIMIT", 0.0, float)
 
 # GRID DRIFT RESET -- percentage price must move from grid center
 # before the bot cancels everything and rebuilds the grid.
@@ -586,12 +586,12 @@ OPEN_ORDER_SAFETY_RATIO: float = _env("OPEN_ORDER_SAFETY_RATIO", 0.75, float)
 # This is a persistence canary, not a one-sample spike alarm.
 # Auto-soft-close: when capacity utilization >= this %, soft-close farthest
 # recovery orders each cycle to prevent hitting the hard order limit.
-AUTO_SOFT_CLOSE_CAPACITY_PCT: float = _env("AUTO_SOFT_CLOSE_CAPACITY_PCT", 95.0, float)
+AUTO_SOFT_CLOSE_CAPACITY_PCT: float = _env("AUTO_SOFT_CLOSE_CAPACITY_PCT", 100.1, float)
 AUTO_SOFT_CLOSE_BATCH: int = _env("AUTO_SOFT_CLOSE_BATCH", 2, int)
 
 # Auto recovery drain: force-close a small number of recoveries each loop
 # to reduce backlog when above per-slot cap or under capacity pressure.
-AUTO_RECOVERY_DRAIN_ENABLED: bool = _env("AUTO_RECOVERY_DRAIN_ENABLED", True, bool)
+AUTO_RECOVERY_DRAIN_ENABLED: bool = _env("AUTO_RECOVERY_DRAIN_ENABLED", False, bool)
 AUTO_RECOVERY_DRAIN_MAX_PER_LOOP: int = _env("AUTO_RECOVERY_DRAIN_MAX_PER_LOOP", 1, int)
 AUTO_RECOVERY_DRAIN_CAPACITY_PCT: float = _env("AUTO_RECOVERY_DRAIN_CAPACITY_PCT", 80.0, float)
 
