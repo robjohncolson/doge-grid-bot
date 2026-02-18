@@ -1113,6 +1113,7 @@ Auxiliary repository modules (outside core state-machine contract but present in
 - `kraken_client.py` (exchange client)
 - `notifier.py` and `telegram_menu.py` (Telegram transport/menu helpers)
 - `grid_strategy.py`, `stats_engine.py`, `pair_scanner.py`, `backtest_v1.py`, `state_machine_visual.py` (legacy/auxiliary tooling)
+- `kelly_sizer.py` (deprecated — replaced by `throughput_sizer.py`)
 - `factory_viz.py` (factory view HTML endpoint helper)
 
 This document is intentionally code-truth first: if this file and code diverge, code wins and doc must be updated in the same change.
