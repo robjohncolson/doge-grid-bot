@@ -1183,6 +1183,8 @@ class BotRuntime:
         self._entry_adds_drained_total = 0
         self._entry_adds_last_deferred_at = 0.0
         self._entry_adds_last_drained_at = 0.0
+        self._entry_floor_applied_count = 0
+        self._entry_floor_applied_sides: dict[str, int] = {}
         self._loop_balance_cache: dict | None = None
         self._loop_available_usd: float | None = None
         self._loop_available_doge: float | None = None
@@ -2473,6 +2475,19 @@ class BotRuntime:
         elif knobs_active:
             base_with_layers *= aggression_mult
         base_with_layers *= suppression_mult
+        # --- Entry floor guard: clamp to exchange minimum volume ---
+        if self._flag_value("ENTRY_FLOOR_ENABLED"):
+            market = float(price_override) if price_override else self._layer_mark_price(slot)
+            if market > 0:
+                min_vol = float(self.constraints.get("min_volume", 13.0))
+                floor_usd = min_vol * market * 1.01
+                if base_with_layers < floor_usd:
+                    base_with_layers = floor_usd
+                    self._entry_floor_applied_count += 1
+                    side_key = str(trade_id or "X").upper()
+                    self._entry_floor_applied_sides[side_key] = (
+                        self._entry_floor_applied_sides.get(side_key, 0) + 1
+                    )
         if trade_id is None or not self._flag_value("REBALANCE_ENABLED"):
             return base_with_layers
 
@@ -5030,6 +5045,8 @@ class BotRuntime:
         self.loop_private_calls = 0
         self.entry_adds_per_loop_used = 0
         self.entry_adds_per_loop_cap = self._compute_entry_adds_loop_cap()
+        self._entry_floor_applied_count = 0
+        self._entry_floor_applied_sides = {}
         self._loop_balance_cache = None
         self._loop_available_usd = None
         self._loop_available_doge = None
@@ -17182,6 +17199,12 @@ class BotRuntime:
                 "throughput_sizer": (
                     self._throughput.status_payload() if self._throughput is not None else {"enabled": False}
                 ),
+                "entry_floor": {
+                    "enabled": self._flag_value("ENTRY_FLOOR_ENABLED"),
+                    "floor_usd": round(float(self.constraints.get("min_volume", 13.0)) * float(self._layer_mark_price() or 0.0) * 1.01, 4),
+                    "floor_applied_count": self._entry_floor_applied_count,
+                    "floor_applied_sides": dict(self._entry_floor_applied_sides),
+                },
                 "dust_sweep": {
                     "enabled": bool(self._dust_sweep_enabled),
                     "current_dividend_usd": dust_dividend_usd,

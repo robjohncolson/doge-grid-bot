@@ -967,6 +967,14 @@ DUST_MIN_THRESHOLD: float = _env("DUST_MIN_THRESHOLD", 0.50, float)
 DUST_MAX_BUMP_PCT: float = _env("DUST_MAX_BUMP_PCT", 0.0, float)
 
 # ---------------------------------------------------------------------------
+# Entry floor guard — prevent throughput sizer from crushing orders below
+# the exchange minimum volume (death spiral: old exits -> low age_pressure
+# -> sub-minimum orders -> rejected -> slot stays one-sided -> can't cycle).
+# ---------------------------------------------------------------------------
+
+ENTRY_FLOOR_ENABLED: bool = _env("ENTRY_FLOOR_ENABLED", True, bool)
+
+# ---------------------------------------------------------------------------
 # Entry backoff after consecutive losses
 # ---------------------------------------------------------------------------
 
