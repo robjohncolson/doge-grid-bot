@@ -117,6 +117,294 @@ class ActionKnobs:
 
 
 @dataclass
+class ManifoldScoreComponents:
+    regime_clarity: float = 0.0
+    regime_stability: float = 0.0
+    throughput_efficiency: float = 0.0
+    signal_coherence: float = 0.0
+
+    def to_status_dict(self) -> dict[str, float]:
+        return {
+            "regime_clarity": round(float(self.regime_clarity), 6),
+            "regime_stability": round(float(self.regime_stability), 6),
+            "throughput_efficiency": round(float(self.throughput_efficiency), 6),
+            "signal_coherence": round(float(self.signal_coherence), 6),
+        }
+
+
+@dataclass
+class ManifoldScore:
+    enabled: bool = False
+    mts: float = 0.0
+    band: str = "disabled"
+    band_color: str = "#6c757d"
+    components: ManifoldScoreComponents = field(default_factory=ManifoldScoreComponents)
+    component_details: dict[str, float] = field(default_factory=dict)
+    fisher_score: float = 0.0
+    kernel_enabled: bool = False
+    kernel_samples: int = 0
+    kernel_score: float | None = None
+    kernel_blend_alpha: float = 0.0
+
+    def to_status_dict(self) -> dict[str, Any]:
+        if not bool(self.enabled):
+            return {
+                "enabled": False,
+                "mts": 0.0,
+                "band": "disabled",
+                "band_color": "#6c757d",
+                "components": ManifoldScoreComponents().to_status_dict(),
+                "component_details": {},
+                "kernel_memory": {
+                    "enabled": False,
+                    "samples": 0,
+                    "score": None,
+                    "blend_alpha": 0.0,
+                },
+            }
+
+        return {
+            "enabled": True,
+            "mts": round(float(self.mts), 6),
+            "band": str(self.band),
+            "band_color": str(self.band_color),
+            "components": self.components.to_status_dict(),
+            "component_details": {
+                str(k): round(float(v), 6)
+                for k, v in self.component_details.items()
+            },
+            "fisher_score": round(float(self.fisher_score), 6),
+            "kernel_memory": {
+                "enabled": bool(self.kernel_enabled),
+                "samples": int(max(0, self.kernel_samples)),
+                "score": (round(float(self.kernel_score), 6) if self.kernel_score is not None else None),
+                "blend_alpha": round(float(self.kernel_blend_alpha), 6),
+            },
+        }
+
+
+def _safe_weights(raw: Any, default: list[float]) -> list[float]:
+    out: list[float] = []
+    if isinstance(raw, (list, tuple)):
+        for i in range(len(default)):
+            if i >= len(raw):
+                break
+            out.append(max(0.0, _safe_float(raw[i], 0.0)))
+    if len(out) != len(default):
+        out = [max(0.0, float(v)) for v in default]
+    total = sum(out)
+    if total <= 1e-12:
+        out = [max(0.0, float(v)) for v in default]
+        total = sum(out)
+    if total <= 1e-12:
+        n = max(1, len(default))
+        return [1.0 / n for _ in range(n)]
+    return [float(v) / float(total) for v in out]
+
+
+def manifold_score_band(score: float) -> tuple[str, str]:
+    mts = _clamp(float(score), 0.0, 1.0)
+    if mts >= 0.80:
+        return "optimal", "#5cb85c"
+    if mts >= 0.60:
+        return "favorable", "#20c997"
+    if mts >= 0.40:
+        return "cautious", "#f0ad4e"
+    if mts >= 0.20:
+        return "defensive", "#fd7e14"
+    return "hostile", "#d9534f"
+
+
+def compute_regime_clarity(
+    *,
+    posterior_1m: Any,
+    posterior_15m: Any,
+    posterior_1h: Any,
+    weights: Any = None,
+) -> tuple[float, dict[str, float]]:
+    def _clarity_from_posterior(raw: Any) -> float:
+        p = _safe_triplet(raw)
+        kl = 0.0
+        uniform = 1.0 / 3.0
+        for pi in p:
+            if pi <= 0.0:
+                continue
+            kl += float(pi) * math.log(float(pi) / uniform)
+        return _clamp(1.0 - math.exp(-kl), 0.0, 1.0)
+
+    clarity_1m = _clarity_from_posterior(posterior_1m)
+    clarity_15m = _clarity_from_posterior(posterior_15m)
+    clarity_1h = _clarity_from_posterior(posterior_1h)
+    w1, w15, w60 = _safe_weights(weights, [0.2, 0.5, 0.3])
+    score = _clamp((w1 * clarity_1m) + (w15 * clarity_15m) + (w60 * clarity_1h), 0.0, 1.0)
+    return score, {
+        "clarity_1m": float(clarity_1m),
+        "clarity_15m": float(clarity_15m),
+        "clarity_1h": float(clarity_1h),
+    }
+
+
+def compute_regime_stability(
+    *,
+    p_switch_1m: float,
+    p_switch_15m: float,
+    p_switch_1h: float,
+    bocpd_change_prob: float,
+    switch_weights: Any = None,
+) -> tuple[float, dict[str, float]]:
+    w1, w15, w60 = _safe_weights(switch_weights, [0.2, 0.5, 0.3])
+    ps1 = _clamp(float(p_switch_1m), 0.0, 1.0)
+    ps15 = _clamp(float(p_switch_15m), 0.0, 1.0)
+    ps60 = _clamp(float(p_switch_1h), 0.0, 1.0)
+    switch_risk = _clamp(max(ps1 * w1, ps15 * w15, ps60 * w60), 0.0, 1.0)
+    bocpd_risk = _clamp(float(bocpd_change_prob), 0.0, 1.0)
+    score = _clamp((1.0 - switch_risk) * (1.0 - bocpd_risk), 0.0, 1.0)
+    return score, {
+        "p_switch_risk": float(switch_risk),
+        "bocpd_risk": float(bocpd_risk),
+    }
+
+
+def compute_throughput_efficiency(
+    *,
+    throughput_multiplier: float,
+    age_pressure: float,
+    stuck_capital_pct: float,
+) -> tuple[float, dict[str, float]]:
+    tp_mult = _clamp(float(throughput_multiplier), 0.0, 2.0)
+    age = _clamp(float(age_pressure), 0.0, 1.0)
+    stuck = _clamp(float(stuck_capital_pct), 0.0, 100.0)
+    age_drag = _clamp(1.0 - (age * stuck / 100.0), 0.0, 1.0)
+    score = _clamp(tp_mult * age_drag, 0.0, 1.0)
+    return score, {
+        "tp_mult": float(tp_mult),
+        "age_drag": float(age_drag),
+    }
+
+
+def compute_signal_coherence(
+    *,
+    entropy_consensus: float,
+    direction_score: float,
+    bocpd_run_length: float,
+    weights: Any = None,
+    bocpd_run_norm_window: float = 50.0,
+) -> tuple[float, dict[str, float]]:
+    agreement = _clamp(1.0 - float(entropy_consensus), 0.0, 1.0)
+    directional_clarity = _clamp(abs(float(direction_score)), 0.0, 1.0)
+    denom = max(1.0, float(bocpd_run_norm_window))
+    bocpd_run_norm = _clamp(float(bocpd_run_length) / denom, 0.0, 1.0)
+    wa, wd, wb = _safe_weights(weights, [0.5, 0.25, 0.25])
+    score = _clamp(
+        (agreement * wa) + (directional_clarity * wd) + (bocpd_run_norm * wb),
+        0.0,
+        1.0,
+    )
+    return score, {
+        "agreement": float(agreement),
+        "directional_clarity": float(directional_clarity),
+        "bocpd_run_norm": float(bocpd_run_norm),
+    }
+
+
+def compute_manifold_score(
+    *,
+    posterior_1m: Any,
+    posterior_15m: Any,
+    posterior_1h: Any,
+    p_switch_1m: float,
+    p_switch_15m: float,
+    p_switch_1h: float,
+    bocpd_change_prob: float,
+    bocpd_run_length: float,
+    throughput_multiplier: float,
+    age_pressure: float,
+    stuck_capital_pct: float,
+    entropy_consensus: float,
+    direction_score: float,
+    clarity_weights: Any = None,
+    stability_switch_weights: Any = None,
+    coherence_weights: Any = None,
+    enabled: bool = True,
+    kernel_enabled: bool = False,
+    kernel_samples: int = 0,
+    kernel_score: float | None = None,
+    kernel_min_samples: int = 200,
+    kernel_alpha_max: float = 0.5,
+) -> ManifoldScore:
+    if not bool(enabled):
+        return ManifoldScore(enabled=False)
+
+    rc, rc_details = compute_regime_clarity(
+        posterior_1m=posterior_1m,
+        posterior_15m=posterior_15m,
+        posterior_1h=posterior_1h,
+        weights=clarity_weights,
+    )
+    rs, rs_details = compute_regime_stability(
+        p_switch_1m=p_switch_1m,
+        p_switch_15m=p_switch_15m,
+        p_switch_1h=p_switch_1h,
+        bocpd_change_prob=bocpd_change_prob,
+        switch_weights=stability_switch_weights,
+    )
+    te, te_details = compute_throughput_efficiency(
+        throughput_multiplier=throughput_multiplier,
+        age_pressure=age_pressure,
+        stuck_capital_pct=stuck_capital_pct,
+    )
+    sc, sc_details = compute_signal_coherence(
+        entropy_consensus=entropy_consensus,
+        direction_score=direction_score,
+        bocpd_run_length=bocpd_run_length,
+        weights=coherence_weights,
+    )
+
+    components = ManifoldScoreComponents(
+        regime_clarity=float(rc),
+        regime_stability=float(rs),
+        throughput_efficiency=float(te),
+        signal_coherence=float(sc),
+    )
+    product = float(rc) * float(rs) * float(te) * float(sc)
+    fisher = _clamp(pow(product, 0.25) if product > 0.0 else 0.0, 0.0, 1.0)
+
+    kernel_score_clean: float | None = None
+    kernel_samples_int = max(0, int(kernel_samples))
+    kernel_enabled_flag = bool(kernel_enabled)
+    alpha_max = _clamp(float(kernel_alpha_max), 0.0, 1.0)
+    min_samples = max(1, int(kernel_min_samples))
+    blend_alpha = 0.0
+    score = fisher
+    if kernel_enabled_flag and kernel_samples_int >= min_samples and kernel_score is not None:
+        kernel_score_clean = _clamp(float(kernel_score), 0.0, 1.0)
+        ramp = _clamp((kernel_samples_int - min_samples) / float(min_samples), 0.0, 1.0)
+        blend_alpha = _clamp(ramp * alpha_max, 0.0, alpha_max)
+        score = _clamp((1.0 - blend_alpha) * fisher + blend_alpha * kernel_score_clean, 0.0, 1.0)
+
+    band, band_color = manifold_score_band(score)
+    component_details: dict[str, float] = {}
+    component_details.update(rc_details)
+    component_details.update(rs_details)
+    component_details.update(te_details)
+    component_details.update(sc_details)
+
+    return ManifoldScore(
+        enabled=True,
+        mts=float(score),
+        band=str(band),
+        band_color=str(band_color),
+        components=components,
+        component_details=component_details,
+        fisher_score=float(fisher),
+        kernel_enabled=kernel_enabled_flag,
+        kernel_samples=kernel_samples_int,
+        kernel_score=kernel_score_clean,
+        kernel_blend_alpha=float(blend_alpha),
+    )
+
+
+@dataclass
 class TradeBeliefState:
     position_id: int
     slot_id: int
@@ -463,4 +751,3 @@ def recommend_trade_action(
         return "hold", max(0.4, min(p1h, confidence))
 
     return "hold", _clamp(max(p1h, 1.0 - abs(agreement)) * 0.5, 0.0, 1.0)
-

@@ -353,17 +353,166 @@ DASHBOARD_HTML = """<!doctype html>
       font-size: 11px;
       border-radius: 6px;
     }
+    .top-actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .btn-soft {
+      padding: 6px 10px;
+      font-size: 12px;
+      border-radius: 999px;
+      background: rgba(88,166,255,.12);
+      border-color: rgba(88,166,255,.45);
+      color: var(--accent);
+    }
+    .btn-soft.warn {
+      background: rgba(210,153,34,.12);
+      border-color: rgba(210,153,34,.45);
+      color: var(--warn);
+    }
+    .metric-note {
+      margin-top: 4px;
+      margin-bottom: 2px;
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .manifold-score {
+      font-size: 22px;
+      font-weight: 800;
+      letter-spacing: .02em;
+    }
+    .bar-track {
+      width: 100%;
+      height: 8px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,.03);
+      overflow: hidden;
+      margin-top: 4px;
+    }
+    .bar-fill {
+      height: 100%;
+      width: 0%;
+      background: var(--accent);
+      transition: width .25s ease;
+    }
+    .bar-fill.good { background: var(--good); }
+    .bar-fill.warn { background: var(--warn); }
+    .bar-fill.bad { background: var(--bad); }
+    .mono-scroll {
+      white-space: nowrap;
+      overflow-x: auto;
+      overflow-y: hidden;
+      padding-bottom: 2px;
+    }
+    .churner-panel {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px;
+      margin-bottom: 12px;
+      background: rgba(255,255,255,.02);
+    }
+    .churner-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 8px;
+    }
+    .churner-actions button {
+      padding: 6px 10px;
+      font-size: 12px;
+    }
+    .ops-drawer-overlay {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      justify-content: flex-end;
+      background: var(--backdrop);
+      z-index: 1300;
+    }
+    .ops-drawer-overlay[hidden] { display: none; }
+    .ops-drawer {
+      width: min(560px, 100vw);
+      height: 100%;
+      border-left: 1px solid var(--line);
+      background: var(--panel);
+      padding: 12px;
+      overflow: auto;
+    }
+    .ops-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    .ops-group {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: rgba(255,255,255,.02);
+      margin: 8px 0;
+      overflow: hidden;
+    }
+    .ops-group summary {
+      cursor: pointer;
+      padding: 8px 10px;
+      font-size: 12px;
+      color: var(--muted);
+      user-select: none;
+    }
+    .ops-body {
+      padding: 0 10px 8px;
+    }
+    .ops-row {
+      border-top: 1px solid #242c36;
+      padding: 8px 0;
+    }
+    .ops-row:first-child { border-top: 0; }
+    .ops-row-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .ops-row-actions {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .ops-tag {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 1px 7px;
+      font-size: 10px;
+      color: var(--muted);
+    }
+    .ops-tag.override {
+      border-color: rgba(210,153,34,.45);
+      color: var(--warn);
+      background: rgba(210,153,34,.1);
+    }
+    .ops-empty {
+      color: var(--muted);
+      font-size: 12px;
+      padding: 10px;
+    }
   </style>
 </head>
 <body>
   <div class=\"wrap\">
     <div class=\"top\">
       <div class=\"title\">DOGE/USD State-Machine Bot v1</div>
-      <div class=\"badges\">
-        <span id=\"mode\" class=\"badge\">MODE</span>
-        <span id=\"phase\" class=\"badge\">PHASE</span>
-        <span id=\"priceAge\" class=\"badge\">PRICE</span>
-        <span id=\"kbMode\" class=\"badge\">KB NORMAL</span>
+      <div class=\"top-actions\">
+        <div class=\"badges\">
+          <span id=\"mode\" class=\"badge\">MODE</span>
+          <span id=\"phase\" class=\"badge\">PHASE</span>
+          <span id=\"priceAge\" class=\"badge\">PRICE</span>
+          <span id=\"kbMode\" class=\"badge\">KB NORMAL</span>
+        </div>
+        <button id=\"opsDrawerBtn\" class=\"btn-soft\" type=\"button\">Ops Panel</button>
       </div>
     </div>
 
@@ -382,6 +531,13 @@ DASHBOARD_HTML = """<!doctype html>
           <button id=\"reconcileBtn\">Reconcile Drift</button>
           <button id=\"cancelStaleBtn\">Refresh Waiting</button>
         </div>
+
+        <h3 style=\"margin-top:14px\">Ops Panel</h3>
+        <div class=\"row\"><span class=\"k\">Overrides Active</span><span id=\"opsOverridesSummary\" class=\"v\">0</span></div>
+        <div class=\"row\"><span class=\"k\">Toggle Catalog</span><span id=\"opsToggleSummary\" class=\"v\">-</span></div>
+        <div id=\"opsStatusLine\" class=\"tiny\"></div>
+        <div style=\"height:8px\"></div>
+        <button id=\"opsOpenBtn\" class=\"wide\" type=\"button\">Open Ops Drawer</button>
 
         <div style=\"height:10px\"></div>
 
@@ -466,6 +622,10 @@ DASHBOARD_HTML = """<!doctype html>
         <div class=\"row\"><span class=\"k\">Churner Activity</span><span id=\"shChurner\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Churner P/L</span><span id=\"shChurnerPerf\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Churner Pause</span><span id=\"shChurnerPause\" class=\"v\"></span></div>
+        <details id=\"shChurnerDetails\" style=\"margin-top:6px\">
+          <summary class=\"tiny\">Active churner slots</summary>
+          <div id=\"shChurnerActiveList\" class=\"tiny mono-scroll\"></div>
+        </details>
         <div id=\"shMigration\" class=\"tiny\"></div>
 
         <h3 style=\"margin-top:14px\">HMM Regime</h3>
@@ -519,6 +679,29 @@ DASHBOARD_HTML = """<!doctype html>
         <div class=\"row\"><span class=\"k\">Cadence</span><span id=\"knobCadence\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Suppression</span><span id=\"knobSuppress\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Derived Tier</span><span id=\"knobTier\" class=\"v\"></span></div>
+
+        <h3 style=\"margin-top:14px\">Manifold Score</h3>
+        <div class=\"row\"><span class=\"k\">Score</span><span id=\"manifoldScore\" class=\"v manifold-score\">-</span></div>
+        <div class=\"row\"><span class=\"k\">Band</span><span id=\"manifoldBand\" class=\"v\">-</span></div>
+        <div class=\"row\"><span class=\"k\">Trend</span><span id=\"manifoldTrend\" class=\"v\">-</span></div>
+        <div class=\"row\"><span class=\"k\">30m Delta</span><span id=\"manifoldDelta30m\" class=\"v\">-</span></div>
+        <div class=\"row\"><span class=\"k\">Kernel</span><span id=\"manifoldKernel\" class=\"v\">-</span></div>
+        <div id=\"manifoldSparkline\" style=\"height:70px;margin:6px 0\"></div>
+        <div id=\"manifoldSparklineMeta\" class=\"tiny\"></div>
+        <div class=\"metric-note\">Regime Clarity</div>
+        <div class=\"bar-track\"><div id=\"manifoldRcBar\" class=\"bar-fill\"></div></div>
+        <div class=\"metric-note\">Regime Stability</div>
+        <div class=\"bar-track\"><div id=\"manifoldRsBar\" class=\"bar-fill\"></div></div>
+        <div class=\"metric-note\">Throughput Efficiency</div>
+        <div class=\"bar-track\"><div id=\"manifoldTeBar\" class=\"bar-fill\"></div></div>
+        <div class=\"metric-note\">Signal Coherence</div>
+        <div class=\"bar-track\"><div id=\"manifoldScBar\" class=\"bar-fill\"></div></div>
+        <div id=\"manifoldComponentDetails\" class=\"tiny mono-scroll\"></div>
+        <div style=\"height:10px\"></div>
+        <div class=\"row\"><span class=\"k\">Belief Simplex</span><span id=\"manifoldSimplexMeta\" class=\"v tiny\"></span></div>
+        <div id=\"manifoldSimplex\" style=\"height:168px;margin:4px 0\"></div>
+        <div class=\"row\"><span class=\"k\">Regime Ribbon</span><span id=\"regimeRibbonMeta\" class=\"v tiny\"></span></div>
+        <div id=\"regimeRibbon\" style=\"height:38px;margin:4px 0\"></div>
 
         <h3 style=\"margin-top:14px\">AI Regime Advisor</h3>
         <div id=\"aiRegimeCard\" class=\"ai-regime-card disabled\">
@@ -622,6 +805,29 @@ DASHBOARD_HTML = """<!doctype html>
         <div id=\"stateBar\" class=\"statebar\"></div>
         <div id=\"slotBeliefs\" class=\"tiny\"></div>
 
+        <div class=\"churner-panel\">
+          <div class=\"row\"><span class=\"k\">Churner Status</span><span id=\"slotChurnerStatus\" class=\"v\">-</span></div>
+          <div class=\"row\"><span class=\"k\">Parent</span><span id=\"slotChurnerParent\" class=\"v\">-</span></div>
+          <div class=\"row\"><span class=\"k\">Gate</span><span id=\"slotChurnerGate\" class=\"v\">-</span></div>
+          <div class=\"row\"><span class=\"k\">Reserve</span><span id=\"slotChurnerReserve\" class=\"v\">-</span></div>
+          <div class=\"tiny\" id=\"slotChurnerHint\"></div>
+          <div style=\"height:8px\"></div>
+          <div class=\"k\">Candidate Parent Position</div>
+          <select id=\"slotChurnerCandidateSelect\">
+            <option value=\"\">Auto-select best candidate</option>
+          </select>
+          <div class=\"churner-actions\">
+            <button id=\"slotChurnerSpawnBtn\" type=\"button\">Spawn Churner</button>
+            <button id=\"slotChurnerKillBtn\" type=\"button\" style=\"background:#8f3a2f\">Kill Churner</button>
+          </div>
+          <div style=\"height:8px\"></div>
+          <div class=\"k\">Runtime Reserve (USD)</div>
+          <div style=\"display:flex;gap:8px\">
+            <input id=\"churnerReserveInput\" type=\"number\" step=\"0.01\" min=\"0\" />
+            <button id=\"churnerReserveSetBtn\" type=\"button\">Set</button>
+          </div>
+        </div>
+
         <div class=\"row\"><span class=\"k\">Order Size USD</span><span id=\"orderUsd\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Runtime Profit %</span><span id=\"runtimeProfit\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Slot Realized</span><span id=\"slotRealized\" class=\"v\"></span></div>
@@ -678,6 +884,7 @@ DASHBOARD_HTML = """<!doctype html>
 |  [/]   prev/next   +    add slot      |
 |  gg    first slot  -    remove slot   |
 |  G     last slot   .    refresh       |
+|                    o    ops panel     |
 |                    f    factory view  |
 |                    s    api/status   |
 |                    :    command       |
@@ -709,6 +916,23 @@ DASHBOARD_HTML = """<!doctype html>
     </div>
   </div>
 
+  <div id=\"opsDrawer\" class=\"ops-drawer-overlay\" hidden>
+    <div class=\"ops-drawer\">
+      <div class=\"ops-header\">
+        <div>
+          <div style=\"font-weight:700\">Runtime Ops Panel</div>
+          <div id=\"opsDrawerMeta\" class=\"tiny\"></div>
+        </div>
+        <div style=\"display:flex;gap:6px\">
+          <button id=\"opsResetAllBtn\" class=\"btn-soft warn\" type=\"button\">Reset All</button>
+          <button id=\"opsDrawerCloseBtn\" class=\"btn-soft\" type=\"button\">Close</button>
+        </div>
+      </div>
+      <div id=\"opsDrawerStatus\" class=\"tiny\"></div>
+      <div id=\"opsGroups\"></div>
+    </div>
+  </div>
+
   <div id=\"toasts\"></div>
 
   <script>
@@ -725,12 +949,18 @@ DASHBOARD_HTML = """<!doctype html>
     let historyIndex = 0;
     let lastRefreshError = '';
     let equityChartRange = '24h';
+    let opsDrawerOpen = false;
+    let opsToggles = null;
+    let opsLastError = '';
+    let churnerRuntime = null;
+    let churnerCandidates = null;
+    let churnerLastError = '';
     const commandHistory = [];
     const COMMAND_COMPLETIONS = [
       'pause', 'resume', 'add', 'remove', 'close', 'release', 'release_eligible', 'audit', 'drift', 'stale',
       'set entry', 'set profit', 'jump', 'layer add', 'layer remove', 'q',
     ];
-    const CONTROL_INPUT_IDS = new Set(['entryInput', 'profitInput', 'layerSourceSelect']);
+    const CONTROL_INPUT_IDS = new Set(['entryInput', 'profitInput', 'layerSourceSelect', 'churnerReserveInput']);
 
     function fmt(n, d=6) {
       if (n === null || n === undefined || Number.isNaN(Number(n))) return '-';
@@ -753,6 +983,78 @@ DASHBOARD_HTML = """<!doctype html>
       if (seconds >= 3600) return `${(seconds / 3600).toFixed(1)}h ago`;
       if (seconds >= 60) return `${(seconds / 60).toFixed(1)}m ago`;
       return `${Math.round(seconds)}s ago`;
+    }
+
+    function clamp(value, lo, hi) {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return Number(lo);
+      const a = Math.min(Number(lo), Number(hi));
+      const b = Math.max(Number(lo), Number(hi));
+      return Math.max(a, Math.min(b, n));
+    }
+
+    function safeNum(value, fallback=0) {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : Number(fallback);
+    }
+
+    function escHtml(raw) {
+      return String(raw || '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;');
+    }
+
+    function renderMiniSparkline(hostId, series, opts={}) {
+      const host = document.getElementById(hostId);
+      if (!host) return 0;
+      const nums = Array.isArray(series)
+        ? series.map((v) => Number(v)).filter((v) => Number.isFinite(v))
+        : [];
+      if (nums.length < 2) {
+        host.innerHTML = '';
+        return 0;
+      }
+      const w = Number(opts.width || 280);
+      const h = Number(opts.height || 56);
+      const pad = Number(opts.pad || 4);
+      const stroke = String(opts.stroke || 'var(--accent)');
+      const minV = Math.min(...nums);
+      const maxV = Math.max(...nums);
+      const span = (maxV - minV) || 1.0;
+      const points = nums.map((v, i) => {
+        const x = (i / Math.max(1, nums.length - 1)) * (w - pad * 2) + pad;
+        const y = (h - pad) - ((v - minV) / span) * (h - pad * 2);
+        return `${x.toFixed(1)},${y.toFixed(1)}`;
+      }).join(' ');
+      host.innerHTML = `<svg width=\"${w}\" height=\"${h}\" viewBox=\"0 0 ${w} ${h}\"><polyline points=\"${points}\" fill=\"none\" stroke=\"${stroke}\" stroke-width=\"1.8\"/></svg>`;
+      return nums.length;
+    }
+
+    function simplexToPoint(posterior, size, pad) {
+      let vals = [0, 1, 0];
+      if (Array.isArray(posterior) && posterior.length >= 3) {
+        vals = [safeNum(posterior[0], 0), safeNum(posterior[1], 1), safeNum(posterior[2], 0)];
+      }
+      vals = vals.map((x) => Math.max(0, x));
+      const sum = vals[0] + vals[1] + vals[2];
+      if (sum <= 1e-12) vals = [0, 1, 0];
+      const b = vals[0] / (sum || 1);
+      const r = vals[1] / (sum || 1);
+      const u = vals[2] / (sum || 1);
+      const h = Math.sqrt(3) * 0.5 * size;
+      const x = (b * 0) + (r * size) + (u * (size * 0.5));
+      const y = (b * h) + (r * h) + (u * 0);
+      return {x: pad + x, y: pad + y};
+    }
+
+    function regimeRibbonColor(regime) {
+      const key = String(regime || '').toUpperCase();
+      if (key === 'RANGING') return '#20c997';
+      if (key === 'BULLISH') return '#58a6ff';
+      if (key === 'BEARISH') return '#f85149';
+      return '#6e7681';
     }
 
     function renderEquityChart(equityHistory, externalFlows) {
@@ -900,6 +1202,7 @@ DASHBOARD_HTML = """<!doctype html>
       closeCommandBarUi();
       closeHelpUi();
       closeConfirmUi();
+      closeOpsDrawer();
       setKbMode('NORMAL');
     }
 
@@ -1126,6 +1429,487 @@ DASHBOARD_HTML = """<!doctype html>
         showToast(err.message || 'request failed', 'error');
         return false;
       }
+    }
+
+    function runtimeChurnerState(slotId) {
+      const runtime = churnerRuntime && typeof churnerRuntime === 'object' ? churnerRuntime : {};
+      const states = Array.isArray(runtime.states) ? runtime.states : [];
+      const sid = Number(slotId || -1);
+      return states.find((row) => Number(row && row.slot_id) === sid) || null;
+    }
+
+    function runtimeChurnerCandidates(slotId) {
+      const payload = churnerCandidates && typeof churnerCandidates === 'object' ? churnerCandidates : {};
+      const rows = Array.isArray(payload.candidates) ? payload.candidates : [];
+      const sid = Number(slotId || -1);
+      return rows.filter((row) => Number(row && row.slot_id) === sid);
+    }
+
+    async function refreshChurnerRuntime(loud=false) {
+      const results = await Promise.allSettled([
+        api('/api/churner/status'),
+        api('/api/churner/candidates'),
+      ]);
+      const statusRes = results[0];
+      const candRes = results[1];
+      if (statusRes.status === 'fulfilled') {
+        churnerRuntime = statusRes.value;
+      } else {
+        churnerRuntime = null;
+      }
+      if (candRes.status === 'fulfilled') {
+        churnerCandidates = candRes.value;
+      } else {
+        churnerCandidates = null;
+      }
+      if (statusRes.status === 'rejected') {
+        const msg = statusRes.reason && statusRes.reason.message ? statusRes.reason.message : 'churner status unavailable';
+        if (loud && msg !== churnerLastError) showToast(msg, 'error');
+        churnerLastError = msg;
+      } else {
+        churnerLastError = '';
+      }
+    }
+
+    function setOpsDrawerStatus(message, isError=false) {
+      const statusEl = document.getElementById('opsDrawerStatus');
+      if (!statusEl) return;
+      statusEl.textContent = String(message || '');
+      statusEl.style.color = isError ? 'var(--bad)' : 'var(--muted)';
+    }
+
+    async function fetchOpsToggles(force=false) {
+      if (!force && opsToggles && typeof opsToggles === 'object') return opsToggles;
+      const payload = await api('/api/ops/toggles');
+      opsToggles = payload;
+      opsLastError = '';
+      return payload;
+    }
+
+    function closeOpsDrawer() {
+      opsDrawerOpen = false;
+      const drawer = document.getElementById('opsDrawer');
+      if (drawer) drawer.hidden = true;
+    }
+
+    async function openOpsDrawer() {
+      opsDrawerOpen = true;
+      const drawer = document.getElementById('opsDrawer');
+      if (drawer) drawer.hidden = false;
+      try {
+        setOpsDrawerStatus('Loading toggles...');
+        await fetchOpsToggles(true);
+        setOpsDrawerStatus('');
+      } catch (err) {
+        const msg = err && err.message ? err.message : 'ops toggles unavailable';
+        opsLastError = msg;
+        setOpsDrawerStatus(msg, true);
+      }
+      renderOpsDrawer();
+    }
+
+    function renderOpsSummary(s) {
+      const panel = s && typeof s.ops_panel === 'object' ? s.ops_panel : {};
+      const overrides = Number(panel.overrides_active || 0);
+      const overridesEl = document.getElementById('opsOverridesSummary');
+      const toggleSummaryEl = document.getElementById('opsToggleSummary');
+      const statusLineEl = document.getElementById('opsStatusLine');
+      if (overridesEl) {
+        overridesEl.textContent = String(overrides);
+        overridesEl.style.color = overrides > 0 ? 'var(--warn)' : 'var(--good)';
+      }
+      const groups = opsToggles && Array.isArray(opsToggles.groups) ? opsToggles.groups : [];
+      const toggles = opsToggles && Array.isArray(opsToggles.toggles) ? opsToggles.toggles : [];
+      if (toggleSummaryEl) {
+        toggleSummaryEl.textContent = groups.length
+          ? `${toggles.length} toggles in ${groups.length} groups`
+          : '-';
+      }
+      if (statusLineEl) {
+        if (overrides <= 0) {
+          statusLineEl.textContent = 'No runtime overrides active.';
+        } else {
+          const rows = panel && typeof panel.overrides === 'object' ? panel.overrides : {};
+          const keys = Object.keys(rows).slice(0, 4);
+          const suffix = Object.keys(rows).length > keys.length ? ` +${Object.keys(rows).length - keys.length} more` : '';
+          statusLineEl.textContent = `Active overrides: ${keys.join(', ')}${suffix}`;
+        }
+      }
+      const btn = document.getElementById('opsDrawerBtn');
+      if (btn) {
+        btn.className = overrides > 0 ? 'btn-soft warn' : 'btn-soft';
+      }
+      const meta = document.getElementById('opsDrawerMeta');
+      if (meta) {
+        meta.textContent = `${overrides} override${overrides === 1 ? '' : 's'} active`;
+      }
+    }
+
+    function renderOpsDrawer() {
+      const groupsEl = document.getElementById('opsGroups');
+      if (!groupsEl) return;
+      const payload = opsToggles && typeof opsToggles === 'object' ? opsToggles : null;
+      if (!payload) {
+        groupsEl.innerHTML = '<div class=\"ops-empty\">Toggle catalog unavailable.</div>';
+        return;
+      }
+      const toggles = Array.isArray(payload.toggles) ? payload.toggles : [];
+      const groups = Array.isArray(payload.groups) ? payload.groups : [];
+      const byGroup = new Map();
+      for (const row of toggles) {
+        const group = String(row && row.group || 'Misc');
+        if (!byGroup.has(group)) byGroup.set(group, []);
+        byGroup.get(group).push(row);
+      }
+      groupsEl.innerHTML = '';
+      for (const groupMeta of groups) {
+        const groupName = String(groupMeta && groupMeta.group || 'Misc');
+        const rows = byGroup.get(groupName) || [];
+        const details = document.createElement('details');
+        details.className = 'ops-group';
+        details.open = true;
+        details.innerHTML = `<summary>${escHtml(groupName)} | enabled ${Number(groupMeta.enabled || 0)}/${Number(groupMeta.total || 0)} | overridden ${Number(groupMeta.overridden || 0)}</summary>`;
+        const body = document.createElement('div');
+        body.className = 'ops-body';
+        for (const row of rows) {
+          const key = String(row && row.key || '');
+          const effective = Boolean(row && row.effective);
+          const overrideActive = Boolean(row && row.override_active);
+          const deps = Array.isArray(row && row.dependencies) ? row.dependencies : [];
+          const desc = String(row && row.description || '');
+          const item = document.createElement('div');
+          item.className = 'ops-row';
+          item.innerHTML = `
+            <div class=\"ops-row-head\">
+              <div>
+                <div class=\"mono\">${escHtml(key)} ${overrideActive ? '<span class=\"ops-tag override\">override</span>' : '<span class=\"ops-tag\">config</span>'}</div>
+                <div class=\"tiny\">${escHtml(desc)}</div>
+                <div class=\"tiny\">deps: ${deps.length ? escHtml(deps.join(', ')) : 'none'}</div>
+              </div>
+              <div class=\"ops-row-actions\">
+                <label class=\"tiny\"><input type=\"checkbox\" data-key=\"${escHtml(key)}\" ${effective ? 'checked' : ''}/> enabled</label>
+                <button type=\"button\" data-reset-key=\"${escHtml(key)}\">Reset</button>
+              </div>
+            </div>
+          `;
+          const checkbox = item.querySelector(`input[data-key=\"${key}\"]`);
+          if (checkbox) {
+            checkbox.addEventListener('change', (ev) => {
+              const checked = Boolean(ev.target && ev.target.checked);
+              void requestOpsToggle(key, checked);
+            });
+          }
+          const resetBtn = item.querySelector(`button[data-reset-key=\"${key}\"]`);
+          if (resetBtn) {
+            resetBtn.addEventListener('click', () => {
+              void requestOpsReset(key);
+            });
+          }
+          body.appendChild(item);
+        }
+        details.appendChild(body);
+        groupsEl.appendChild(details);
+      }
+      if (!groupsEl.children.length) {
+        groupsEl.innerHTML = '<div class=\"ops-empty\">No runtime toggles registered.</div>';
+      }
+    }
+
+    async function requestOpsToggle(key, value) {
+      try {
+        setOpsDrawerStatus(`Setting ${key}...`);
+        const out = await api('/api/ops/toggle', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({key, value: Boolean(value)}),
+        });
+        showToast(out.message || `${key} updated`, 'success');
+        await fetchOpsToggles(true);
+        setOpsDrawerStatus('');
+        await refresh();
+        renderOpsDrawer();
+        return true;
+      } catch (err) {
+        const msg = err && err.message ? err.message : `failed to set ${key}`;
+        setOpsDrawerStatus(msg, true);
+        showToast(msg, 'error');
+        return false;
+      }
+    }
+
+    async function requestOpsReset(key) {
+      try {
+        setOpsDrawerStatus(`Resetting ${key}...`);
+        const out = await api('/api/ops/reset', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({key}),
+        });
+        showToast(out.message || `${key} reset`, 'success');
+        await fetchOpsToggles(true);
+        setOpsDrawerStatus('');
+        await refresh();
+        renderOpsDrawer();
+        return true;
+      } catch (err) {
+        const msg = err && err.message ? err.message : `failed to reset ${key}`;
+        setOpsDrawerStatus(msg, true);
+        showToast(msg, 'error');
+        return false;
+      }
+    }
+
+    async function requestOpsResetAll() {
+      try {
+        setOpsDrawerStatus('Clearing all overrides...');
+        const out = await api('/api/ops/reset-all', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({}),
+        });
+        showToast(out.message || 'overrides cleared', 'success');
+        await fetchOpsToggles(true);
+        setOpsDrawerStatus('');
+        await refresh();
+        renderOpsDrawer();
+        return true;
+      } catch (err) {
+        const msg = err && err.message ? err.message : 'failed to clear overrides';
+        setOpsDrawerStatus(msg, true);
+        showToast(msg, 'error');
+        return false;
+      }
+    }
+
+    async function requestChurnerSpawn(slotId, positionId=null) {
+      try {
+        const payload = {slot_id: Number(slotId)};
+        if (positionId != null && Number(positionId) > 0) payload.position_id = Number(positionId);
+        const out = await api('/api/churner/spawn', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(payload),
+        });
+        showToast(out.message || 'churner spawned', 'success');
+        await refresh();
+        return true;
+      } catch (err) {
+        showToast(err && err.message ? err.message : 'spawn failed', 'error');
+        return false;
+      }
+    }
+
+    async function requestChurnerKill(slotId) {
+      try {
+        const out = await api('/api/churner/kill', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({slot_id: Number(slotId)}),
+        });
+        showToast(out.message || 'churner killed', 'success');
+        await refresh();
+        return true;
+      } catch (err) {
+        showToast(err && err.message ? err.message : 'kill failed', 'error');
+        return false;
+      }
+    }
+
+    async function requestChurnerReserveUpdate(reserveUsd) {
+      const reserve = Number(reserveUsd);
+      if (!Number.isFinite(reserve) || reserve < 0) {
+        showToast('reserve must be a non-negative number', 'error');
+        return false;
+      }
+      try {
+        const out = await api('/api/churner/config', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({reserve_usd: reserve}),
+        });
+        showToast(out.message || 'churner reserve updated', 'success');
+        await refresh();
+        return true;
+      } catch (err) {
+        showToast(err && err.message ? err.message : 'reserve update failed', 'error');
+        return false;
+      }
+    }
+
+    function manifoldBandColor(band) {
+      const b = String(band || '').toLowerCase();
+      if (b === 'optimal') return '#5cb85c';
+      if (b === 'favorable') return '#20c997';
+      if (b === 'cautious') return '#f0ad4e';
+      if (b === 'defensive') return '#fd7e14';
+      if (b === 'hostile') return '#d9534f';
+      return '#6c757d';
+    }
+
+    function setComponentBar(id, value) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      const score = clamp(value, 0, 1);
+      el.style.width = `${(score * 100).toFixed(1)}%`;
+      let cls = 'bar-fill';
+      if (score >= 0.6) cls += ' good';
+      else if (score >= 0.35) cls += ' warn';
+      else cls += ' bad';
+      el.className = cls;
+    }
+
+    function renderManifoldSimplex(belief) {
+      const host = document.getElementById('manifoldSimplex');
+      const meta = document.getElementById('manifoldSimplexMeta');
+      if (!host || !meta) return;
+      const p1 = simplexToPoint(belief.posterior_1m, 180, 16);
+      const p15 = simplexToPoint(belief.posterior_15m, 180, 16);
+      const p60 = simplexToPoint(belief.posterior_1h, 180, 16);
+      const v0 = `${16},${(16 + Math.sqrt(3) * 0.5 * 180).toFixed(1)}`;
+      const v1 = `${(16 + 180)},${(16 + Math.sqrt(3) * 0.5 * 180).toFixed(1)}`;
+      const v2 = `${(16 + 90)},16`;
+      host.innerHTML = `
+        <svg width=\"220\" height=\"178\" viewBox=\"0 0 220 178\">
+          <polygon points=\"${v0} ${v1} ${v2}\" fill=\"none\" stroke=\"var(--line)\" stroke-width=\"1.2\"/>
+          <line x1=\"${p1.x.toFixed(1)}\" y1=\"${p1.y.toFixed(1)}\" x2=\"${p15.x.toFixed(1)}\" y2=\"${p15.y.toFixed(1)}\" stroke=\"#6e7681\" stroke-dasharray=\"3,3\"/>
+          <line x1=\"${p15.x.toFixed(1)}\" y1=\"${p15.y.toFixed(1)}\" x2=\"${p60.x.toFixed(1)}\" y2=\"${p60.y.toFixed(1)}\" stroke=\"#6e7681\" stroke-dasharray=\"3,3\"/>
+          <circle cx=\"${p1.x.toFixed(1)}\" cy=\"${p1.y.toFixed(1)}\" r=\"4.2\" fill=\"#58a6ff\"/>
+          <circle cx=\"${p15.x.toFixed(1)}\" cy=\"${p15.y.toFixed(1)}\" r=\"4.2\" fill=\"#f0ad4e\"/>
+          <circle cx=\"${p60.x.toFixed(1)}\" cy=\"${p60.y.toFixed(1)}\" r=\"4.2\" fill=\"#2ea043\"/>
+          <text x=\"8\" y=\"172\" fill=\"var(--muted)\" font-size=\"10\">Bear</text>
+          <text x=\"100\" y=\"12\" fill=\"var(--muted)\" font-size=\"10\">Bull</text>
+          <text x=\"188\" y=\"172\" fill=\"var(--muted)\" font-size=\"10\">Range</text>
+        </svg>
+      `;
+      meta.textContent = '1m blue | 15m amber | 1h green';
+    }
+
+    function renderRegimeRibbon(history, nowSec) {
+      const host = document.getElementById('regimeRibbon');
+      const meta = document.getElementById('regimeRibbonMeta');
+      if (!host || !meta) return;
+      const rows = Array.isArray(history) ? history.slice(-90) : [];
+      if (!rows.length) {
+        host.innerHTML = '';
+        meta.textContent = '-';
+        return;
+      }
+      const w = 280;
+      const h = 30;
+      const segW = w / rows.length;
+      let rects = '';
+      for (let i = 0; i < rows.length; i += 1) {
+        const row = rows[i] || {};
+        const regime = String(row.regime || '').toUpperCase();
+        const color = regimeRibbonColor(regime);
+        const conf = safeNum(row.conf, 0);
+        const bias = safeNum(row.bias, 0);
+        const ts = safeNum(row.ts, 0);
+        const age = ts > 0 ? fmtAgo(nowSec - ts) : '-';
+        const title = `${regime || 'UNKNOWN'} conf=${fmt(conf * 100, 1)}% bias=${fmt(bias, 2)} ${age}`;
+        rects += `<rect x=\"${(i * segW).toFixed(2)}\" y=\"2\" width=\"${Math.max(1, segW).toFixed(2)}\" height=\"26\" fill=\"${color}\"><title>${escHtml(title)}</title></rect>`;
+      }
+      host.innerHTML = `<svg width=\"${w}\" height=\"${h}\" viewBox=\"0 0 ${w} ${h}\">${rects}</svg>`;
+      const latest = rows[rows.length - 1] || {};
+      meta.textContent = `${rows.length} samples | latest ${String(latest.regime || 'UNKNOWN').toUpperCase()}`;
+    }
+
+    function renderManifoldPanel(s, nowSec) {
+      const m = s && typeof s.manifold_score === 'object' ? s.manifold_score : {};
+      const enabled = Boolean(m.enabled);
+      const score = clamp(m.mts, 0, 1);
+      const band = String(m.band || 'disabled');
+      const bandColor = String(m.band_color || manifoldBandColor(band));
+      const trend = String(m.trend || 'stable').toLowerCase();
+      const mts30 = m.mts_30m_ago == null ? null : clamp(m.mts_30m_ago, 0, 1);
+      const scoreEl = document.getElementById('manifoldScore');
+      const bandEl = document.getElementById('manifoldBand');
+      const trendEl = document.getElementById('manifoldTrend');
+      const deltaEl = document.getElementById('manifoldDelta30m');
+      const kernelEl = document.getElementById('manifoldKernel');
+      const metaEl = document.getElementById('manifoldSparklineMeta');
+      const detailsEl = document.getElementById('manifoldComponentDetails');
+      if (!enabled) {
+        if (scoreEl) { scoreEl.textContent = 'OFF'; scoreEl.style.color = 'var(--muted)'; }
+        if (bandEl) { bandEl.textContent = 'disabled'; bandEl.style.color = 'var(--muted)'; }
+        if (trendEl) trendEl.textContent = '-';
+        if (deltaEl) deltaEl.textContent = '-';
+        if (kernelEl) kernelEl.textContent = '-';
+        if (metaEl) metaEl.textContent = '';
+        if (detailsEl) detailsEl.textContent = '';
+        setComponentBar('manifoldRcBar', 0);
+        setComponentBar('manifoldRsBar', 0);
+        setComponentBar('manifoldTeBar', 0);
+        setComponentBar('manifoldScBar', 0);
+        renderMiniSparkline('manifoldSparkline', []);
+        renderManifoldSimplex(s && s.belief_state ? s.belief_state : {});
+        renderRegimeRibbon(s && Array.isArray(s.regime_history_30m) ? s.regime_history_30m : [], nowSec);
+        return;
+      }
+
+      if (scoreEl) {
+        scoreEl.textContent = fmt(score, 3);
+        scoreEl.style.color = bandColor;
+      }
+      if (bandEl) {
+        bandEl.textContent = band.toUpperCase();
+        bandEl.style.color = bandColor;
+      }
+      if (trendEl) {
+        trendEl.textContent = trend.toUpperCase();
+        trendEl.style.color = trend === 'rising' ? 'var(--good)' : trend === 'falling' ? 'var(--bad)' : 'var(--muted)';
+      }
+      if (deltaEl) {
+        if (mts30 == null) {
+          deltaEl.textContent = '-';
+          deltaEl.style.color = '';
+        } else {
+          const delta = score - mts30;
+          const sign = delta >= 0 ? '+' : '';
+          deltaEl.textContent = `${sign}${fmt(delta, 3)} (${fmt(mts30, 3)} -> ${fmt(score, 3)})`;
+          deltaEl.style.color = delta > 0 ? 'var(--good)' : delta < 0 ? 'var(--bad)' : '';
+        }
+      }
+      const kernel = m && typeof m.kernel_memory === 'object' ? m.kernel_memory : {};
+      const kernelOn = Boolean(kernel.enabled);
+      const kernelSamples = Number(kernel.samples || 0);
+      const kernelScore = kernel.score == null ? null : clamp(kernel.score, 0, 1);
+      const alpha = clamp(kernel.blend_alpha, 0, 1);
+      if (kernelEl) {
+        kernelEl.textContent = kernelOn
+          ? `ON n=${kernelSamples} score=${kernelScore == null ? '-' : fmt(kernelScore, 3)} alpha=${fmt(alpha, 2)}`
+          : 'OFF';
+        kernelEl.style.color = kernelOn ? 'var(--good)' : 'var(--muted)';
+      }
+      const history = Array.isArray(m.history_sparkline) ? m.history_sparkline : [];
+      const pointCount = renderMiniSparkline('manifoldSparkline', history, {height: 64, stroke: bandColor});
+      if (metaEl) {
+        metaEl.textContent = pointCount > 0 ? `${pointCount} points | band ${band.toUpperCase()}` : '';
+      }
+      const c = m && typeof m.components === 'object' ? m.components : {};
+      setComponentBar('manifoldRcBar', c.regime_clarity);
+      setComponentBar('manifoldRsBar', c.regime_stability);
+      setComponentBar('manifoldTeBar', c.throughput_efficiency);
+      setComponentBar('manifoldScBar', c.signal_coherence);
+      const componentDetails = m && typeof m.component_details === 'object' ? m.component_details : {};
+      if (detailsEl) {
+        const keys = Object.keys(componentDetails);
+        detailsEl.textContent = keys.length
+          ? keys.slice(0, 10).map((k) => `${k}:${fmt(componentDetails[k], 3)}`).join(' | ')
+          : '';
+      }
+      renderManifoldSimplex(s && s.belief_state ? s.belief_state : {});
+      const historyRows = Array.isArray(s.regime_history_30m)
+        ? s.regime_history_30m
+        : (s.hmm_regime && Array.isArray(s.hmm_regime.regime_history_30m) ? s.hmm_regime.regime_history_30m : []);
+      renderRegimeRibbon(historyRows, nowSec);
+    }
+
+    function churnerStageLabel(stage) {
+      const key = String(stage || 'idle').toLowerCase();
+      if (key === 'entry_open') return 'ENTRY OPEN';
+      if (key === 'exit_open') return 'EXIT OPEN';
+      return 'IDLE';
     }
 
     function openConfirmDialog(text, onConfirm) {
@@ -1518,6 +2302,8 @@ DASHBOARD_HTML = """<!doctype html>
       const shChurnerEl = document.getElementById('shChurner');
       const shChurnerPerfEl = document.getElementById('shChurnerPerf');
       const shChurnerPauseEl = document.getElementById('shChurnerPause');
+      const shChurnerDetailsEl = document.getElementById('shChurnerDetails');
+      const shChurnerActiveListEl = document.getElementById('shChurnerActiveList');
       const shMigrationEl = document.getElementById('shMigration');
 
       const cleanupTitleEl = document.getElementById('cleanupTitle');
@@ -1536,6 +2322,8 @@ DASHBOARD_HTML = """<!doctype html>
         if (shChurnerEl) shChurnerEl.textContent = '-';
         if (shChurnerPerfEl) shChurnerPerfEl.textContent = '-';
         if (shChurnerPauseEl) shChurnerPauseEl.textContent = '-';
+        if (shChurnerActiveListEl) shChurnerActiveListEl.textContent = '';
+        if (shChurnerDetailsEl) shChurnerDetailsEl.open = false;
         if (shMigrationEl) shMigrationEl.textContent = '';
 
         cleanupTitleEl.textContent = 'Cleanup Queue (0)';
@@ -1617,6 +2405,28 @@ DASHBOARD_HTML = """<!doctype html>
       }
       if (shChurnerPauseEl) {
         shChurnerPauseEl.textContent = pauseReason || '-';
+      }
+      if (shChurnerActiveListEl) {
+        const runtime = churnerRuntime && typeof churnerRuntime === 'object' ? churnerRuntime : {};
+        const states = Array.isArray(runtime.states) ? runtime.states : [];
+        const activeRows = states.filter((row) => Boolean(row && row.active));
+        if (!activeRows.length) {
+          shChurnerActiveListEl.textContent = activeSlots > 0
+            ? `${activeSlots} active slot${activeSlots === 1 ? '' : 's'} (detailed runtime state unavailable)`
+            : 'No active slots';
+          if (shChurnerDetailsEl) shChurnerDetailsEl.open = false;
+        } else {
+          const bits = activeRows.map((row) => {
+            const sid = Number(row.slot_id || 0);
+            const pid = Number(row.parent_position_id || 0);
+            const trade = String(row.parent_trade_id || '');
+            const stage = churnerStageLabel(row.stage);
+            const changedAt = Number(row.last_state_change_at || 0);
+            const age = changedAt > 0 ? fmtAgo(nowSec - changedAt) : '-';
+            return `slot ${sid} ${stage} #${pid}${trade ? ` ${trade}` : ''} ${age}`;
+          });
+          shChurnerActiveListEl.textContent = bits.join(' | ');
+        }
       }
 
       if (shMigrationEl) {
@@ -1724,6 +2534,7 @@ DASHBOARD_HTML = """<!doctype html>
       document.getElementById('totalUnrealized').textContent =
         `$${fmt(s.total_unrealized_profit, 6)} (${fmt(s.total_unrealized_doge, 3)} DOGE)`;
       document.getElementById('todayLoss').textContent = `$${fmt(s.today_realized_loss, 4)}`;
+      renderOpsSummary(s);
       const pnlAudit = s.pnl_audit || null;
       const pnlAuditEl = document.getElementById('pnlAudit');
       const pnlAuditDetailsEl = document.getElementById('pnlAuditDetails');
@@ -2832,6 +3643,8 @@ DASHBOARD_HTML = """<!doctype html>
         trendIdleEl.textContent = `${fmt(dynamicTarget * 100, 1)}% (base ${fmt(baseTarget * 100, 1)}%)`;
         trendIdleEl.style.color = dynamicTarget < baseTarget ? 'var(--good)' : dynamicTarget > baseTarget ? 'var(--warn)' : '';
       }
+
+      renderManifoldPanel(s, nowSec);
     }
 
     function renderSlots(s) {
@@ -2887,6 +3700,107 @@ DASHBOARD_HTML = """<!doctype html>
         slotBeliefsEl.textContent = `Belief: ${bits.join(' | ')}`;
       } else {
         slotBeliefsEl.textContent = '';
+      }
+
+      const churnerStatusEl = document.getElementById('slotChurnerStatus');
+      const churnerParentEl = document.getElementById('slotChurnerParent');
+      const churnerGateEl = document.getElementById('slotChurnerGate');
+      const churnerReserveEl = document.getElementById('slotChurnerReserve');
+      const churnerHintEl = document.getElementById('slotChurnerHint');
+      const churnerCandidateSelect = document.getElementById('slotChurnerCandidateSelect');
+      const churnerSpawnBtn = document.getElementById('slotChurnerSpawnBtn');
+      const churnerKillBtn = document.getElementById('slotChurnerKillBtn');
+      const churnerReserveInput = document.getElementById('churnerReserveInput');
+      const runtimePayload = churnerRuntime && typeof churnerRuntime === 'object' ? churnerRuntime : {};
+      const fallbackChurner = s && s.self_healing && typeof s.self_healing.churner === 'object' ? s.self_healing.churner : {};
+      const enabled = Boolean(runtimePayload.enabled != null ? runtimePayload.enabled : fallbackChurner.enabled);
+      const runtimeState = runtimeChurnerState(slot.slot_id);
+      const active = Boolean(runtimeState && runtimeState.active);
+      const stage = runtimeState ? churnerStageLabel(runtimeState.stage) : 'IDLE';
+      const mtsValue = clamp(runtimePayload.mts, 0, 1);
+      const mtsGate = clamp(runtimePayload.mts_gate, 0, 1);
+      const manifoldEnabled = Boolean(s && s.manifold_score && s.manifold_score.enabled);
+      const gateBlocked = enabled && manifoldEnabled && (mtsValue + 1e-12 < mtsGate);
+      const reserveAvail = safeNum(runtimePayload.reserve_available_usd, fallbackChurner.reserve_available_usd || 0);
+      const reserveCfg = safeNum(runtimePayload.reserve_config_usd, 0);
+      const activeSlots = safeNum(runtimePayload.active_slots, fallbackChurner.active_slots || 0);
+      const maxActive = Math.max(1, safeNum(runtimePayload.max_active, 1));
+      if (churnerStatusEl) {
+        if (!enabled) {
+          churnerStatusEl.textContent = 'OFF';
+          churnerStatusEl.style.color = 'var(--muted)';
+        } else if (active) {
+          churnerStatusEl.textContent = `${stage} (${activeSlots}/${maxActive} active)`;
+          churnerStatusEl.style.color = 'var(--good)';
+        } else {
+          churnerStatusEl.textContent = `IDLE (${activeSlots}/${maxActive} active)`;
+          churnerStatusEl.style.color = '';
+        }
+      }
+      if (churnerParentEl) {
+        if (runtimeState && Number(runtimeState.parent_position_id || 0) > 0) {
+          const pid = Number(runtimeState.parent_position_id || 0);
+          const trade = String(runtimeState.parent_trade_id || '');
+          churnerParentEl.textContent = `#${pid}${trade ? ` (${trade})` : ''}`;
+        } else {
+          churnerParentEl.textContent = '-';
+        }
+      }
+      if (churnerGateEl) {
+        if (!enabled) {
+          churnerGateEl.textContent = '-';
+          churnerGateEl.style.color = '';
+        } else if (!manifoldEnabled) {
+          churnerGateEl.textContent = `MTS disabled (gate bypass)`;
+          churnerGateEl.style.color = 'var(--muted)';
+        } else {
+          churnerGateEl.textContent = `${fmt(mtsValue, 3)} / ${fmt(mtsGate, 3)}`;
+          churnerGateEl.style.color = gateBlocked ? 'var(--bad)' : 'var(--good)';
+        }
+      }
+      if (churnerReserveEl) {
+        const cyclesToday = safeNum(runtimePayload.cycles_today, fallbackChurner.cycles_today || 0);
+        const profitToday = safeNum(runtimePayload.profit_today, fallbackChurner.profit_today || 0);
+        churnerReserveEl.textContent = `$${fmt(reserveAvail, 3)} (cfg $${fmt(reserveCfg, 3)}) | ${cyclesToday} cyc | $${fmt(profitToday, 3)}`;
+      }
+      if (churnerHintEl) {
+        const parts = [];
+        if (!enabled) parts.push('churner toggle is disabled');
+        if (gateBlocked) parts.push(`MTS too low (${fmt(mtsValue, 3)} < ${fmt(mtsGate, 3)})`);
+        if (runtimeState && runtimeState.last_error) parts.push(`last error: ${String(runtimeState.last_error)}`);
+        if (runtimeState && Number(runtimeState.last_state_change_at || 0) > 0) {
+          parts.push(`state changed ${fmtAgo((Date.now() / 1000) - Number(runtimeState.last_state_change_at || 0))}`);
+        }
+        churnerHintEl.textContent = parts.join(' | ');
+      }
+      if (churnerCandidateSelect) {
+        const rows = runtimeChurnerCandidates(slot.slot_id);
+        const prior = churnerCandidateSelect.value;
+        churnerCandidateSelect.innerHTML = '<option value=\"\">Auto-select best candidate</option>';
+        for (const row of rows) {
+          const pid = Number(row.position_id || 0);
+          if (!Number.isFinite(pid) || pid <= 0) continue;
+          const opt = document.createElement('option');
+          opt.value = String(pid);
+          const dist = fmt(Number(row.distance_pct || 0), 2);
+          const age = fmtAgeSeconds(Number(row.effective_age_sec || 0));
+          const subsidy = fmt(Number(row.subsidy_needed || 0), 3);
+          opt.textContent = `#${pid} ${String(row.trade_id || '')}.${Number(row.cycle || 0)} | dist ${dist}% | age ${age} | need $${subsidy}`;
+          churnerCandidateSelect.appendChild(opt);
+        }
+        if (prior && churnerCandidateSelect.querySelector(`option[value=\"${prior}\"]`)) {
+          churnerCandidateSelect.value = prior;
+        }
+      }
+      if (churnerSpawnBtn) {
+        churnerSpawnBtn.disabled = !enabled || active || gateBlocked;
+        churnerSpawnBtn.title = gateBlocked ? `MTS too low (${fmt(mtsValue, 3)} < ${fmt(mtsGate, 3)})` : '';
+      }
+      if (churnerKillBtn) {
+        churnerKillBtn.disabled = !enabled || !active;
+      }
+      if (churnerReserveInput && document.activeElement !== churnerReserveInput) {
+        churnerReserveInput.value = fmt(reserveCfg, 2);
       }
 
       document.getElementById('orderUsd').textContent = `$${fmt(slot.order_size_usd, 4)}`;
@@ -2966,7 +3880,30 @@ DASHBOARD_HTML = """<!doctype html>
 
     async function refresh() {
       try {
-        const nextState = await api('/api/status');
+        const results = await Promise.allSettled([
+          api('/api/status'),
+          api('/api/churner/status'),
+          api('/api/churner/candidates'),
+        ]);
+        if (results[0].status !== 'fulfilled') {
+          throw results[0].reason;
+        }
+        const nextState = results[0].value;
+        if (results[1].status === 'fulfilled') {
+          churnerRuntime = results[1].value;
+          churnerLastError = '';
+        } else {
+          churnerRuntime = null;
+          const msg = results[1].reason && results[1].reason.message
+            ? results[1].reason.message
+            : 'churner status unavailable';
+          churnerLastError = msg;
+        }
+        if (results[2].status === 'fulfilled') {
+          churnerCandidates = results[2].value;
+        } else {
+          churnerCandidates = null;
+        }
         state = nextState;
         lastRefreshError = '';
         if (kbMode === 'NORMAL') {
@@ -2974,6 +3911,9 @@ DASHBOARD_HTML = """<!doctype html>
           pendingRenderState = null;
         } else {
           pendingRenderState = nextState;
+        }
+        if (opsDrawerOpen) {
+          renderOpsDrawer();
         }
       } catch (err) {
         const msg = err.message || 'status refresh failed';
@@ -3076,6 +4016,11 @@ DASHBOARD_HTML = """<!doctype html>
         window.location.href = '/factory';
         return true;
       }
+      if (key === 'o') {
+        clearChordBuffer();
+        void openOpsDrawer();
+        return true;
+      }
       if (key === 's') {
         clearChordBuffer();
         window.location.href = '/api/status';
@@ -3098,6 +4043,14 @@ DASHBOARD_HTML = """<!doctype html>
           event.preventDefault();
           document.activeElement.blur();
           leaveToNormal();
+        }
+        return;
+      }
+
+      if (opsDrawerOpen) {
+        if (event.key === 'Escape' || event.key === 'o') {
+          event.preventDefault();
+          closeOpsDrawer();
         }
         return;
       }
@@ -3185,6 +4138,13 @@ DASHBOARD_HTML = """<!doctype html>
       equityChartRange = '7d';
       if (state) renderAll(state);
     };
+    document.getElementById('opsDrawerBtn').onclick = () => { void openOpsDrawer(); };
+    document.getElementById('opsOpenBtn').onclick = () => { void openOpsDrawer(); };
+    document.getElementById('opsDrawerCloseBtn').onclick = () => closeOpsDrawer();
+    document.getElementById('opsResetAllBtn').onclick = () => { void requestOpsResetAll(); };
+    document.getElementById('opsDrawer').onclick = (event) => {
+      if (event.target === event.currentTarget) closeOpsDrawer();
+    };
     document.getElementById('aiApplyOverrideBtn').onclick = () => {
       const ai = state && state.ai_regime_advisor ? state.ai_regime_advisor : {};
       const ttl = Number(ai.suggested_ttl_sec || ai.default_ttl_sec || 1800);
@@ -3192,6 +4152,30 @@ DASHBOARD_HTML = """<!doctype html>
     };
     document.getElementById('aiDismissBtn').onclick = () => requestAiRegimeDismiss();
     document.getElementById('aiRevertBtn').onclick = () => requestAiRegimeRevert();
+    document.getElementById('slotChurnerSpawnBtn').onclick = () => {
+      const slots = getSlots();
+      if (!slots.length) { showToast('no slots available', 'error'); return; }
+      const slotId = selectedSlot || slots[0].slot_id;
+      const select = document.getElementById('slotChurnerCandidateSelect');
+      const candidateRaw = select ? String(select.value || '').trim() : '';
+      const candidateId = candidateRaw ? Number(candidateRaw) : null;
+      if (candidateRaw && (!Number.isFinite(candidateId) || candidateId <= 0)) {
+        showToast('invalid candidate selection', 'error');
+        return;
+      }
+      void requestChurnerSpawn(slotId, candidateId);
+    };
+    document.getElementById('slotChurnerKillBtn').onclick = () => {
+      const slots = getSlots();
+      if (!slots.length) { showToast('no slots available', 'error'); return; }
+      const slotId = selectedSlot || slots[0].slot_id;
+      void requestChurnerKill(slotId);
+    };
+    document.getElementById('churnerReserveSetBtn').onclick = () => {
+      const input = document.getElementById('churnerReserveInput');
+      const value = Number(input && input.value);
+      void requestChurnerReserveUpdate(value);
+    };
 
     document.getElementById('confirmOkBtn').onclick = () => { void confirmAccept(); };
     document.getElementById('confirmCancelBtn').onclick = () => confirmCancel();

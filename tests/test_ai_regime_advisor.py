@@ -193,6 +193,8 @@ class AIRegimeAdvisorP0Tests(unittest.TestCase):
         prompt = ai_advisor._REGIME_SYSTEM_PROMPT
         self.assertIn("confidence in the ASSESSMENT", prompt)
         self.assertIn("Even Tier 0 can have high conviction", prompt)
+        self.assertIn("Manifold Trading Score (MTS)", prompt)
+        self.assertIn("Position age distribution", prompt)
         self.assertIn("Return ONLY a JSON object", prompt)
         self.assertIn('"accumulation_signal"', prompt)
         self.assertIn('"accumulation_conviction"', prompt)
@@ -310,6 +312,34 @@ class AIRegimeAdvisorP0Tests(unittest.TestCase):
                 "budget_remaining_usd": 42.0,
                 "cooldown_remaining_sec": 0,
             },
+            "manifold": {
+                "mts": 0.58,
+                "band": "cautious",
+                "components": {"clarity": 0.50, "stability": 0.89, "throughput": 0.63, "coherence": 0.41},
+                "trend": "falling",
+                "mts_30m_ago": 0.64,
+            },
+            "positions": {
+                "total_open": 42,
+                "age_bands": {"fresh": 2, "aging": 2, "stale": 24, "stuck": 5, "write_off": 9},
+                "stuck_capital_pct": 0.12,
+                "avg_distance_pct": 5.8,
+                "negative_ev_count": 29,
+            },
+            "throughput": {
+                "active_regime": "ranging",
+                "multiplier": 0.67,
+                "age_pressure": 0.43,
+                "median_fill_sec": 7377,
+                "sufficient_data_regimes": ["bearish_A", "ranging_A", "ranging_B"],
+            },
+            "churner": {
+                "enabled": False,
+                "active_slots": 0,
+                "reserve_usd": 5.0,
+                "subsidy_balance": 0.0,
+                "subsidy_needed": 0.46,
+            },
         }
 
         payload = ai_advisor._build_regime_context(raw)
@@ -331,6 +361,16 @@ class AIRegimeAdvisorP0Tests(unittest.TestCase):
         self.assertEqual(payload["accumulation"]["state"], "ARMED")
         self.assertEqual(payload["accumulation"]["signal"], "accumulate_doge")
         self.assertEqual(payload["accumulation"]["conviction"], 74)
+        self.assertAlmostEqual(float(payload["manifold"]["mts"]), 0.58)
+        self.assertEqual(payload["manifold"]["trend"], "falling")
+        self.assertAlmostEqual(float(payload["manifold"]["mts_30m_ago"]), 0.64)
+        self.assertEqual(payload["positions"]["total_open"], 42)
+        self.assertEqual(payload["positions"]["age_bands"]["stale"], 24)
+        self.assertAlmostEqual(float(payload["throughput"]["multiplier"]), 0.67)
+        self.assertEqual(payload["throughput"]["active_regime"], "ranging")
+        self.assertEqual(payload["throughput"]["sufficient_data_regimes"], ["bearish_A", "ranging_A", "ranging_B"])
+        self.assertFalse(payload["churner"]["enabled"])
+        self.assertAlmostEqual(float(payload["churner"]["subsidy_needed"]), 0.46)
 
     def test_consensus_probs_missing_defaults(self):
         payload = ai_advisor._build_regime_context({
@@ -342,6 +382,10 @@ class AIRegimeAdvisorP0Tests(unittest.TestCase):
             },
         })
         self.assertEqual(payload["hmm"]["consensus"]["consensus_probabilities"], [0.0, 1.0, 0.0])
+        self.assertIn("manifold", payload)
+        self.assertIn("positions", payload)
+        self.assertIn("throughput", payload)
+        self.assertIn("churner", payload)
 
     def test_consensus_probs_dict_format_supported(self):
         out = ai_advisor._sanitize_probabilities({

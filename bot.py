@@ -140,6 +140,76 @@ if _bayesian_engine is None:  # pragma: no cover - fallback path for minimal run
             }
 
     @dataclass
+    class _FallbackManifoldScoreComponents:
+        regime_clarity: float = 0.0
+        regime_stability: float = 0.0
+        throughput_efficiency: float = 0.0
+        signal_coherence: float = 0.0
+
+        def to_status_dict(self) -> dict[str, float]:
+            return {
+                "regime_clarity": float(self.regime_clarity),
+                "regime_stability": float(self.regime_stability),
+                "throughput_efficiency": float(self.throughput_efficiency),
+                "signal_coherence": float(self.signal_coherence),
+            }
+
+    @dataclass
+    class _FallbackManifoldScore:
+        enabled: bool = False
+        mts: float = 0.0
+        band: str = "disabled"
+        band_color: str = "#6c757d"
+        components: _FallbackManifoldScoreComponents = None
+        component_details: dict[str, float] = None
+        fisher_score: float = 0.0
+        kernel_enabled: bool = False
+        kernel_samples: int = 0
+        kernel_score: float | None = None
+        kernel_blend_alpha: float = 0.0
+
+        def __post_init__(self) -> None:
+            if self.components is None:
+                self.components = _FallbackManifoldScoreComponents()
+            if self.component_details is None:
+                self.component_details = {}
+
+        def to_status_dict(self) -> dict[str, Any]:
+            if not bool(self.enabled):
+                return {
+                    "enabled": False,
+                    "mts": 0.0,
+                    "band": "disabled",
+                    "band_color": "#6c757d",
+                    "components": _FallbackManifoldScoreComponents().to_status_dict(),
+                    "component_details": {},
+                    "kernel_memory": {
+                        "enabled": False,
+                        "samples": 0,
+                        "score": None,
+                        "blend_alpha": 0.0,
+                    },
+                }
+            return {
+                "enabled": True,
+                "mts": float(self.mts),
+                "band": str(self.band),
+                "band_color": str(self.band_color),
+                "components": self.components.to_status_dict(),
+                "component_details": {
+                    str(k): float(v)
+                    for k, v in (self.component_details or {}).items()
+                },
+                "fisher_score": float(self.fisher_score),
+                "kernel_memory": {
+                    "enabled": bool(self.kernel_enabled),
+                    "samples": int(max(0, self.kernel_samples)),
+                    "score": (float(self.kernel_score) if self.kernel_score is not None else None),
+                    "blend_alpha": float(self.kernel_blend_alpha),
+                },
+            }
+
+    @dataclass
     class _FallbackTradeBeliefState:
         position_id: int
         slot_id: int
@@ -213,9 +283,55 @@ if _bayesian_engine is None:  # pragma: no cover - fallback path for minimal run
         hmax = log(3.0)
         return max(0.0, min(1.0, h / hmax))
 
+    def _fallback_clamp(value: float, lo: float, hi: float) -> float:
+        low = min(float(lo), float(hi))
+        high = max(float(lo), float(hi))
+        return max(low, min(float(value), high))
+
+    def _fallback_safe_float(value: Any, default: float = 0.0) -> float:
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        if not isfinite(out):
+            return float(default)
+        return out
+
+    def _fallback_weights(raw: Any, default: list[float]) -> list[float]:
+        out: list[float] = []
+        if isinstance(raw, (list, tuple)):
+            for i in range(len(default)):
+                if i >= len(raw):
+                    break
+                out.append(max(0.0, _fallback_safe_float(raw[i], 0.0)))
+        if len(out) != len(default):
+            out = [max(0.0, float(v)) for v in default]
+        total = float(sum(out))
+        if total <= 1e-12:
+            out = [max(0.0, float(v)) for v in default]
+            total = float(sum(out))
+        if total <= 1e-12:
+            n = max(1, len(default))
+            return [1.0 / float(n) for _ in range(n)]
+        return [float(v) / total for v in out]
+
+    def _fallback_manifold_score_band(score: float) -> tuple[str, str]:
+        mts = _fallback_clamp(float(score), 0.0, 1.0)
+        if mts >= 0.80:
+            return "optimal", "#5cb85c"
+        if mts >= 0.60:
+            return "favorable", "#20c997"
+        if mts >= 0.40:
+            return "cautious", "#f0ad4e"
+        if mts >= 0.20:
+            return "defensive", "#fd7e14"
+        return "hostile", "#d9534f"
+
     class _FallbackBayesianModule:
         BeliefState = _FallbackBeliefState
         ActionKnobs = _FallbackActionKnobs
+        ManifoldScoreComponents = _FallbackManifoldScoreComponents
+        ManifoldScore = _FallbackManifoldScore
         TradeBeliefState = _FallbackTradeBeliefState
 
         @staticmethod
@@ -373,6 +489,136 @@ if _bayesian_engine is None:  # pragma: no cover - fallback path for minimal run
             ):
                 return "tighten", 0.6
             return "hold", 0.5
+
+        @staticmethod
+        def manifold_score_band(score: float) -> tuple[str, str]:
+            return _fallback_manifold_score_band(score)
+
+        @staticmethod
+        def compute_manifold_score(
+            *,
+            posterior_1m: Any,
+            posterior_15m: Any,
+            posterior_1h: Any,
+            p_switch_1m: float,
+            p_switch_15m: float,
+            p_switch_1h: float,
+            bocpd_change_prob: float,
+            bocpd_run_length: float,
+            throughput_multiplier: float,
+            age_pressure: float,
+            stuck_capital_pct: float,
+            entropy_consensus: float,
+            direction_score: float,
+            clarity_weights: Any = None,
+            stability_switch_weights: Any = None,
+            coherence_weights: Any = None,
+            enabled: bool = True,
+            kernel_enabled: bool = False,
+            kernel_samples: int = 0,
+            kernel_score: float | None = None,
+            kernel_min_samples: int = 200,
+            kernel_alpha_max: float = 0.5,
+        ) -> _FallbackManifoldScore:
+            if not bool(enabled):
+                return _FallbackManifoldScore(enabled=False)
+
+            def _clarity(raw: Any) -> float:
+                p = _fallback_triplet(raw)
+                kl = 0.0
+                uniform = 1.0 / 3.0
+                for pi in p:
+                    if pi <= 0.0:
+                        continue
+                    kl += float(pi) * log(float(pi) / uniform)
+                return _fallback_clamp(1.0 - exp(-kl), 0.0, 1.0)
+
+            clarity_1m = _clarity(posterior_1m)
+            clarity_15m = _clarity(posterior_15m)
+            clarity_1h = _clarity(posterior_1h)
+            cw1, cw15, cw60 = _fallback_weights(clarity_weights, [0.2, 0.5, 0.3])
+            rc = _fallback_clamp(
+                (cw1 * clarity_1m) + (cw15 * clarity_15m) + (cw60 * clarity_1h),
+                0.0,
+                1.0,
+            )
+
+            sw1, sw15, sw60 = _fallback_weights(stability_switch_weights, [0.2, 0.5, 0.3])
+            ps1 = _fallback_clamp(float(p_switch_1m), 0.0, 1.0)
+            ps15 = _fallback_clamp(float(p_switch_15m), 0.0, 1.0)
+            ps60 = _fallback_clamp(float(p_switch_1h), 0.0, 1.0)
+            switch_risk = _fallback_clamp(max(ps1 * sw1, ps15 * sw15, ps60 * sw60), 0.0, 1.0)
+            bocpd_risk = _fallback_clamp(float(bocpd_change_prob), 0.0, 1.0)
+            rs = _fallback_clamp((1.0 - switch_risk) * (1.0 - bocpd_risk), 0.0, 1.0)
+
+            tp_mult = _fallback_clamp(float(throughput_multiplier), 0.0, 2.0)
+            age = _fallback_clamp(float(age_pressure), 0.0, 1.0)
+            stuck = _fallback_clamp(float(stuck_capital_pct), 0.0, 100.0)
+            age_drag = _fallback_clamp(1.0 - (age * stuck / 100.0), 0.0, 1.0)
+            te = _fallback_clamp(tp_mult * age_drag, 0.0, 1.0)
+
+            agreement = _fallback_clamp(1.0 - float(entropy_consensus), 0.0, 1.0)
+            directional_clarity = _fallback_clamp(abs(float(direction_score)), 0.0, 1.0)
+            bocpd_run_norm = _fallback_clamp(float(bocpd_run_length) / 50.0, 0.0, 1.0)
+            wa, wd, wb = _fallback_weights(coherence_weights, [0.5, 0.25, 0.25])
+            sc = _fallback_clamp(
+                (agreement * wa) + (directional_clarity * wd) + (bocpd_run_norm * wb),
+                0.0,
+                1.0,
+            )
+
+            components = _FallbackManifoldScoreComponents(
+                regime_clarity=rc,
+                regime_stability=rs,
+                throughput_efficiency=te,
+                signal_coherence=sc,
+            )
+            product = float(rc) * float(rs) * float(te) * float(sc)
+            fisher = _fallback_clamp(pow(product, 0.25) if product > 0.0 else 0.0, 0.0, 1.0)
+
+            kernel_score_clean: float | None = None
+            kernel_samples_int = max(0, int(kernel_samples))
+            kernel_enabled_flag = bool(kernel_enabled)
+            alpha_max = _fallback_clamp(float(kernel_alpha_max), 0.0, 1.0)
+            min_samples = max(1, int(kernel_min_samples))
+            blend_alpha = 0.0
+            score = fisher
+            if kernel_enabled_flag and kernel_samples_int >= min_samples and kernel_score is not None:
+                kernel_score_clean = _fallback_clamp(float(kernel_score), 0.0, 1.0)
+                ramp = _fallback_clamp((kernel_samples_int - min_samples) / float(min_samples), 0.0, 1.0)
+                blend_alpha = _fallback_clamp(ramp * alpha_max, 0.0, alpha_max)
+                score = _fallback_clamp(
+                    (1.0 - blend_alpha) * fisher + blend_alpha * kernel_score_clean,
+                    0.0,
+                    1.0,
+                )
+
+            band, band_color = _fallback_manifold_score_band(score)
+            details = {
+                "clarity_1m": float(clarity_1m),
+                "clarity_15m": float(clarity_15m),
+                "clarity_1h": float(clarity_1h),
+                "p_switch_risk": float(switch_risk),
+                "bocpd_risk": float(bocpd_risk),
+                "tp_mult": float(tp_mult),
+                "age_drag": float(age_drag),
+                "agreement": float(agreement),
+                "directional_clarity": float(directional_clarity),
+                "bocpd_run_norm": float(bocpd_run_norm),
+            }
+            return _FallbackManifoldScore(
+                enabled=True,
+                mts=float(score),
+                band=str(band),
+                band_color=str(band_color),
+                components=components,
+                component_details=details,
+                fisher_score=float(fisher),
+                kernel_enabled=kernel_enabled_flag,
+                kernel_samples=kernel_samples_int,
+                kernel_score=kernel_score_clean,
+                kernel_blend_alpha=float(blend_alpha),
+            )
 
     bayesian_engine = _FallbackBayesianModule()
 else:
@@ -772,6 +1018,15 @@ class ExternalFlow:
     price_at_detect: float
 
 
+@dataclass(frozen=True)
+class RuntimeToggleSpec:
+    key: str
+    group: str
+    description: str
+    dependencies: tuple[str, ...] = ()
+    side_effect: str | None = None
+
+
 class CapitalLedger:
     """Within-loop capital tracker that prevents over-commitment across slots."""
 
@@ -864,6 +1119,8 @@ class BotRuntime:
         self.lock = threading.RLock()
         self.started_at = _now()
         self.running = True
+        self._runtime_overrides: dict[str, bool] = {}
+        self._toggle_registry: dict[str, RuntimeToggleSpec] = self._build_toggle_registry()
 
         self.mode = "INIT"  # INIT | RUNNING | PAUSED | HALTED
         self.pause_reason = ""
@@ -916,7 +1173,7 @@ class BotRuntime:
         self._loop_dust_dividend: float | None = None
         self._loop_b_side_base: float | None = None
         self._loop_effective_layers: dict[str, float | int | None] | None = None
-        self._dust_sweep_enabled: bool = bool(getattr(config, "DUST_SWEEP_ENABLED", True))
+        self._dust_sweep_enabled: bool = self._flag_value("DUST_SWEEP_ENABLED")
         self._dust_min_threshold_usd: float = max(0.0, float(getattr(config, "DUST_MIN_THRESHOLD", 0.50)))
         self._dust_max_bump_pct: float = max(0.0, float(getattr(config, "DUST_MAX_BUMP_PCT", 25.0)))
         self._dust_last_absorbed_usd: float = 0.0
@@ -1026,13 +1283,13 @@ class BotRuntime:
         self._regime_history_window_sec: float = 1800.0
         self._hmm_state: dict[str, Any] = self._hmm_default_state()
         self._hmm_state_secondary: dict[str, Any] = self._hmm_default_state(
-            enabled=bool(getattr(config, "HMM_ENABLED", False))
-            and bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)),
+            enabled=self._flag_value("HMM_ENABLED")
+            and self._flag_value("HMM_MULTI_TIMEFRAME_ENABLED"),
             interval_min=max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15))),
         )
         self._hmm_state_tertiary: dict[str, Any] = self._hmm_default_state(
-            enabled=bool(getattr(config, "HMM_ENABLED", False))
-            and bool(getattr(config, "HMM_TERTIARY_ENABLED", False)),
+            enabled=self._flag_value("HMM_ENABLED")
+            and self._flag_value("HMM_TERTIARY_ENABLED"),
             interval_min=max(1, int(getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60))),
         )
         self._hmm_consensus: dict[str, Any] = dict(self._hmm_state)
@@ -1090,25 +1347,16 @@ class BotRuntime:
         self._bocpd: bocpd.BOCPD | None = None
         self._bocpd_state: bocpd.BOCPDState = bocpd.BOCPDState()
         self._bocpd_last_price: float = 0.0
-        if bool(getattr(config, "BOCPD_ENABLED", False)):
-            self._bocpd = bocpd.BOCPD(
-                expected_run_length=max(2, int(getattr(config, "BOCPD_EXPECTED_RUN_LENGTH", 200))),
-                max_run_length=max(10, int(getattr(config, "BOCPD_MAX_RUN_LENGTH", 500))),
-                alert_threshold=float(getattr(config, "BOCPD_ALERT_THRESHOLD", 0.30)),
-                urgent_threshold=float(getattr(config, "BOCPD_URGENT_THRESHOLD", 0.50)),
-            )
+        self._manifold_score: bayesian_engine.ManifoldScore = bayesian_engine.ManifoldScore(enabled=False)
+        self._manifold_history: deque[tuple[float, float, float, float, float, float]] = deque(
+            maxlen=max(1, int(getattr(config, "MTS_HISTORY_SIZE", 360)))
+        )
+        if self._flag_value("BOCPD_ENABLED"):
+            self._bocpd = self._new_bocpd_instance()
         self._survival_model: survival_model.SurvivalModel | None = None
         self._survival_last_retrain_ts: float = 0.0
-        if bool(getattr(config, "SURVIVAL_MODEL_ENABLED", False)):
-            self._survival_model = survival_model.SurvivalModel(
-                survival_model.SurvivalConfig(
-                    min_observations=max(1, int(getattr(config, "SURVIVAL_MIN_OBSERVATIONS", 50))),
-                    min_per_stratum=max(1, int(getattr(config, "SURVIVAL_MIN_PER_STRATUM", 10))),
-                    synthetic_weight=max(0.0, min(1.0, float(getattr(config, "SURVIVAL_SYNTHETIC_WEIGHT", 0.30)))),
-                    horizons=list(getattr(config, "SURVIVAL_HORIZONS", [1800, 3600, 14400])),
-                ),
-                model_tier=str(getattr(config, "SURVIVAL_MODEL_TIER", "kaplan_meier")),
-            )
+        if self._flag_value("SURVIVAL_MODEL_ENABLED"):
+            self._survival_model = self._new_survival_model_instance()
         self._trade_beliefs: dict[int, bayesian_engine.TradeBeliefState] = {}
         self._trade_belief_ev_history: dict[int, list[float]] = {}
         self._trade_belief_widen_count: dict[int, int] = {}
@@ -1210,7 +1458,7 @@ class BotRuntime:
         self._position_ledger_migration_last_created: int = 0
         self._position_ledger_migration_last_scanned: int = 0
         self._position_ledger = PositionLedger(
-            enabled=bool(getattr(config, "POSITION_LEDGER_ENABLED", True)),
+            enabled=self._flag_value("POSITION_LEDGER_ENABLED"),
             journal_local_limit=max(50, int(getattr(config, "POSITION_JOURNAL_LOCAL_LIMIT", 500))),
         )
         # Active exit identity -> position mappings (runtime convenience index).
@@ -1229,30 +1477,431 @@ class BotRuntime:
         self._churner_cycles_total: int = 0
         self._churner_profit_total: float = 0.0
         self._throughput: ThroughputSizer | None = None
-        if bool(getattr(config, "TP_ENABLED", False)):
-            self._throughput = ThroughputSizer(
-                ThroughputConfig(
-                    enabled=bool(getattr(config, "TP_ENABLED", False)),
-                    lookback_cycles=int(getattr(config, "TP_LOOKBACK_CYCLES", 500)),
-                    min_samples=int(getattr(config, "TP_MIN_SAMPLES", 20)),
-                    min_samples_per_bucket=int(getattr(config, "TP_MIN_SAMPLES_PER_BUCKET", 10)),
-                    full_confidence_samples=int(getattr(config, "TP_FULL_CONFIDENCE_SAMPLES", 50)),
-                    floor_mult=float(getattr(config, "TP_FLOOR_MULT", 0.5)),
-                    ceiling_mult=float(getattr(config, "TP_CEILING_MULT", 2.0)),
-                    censored_weight=float(getattr(config, "TP_CENSORED_WEIGHT", 0.5)),
-                    age_pressure_trigger=float(getattr(config, "TP_AGE_PRESSURE_TRIGGER", 1.5)),
-                    age_pressure_sensitivity=float(getattr(config, "TP_AGE_PRESSURE_SENSITIVITY", 0.5)),
-                    age_pressure_floor=float(getattr(config, "TP_AGE_PRESSURE_FLOOR", 0.3)),
-                    util_threshold=float(getattr(config, "TP_UTIL_THRESHOLD", 0.7)),
-                    util_sensitivity=float(getattr(config, "TP_UTIL_SENSITIVITY", 0.8)),
-                    util_floor=float(getattr(config, "TP_UTIL_FLOOR", 0.4)),
-                    recency_halflife=int(getattr(config, "TP_RECENCY_HALFLIFE", 100)),
-                    log_updates=bool(getattr(config, "TP_LOG_UPDATES", True)),
-                )
-            )
+        if self._flag_value("TP_ENABLED"):
+            self._throughput = self._new_throughput_sizer()
         self._init_hmm_runtime()
 
     # ------------------ Config/State ------------------
+
+    @staticmethod
+    def _build_toggle_registry() -> dict[str, RuntimeToggleSpec]:
+        specs = (
+            RuntimeToggleSpec(
+                key="HMM_ENABLED",
+                group="Regime Detection",
+                description="Primary 1-minute regime detector",
+                side_effect="_toggle_side_effect_hmm_runtime",
+            ),
+            RuntimeToggleSpec(
+                key="HMM_MULTI_TIMEFRAME_ENABLED",
+                group="Regime Detection",
+                description="1m + 15m consensus mode",
+                dependencies=("HMM_ENABLED",),
+                side_effect="_toggle_side_effect_hmm_runtime",
+            ),
+            RuntimeToggleSpec(
+                key="HMM_SECONDARY_OHLCV_ENABLED",
+                group="Regime Detection",
+                description="15m candle collection",
+            ),
+            RuntimeToggleSpec(
+                key="HMM_TERTIARY_ENABLED",
+                group="Regime Detection",
+                description="1h strategic transitions",
+                dependencies=("HMM_ENABLED",),
+                side_effect="_toggle_side_effect_hmm_runtime",
+            ),
+            RuntimeToggleSpec(
+                key="HMM_DEEP_DECAY_ENABLED",
+                group="Regime Detection",
+                description="Recency decay on training window",
+            ),
+            RuntimeToggleSpec(
+                key="AI_REGIME_ADVISOR_ENABLED",
+                group="Intelligence",
+                description="LLM regime second opinion",
+            ),
+            RuntimeToggleSpec(
+                key="AI_AUTO_EXECUTE",
+                group="Intelligence",
+                description="Auto-apply conservative AI actions",
+            ),
+            RuntimeToggleSpec(
+                key="BELIEF_TRACKER_ENABLED",
+                group="Intelligence",
+                description="Per-trade belief tracker",
+                dependencies=("POSITION_LEDGER_ENABLED",),
+                side_effect="_toggle_side_effect_belief_tracker_runtime",
+            ),
+            RuntimeToggleSpec(
+                key="BELIEF_WIDEN_ENABLED",
+                group="Intelligence",
+                description="Allow belief-driven widening",
+                dependencies=("BELIEF_TRACKER_ENABLED",),
+            ),
+            RuntimeToggleSpec(
+                key="BOCPD_ENABLED",
+                group="Intelligence",
+                description="Bayesian changepoint detector",
+                side_effect="_toggle_side_effect_bocpd_runtime",
+            ),
+            RuntimeToggleSpec(
+                key="ENRICHED_FEATURES_ENABLED",
+                group="Intelligence",
+                description="Private microstructure features",
+                side_effect="_toggle_side_effect_enriched_features_runtime",
+            ),
+            RuntimeToggleSpec(
+                key="SURVIVAL_MODEL_ENABLED",
+                group="Intelligence",
+                description="Survival model predictions",
+                side_effect="_toggle_side_effect_survival_runtime",
+            ),
+            RuntimeToggleSpec(
+                key="KNOB_MODE_ENABLED",
+                group="Intelligence",
+                description="Continuous action knob mode",
+            ),
+            RuntimeToggleSpec(
+                key="TP_ENABLED",
+                group="Capital & Sizing",
+                description="Throughput advisory sizing",
+                side_effect="_toggle_side_effect_throughput_runtime",
+            ),
+            RuntimeToggleSpec(
+                key="REGIME_DIRECTIONAL_ENABLED",
+                group="Capital & Sizing",
+                description="Directional regime actuation",
+            ),
+            RuntimeToggleSpec(
+                key="REGIME_SHADOW_ENABLED",
+                group="Capital & Sizing",
+                description="Directional shadow evaluation",
+            ),
+            RuntimeToggleSpec(
+                key="DUST_SWEEP_ENABLED",
+                group="Capital & Sizing",
+                description="Fold idle USD into B-side entries",
+                side_effect="_toggle_side_effect_dust_sweep_runtime",
+            ),
+            RuntimeToggleSpec(
+                key="REBALANCE_ENABLED",
+                group="Capital & Sizing",
+                description="Inventory skew governor",
+            ),
+            RuntimeToggleSpec(
+                key="ACCUM_ENABLED",
+                group="Capital & Sizing",
+                description="Strategic accumulation engine",
+            ),
+            RuntimeToggleSpec(
+                key="MTS_ENABLED",
+                group="Capital & Sizing",
+                description="Manifold Trading Score master switch",
+            ),
+            RuntimeToggleSpec(
+                key="MTS_ENTRY_THROTTLE_ENABLED",
+                group="Capital & Sizing",
+                description="Apply MTS entry throttling",
+                dependencies=("MTS_ENABLED",),
+            ),
+            RuntimeToggleSpec(
+                key="MTS_KERNEL_ENABLED",
+                group="Capital & Sizing",
+                description="Enable kernel-memory blend",
+                dependencies=("MTS_ENABLED",),
+            ),
+            RuntimeToggleSpec(
+                key="STICKY_MODE_ENABLED",
+                group="Position Management",
+                description="Keep exits waiting indefinitely",
+            ),
+            RuntimeToggleSpec(
+                key="RECOVERY_ORDERS_ENABLED",
+                group="Position Management",
+                description="Recovery order management",
+            ),
+            RuntimeToggleSpec(
+                key="SUBSIDY_ENABLED",
+                group="Position Management",
+                description="Subsidy-funded repricing",
+                dependencies=("POSITION_LEDGER_ENABLED",),
+            ),
+            RuntimeToggleSpec(
+                key="CHURNER_ENABLED",
+                group="Position Management",
+                description="Regime-gated churner helper cycles",
+                dependencies=("POSITION_LEDGER_ENABLED",),
+            ),
+            RuntimeToggleSpec(
+                key="POSITION_LEDGER_ENABLED",
+                group="Position Management",
+                description="Position ledger subsystem",
+                side_effect="_toggle_side_effect_position_ledger_runtime",
+            ),
+            RuntimeToggleSpec(
+                key="RELEASE_AUTO_ENABLED",
+                group="Position Management",
+                description="Auto-release eligible exits",
+            ),
+        )
+        return {spec.key: spec for spec in specs}
+
+    def _flag_value(self, key: str) -> bool:
+        norm_key = str(key or "").strip().upper()
+        if not norm_key:
+            return False
+        if norm_key in self._runtime_overrides:
+            return bool(self._runtime_overrides[norm_key])
+        return bool(getattr(config, norm_key, False))
+
+    def _new_throughput_sizer(self) -> ThroughputSizer:
+        return ThroughputSizer(
+            ThroughputConfig(
+                enabled=self._flag_value("TP_ENABLED"),
+                lookback_cycles=int(getattr(config, "TP_LOOKBACK_CYCLES", 500)),
+                min_samples=int(getattr(config, "TP_MIN_SAMPLES", 20)),
+                min_samples_per_bucket=int(getattr(config, "TP_MIN_SAMPLES_PER_BUCKET", 10)),
+                full_confidence_samples=int(getattr(config, "TP_FULL_CONFIDENCE_SAMPLES", 50)),
+                floor_mult=float(getattr(config, "TP_FLOOR_MULT", 0.5)),
+                ceiling_mult=float(getattr(config, "TP_CEILING_MULT", 2.0)),
+                censored_weight=float(getattr(config, "TP_CENSORED_WEIGHT", 0.5)),
+                age_pressure_trigger=float(getattr(config, "TP_AGE_PRESSURE_TRIGGER", 1.5)),
+                age_pressure_sensitivity=float(getattr(config, "TP_AGE_PRESSURE_SENSITIVITY", 0.5)),
+                age_pressure_floor=float(getattr(config, "TP_AGE_PRESSURE_FLOOR", 0.3)),
+                util_threshold=float(getattr(config, "TP_UTIL_THRESHOLD", 0.7)),
+                util_sensitivity=float(getattr(config, "TP_UTIL_SENSITIVITY", 0.8)),
+                util_floor=float(getattr(config, "TP_UTIL_FLOOR", 0.4)),
+                recency_halflife=int(getattr(config, "TP_RECENCY_HALFLIFE", 100)),
+                log_updates=bool(getattr(config, "TP_LOG_UPDATES", True)),
+            )
+        )
+
+    @staticmethod
+    def _new_bocpd_instance() -> bocpd.BOCPD:
+        return bocpd.BOCPD(
+            expected_run_length=max(2, int(getattr(config, "BOCPD_EXPECTED_RUN_LENGTH", 200))),
+            max_run_length=max(10, int(getattr(config, "BOCPD_MAX_RUN_LENGTH", 500))),
+            alert_threshold=float(getattr(config, "BOCPD_ALERT_THRESHOLD", 0.30)),
+            urgent_threshold=float(getattr(config, "BOCPD_URGENT_THRESHOLD", 0.50)),
+        )
+
+    @staticmethod
+    def _new_survival_model_instance() -> survival_model.SurvivalModel:
+        return survival_model.SurvivalModel(
+            survival_model.SurvivalConfig(
+                min_observations=max(1, int(getattr(config, "SURVIVAL_MIN_OBSERVATIONS", 50))),
+                min_per_stratum=max(1, int(getattr(config, "SURVIVAL_MIN_PER_STRATUM", 10))),
+                synthetic_weight=max(0.0, min(1.0, float(getattr(config, "SURVIVAL_SYNTHETIC_WEIGHT", 0.30)))),
+                horizons=list(getattr(config, "SURVIVAL_HORIZONS", [1800, 3600, 14400])),
+            ),
+            model_tier=str(getattr(config, "SURVIVAL_MODEL_TIER", "kaplan_meier")),
+        )
+
+    def _apply_toggle_side_effect(self, key: str) -> tuple[bool, str]:
+        spec = self._toggle_registry.get(str(key or "").strip().upper())
+        if spec is None:
+            return False, "unknown toggle"
+        if not spec.side_effect:
+            return True, ""
+        handler = getattr(self, str(spec.side_effect), None)
+        if not callable(handler):
+            return False, f"missing side-effect handler: {spec.side_effect}"
+        try:
+            handler()
+        except Exception as exc:
+            return False, f"side-effect failed: {exc}"
+        return True, ""
+
+    def _set_runtime_override(self, key: str, value: bool) -> tuple[bool, str]:
+        norm_key = str(key or "").strip().upper()
+        if not norm_key:
+            return False, "toggle key required"
+        spec = self._toggle_registry.get(norm_key)
+        if spec is None:
+            return False, f"unknown toggle: {norm_key}"
+
+        old_present = norm_key in self._runtime_overrides
+        old_value = self._runtime_overrides.get(norm_key)
+        old_effective = self._flag_value(norm_key)
+        self._runtime_overrides[norm_key] = bool(value)
+        new_effective = self._flag_value(norm_key)
+
+        if bool(value):
+            missing = [dep for dep in spec.dependencies if dep != norm_key and not self._flag_value(dep)]
+            if missing:
+                if old_present:
+                    self._runtime_overrides[norm_key] = bool(old_value)
+                else:
+                    self._runtime_overrides.pop(norm_key, None)
+                return False, f"dependency blocked: requires {', '.join(sorted(missing))}"
+
+        if new_effective != old_effective:
+            ok, msg = self._apply_toggle_side_effect(norm_key)
+            if not ok:
+                if old_present:
+                    self._runtime_overrides[norm_key] = bool(old_value)
+                else:
+                    self._runtime_overrides.pop(norm_key, None)
+                logger.warning("runtime override failed key=%s value=%s: %s", norm_key, bool(value), msg)
+                return False, msg
+
+        return True, f"{norm_key} override set to {bool(value)}"
+
+    def _clear_runtime_override(self, key: str) -> tuple[bool, str]:
+        norm_key = str(key or "").strip().upper()
+        if not norm_key:
+            return False, "toggle key required"
+        if norm_key not in self._toggle_registry:
+            return False, f"unknown toggle: {norm_key}"
+        if norm_key not in self._runtime_overrides:
+            return True, f"{norm_key} already using config default"
+
+        old_value = bool(self._runtime_overrides.get(norm_key))
+        old_effective = self._flag_value(norm_key)
+        self._runtime_overrides.pop(norm_key, None)
+        new_effective = self._flag_value(norm_key)
+        if old_effective != new_effective:
+            ok, msg = self._apply_toggle_side_effect(norm_key)
+            if not ok:
+                self._runtime_overrides[norm_key] = old_value
+                logger.warning("runtime reset failed key=%s: %s", norm_key, msg)
+                return False, msg
+        return True, f"{norm_key} override cleared"
+
+    def _clear_all_runtime_overrides(self) -> int:
+        keys = list(self._runtime_overrides.keys())
+        if not keys:
+            return 0
+        old_effective = {key: self._flag_value(key) for key in keys}
+        self._runtime_overrides.clear()
+        for key in keys:
+            if old_effective.get(key) == self._flag_value(key):
+                continue
+            ok, msg = self._apply_toggle_side_effect(key)
+            if not ok:
+                logger.warning("runtime reset-all side-effect failed key=%s: %s", key, msg)
+        return len(keys)
+
+    def _ops_panel_status_payload(self) -> dict[str, Any]:
+        overrides: dict[str, dict[str, Any]] = {}
+        for key in sorted(self._runtime_overrides.keys()):
+            overrides[str(key)] = {
+                "effective": bool(self._flag_value(key)),
+                "config_default": bool(getattr(config, str(key), False)),
+                "source": "runtime_override",
+            }
+        return {
+            "overrides_active": int(len(overrides)),
+            "overrides": overrides,
+        }
+
+    def _ops_toggles_payload(self) -> dict[str, Any]:
+        rows: list[dict[str, Any]] = []
+        group_summary: dict[str, dict[str, Any]] = {}
+        ordered = sorted(self._toggle_registry.items(), key=lambda row: (row[1].group.lower(), row[0]))
+        for key, spec in ordered:
+            override_active = key in self._runtime_overrides
+            effective = bool(self._flag_value(key))
+            config_default = bool(getattr(config, key, False))
+            group = str(spec.group)
+            row = {
+                "key": str(key),
+                "group": group,
+                "description": str(spec.description),
+                "dependencies": [str(dep) for dep in spec.dependencies],
+                "effective": effective,
+                "config_default": config_default,
+                "override_active": bool(override_active),
+                "source": ("runtime_override" if override_active else "config_default"),
+            }
+            rows.append(row)
+            agg = group_summary.setdefault(
+                group,
+                {
+                    "group": group,
+                    "enabled": 0,
+                    "overridden": 0,
+                    "total": 0,
+                },
+            )
+            agg["total"] = int(agg["total"]) + 1
+            if effective:
+                agg["enabled"] = int(agg["enabled"]) + 1
+            if override_active:
+                agg["overridden"] = int(agg["overridden"]) + 1
+
+        groups = [group_summary[name] for name in sorted(group_summary.keys(), key=str.lower)]
+        return {
+            "overrides_active": int(len(self._runtime_overrides)),
+            "groups": groups,
+            "toggles": rows,
+        }
+
+    def _toggle_side_effect_hmm_runtime(self) -> None:
+        self._init_hmm_runtime()
+
+    def _toggle_side_effect_throughput_runtime(self) -> None:
+        if self._flag_value("TP_ENABLED"):
+            self._throughput = self._new_throughput_sizer()
+            return
+        self._throughput = None
+
+    def _toggle_side_effect_bocpd_runtime(self) -> None:
+        if self._flag_value("BOCPD_ENABLED"):
+            self._bocpd = self._new_bocpd_instance()
+        else:
+            self._bocpd = None
+        self._bocpd_state = bocpd.BOCPDState()
+        self._bocpd_last_price = 0.0
+
+    def _toggle_side_effect_survival_runtime(self) -> None:
+        if self._flag_value("SURVIVAL_MODEL_ENABLED"):
+            self._survival_model = self._new_survival_model_instance()
+            return
+        self._survival_model = None
+
+    def _toggle_side_effect_belief_tracker_runtime(self) -> None:
+        if self._flag_value("BELIEF_TRACKER_ENABLED"):
+            return
+        self._trade_beliefs.clear()
+        self._trade_belief_ev_history.clear()
+        self._trade_belief_widen_count.clear()
+        self._trade_belief_widen_total_pct.clear()
+        self._trade_belief_action_counts = {
+            "hold": 0,
+            "tighten": 0,
+            "widen": 0,
+            "reprice_breakeven": 0,
+        }
+        self._belief_timer_overrides.clear()
+        self._belief_slot_override_until.clear()
+
+    def _toggle_side_effect_enriched_features_runtime(self) -> None:
+        if self._flag_value("ENRICHED_FEATURES_ENABLED"):
+            return
+        self._micro_features = {
+            "fill_imbalance": 0.0,
+            "spread_realization": 1.0,
+            "fill_time_derivative": 0.0,
+            "congestion_ratio": 0.0,
+        }
+        self._fill_events_recent.clear()
+        self._fill_duration_events.clear()
+        self._spread_realization_events.clear()
+
+    def _toggle_side_effect_position_ledger_runtime(self) -> None:
+        enabled = self._flag_value("POSITION_LEDGER_ENABLED")
+        self._position_ledger.enabled = bool(enabled)
+        if enabled:
+            return
+        now_ts = _now()
+        for state in list(self._churner_by_slot.values()):
+            self._churner_reset_state(state, now_ts=now_ts, reason="position_ledger_disabled")
+        self._reconcile_churner_state()
+
+    def _toggle_side_effect_dust_sweep_runtime(self) -> None:
+        self._dust_sweep_enabled = self._flag_value("DUST_SWEEP_ENABLED")
 
     def _regime_entry_spacing_multipliers(self) -> tuple[float, float]:
         """
@@ -1260,13 +1909,13 @@ class BotRuntime:
 
         Returns A/B entry spacing multipliers. Shadow mode must remain non-actuating.
         """
-        if bool(getattr(config, "KNOB_MODE_ENABLED", False)) and bool(getattr(self._action_knobs, "enabled", False)):
+        if self._flag_value("KNOB_MODE_ENABLED") and bool(getattr(self._action_knobs, "enabled", False)):
             return (
                 max(0.10, min(3.0, float(self._action_knobs.spacing_a))),
                 max(0.10, min(3.0, float(self._action_knobs.spacing_b))),
             )
 
-        if not bool(getattr(config, "REGIME_DIRECTIONAL_ENABLED", False)):
+        if not self._flag_value("REGIME_DIRECTIONAL_ENABLED"):
             return 1.0, 1.0
         if int(self._regime_tier) < 1:
             return 1.0, 1.0
@@ -1300,14 +1949,14 @@ class BotRuntime:
         return max(0.10, min(3.0, mult_a)), max(0.10, min(3.0, mult_b))
 
     def _recovery_orders_enabled(self) -> bool:
-        return _recovery_orders_enabled_flag()
+        return self._flag_value("RECOVERY_ORDERS_ENABLED")
 
     def _engine_cfg(self, slot: SlotRuntime) -> sm.EngineConfig:
         spacing_mult_a, spacing_mult_b = self._regime_entry_spacing_multipliers()
         base_entry_pct = float(self.entry_pct)
         recovery_orders_enabled = self._recovery_orders_enabled()
         knob_cadence = 1.0
-        if bool(getattr(config, "KNOB_MODE_ENABLED", False)) and bool(getattr(self._action_knobs, "enabled", False)):
+        if self._flag_value("KNOB_MODE_ENABLED") and bool(getattr(self._action_knobs, "enabled", False)):
             knob_cadence = max(0.05, float(getattr(self._action_knobs, "cadence_mult", 1.0) or 1.0))
         s1_orphan_after_sec = (
             float(config.S1_ORPHAN_AFTER_SEC) * knob_cadence
@@ -1344,7 +1993,7 @@ class BotRuntime:
             backoff_factor=float(config.ENTRY_BACKOFF_FACTOR),
             backoff_max_multiplier=float(config.ENTRY_BACKOFF_MAX_MULTIPLIER),
             max_recovery_slots=max(1, int(config.MAX_RECOVERY_SLOTS)),
-            sticky_mode_enabled=bool(config.STICKY_MODE_ENABLED),
+            sticky_mode_enabled=self._flag_value("STICKY_MODE_ENABLED"),
         )
 
     def _allocate_slot_alias(self, used_aliases: set[str] | None = None) -> str:
@@ -1732,7 +2381,7 @@ class BotRuntime:
         if trade_id == "B":
             # Account-aware: divide available USD evenly across all slots.
             base = self._b_side_base_usd()
-        elif bool(config.STICKY_MODE_ENABLED) and str(getattr(config, "STICKY_COMPOUNDING_MODE", "legacy_profit")).strip().lower() == "fixed":
+        elif self._flag_value("STICKY_MODE_ENABLED") and str(getattr(config, "STICKY_COMPOUNDING_MODE", "legacy_profit")).strip().lower() == "fixed":
             base = max(base_order, base_order)
         else:
             # Independent compounding per slot (A-side and baseline queries).
@@ -1751,7 +2400,7 @@ class BotRuntime:
         if include_dust and trade_id == "B" and not bool(getattr(config, "QUOTE_FIRST_ALLOCATION", False)):
             dust_bump = self._dust_bump_usd(slot, trade_id=trade_id)
             base_with_layers = max(0.0, base_with_layers + dust_bump)
-        knobs_active = bool(getattr(config, "KNOB_MODE_ENABLED", False)) and bool(
+        knobs_active = self._flag_value("KNOB_MODE_ENABLED") and bool(
             getattr(self._action_knobs, "enabled", False)
         )
         aggression_mult = 1.0
@@ -1782,7 +2431,7 @@ class BotRuntime:
         elif knobs_active:
             base_with_layers *= aggression_mult
         base_with_layers *= suppression_mult
-        if trade_id is None or not bool(config.REBALANCE_ENABLED):
+        if trade_id is None or not self._flag_value("REBALANCE_ENABLED"):
             return base_with_layers
 
         skew = float(self._rebalancer_current_skew)
@@ -1936,12 +2585,29 @@ class BotRuntime:
 
         # Tighten entry velocity as we approach order-cap pressure.
         if headroom <= 5:
-            return 1
-        if headroom <= 10:
-            return min(base_cap, 2)
-        if headroom <= 20:
-            return min(base_cap, 3)
-        return base_cap
+            cap = 1
+        elif headroom <= 10:
+            cap = min(base_cap, 2)
+        elif headroom <= 20:
+            cap = min(base_cap, 3)
+        else:
+            cap = base_cap
+
+        if not (
+            self._flag_value("MTS_ENABLED")
+            and self._flag_value("MTS_ENTRY_THROTTLE_ENABLED")
+        ):
+            return int(cap)
+
+        if not bool(getattr(self._manifold_score, "enabled", False)):
+            return int(cap)
+
+        mts_floor = max(0.0, min(1.0, float(getattr(config, "MTS_ENTRY_THROTTLE_FLOOR", 0.3))))
+        mts_value = max(0.0, min(1.0, float(getattr(self._manifold_score, "mts", 0.0) or 0.0)))
+        if mts_value < mts_floor:
+            return 0
+        scaled = int(floor(float(cap) * mts_value))
+        return max(1, min(int(cap), scaled))
 
     def _defer_entry_due_scheduler(self, slot_id: int, action: sm.PlaceOrderAction, source: str) -> None:
         self._entry_adds_deferred_total += 1
@@ -1972,7 +2638,7 @@ class BotRuntime:
             return
 
         # Purge suppressed-side deferred entries during Tier 2 after grace.
-        if bool(getattr(config, "REGIME_DIRECTIONAL_ENABLED", False)) and self._regime_grace_elapsed(_now()):
+        if self._flag_value("REGIME_DIRECTIONAL_ENABLED") and self._regime_grace_elapsed(_now()):
             suppressed = self._regime_side_suppressed
             if suppressed in ("A", "B"):
                 suppressed_side = "sell" if suppressed == "A" else "buy"
@@ -2234,8 +2900,8 @@ class BotRuntime:
         should_compute = bool(
             bool(getattr(config, "BELIEF_STATE_LOGGING_ENABLED", True))
             or bool(getattr(config, "BELIEF_STATE_IN_STATUS", True))
-            or bool(getattr(config, "BELIEF_TRACKER_ENABLED", False))
-            or bool(getattr(config, "KNOB_MODE_ENABLED", False))
+            or self._flag_value("BELIEF_TRACKER_ENABLED")
+            or self._flag_value("KNOB_MODE_ENABLED")
         )
         if not should_compute:
             self._belief_state = bayesian_engine.BeliefState(enabled=False)
@@ -2601,7 +3267,7 @@ class BotRuntime:
         now_ts = float(now if now is not None else _now())
         if self._survival_model is None:
             return
-        if not bool(getattr(config, "SURVIVAL_MODEL_ENABLED", False)):
+        if not self._flag_value("SURVIVAL_MODEL_ENABLED"):
             return
 
         interval = max(300.0, float(getattr(config, "SURVIVAL_RETRAIN_INTERVAL_SEC", 21600.0)))
@@ -2633,7 +3299,7 @@ class BotRuntime:
         now_ts: float | None = None,
     ) -> survival_model.SurvivalPrediction:
         now = float(now_ts if now_ts is not None else _now())
-        if self._survival_model is None or not bool(getattr(config, "SURVIVAL_MODEL_ENABLED", False)):
+        if self._survival_model is None or not self._flag_value("SURVIVAL_MODEL_ENABLED"):
             return survival_model.SurvivalPrediction(
                 p_fill_30m=0.5,
                 p_fill_1h=0.5,
@@ -2784,7 +3450,7 @@ class BotRuntime:
         now_ts = float(now if now is not None else _now())
         self._prune_belief_timer_overrides(now_ts)
 
-        if not bool(getattr(config, "BELIEF_TRACKER_ENABLED", False)) or not self._position_ledger_enabled():
+        if not self._flag_value("BELIEF_TRACKER_ENABLED") or not self._position_ledger_enabled():
             self._trade_beliefs = {}
             self._refresh_belief_slot_overrides()
             return
@@ -2869,7 +3535,7 @@ class BotRuntime:
                 expected_value_usd=float(expected_value),
                 ev_trend_label=str(trend),
                 is_s2=bool(is_s2),
-                widen_enabled=bool(getattr(config, "BELIEF_WIDEN_ENABLED", False)),
+                widen_enabled=self._flag_value("BELIEF_WIDEN_ENABLED"),
                 immediate_reprice_agreement=float(getattr(config, "BELIEF_IMMEDIATE_REPRICE_AGREEMENT", 0.30)),
                 immediate_reprice_confidence=float(getattr(config, "BELIEF_IMMEDIATE_REPRICE_CONFIDENCE", 0.60)),
                 tighten_threshold_pfill=float(getattr(config, "BELIEF_TIGHTEN_THRESHOLD_PFILL", 0.10)),
@@ -2959,7 +3625,7 @@ class BotRuntime:
         self._refresh_belief_slot_overrides()
 
     def _trade_beliefs_status_payload(self) -> dict[str, Any]:
-        enabled = bool(getattr(config, "BELIEF_TRACKER_ENABLED", False)) and self._position_ledger_enabled()
+        enabled = self._flag_value("BELIEF_TRACKER_ENABLED") and self._position_ledger_enabled()
         beliefs = list(self._trade_beliefs.values())
         tracked = len(beliefs)
         avg_agree = (sum(float(b.regime_agreement) for b in beliefs) / tracked) if tracked else 0.0
@@ -4418,6 +5084,7 @@ class BotRuntime:
         self._build_belief_state(startup_now)
         self._maybe_retrain_survival_model(startup_now, force=True)
         self._update_regime_tier(startup_now)
+        self._update_manifold_score(startup_now)
 
         # Push price into all slots.
         for sid, slot in self.slots.items():
@@ -4743,7 +5410,7 @@ class BotRuntime:
         interval_min: int | None = None,
     ) -> dict[str, Any]:
         blend = max(0.0, min(1.0, float(getattr(config, "HMM_BLEND_WITH_TREND", 0.5))))
-        use_enabled = bool(getattr(config, "HMM_ENABLED", False)) if enabled is None else bool(enabled)
+        use_enabled = self._flag_value("HMM_ENABLED") if enabled is None else bool(enabled)
         use_interval = max(
             1,
             int(
@@ -4779,15 +5446,15 @@ class BotRuntime:
     def _hmm_source_mode(self) -> str:
         raw = str(getattr(config, "HMM_MULTI_TIMEFRAME_SOURCE", "primary") or "primary").strip().lower()
         mode = "consensus" if raw == "consensus" else "primary"
-        if mode == "consensus" and not bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)):
+        if mode == "consensus" and not self._flag_value("HMM_MULTI_TIMEFRAME_ENABLED"):
             return "primary"
         return mode
 
     def _policy_hmm_source(self) -> dict[str, Any]:
         primary = self._hmm_state if isinstance(self._hmm_state, dict) else self._hmm_default_state()
-        if not bool(getattr(config, "HMM_ENABLED", False)):
+        if not self._flag_value("HMM_ENABLED"):
             return primary
-        if not bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)):
+        if not self._flag_value("HMM_MULTI_TIMEFRAME_ENABLED"):
             return primary
         if self._hmm_source_mode() != "consensus":
             return primary
@@ -4801,14 +5468,14 @@ class BotRuntime:
         confidence = max(0.0, min(1.0, float(source.get("confidence", 0.0) or 0.0)))
         bias = float(source.get("bias_signal", 0.0) or 0.0)
         ready = bool(
-            bool(getattr(config, "HMM_ENABLED", False))
+            self._flag_value("HMM_ENABLED")
             and bool(source.get("available"))
             and bool(source.get("trained"))
         )
         return regime, confidence, bias, ready, source
 
     def _current_regime_id(self) -> int | None:
-        if not bool(getattr(config, "HMM_ENABLED", False)):
+        if not self._flag_value("HMM_ENABLED"):
             return None
         source = dict(self._policy_hmm_source() or {})
         if not (bool(source.get("available")) and bool(source.get("trained"))):
@@ -4824,14 +5491,14 @@ class BotRuntime:
         return {0: "bearish", 1: "ranging", 2: "bullish"}.get(regime_id, "ranging")
 
     def _position_ledger_enabled(self) -> bool:
-        return bool(getattr(config, "POSITION_LEDGER_ENABLED", True)) and bool(
+        return self._flag_value("POSITION_LEDGER_ENABLED") and bool(
             self._position_ledger.enabled
         )
 
     def _slot_mode_for_position(self, *, churner: bool = False) -> str:
         if churner:
             return "churner"
-        if bool(getattr(config, "STICKY_MODE_ENABLED", False)):
+        if self._flag_value("STICKY_MODE_ENABLED"):
             return "sticky"
         return "legacy"
 
@@ -6137,7 +6804,7 @@ class BotRuntime:
         now = float(now_ts if now_ts is not None else _now())
         if not self._position_ledger_enabled():
             return
-        if not bool(getattr(config, "SUBSIDY_ENABLED", False)):
+        if not self._flag_value("SUBSIDY_ENABLED"):
             return
 
         open_positions = self._position_ledger.get_open_positions()
@@ -6313,7 +6980,7 @@ class BotRuntime:
         self._self_heal_reprice_last_summary = summary
 
     def _churner_enabled(self) -> bool:
-        return bool(getattr(config, "CHURNER_ENABLED", False)) and self._position_ledger_enabled()
+        return self._flag_value("CHURNER_ENABLED") and self._position_ledger_enabled()
 
     def _ensure_churner_state(self, slot_id: int) -> ChurnerRuntimeState:
         sid = int(slot_id)
@@ -6357,6 +7024,7 @@ class BotRuntime:
         now_ts: float,
         reason: str = "",
         keep_compound: bool = True,
+        keep_active: bool = False,
     ) -> None:
         self._churner_release_reserve(state)
         compound = float(state.compound_usd) if keep_compound else 0.0
@@ -6364,7 +7032,7 @@ class BotRuntime:
             0.0,
             float(getattr(config, "CHURNER_ORDER_SIZE_USD", getattr(config, "ORDER_SIZE_USD", 0.0))),
         )
-        state.active = False
+        state.active = bool(keep_active)
         state.stage = "idle"
         state.parent_position_id = 0
         state.parent_trade_id = ""
@@ -6449,6 +7117,281 @@ class BotRuntime:
                 best_key = key
                 best = (pos, order, effective_age, band)
         return best
+
+    def _churner_active_slot_count(self) -> int:
+        return sum(1 for state in self._churner_by_slot.values() if bool(state.active))
+
+    def _churner_mts_gate_values(self) -> tuple[float, float]:
+        gate = max(0.0, min(1.0, float(getattr(config, "MTS_CHURNER_GATE", 0.3))))
+        mts_value = 0.0
+        if self._flag_value("MTS_ENABLED") and bool(getattr(self._manifold_score, "enabled", False)):
+            mts_value = max(0.0, min(1.0, float(getattr(self._manifold_score, "mts", 0.0) or 0.0)))
+        return float(mts_value), float(gate)
+
+    def _churner_spawn_parent_candidate(
+        self,
+        *,
+        slot_id: int,
+        now_ts: float,
+        position_id: int | None = None,
+    ) -> tuple[tuple[dict[str, Any], sm.OrderState, float, str] | None, str]:
+        sid = int(slot_id)
+        pid = int(position_id or 0)
+        if pid <= 0:
+            candidate = self._churner_candidate_parent_position(sid, now_ts=float(now_ts))
+            if candidate is None:
+                return None, "no_candidate"
+            return candidate, ""
+
+        slot = self.slots.get(sid)
+        if slot is None:
+            return None, "slot_missing"
+        market = float(slot.state.market_price if slot.state.market_price > 0 else self.last_price)
+        if market <= 0:
+            return None, "market_unavailable"
+
+        aging_rank = self._self_heal_band_rank("aging")
+        for pos in self._position_ledger.get_open_positions(slot_id=sid):
+            if int(pos.get("position_id", 0) or 0) != pid:
+                continue
+            if str(pos.get("slot_mode") or "") == "churner":
+                return None, "position_is_churner"
+            live = self._find_live_exit_for_position(pos)
+            if live is None:
+                return None, "parent_exit_missing"
+            _local_id, order = live
+            age = max(0.0, float(now_ts) - float(pos.get("entry_time", now_ts) or now_ts))
+            distance = abs(float(pos.get("current_exit_price", order.price) or order.price) - market) / market * 100.0
+            effective_age = self._effective_age_seconds(age, distance)
+            band = self._age_band_for_effective_age(effective_age)
+            if self._self_heal_band_rank(band) < aging_rank:
+                return None, "position_not_aging"
+            return (pos, order, effective_age, band), ""
+
+        return None, "position_not_found"
+
+    def _churner_status_payload(self, now_ts: float | None = None) -> dict[str, Any]:
+        now = float(now_ts if now_ts is not None else _now())
+        self._reconcile_churner_state()
+        enabled = bool(self._churner_enabled())
+        mts_value, mts_gate = self._churner_mts_gate_values()
+        max_active = max(1, int(getattr(config, "CHURNER_MAX_ACTIVE", 5)))
+        active_slots = int(self._churner_active_slot_count())
+        subsidy_balance = 0.0
+        subsidy_needed = 0.0
+        if self._position_ledger_enabled():
+            totals = self._position_ledger.get_subsidy_totals()
+            subsidy_balance = float(totals.get("balance", 0.0) or 0.0)
+            try:
+                self_heal = self._self_healing_status_payload(now)
+                subsidy_needed = float((self_heal.get("subsidy") or {}).get("pending_needed", 0.0) or 0.0)
+            except Exception:
+                subsidy_needed = 0.0
+
+        states: list[dict[str, Any]] = []
+        for sid in sorted(self.slots.keys()):
+            state = self._churner_by_slot.get(int(sid))
+            if state is None:
+                states.append(
+                    {
+                        "slot_id": int(sid),
+                        "active": False,
+                        "stage": "idle",
+                        "parent_position_id": 0,
+                        "parent_trade_id": "",
+                        "cycle_id": 0,
+                        "entry_txid": "",
+                        "exit_txid": "",
+                        "last_error": "",
+                        "last_state_change_at": 0.0,
+                    }
+                )
+                continue
+            states.append(
+                {
+                    "slot_id": int(sid),
+                    "active": bool(state.active),
+                    "stage": str(state.stage or "idle"),
+                    "parent_position_id": int(state.parent_position_id or 0),
+                    "parent_trade_id": str(state.parent_trade_id or ""),
+                    "cycle_id": int(state.cycle_id or 0),
+                    "entry_txid": str(state.entry_txid or ""),
+                    "exit_txid": str(state.exit_txid or ""),
+                    "last_error": str(state.last_error or ""),
+                    "last_state_change_at": float(state.last_state_change_at or 0.0),
+                }
+            )
+
+        return {
+            "enabled": enabled,
+            "active_slots": active_slots,
+            "max_active": int(max_active),
+            "reserve_available_usd": float(self._churner_reserve_available_usd),
+            "reserve_config_usd": float(getattr(config, "CHURNER_RESERVE_USD", 0.0)),
+            "cycles_today": int(self._churner_cycles_today),
+            "profit_today": float(self._churner_profit_today),
+            "cycles_total": int(self._churner_cycles_total),
+            "profit_total": float(self._churner_profit_total),
+            "mts": float(mts_value),
+            "mts_gate": float(mts_gate),
+            "subsidy_balance": float(subsidy_balance),
+            "subsidy_needed": float(subsidy_needed),
+            "states": states,
+        }
+
+    def _churner_candidates_payload(self, now_ts: float | None = None) -> dict[str, Any]:
+        now = float(now_ts if now_ts is not None else _now())
+        self._reconcile_churner_state()
+        rows: list[dict[str, Any]] = []
+        if not self._position_ledger_enabled():
+            return {
+                "enabled": False,
+                "count": 0,
+                "candidates": rows,
+            }
+
+        for sid in sorted(self.slots.keys()):
+            candidate = self._churner_candidate_parent_position(int(sid), now_ts=now)
+            if candidate is None:
+                continue
+            parent, order, effective_age, band = candidate
+            slot = self.slots.get(int(sid))
+            if slot is None:
+                continue
+            market = float(slot.state.market_price if slot.state.market_price > 0 else self.last_price)
+            if market <= 0:
+                continue
+            exit_px = float(parent.get("current_exit_price", order.price) or order.price)
+            distance_pct = abs(exit_px - market) / market * 100.0
+            subsidy_needed, fillable_price = self._subsidy_needed_for_position(
+                parent,
+                slot=slot,
+                side=order.side,
+                market=market,
+                volume_override=float(order.volume),
+            )
+            rows.append(
+                {
+                    "slot_id": int(sid),
+                    "position_id": int(parent.get("position_id", 0) or 0),
+                    "trade_id": str(parent.get("trade_id") or order.trade_id),
+                    "cycle": int(parent.get("cycle", 0) or 0),
+                    "side": str(order.side or ""),
+                    "current_exit_price": float(exit_px),
+                    "market_price": float(market),
+                    "distance_pct": float(distance_pct),
+                    "effective_age_sec": float(effective_age),
+                    "age_band": str(band),
+                    "subsidy_needed": float(max(0.0, subsidy_needed)),
+                    "fillable_price": float(fillable_price),
+                    "active": bool(getattr(self._churner_by_slot.get(int(sid)), "active", False)),
+                }
+            )
+        return {
+            "enabled": bool(self._churner_enabled()),
+            "count": int(len(rows)),
+            "candidates": rows,
+        }
+
+    def _churner_spawn(
+        self,
+        *,
+        slot_id: int,
+        position_id: int | None = None,
+        now_ts: float | None = None,
+    ) -> tuple[bool, str]:
+        now = float(now_ts if now_ts is not None else _now())
+        sid = int(slot_id)
+        if sid not in self.slots:
+            return False, "slot_missing"
+        if not self._churner_enabled():
+            return False, "churner_disabled"
+        self._reconcile_churner_state()
+        state = self._ensure_churner_state(sid)
+        if bool(state.active):
+            return False, "slot_already_active"
+
+        max_active = max(1, int(getattr(config, "CHURNER_MAX_ACTIVE", 5)))
+        if int(self._churner_active_slot_count()) >= max_active:
+            return False, f"max_active_reached ({max_active})"
+
+        mts_value, mts_gate = self._churner_mts_gate_values()
+        if self._flag_value("MTS_ENABLED") and mts_value + 1e-12 < mts_gate:
+            return False, f"mts_below_gate ({mts_value:.3f} < {mts_gate:.3f})"
+
+        regime_name, _conf, _bias, _ready, _source = self._policy_hmm_signal()
+        if str(regime_name or "").strip().upper() != "RANGING":
+            return False, "regime_not_ranging"
+
+        capacity = self._compute_capacity_health(now)
+        headroom = int(capacity.get("open_order_headroom") or 0)
+        min_headroom = max(0, int(getattr(config, "CHURNER_MIN_HEADROOM", 0)))
+        if headroom < min_headroom:
+            return False, "headroom_low"
+
+        candidate, reason = self._churner_spawn_parent_candidate(
+            slot_id=sid,
+            now_ts=now,
+            position_id=position_id,
+        )
+        if candidate is None:
+            return False, str(reason or "no_candidate")
+        parent, parent_order, _effective_age, _band = candidate
+
+        state.active = True
+        state.stage = "idle"
+        state.parent_position_id = int(parent.get("position_id", 0) or 0)
+        state.parent_trade_id = str(parent.get("trade_id") or parent_order.trade_id)
+        state.last_error = ""
+        state.last_state_change_at = float(now)
+        return True, f"spawned churner on slot {sid}"
+
+    def _churner_kill(
+        self,
+        *,
+        slot_id: int,
+        now_ts: float | None = None,
+    ) -> tuple[bool, str]:
+        now = float(now_ts if now_ts is not None else _now())
+        sid = int(slot_id)
+        if sid not in self.slots:
+            return False, "slot_missing"
+        state = self._churner_by_slot.get(sid)
+        if state is None:
+            return True, f"slot {sid} already idle"
+
+        txids = [str(state.entry_txid or "").strip(), str(state.exit_txid or "").strip()]
+        for txid in txids:
+            if not txid:
+                continue
+            try:
+                self._cancel_order(txid)
+            except Exception:
+                pass
+        if str(state.stage) == "exit_open":
+            self._churner_close_position_cancelled(
+                slot_id=int(sid),
+                state=state,
+                now_ts=now,
+                reason="killed",
+            )
+        self._churner_reset_state(state, now_ts=now, reason="killed")
+        return True, f"killed churner on slot {sid}"
+
+    def _churner_update_runtime_config(
+        self,
+        *,
+        reserve_usd: float | None = None,
+    ) -> tuple[bool, str]:
+        if reserve_usd is None:
+            return False, "reserve_usd required"
+        try:
+            reserve = max(0.0, float(reserve_usd))
+        except (TypeError, ValueError):
+            return False, "invalid reserve_usd"
+        setattr(config, "CHURNER_RESERVE_USD", reserve)
+        self._reconcile_churner_state()
+        return True, f"churner reserve set to {reserve:.4f}"
 
     def _churner_gate_check(
         self,
@@ -6696,7 +7639,12 @@ class BotRuntime:
             market=float(market),
         )
         if exit_price <= 0:
-            self._churner_reset_state(state, now_ts=float(fill_ts), reason="invalid_exit_price")
+            self._churner_reset_state(
+                state,
+                now_ts=float(fill_ts),
+                reason="invalid_exit_price",
+                keep_active=True,
+            )
             return
 
         pid = self._churner_open_position_on_entry_fill(
@@ -6728,7 +7676,12 @@ class BotRuntime:
                 now_ts=float(fill_ts),
                 reason="exit_place_failed",
             )
-            self._churner_reset_state(state, now_ts=float(fill_ts), reason="exit_place_failed")
+            self._churner_reset_state(
+                state,
+                now_ts=float(fill_ts),
+                reason="exit_place_failed",
+                keep_active=True,
+            )
             return
 
         state.exit_txid = str(txid_new)
@@ -6804,7 +7757,7 @@ class BotRuntime:
         self._churner_profit_total += float(net_profit)
         self._churner_cycles_today += 1
         self._churner_profit_today += float(net_profit)
-        self._churner_reset_state(state, now_ts=float(fill_ts), reason="")
+        self._churner_reset_state(state, now_ts=float(fill_ts), reason="", keep_active=True)
 
     def _churner_on_order_canceled(
         self,
@@ -6819,7 +7772,12 @@ class BotRuntime:
             return
         txid_norm = str(txid or "").strip()
         if kind == "churner_entry" and txid_norm == str(state.entry_txid or "").strip():
-            self._churner_reset_state(state, now_ts=float(now_ts), reason="entry_canceled")
+            self._churner_reset_state(
+                state,
+                now_ts=float(now_ts),
+                reason="entry_canceled",
+                keep_active=bool(state.active),
+            )
             return
         if kind == "churner_exit" and txid_norm == str(state.exit_txid or "").strip():
             self._churner_close_position_cancelled(
@@ -6828,7 +7786,12 @@ class BotRuntime:
                 now_ts=float(now_ts),
                 reason="exit_canceled",
             )
-            self._churner_reset_state(state, now_ts=float(now_ts), reason="exit_canceled")
+            self._churner_reset_state(
+                state,
+                now_ts=float(now_ts),
+                reason="exit_canceled",
+                keep_active=bool(state.active),
+            )
 
     def _churner_timeout_tick(self, *, slot_id: int, state: ChurnerRuntimeState, now_ts: float) -> None:
         now = float(now_ts)
@@ -6844,7 +7807,7 @@ class BotRuntime:
                     if not ok:
                         state.last_error = "entry_timeout_cancel_failed"
                         return
-                self._churner_reset_state(state, now_ts=now, reason="entry_timeout")
+                self._churner_reset_state(state, now_ts=now, reason="entry_timeout", keep_active=True)
             return
 
         if str(state.stage) == "exit_open" and state.exit_placed_at > 0:
@@ -6868,7 +7831,7 @@ class BotRuntime:
                     now_ts=now,
                     reason="exit_timeout",
                 )
-                self._churner_reset_state(state, now_ts=now, reason="exit_timeout")
+                self._churner_reset_state(state, now_ts=now, reason="exit_timeout", keep_active=True)
 
     def _run_churner_engine(self, now_ts: float | None = None) -> None:
         now = float(now_ts if now_ts is not None else _now())
@@ -6904,77 +7867,99 @@ class BotRuntime:
 
         for sid in sorted(self.slots.keys()):
             state = self._ensure_churner_state(int(sid))
-            if state.active:
-                parent_id = int(state.parent_position_id or 0)
-                if parent_id <= 0:
-                    self._churner_reset_state(state, now_ts=now, reason="parent_missing")
-                    continue
-                parent = self._position_ledger.get_position(parent_id)
-                if not isinstance(parent, dict) or str(parent.get("status") or "") != "open":
-                    txids = [str(state.entry_txid or "").strip(), str(state.exit_txid or "").strip()]
-                    for txid in txids:
-                        if not txid:
-                            continue
-                        try:
-                            self._cancel_order(txid)
-                        except Exception:
-                            pass
-                    if str(state.stage) == "exit_open":
-                        self._churner_close_position_cancelled(
-                            slot_id=int(sid),
-                            state=state,
-                            now_ts=now,
-                            reason="parent_closed",
-                        )
-                    self._churner_reset_state(state, now_ts=now, reason="parent_closed")
-                    continue
-                capacity = self._compute_capacity_health(now)
-                headroom = int(capacity.get("open_order_headroom") or 0)
-                min_headroom = max(0, int(getattr(config, "CHURNER_MIN_HEADROOM", 0)))
-                if headroom < min_headroom:
-                    txids = [str(state.entry_txid or "").strip(), str(state.exit_txid or "").strip()]
-                    for txid in txids:
-                        if not txid:
-                            continue
-                        try:
-                            self._cancel_order(txid)
-                        except Exception:
-                            pass
-                    if str(state.stage) == "exit_open":
-                        self._churner_close_position_cancelled(
-                            slot_id=int(sid),
-                            state=state,
-                            now_ts=now,
-                            reason="headroom_low",
-                        )
-                    self._churner_reset_state(state, now_ts=now, reason="headroom_low")
-                    continue
-                regime_name, _conf, _bias, _ready, _source = self._policy_hmm_signal()
-                if str(regime_name or "").strip().upper() != "RANGING":
-                    txids = [str(state.entry_txid or "").strip(), str(state.exit_txid or "").strip()]
-                    for txid in txids:
-                        if not txid:
-                            continue
-                        try:
-                            self._cancel_order(txid)
-                        except Exception:
-                            pass
-                    if str(state.stage) == "exit_open":
-                        self._churner_close_position_cancelled(
-                            slot_id=int(sid),
-                            state=state,
-                            now_ts=now,
-                            reason="regime_shift",
-                        )
-                    self._churner_reset_state(state, now_ts=now, reason="regime_shift")
-                    continue
+            if not bool(state.active):
+                continue
+
+            stage = str(state.stage or "idle")
+            txids = [str(state.entry_txid or "").strip(), str(state.exit_txid or "").strip()]
+            parent_id = int(state.parent_position_id or 0)
+            parent: dict[str, Any] | None = None
+            if parent_id > 0:
+                parent_row = self._position_ledger.get_position(parent_id)
+                if isinstance(parent_row, dict) and str(parent_row.get("status") or "") == "open":
+                    parent = parent_row
+
+            if stage in {"entry_open", "exit_open"} and parent is None:
+                for txid in txids:
+                    if not txid:
+                        continue
+                    try:
+                        self._cancel_order(txid)
+                    except Exception:
+                        pass
+                if stage == "exit_open":
+                    self._churner_close_position_cancelled(
+                        slot_id=int(sid),
+                        state=state,
+                        now_ts=now,
+                        reason="parent_closed",
+                    )
+                self._churner_reset_state(state, now_ts=now, reason="parent_closed", keep_active=True)
+                continue
+
+            capacity = self._compute_capacity_health(now)
+            headroom = int(capacity.get("open_order_headroom") or 0)
+            min_headroom = max(0, int(getattr(config, "CHURNER_MIN_HEADROOM", 0)))
+            if headroom < min_headroom:
+                for txid in txids:
+                    if not txid:
+                        continue
+                    try:
+                        self._cancel_order(txid)
+                    except Exception:
+                        pass
+                if stage == "exit_open":
+                    self._churner_close_position_cancelled(
+                        slot_id=int(sid),
+                        state=state,
+                        now_ts=now,
+                        reason="headroom_low",
+                    )
+                self._churner_reset_state(state, now_ts=now, reason="headroom_low", keep_active=True)
+                continue
+
+            regime_name, _conf, _bias, _ready, _source = self._policy_hmm_signal()
+            if str(regime_name or "").strip().upper() != "RANGING":
+                for txid in txids:
+                    if not txid:
+                        continue
+                    try:
+                        self._cancel_order(txid)
+                    except Exception:
+                        pass
+                if stage == "exit_open":
+                    self._churner_close_position_cancelled(
+                        slot_id=int(sid),
+                        state=state,
+                        now_ts=now,
+                        reason="regime_shift",
+                    )
+                self._churner_reset_state(state, now_ts=now, reason="regime_shift", keep_active=True)
+                continue
+
+            if stage in {"entry_open", "exit_open"}:
                 self._churner_timeout_tick(slot_id=int(sid), state=state, now_ts=now)
                 continue
 
-            candidate = self._churner_candidate_parent_position(int(sid), now_ts=now)
-            if candidate is None:
-                continue
-            parent, parent_order, _effective_age, _band = candidate
+            parent_order: sm.OrderState | None = None
+            if parent is not None:
+                live = self._find_live_exit_for_position(parent)
+                if live is not None:
+                    _local_id, parent_order = live
+
+            if parent is None or parent_order is None:
+                candidate = self._churner_candidate_parent_position(int(sid), now_ts=now)
+                if candidate is None:
+                    state.parent_position_id = 0
+                    state.parent_trade_id = ""
+                    state.stage = "idle"
+                    state.last_error = "no_candidate"
+                    state.last_state_change_at = float(now)
+                    continue
+                parent, parent_order, _effective_age, _band = candidate
+                state.parent_position_id = int(parent.get("position_id", 0) or 0)
+                state.parent_trade_id = str(parent.get("trade_id") or parent_order.trade_id)
+
             ok, gate_reason, entry_price, volume, _required_usd = self._churner_gate_check(
                 slot_id=int(sid),
                 state=state,
@@ -6986,8 +7971,6 @@ class BotRuntime:
                 state.last_error = str(gate_reason)
                 continue
 
-            state.parent_position_id = int(parent.get("position_id", 0) or 0)
-            state.parent_trade_id = str(parent.get("trade_id") or parent_order.trade_id)
             state.cycle_id = max(1, int(self._churner_next_cycle_id))
             self._churner_next_cycle_id += 1
             state.order_size_usd = max(
@@ -7020,12 +8003,11 @@ class BotRuntime:
                         side=str(state.entry_side),
                         volume=float(volume),
                         price=float(entry_price),
-                    )
+                )
                 state.last_error = "entry_place_failed"
                 self._churner_release_reserve(state)
                 continue
 
-            state.active = True
             state.stage = "entry_open"
             state.entry_txid = str(txid_new)
             state.entry_price = float(entry_price)
@@ -7163,7 +8145,7 @@ class BotRuntime:
                 "bands": age_heatmap_rows,
             },
             "repricing": {
-                "enabled": bool(getattr(config, "SUBSIDY_ENABLED", False)),
+                "enabled": self._flag_value("SUBSIDY_ENABLED"),
                 "auto_band": str(getattr(config, "SUBSIDY_AUTO_REPRICE_BAND", "stuck")),
                 "lifetime_repriced": int(self._self_heal_reprice_total),
                 "last_reprice_at": self._self_heal_reprice_last_at or None,
@@ -7261,6 +8243,93 @@ class BotRuntime:
             free_doge=float(free_doge),
         )
 
+    @staticmethod
+    def _manifold_active_throughput_multiplier(throughput_payload: dict[str, Any]) -> float:
+        def _bucket_mult(name: str) -> float:
+            try:
+                return float((throughput_payload.get(name) or {}).get("multiplier", 1.0) or 1.0)
+            except Exception:
+                return 1.0
+
+        regime = str(throughput_payload.get("active_regime", "ranging") or "ranging").strip().lower()
+        if regime in {"bearish", "ranging", "bullish"}:
+            mult = (_bucket_mult(f"{regime}_A") + _bucket_mult(f"{regime}_B")) * 0.5
+        else:
+            mult = _bucket_mult("aggregate")
+        return max(0.0, min(2.0, float(mult)))
+
+    def _update_manifold_score(self, now: float | None = None) -> None:
+        now_ts = float(now if now is not None else _now())
+        if not self._flag_value("MTS_ENABLED"):
+            self._manifold_score = bayesian_engine.ManifoldScore(enabled=False)
+            self._manifold_history.clear()
+            return
+
+        belief = self._belief_state
+        throughput_payload = self._throughput.status_payload() if self._throughput is not None else {}
+        throughput_mult = 1.0
+        age_pressure = 1.0
+        if isinstance(throughput_payload, dict):
+            throughput_mult = self._manifold_active_throughput_multiplier(throughput_payload)
+            try:
+                age_pressure = float(throughput_payload.get("age_pressure", 1.0) or 1.0)
+            except Exception:
+                age_pressure = 1.0
+        age_pressure = max(0.0, min(1.0, age_pressure))
+        try:
+            slot_vintage = self._slot_vintage_metrics_locked(now_ts)
+            stuck_capital_pct = float(slot_vintage.get("stuck_capital_pct", 0.0) or 0.0)
+        except Exception:
+            stuck_capital_pct = 0.0
+
+        try:
+            self._manifold_score = bayesian_engine.compute_manifold_score(
+                posterior_1m=getattr(belief, "posterior_1m", [0.0, 1.0, 0.0]),
+                posterior_15m=getattr(belief, "posterior_15m", [0.0, 1.0, 0.0]),
+                posterior_1h=getattr(belief, "posterior_1h", [0.0, 1.0, 0.0]),
+                p_switch_1m=float(getattr(belief, "p_switch_1m", 0.0) or 0.0),
+                p_switch_15m=float(getattr(belief, "p_switch_15m", 0.0) or 0.0),
+                p_switch_1h=float(getattr(belief, "p_switch_1h", 0.0) or 0.0),
+                bocpd_change_prob=float(getattr(self._bocpd_state, "change_prob", 0.0) or 0.0),
+                bocpd_run_length=float(getattr(self._bocpd_state, "run_length_mode", 0.0) or 0.0),
+                throughput_multiplier=throughput_mult,
+                age_pressure=age_pressure,
+                stuck_capital_pct=stuck_capital_pct,
+                entropy_consensus=float(getattr(belief, "entropy_consensus", 0.0) or 0.0),
+                direction_score=float(getattr(belief, "direction_score", 0.0) or 0.0),
+                clarity_weights=list(getattr(config, "MTS_CLARITY_WEIGHTS", [0.2, 0.5, 0.3])),
+                stability_switch_weights=list(
+                    getattr(config, "MTS_STABILITY_SWITCH_WEIGHTS", [0.2, 0.5, 0.3])
+                ),
+                coherence_weights=list(getattr(config, "MTS_COHERENCE_WEIGHTS", [0.5, 0.25, 0.25])),
+                enabled=True,
+                kernel_enabled=self._flag_value("MTS_KERNEL_ENABLED"),
+                kernel_samples=len(self._manifold_history),
+                kernel_score=None,
+                kernel_min_samples=max(1, int(getattr(config, "MTS_KERNEL_MIN_SAMPLES", 200))),
+                kernel_alpha_max=max(0.0, min(1.0, float(getattr(config, "MTS_KERNEL_ALPHA_MAX", 0.5)))),
+            )
+        except Exception as exc:
+            logger.debug("manifold score update failed: %s", exc)
+            self._manifold_score = bayesian_engine.ManifoldScore(enabled=False)
+            return
+
+        if not bool(getattr(self._manifold_score, "enabled", False)):
+            self._manifold_history.clear()
+            return
+
+        components = getattr(self._manifold_score, "components", None)
+        self._manifold_history.append(
+            (
+                float(now_ts),
+                float(getattr(self._manifold_score, "mts", 0.0) or 0.0),
+                float(getattr(components, "regime_clarity", 0.0) if components is not None else 0.0),
+                float(getattr(components, "regime_stability", 0.0) if components is not None else 0.0),
+                float(getattr(components, "throughput_efficiency", 0.0) if components is not None else 0.0),
+                float(getattr(components, "signal_coherence", 0.0) if components is not None else 0.0),
+            )
+        )
+
     def _hmm_runtime_config(self, *, min_train_samples: int | None = None) -> dict[str, Any]:
         resolved_min_samples = max(
             50,
@@ -7286,7 +8355,7 @@ class BotRuntime:
             "HMM_BLEND_WITH_TREND": max(
                 0.0, min(1.0, float(getattr(config, "HMM_BLEND_WITH_TREND", 0.5)))
             ),
-            "ENRICHED_FEATURES_ENABLED": bool(getattr(config, "ENRICHED_FEATURES_ENABLED", False)),
+            "ENRICHED_FEATURES_ENABLED": self._flag_value("ENRICHED_FEATURES_ENABLED"),
         }
 
     def _refresh_hmm_state_from_detector(
@@ -7305,35 +8374,35 @@ class BotRuntime:
         if tertiary:
             if not isinstance(self._hmm_state_tertiary, dict):
                 self._hmm_state_tertiary = self._hmm_default_state(
-                    enabled=bool(getattr(config, "HMM_ENABLED", False))
-                    and bool(getattr(config, "HMM_TERTIARY_ENABLED", False)),
+                    enabled=self._flag_value("HMM_ENABLED")
+                    and self._flag_value("HMM_TERTIARY_ENABLED"),
                     interval_min=max(1, int(getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60))),
                 )
             state = self._hmm_state_tertiary
-            enabled_flag = bool(getattr(config, "HMM_ENABLED", False)) and bool(
-                getattr(config, "HMM_TERTIARY_ENABLED", False)
+            enabled_flag = self._flag_value("HMM_ENABLED") and bool(
+                self._flag_value("HMM_TERTIARY_ENABLED")
             )
             interval_min = max(1, int(getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60)))
         elif secondary:
             if not isinstance(self._hmm_state_secondary, dict):
                 self._hmm_state_secondary = self._hmm_default_state(
-                    enabled=bool(getattr(config, "HMM_ENABLED", False))
-                    and bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)),
+                    enabled=self._flag_value("HMM_ENABLED")
+                    and self._flag_value("HMM_MULTI_TIMEFRAME_ENABLED"),
                     interval_min=max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15))),
                 )
             state = self._hmm_state_secondary
-            enabled_flag = bool(getattr(config, "HMM_ENABLED", False)) and bool(
-                getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)
+            enabled_flag = self._flag_value("HMM_ENABLED") and bool(
+                self._flag_value("HMM_MULTI_TIMEFRAME_ENABLED")
             )
             interval_min = max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15)))
         else:
             if not isinstance(self._hmm_state, dict):
                 self._hmm_state = self._hmm_default_state(
-                    enabled=bool(getattr(config, "HMM_ENABLED", False)),
+                    enabled=self._flag_value("HMM_ENABLED"),
                     interval_min=max(1, int(getattr(config, "HMM_OHLCV_INTERVAL_MIN", 1))),
                 )
             state = self._hmm_state
-            enabled_flag = bool(getattr(config, "HMM_ENABLED", False))
+            enabled_flag = self._flag_value("HMM_ENABLED")
             interval_min = max(1, int(getattr(config, "HMM_OHLCV_INTERVAL_MIN", 1)))
 
         if not detector:
@@ -7397,9 +8466,9 @@ class BotRuntime:
         primary_interval = max(1, int(getattr(config, "HMM_OHLCV_INTERVAL_MIN", 1)))
         secondary_interval = max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15)))
         tertiary_interval = max(1, int(getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60)))
-        hmm_enabled = bool(getattr(config, "HMM_ENABLED", False))
-        multi_enabled = bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False))
-        tertiary_enabled = bool(getattr(config, "HMM_TERTIARY_ENABLED", False))
+        hmm_enabled = self._flag_value("HMM_ENABLED")
+        multi_enabled = self._flag_value("HMM_MULTI_TIMEFRAME_ENABLED")
+        tertiary_enabled = self._flag_value("HMM_TERTIARY_ENABLED")
 
         self._hmm_state = self._hmm_default_state(enabled=hmm_enabled, interval_min=primary_interval)
         self._hmm_state_secondary = self._hmm_default_state(
@@ -7688,7 +8757,7 @@ class BotRuntime:
         return ok
 
     def _update_hmm_secondary(self, now: float) -> None:
-        if not bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)):
+        if not self._flag_value("HMM_MULTI_TIMEFRAME_ENABLED"):
             return
         if not self._hmm_detector_secondary or self._hmm_numpy is None:
             self._refresh_hmm_state_from_detector(secondary=True)
@@ -7731,7 +8800,7 @@ class BotRuntime:
             self._refresh_hmm_state_from_detector(secondary=True)
 
     def _train_hmm_tertiary(self, *, now: float | None = None, reason: str = "scheduled") -> bool:
-        if not bool(getattr(config, "HMM_TERTIARY_ENABLED", False)):
+        if not self._flag_value("HMM_TERTIARY_ENABLED"):
             return False
         if not self._hmm_detector_tertiary or self._hmm_numpy is None:
             return False
@@ -7808,7 +8877,7 @@ class BotRuntime:
         return ok
 
     def _update_hmm_tertiary(self, now: float) -> None:
-        if not bool(getattr(config, "HMM_TERTIARY_ENABLED", False)):
+        if not self._flag_value("HMM_TERTIARY_ENABLED"):
             self._update_hmm_tertiary_transition(now)
             return
         if not self._hmm_detector_tertiary or self._hmm_numpy is None:
@@ -7881,12 +8950,12 @@ class BotRuntime:
         secondary = dict(
             self._hmm_state_secondary
             or self._hmm_default_state(
-                enabled=bool(getattr(config, "HMM_ENABLED", False))
-                and bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)),
+                enabled=self._flag_value("HMM_ENABLED")
+                and self._flag_value("HMM_MULTI_TIMEFRAME_ENABLED"),
                 interval_min=max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15))),
             )
         )
-        multi_enabled = bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False))
+        multi_enabled = self._flag_value("HMM_MULTI_TIMEFRAME_ENABLED")
         source_mode = self._hmm_source_mode()
         primary_ready = bool(primary.get("available")) and bool(primary.get("trained"))
         primary_probs = self._hmm_prob_triplet(primary)
@@ -7894,7 +8963,7 @@ class BotRuntime:
 
         if not primary_ready:
             return {
-                "enabled": bool(getattr(config, "HMM_ENABLED", False)),
+                "enabled": self._flag_value("HMM_ENABLED"),
                 "available": bool(primary.get("available")),
                 "trained": False,
                 "interval_min": int(primary.get("interval_min", getattr(config, "HMM_OHLCV_INTERVAL_MIN", 1))),
@@ -8015,7 +9084,7 @@ class BotRuntime:
             effective_regime = "RANGING"
 
         return {
-            "enabled": bool(getattr(config, "HMM_ENABLED", False)),
+            "enabled": self._flag_value("HMM_ENABLED"),
             "available": bool(primary.get("available")) and bool(secondary.get("available")),
             "trained": bool(primary.get("trained")) and bool(secondary.get("trained")),
             "interval_min": int(primary.get("interval_min", getattr(config, "HMM_OHLCV_INTERVAL_MIN", 1))),
@@ -8050,11 +9119,11 @@ class BotRuntime:
         }
 
     def _update_hmm(self, now: float) -> None:
-        multi_enabled = bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False))
-        tertiary_enabled = bool(getattr(config, "HMM_TERTIARY_ENABLED", False))
+        multi_enabled = self._flag_value("HMM_MULTI_TIMEFRAME_ENABLED")
+        tertiary_enabled = self._flag_value("HMM_TERTIARY_ENABLED")
         self._push_private_features_to_hmm_detectors()
 
-        if not bool(getattr(config, "HMM_ENABLED", False)):
+        if not self._flag_value("HMM_ENABLED"):
             if tertiary_enabled:
                 self._update_hmm_tertiary(now)
             else:
@@ -8136,23 +9205,23 @@ class BotRuntime:
         primary = dict(
             self._hmm_state
             or self._hmm_default_state(
-                enabled=bool(getattr(config, "HMM_ENABLED", False)),
+                enabled=self._flag_value("HMM_ENABLED"),
                 interval_min=max(1, int(getattr(config, "HMM_OHLCV_INTERVAL_MIN", 1))),
             )
         )
         secondary = dict(
             self._hmm_state_secondary
             or self._hmm_default_state(
-                enabled=bool(getattr(config, "HMM_ENABLED", False))
-                and bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)),
+                enabled=self._flag_value("HMM_ENABLED")
+                and self._flag_value("HMM_MULTI_TIMEFRAME_ENABLED"),
                 interval_min=max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15))),
             )
         )
         tertiary = dict(
             self._hmm_state_tertiary
             or self._hmm_default_state(
-                enabled=bool(getattr(config, "HMM_ENABLED", False))
-                and bool(getattr(config, "HMM_TERTIARY_ENABLED", False)),
+                enabled=self._flag_value("HMM_ENABLED")
+                and self._flag_value("HMM_TERTIARY_ENABLED"),
                 interval_min=max(1, int(getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60))),
             )
         )
@@ -8174,9 +9243,9 @@ class BotRuntime:
         source_interval = int(source.get("interval_min", primary.get("interval_min", 1)) or 1)
         secondary_interval = max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15)))
         tertiary_interval = max(1, int(getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60)))
-        if source_interval == tertiary_interval and bool(getattr(config, "HMM_TERTIARY_ENABLED", False)):
+        if source_interval == tertiary_interval and self._flag_value("HMM_TERTIARY_ENABLED"):
             training_depth = training_depth_tertiary
-        elif source_interval == secondary_interval and bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)):
+        elif source_interval == secondary_interval and self._flag_value("HMM_MULTI_TIMEFRAME_ENABLED"):
             training_depth = training_depth_secondary
         else:
             training_depth = training_depth_primary
@@ -8209,7 +9278,7 @@ class BotRuntime:
             "last_train_ts": float(source.get("last_train_ts", 0.0)),
             "error": str(source.get("error", "")),
             "source_mode": source_mode,
-            "multi_timeframe": bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)),
+            "multi_timeframe": self._flag_value("HMM_MULTI_TIMEFRAME_ENABLED"),
             "agreement": str(consensus.get("agreement", "primary_only")),
             "primary": primary,
             "secondary": secondary,
@@ -8464,16 +9533,16 @@ class BotRuntime:
         secondary = dict(
             self._hmm_state_secondary
             or self._hmm_default_state(
-                enabled=bool(getattr(config, "HMM_ENABLED", False))
-                and bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)),
+                enabled=self._flag_value("HMM_ENABLED")
+                and self._flag_value("HMM_MULTI_TIMEFRAME_ENABLED"),
                 interval_min=max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15))),
             )
         )
         tertiary = dict(
             self._hmm_state_tertiary
             or self._hmm_default_state(
-                enabled=bool(getattr(config, "HMM_ENABLED", False))
-                and bool(getattr(config, "HMM_TERTIARY_ENABLED", False)),
+                enabled=self._flag_value("HMM_ENABLED")
+                and self._flag_value("HMM_TERTIARY_ENABLED"),
                 interval_min=max(1, int(getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60))),
             )
         )
@@ -8482,9 +9551,9 @@ class BotRuntime:
         source_interval = int(source.get("interval_min", primary.get("interval_min", 1)) or 1)
         secondary_interval = max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15)))
         tertiary_interval = max(1, int(getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60)))
-        if source_interval == tertiary_interval and bool(getattr(config, "HMM_TERTIARY_ENABLED", False)):
+        if source_interval == tertiary_interval and self._flag_value("HMM_TERTIARY_ENABLED"):
             depth = dict(self._hmm_training_depth_tertiary or self._hmm_training_depth_default(state_key="tertiary"))
-        elif source_interval == secondary_interval and bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)):
+        elif source_interval == secondary_interval and self._flag_value("HMM_MULTI_TIMEFRAME_ENABLED"):
             depth = dict(self._hmm_training_depth_secondary or self._hmm_training_depth_default(state_key="secondary"))
         else:
             depth = dict(self._hmm_training_depth or self._hmm_training_depth_default(state_key="primary"))
@@ -8525,6 +9594,11 @@ class BotRuntime:
         bull_edge = 0.0
         bear_edge = 0.0
         range_edge = 0.0
+        throughput_active_regime = "ranging"
+        throughput_multiplier = 1.0
+        throughput_age_pressure = 1.0
+        throughput_median_fill_sec = 0.0
+        throughput_sufficient_data_regimes: list[str] = []
         if isinstance(throughput_payload, dict):
             def _bucket_mult(name: str) -> float:
                 try:
@@ -8535,6 +9609,41 @@ class BotRuntime:
             bull_edge = ((_bucket_mult("bullish_A") + _bucket_mult("bullish_B")) * 0.5) - 1.0
             bear_edge = ((_bucket_mult("bearish_A") + _bucket_mult("bearish_B")) * 0.5) - 1.0
             range_edge = ((_bucket_mult("ranging_A") + _bucket_mult("ranging_B")) * 0.5) - 1.0
+            throughput_active_regime = str(throughput_payload.get("active_regime", "ranging") or "ranging").strip().lower()
+            if throughput_active_regime not in {"bearish", "ranging", "bullish"}:
+                throughput_active_regime = "ranging"
+            throughput_multiplier = self._manifold_active_throughput_multiplier(throughput_payload)
+            try:
+                throughput_age_pressure = float(throughput_payload.get("age_pressure", 1.0) or 1.0)
+            except Exception:
+                throughput_age_pressure = 1.0
+            throughput_age_pressure = max(0.0, min(1.0, throughput_age_pressure))
+            median_rows: list[float] = []
+            for bucket_name in (
+                f"{throughput_active_regime}_A",
+                f"{throughput_active_regime}_B",
+                "aggregate",
+            ):
+                row = throughput_payload.get(bucket_name) or {}
+                try:
+                    value = float(row.get("median_fill_sec", 0.0) or 0.0)
+                except Exception:
+                    value = 0.0
+                if value > 0.0:
+                    median_rows.append(value)
+            if median_rows:
+                throughput_median_fill_sec = float(median(median_rows))
+            for bucket_name in (
+                "bearish_A",
+                "bearish_B",
+                "ranging_A",
+                "ranging_B",
+                "bullish_A",
+                "bullish_B",
+            ):
+                row = throughput_payload.get(bucket_name) or {}
+                if bool(row.get("sufficient_data", False)):
+                    throughput_sufficient_data_regimes.append(bucket_name)
 
         free_usd, free_doge = self._available_free_balances(prefer_fresh=False)
         scoreboard = self._compute_doge_bias_scoreboard() or {}
@@ -8553,6 +9662,86 @@ class BotRuntime:
         accum_budget_used = max(0.0, float(accum_status.get("spent_usd", 0.0) or 0.0))
         accum_budget_remaining = max(0.0, float(accum_status.get("budget_remaining_usd", 0.0) or 0.0))
         accum_cooldown_remaining = max(0, int(accum_status.get("cooldown_remaining_sec", 0) or 0))
+
+        manifold_components = getattr(self._manifold_score, "components", None)
+        manifold_history = list(self._manifold_history)
+        manifold_trend = "stable"
+        history_sparkline = [float(row[1]) for row in manifold_history]
+        if history_sparkline:
+            try:
+                manifold_trend = str(
+                    bayesian_engine.ev_trend(
+                        history_sparkline,
+                        window=min(4, len(history_sparkline)),
+                    )
+                )
+            except Exception:
+                manifold_trend = "stable"
+        if manifold_trend not in {"rising", "falling", "stable"}:
+            manifold_trend = "stable"
+        mts_30m_ago: float | None = None
+        if manifold_history:
+            cutoff = float(now) - max(60.0, float(self._regime_history_window_sec))
+            mts_30m_ago = float(manifold_history[0][1])
+            for row in manifold_history:
+                row_ts = float(row[0])
+                row_mts = float(row[1])
+                if row_ts <= cutoff:
+                    mts_30m_ago = row_mts
+                    continue
+                break
+
+        self_heal_payload = self._self_healing_status_payload(now)
+        age_bands = {"fresh": 0, "aging": 0, "stale": 0, "stuck": 0, "write_off": 0}
+        subsidy_balance = 0.0
+        subsidy_needed = 0.0
+        churner_enabled = bool(self._churner_enabled())
+        churner_active_slots = int(self._churner_active_slot_count())
+        churner_reserve = float(self._churner_reserve_available_usd)
+        if isinstance(self_heal_payload, dict):
+            raw_bands = self_heal_payload.get("age_bands")
+            if isinstance(raw_bands, dict):
+                for key in age_bands.keys():
+                    age_bands[key] = max(0, int(raw_bands.get(key, 0) or 0))
+            subsidy = self_heal_payload.get("subsidy")
+            if isinstance(subsidy, dict):
+                subsidy_balance = max(0.0, float(subsidy.get("balance", 0.0) or 0.0))
+                subsidy_needed = max(0.0, float(subsidy.get("pending_needed", 0.0) or 0.0))
+            churner = self_heal_payload.get("churner")
+            if isinstance(churner, dict):
+                churner_enabled = bool(churner.get("enabled", churner_enabled))
+                churner_active_slots = max(0, int(churner.get("active_slots", churner_active_slots) or churner_active_slots))
+                churner_reserve = max(0.0, float(churner.get("reserve_available_usd", churner_reserve) or churner_reserve))
+
+        total_open_positions = 0
+        avg_distance_pct = 0.0
+        distance_samples: list[float] = []
+        if self._position_ledger_enabled():
+            open_positions = self._position_ledger.get_open_positions()
+            total_open_positions = int(len(open_positions))
+            for pos in open_positions:
+                try:
+                    sid = int(pos.get("slot_id", -1))
+                except (TypeError, ValueError):
+                    continue
+                slot = self.slots.get(sid)
+                if slot is None:
+                    continue
+                live = self._find_live_exit_for_position(pos)
+                if live is None:
+                    continue
+                _local_id, order = live
+                market = float(slot.state.market_price if slot.state.market_price > 0 else self.last_price)
+                if market <= 0.0:
+                    continue
+                exit_px = float(pos.get("current_exit_price", order.price) or order.price)
+                distance_samples.append(abs(exit_px - market) / market * 100.0)
+        if distance_samples:
+            avg_distance_pct = float(sum(distance_samples) / len(distance_samples))
+
+        trade_beliefs_payload = self._trade_beliefs_status_payload()
+        negative_ev_count = max(0, int(trade_beliefs_payload.get("exits_with_negative_ev", 0) or 0))
+        slot_vintage = self._slot_vintage_metrics_locked(now)
 
         return {
             "hmm_primary": {
@@ -8621,7 +9810,7 @@ class BotRuntime:
                 "util_ratio": float(util_ratio),
             },
             "accumulation": {
-                "enabled": bool(getattr(config, "ACCUM_ENABLED", False)),
+                "enabled": self._flag_value("ACCUM_ENABLED"),
                 "state": str(accum_state),
                 "active": bool(accum_active),
                 "signal": str(accum_signal),
@@ -8629,6 +9818,45 @@ class BotRuntime:
                 "budget_used_usd": float(accum_budget_used),
                 "budget_remaining_usd": float(accum_budget_remaining),
                 "cooldown_remaining_sec": int(accum_cooldown_remaining),
+            },
+            "manifold": {
+                "mts": float(max(0.0, min(1.0, float(getattr(self._manifold_score, "mts", 0.0) or 0.0)))),
+                "band": str(getattr(self._manifold_score, "band", "disabled") or "disabled"),
+                "components": {
+                    "clarity": float(getattr(manifold_components, "regime_clarity", 0.0) if manifold_components else 0.0),
+                    "stability": float(
+                        getattr(manifold_components, "regime_stability", 0.0) if manifold_components else 0.0
+                    ),
+                    "throughput": float(
+                        getattr(manifold_components, "throughput_efficiency", 0.0) if manifold_components else 0.0
+                    ),
+                    "coherence": float(
+                        getattr(manifold_components, "signal_coherence", 0.0) if manifold_components else 0.0
+                    ),
+                },
+                "trend": str(manifold_trend),
+                "mts_30m_ago": None if mts_30m_ago is None else float(mts_30m_ago),
+            },
+            "positions": {
+                "total_open": int(total_open_positions),
+                "age_bands": age_bands,
+                "stuck_capital_pct": float(max(0.0, float(slot_vintage.get("stuck_capital_pct", 0.0) or 0.0))),
+                "avg_distance_pct": float(max(0.0, avg_distance_pct)),
+                "negative_ev_count": int(negative_ev_count),
+            },
+            "throughput": {
+                "active_regime": str(throughput_active_regime),
+                "multiplier": float(max(0.0, min(2.0, throughput_multiplier))),
+                "age_pressure": float(max(0.0, min(1.0, throughput_age_pressure))),
+                "median_fill_sec": float(max(0.0, throughput_median_fill_sec)),
+                "sufficient_data_regimes": throughput_sufficient_data_regimes,
+            },
+            "churner": {
+                "enabled": bool(churner_enabled),
+                "active_slots": int(churner_active_slots),
+                "reserve_usd": float(max(0.0, churner_reserve)),
+                "subsidy_balance": float(max(0.0, subsidy_balance)),
+                "subsidy_needed": float(max(0.0, subsidy_needed)),
             },
         }
 
@@ -8892,7 +10120,7 @@ class BotRuntime:
         tertiary_state = dict(self._hmm_state_tertiary or {})
         current_regime = self._normalize_regime_label(tertiary_state.get("regime", to_regime), to_regime)
 
-        if not bool(getattr(config, "ACCUM_ENABLED", False)):
+        if not self._flag_value("ACCUM_ENABLED"):
             if state in {"ARMED", "ACTIVE"}:
                 self._finalize_accumulation(
                     now=now_ts,
@@ -9123,7 +10351,7 @@ class BotRuntime:
         trigger_to = self._normalize_regime_label(self._accum_trigger_to_regime, "RANGING")
 
         return {
-            "enabled": bool(getattr(config, "ACCUM_ENABLED", False)),
+            "enabled": self._flag_value("ACCUM_ENABLED"),
             "state": str(state),
             "active": bool(state == "ACTIVE"),
             "direction": direction,
@@ -9172,7 +10400,7 @@ class BotRuntime:
         self._ai_regime_history[-1] = tail
 
     def apply_ai_regime_override(self, ttl_sec: int | None = None) -> tuple[bool, str]:
-        if not bool(getattr(config, "AI_REGIME_ADVISOR_ENABLED", False)):
+        if not self._flag_value("AI_REGIME_ADVISOR_ENABLED"):
             return False, "ai regime advisor disabled"
 
         opinion = dict(self._ai_regime_opinion or {})
@@ -9262,7 +10490,7 @@ class BotRuntime:
         return True, "override state cleared"
 
     def dismiss_ai_regime_opinion(self) -> tuple[bool, str]:
-        if not bool(getattr(config, "AI_REGIME_ADVISOR_ENABLED", False)):
+        if not self._flag_value("AI_REGIME_ADVISOR_ENABLED"):
             return False, "ai regime advisor disabled"
         opinion = dict(self._ai_regime_opinion or {})
         if not opinion:
@@ -9331,7 +10559,7 @@ class BotRuntime:
             self._ai_regime_thread_alive = False
 
     def _start_ai_regime_run(self, now: float, trigger: str) -> None:
-        if not bool(getattr(config, "AI_REGIME_ADVISOR_ENABLED", False)):
+        if not self._flag_value("AI_REGIME_ADVISOR_ENABLED"):
             return
         if self._ai_regime_thread_alive:
             return
@@ -9462,7 +10690,7 @@ class BotRuntime:
             )
 
     def _maybe_schedule_ai_regime(self, now: float) -> None:
-        if not bool(getattr(config, "AI_REGIME_ADVISOR_ENABLED", False)):
+        if not self._flag_value("AI_REGIME_ADVISOR_ENABLED"):
             return
         if self._ai_regime_thread_alive:
             return
@@ -9515,8 +10743,8 @@ class BotRuntime:
             return
         self._regime_last_eval_ts = now
 
-        actuation_enabled = bool(getattr(config, "REGIME_DIRECTIONAL_ENABLED", False))
-        shadow_enabled = bool(getattr(config, "REGIME_SHADOW_ENABLED", False))
+        actuation_enabled = self._flag_value("REGIME_DIRECTIONAL_ENABLED")
+        shadow_enabled = self._flag_value("REGIME_SHADOW_ENABLED")
         enabled = bool(actuation_enabled or shadow_enabled)
 
         # Backward-compatible bootstrap for tests/snapshots that only seed
@@ -9546,9 +10774,7 @@ class BotRuntime:
                 self._update_bocpd_state(now)
 
         regime, confidence_raw, bias, hmm_ready, policy_source = self._policy_hmm_signal()
-        use_entropy_confidence = bool(getattr(config, "BOCPD_ENABLED", False)) or bool(
-            getattr(config, "KNOB_MODE_ENABLED", False)
-        )
+        use_entropy_confidence = self._flag_value("BOCPD_ENABLED") or self._flag_value("KNOB_MODE_ENABLED")
         if use_entropy_confidence and bool(self._belief_state.enabled):
             confidence_raw = float(self._belief_state.confidence_score)
         confidence_modifier, confidence_modifier_source = self._hmm_confidence_modifier_for_source(
@@ -9851,7 +11077,7 @@ class BotRuntime:
             "mechanical_direction": str(self._regime_mechanical_direction),
             "override_active": bool(reason == "ai_override"),
         }
-        if bool(getattr(config, "KNOB_MODE_ENABLED", False)):
+        if self._flag_value("KNOB_MODE_ENABLED"):
             try:
                 cap_band = str(self._compute_capacity_health(now).get("status_band") or "normal")
             except Exception:
@@ -9873,9 +11099,9 @@ class BotRuntime:
         self._update_throughput()
 
     def _apply_tier2_suppression(self, now: float) -> None:
-        if bool(getattr(config, "KNOB_MODE_ENABLED", False)):
+        if self._flag_value("KNOB_MODE_ENABLED"):
             return
-        if not bool(getattr(config, "REGIME_DIRECTIONAL_ENABLED", False)):
+        if not self._flag_value("REGIME_DIRECTIONAL_ENABLED"):
             return
         if int(self._regime_tier) != 2:
             return
@@ -10043,7 +11269,7 @@ class BotRuntime:
 
     def _ai_regime_status_payload(self, now: float | None = None) -> dict[str, Any]:
         now_ts = float(now if now is not None else _now())
-        enabled = bool(getattr(config, "AI_REGIME_ADVISOR_ENABLED", False))
+        enabled = self._flag_value("AI_REGIME_ADVISOR_ENABLED")
         last_run_ts = float(self._ai_regime_last_run_ts or 0.0)
         last_run_age = (now_ts - last_run_ts) if last_run_ts > 0.0 else None
         interval_sec = max(1.0, float(getattr(config, "AI_REGIME_INTERVAL_SEC", 300.0)))
@@ -10288,8 +11514,8 @@ class BotRuntime:
             state_key="primary",
         )
 
-        secondary_collect_enabled = bool(getattr(config, "HMM_SECONDARY_OHLCV_ENABLED", False)) or bool(
-            getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)
+        secondary_collect_enabled = self._flag_value("HMM_SECONDARY_OHLCV_ENABLED") or bool(
+            self._flag_value("HMM_MULTI_TIMEFRAME_ENABLED")
         )
         if secondary_collect_enabled:
             self._sync_ohlcv_candles_for_interval(
@@ -10308,7 +11534,7 @@ class BotRuntime:
                 state_key="secondary",
             )
 
-        if bool(getattr(config, "HMM_TERTIARY_ENABLED", False)):
+        if self._flag_value("HMM_TERTIARY_ENABLED"):
             self._sync_ohlcv_candles_for_interval(
                 now_ts,
                 interval_min=max(1, int(getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60))),
@@ -10543,8 +11769,8 @@ class BotRuntime:
             else:
                 logger.warning("OHLCV startup backfill: %s", msg)
 
-        secondary_collect_enabled = bool(getattr(config, "HMM_SECONDARY_OHLCV_ENABLED", False)) or bool(
-            getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)
+        secondary_collect_enabled = self._flag_value("HMM_SECONDARY_OHLCV_ENABLED") or bool(
+            self._flag_value("HMM_MULTI_TIMEFRAME_ENABLED")
         )
         if secondary_collect_enabled:
             secondary_readiness = self._hmm_data_readiness(
@@ -10578,7 +11804,7 @@ class BotRuntime:
                 else:
                     logger.warning("OHLCV startup backfill (secondary): %s", msg)
 
-        if not bool(getattr(config, "HMM_TERTIARY_ENABLED", False)):
+        if not self._flag_value("HMM_TERTIARY_ENABLED"):
             return
 
         tertiary_readiness = self._hmm_data_readiness(
@@ -10775,10 +12001,10 @@ class BotRuntime:
                 return dict(cached)
 
         try:
-            secondary_collect_enabled = bool(getattr(config, "HMM_SECONDARY_OHLCV_ENABLED", False)) or bool(
-                getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)
+            secondary_collect_enabled = self._flag_value("HMM_SECONDARY_OHLCV_ENABLED") or bool(
+                self._flag_value("HMM_MULTI_TIMEFRAME_ENABLED")
             )
-            tertiary_collect_enabled = bool(getattr(config, "HMM_TERTIARY_ENABLED", False))
+            tertiary_collect_enabled = self._flag_value("HMM_TERTIARY_ENABLED")
             enabled = bool(getattr(config, "HMM_OHLCV_ENABLED", True))
             if use_state_key == "secondary":
                 enabled = bool(enabled and secondary_collect_enabled)
@@ -11182,7 +12408,7 @@ class BotRuntime:
             if self._regime_cooldown_suppressed_side in ("A", "B")
             else None
         )
-        if bool(getattr(config, "REGIME_DIRECTIONAL_ENABLED", False)):
+        if self._flag_value("REGIME_DIRECTIONAL_ENABLED"):
             if int(self._regime_tier) == 2 and self._regime_grace_elapsed(now_ts):
                 if self._regime_side_suppressed in ("A", "B"):
                     suppressed = self._regime_side_suppressed
@@ -11341,7 +12567,7 @@ class BotRuntime:
             # If suppression has lapsed (tier dropped, cooldown expired),
             # clear mode_source and fall through to attempt normal repair.
             still_suppressed = False
-            if bool(getattr(config, "REGIME_DIRECTIONAL_ENABLED", False)):
+            if self._flag_value("REGIME_DIRECTIONAL_ENABLED"):
                 now_ts = _now()
                 if int(self._regime_tier) == 2 and self._regime_grace_elapsed(now_ts):
                     if self._regime_side_suppressed in ("A", "B"):
@@ -12308,7 +13534,7 @@ class BotRuntime:
     def soft_close(self, slot_id: int, recovery_id: int) -> tuple[bool, str]:
         if not self._recovery_orders_enabled():
             return False, _recovery_disabled_message("soft_close")
-        if bool(config.STICKY_MODE_ENABLED):
+        if self._flag_value("STICKY_MODE_ENABLED"):
             return False, "soft_close disabled in sticky mode; use release_slot"
         slot = self.slots.get(slot_id)
         if not slot:
@@ -12356,7 +13582,7 @@ class BotRuntime:
     def soft_close_next(self) -> tuple[bool, str]:
         if not self._recovery_orders_enabled():
             return False, _recovery_disabled_message("soft_close_next")
-        if bool(config.STICKY_MODE_ENABLED):
+        if self._flag_value("STICKY_MODE_ENABLED"):
             return False, "soft_close_next disabled in sticky mode; use release_slot"
         oldest: tuple[int, sm.RecoveryOrder] | None = None
         for sid, slot in self.slots.items():
@@ -12662,7 +13888,7 @@ class BotRuntime:
         """
         if not self._recovery_orders_enabled():
             return False, _recovery_disabled_message("cancel_stale_recoveries")
-        if bool(config.STICKY_MODE_ENABLED):
+        if self._flag_value("STICKY_MODE_ENABLED"):
             return False, "cancel_stale_recoveries disabled in sticky mode; use release_slot"
         if self.last_price <= 0:
             return False, "no market price"
@@ -13057,9 +14283,9 @@ class BotRuntime:
         return False, f"slot {slot_id}: no release-eligible exits (age/distance/regime)"
 
     def _auto_release_sticky_slots(self) -> None:
-        if not bool(config.STICKY_MODE_ENABLED):
+        if not self._flag_value("STICKY_MODE_ENABLED"):
             return
-        if not bool(config.RELEASE_AUTO_ENABLED):
+        if not self._flag_value("RELEASE_AUTO_ENABLED"):
             return
         gate_ok, _gate_msg = self._update_release_recon_gate_locked()
         if not gate_ok:
@@ -13295,6 +14521,7 @@ class BotRuntime:
             self._build_belief_state(loop_now)
             self._maybe_retrain_survival_model(loop_now)
             self._update_regime_tier(loop_now)
+            self._update_manifold_score(loop_now)
             self._maybe_schedule_ai_regime(loop_now)
             self._update_accumulation(loop_now)
             self._apply_tier2_suppression(loop_now)
@@ -13786,7 +15013,7 @@ class BotRuntime:
             self._trend_score = (float(self._trend_fast_ema) - slow) / slow
 
         signal_for_target = float(self._trend_score)
-        hmm_enabled = bool(getattr(config, "HMM_ENABLED", False))
+        hmm_enabled = self._flag_value("HMM_ENABLED")
         _, _, policy_bias, hmm_ready, _ = self._policy_hmm_signal()
         if hmm_enabled and hmm_ready:
             blend_factor = max(
@@ -13834,7 +15061,7 @@ class BotRuntime:
         return max(0.0, min(1.0, smoothed_target))
 
     def _update_rebalancer(self, now: float) -> None:
-        if not bool(config.REBALANCE_ENABLED):
+        if not self._flag_value("REBALANCE_ENABLED"):
             self._rebalancer_current_skew = 0.0
             return
 
@@ -14422,8 +15649,8 @@ class BotRuntime:
             orders_at_funded_size = self._count_orders_at_funded_size()
             slot_vintage = self._slot_vintage_metrics_locked(now)
             hmm_data_pipeline = self._hmm_data_readiness(now)
-            secondary_collect_enabled = bool(getattr(config, "HMM_SECONDARY_OHLCV_ENABLED", False)) or bool(
-                getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False)
+            secondary_collect_enabled = self._flag_value("HMM_SECONDARY_OHLCV_ENABLED") or bool(
+                self._flag_value("HMM_MULTI_TIMEFRAME_ENABLED")
             )
             if secondary_collect_enabled:
                 hmm_data_pipeline_secondary = self._hmm_data_readiness(
@@ -14451,7 +15678,7 @@ class BotRuntime:
                     "ready_for_target_window": False,
                     "gaps": ["pipeline_disabled"],
                 }
-            if bool(getattr(config, "HMM_TERTIARY_ENABLED", False)):
+            if self._flag_value("HMM_TERTIARY_ENABLED"):
                 hmm_data_pipeline_tertiary = self._hmm_data_readiness(
                     now,
                     interval_min=max(1, int(getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60))),
@@ -14480,7 +15707,7 @@ class BotRuntime:
             hmm_regime = self._hmm_status_payload()
             hmm_consensus = dict(self._hmm_consensus or self._compute_hmm_consensus())
             hmm_consensus["source_mode"] = self._hmm_source_mode()
-            hmm_consensus["multi_timeframe"] = bool(getattr(config, "HMM_MULTI_TIMEFRAME_ENABLED", False))
+            hmm_consensus["multi_timeframe"] = self._flag_value("HMM_MULTI_TIMEFRAME_ENABLED")
             regime_directional = self._regime_status_payload(now)
             ai_regime_advisor = self._ai_regime_status_payload(now)
             oldest_exit_age_sec = float(slot_vintage.get("oldest_exit_age_sec", 0.0) or 0.0)
@@ -14510,7 +15737,7 @@ class BotRuntime:
             }
             if self._survival_model is not None:
                 survival_payload = self._survival_model.status_payload(
-                    enabled=bool(getattr(config, "SURVIVAL_MODEL_ENABLED", False))
+                    enabled=self._flag_value("SURVIVAL_MODEL_ENABLED")
                 )
                 survival_payload["last_retrain_ts"] = float(self._survival_last_retrain_ts)
             else:
@@ -14526,8 +15753,39 @@ class BotRuntime:
                 }
             trade_beliefs_payload = self._trade_beliefs_status_payload()
             action_knobs_payload = self._action_knobs.to_status_dict()
-            if not bool(getattr(config, "KNOB_MODE_ENABLED", False)):
+            if not self._flag_value("KNOB_MODE_ENABLED"):
                 action_knobs_payload = bayesian_engine.ActionKnobs(enabled=False).to_status_dict()
+            manifold_payload = self._manifold_score.to_status_dict()
+            manifold_history = list(self._manifold_history)
+            history_sparkline: list[float] = [round(float(row[1]), 6) for row in manifold_history]
+            trend = "stable"
+            if history_sparkline:
+                try:
+                    trend = str(
+                        bayesian_engine.ev_trend(
+                            history_sparkline,
+                            window=min(4, len(history_sparkline)),
+                        )
+                    )
+                except Exception:
+                    trend = "stable"
+            if trend not in {"rising", "falling", "stable"}:
+                trend = "stable"
+            mts_30m_ago: float | None = None
+            if manifold_history:
+                cutoff = float(now) - max(60.0, float(self._regime_history_window_sec))
+                mts_30m_ago = float(manifold_history[0][1])
+                for row in manifold_history:
+                    row_ts = float(row[0])
+                    row_mts = float(row[1])
+                    if row_ts <= cutoff:
+                        mts_30m_ago = row_mts
+                        continue
+                    break
+                mts_30m_ago = round(float(mts_30m_ago), 6)
+            manifold_payload["history_sparkline"] = history_sparkline
+            manifold_payload["trend"] = trend
+            manifold_payload["mts_30m_ago"] = mts_30m_ago
 
             return {
                 "mode": self.mode,
@@ -14629,11 +15887,11 @@ class BotRuntime:
                 "external_flows": self._external_flows_status_payload(now),
                 "equity_history": self._equity_history_status_payload(now),
                 "sticky_mode": {
-                    "enabled": bool(config.STICKY_MODE_ENABLED),
+                    "enabled": self._flag_value("STICKY_MODE_ENABLED"),
                     "target_slots": int(config.STICKY_TARGET_SLOTS),
                     "max_target_slots": int(config.STICKY_MAX_TARGET_SLOTS),
                     "compounding_mode": str(getattr(config, "STICKY_COMPOUNDING_MODE", "legacy_profit")),
-                    "auto_release_enabled": bool(config.RELEASE_AUTO_ENABLED),
+                    "auto_release_enabled": self._flag_value("RELEASE_AUTO_ENABLED"),
                 },
                 "self_healing": self._self_healing_status_payload(now),
                 "slot_vintage": slot_vintage,
@@ -14647,6 +15905,8 @@ class BotRuntime:
                 "survival_model": survival_payload,
                 "trade_beliefs": trade_beliefs_payload,
                 "action_knobs": action_knobs_payload,
+                "manifold_score": manifold_payload,
+                "ops_panel": self._ops_panel_status_payload(),
                 "regime_history_30m": list(self._regime_history_30m),
                 "throughput_sizer": (
                     self._throughput.status_payload() if self._throughput is not None else {"enabled": False}
@@ -14681,7 +15941,7 @@ class BotRuntime:
                 },
                 "doge_bias_scoreboard": self._compute_doge_bias_scoreboard(),
                 "rebalancer": {
-                    "enabled": bool(config.REBALANCE_ENABLED),
+                    "enabled": self._flag_value("REBALANCE_ENABLED"),
                     "idle_ratio": float(self._rebalancer_idle_ratio),
                     "target": float(max(0.0, min(1.0, self._trend_dynamic_target))),
                     "base_target": float(max(0.0, min(1.0, float(config.REBALANCE_TARGET_IDLE_PCT)))),
@@ -14817,11 +16077,211 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json(_RUNTIME.status_payload())
             return
 
+        if self.path.startswith("/api/ops/toggles"):
+            if _RUNTIME is None:
+                self._send_json({"error": "runtime not ready"}, 503)
+                return
+            with _RUNTIME.lock:
+                self._send_json(_RUNTIME._ops_toggles_payload())
+            return
+
+        if self.path.startswith("/api/churner/status"):
+            if _RUNTIME is None:
+                self._send_json({"error": "runtime not ready"}, 503)
+                return
+            with _RUNTIME.lock:
+                self._send_json(_RUNTIME._churner_status_payload())
+            return
+
+        if self.path.startswith("/api/churner/candidates"):
+            if _RUNTIME is None:
+                self._send_json({"error": "runtime not ready"}, 503)
+                return
+            with _RUNTIME.lock:
+                self._send_json(_RUNTIME._churner_candidates_payload())
+            return
+
         self._send_json({"error": "not found"}, 404)
 
     def do_POST(self) -> None:  # noqa: N802
         global _RUNTIME
         try:
+            if self.path.startswith("/api/ops/"):
+                if _RUNTIME is None:
+                    self._send_json({"ok": False, "message": "runtime not ready"}, 503)
+                    return
+                try:
+                    body = self._read_json()
+                except Exception:
+                    self._send_json({"ok": False, "message": "invalid request body"}, 400)
+                    return
+
+                def _parse_bool_value(raw: Any) -> tuple[bool, bool]:
+                    if isinstance(raw, bool):
+                        return bool(raw), True
+                    if isinstance(raw, (int, float)):
+                        if float(raw) in (0.0, 1.0):
+                            return bool(int(raw)), True
+                        return False, False
+                    text = str(raw or "").strip().lower()
+                    if text in {"1", "true", "yes", "on"}:
+                        return True, True
+                    if text in {"0", "false", "no", "off"}:
+                        return False, True
+                    return False, False
+
+                with _RUNTIME.lock:
+                    if self.path.startswith("/api/ops/toggle"):
+                        key = str(body.get("key", "")).strip().upper()
+                        if not key:
+                            self._send_json({"ok": False, "message": "toggle key required"}, 400)
+                            return
+                        value, ok_bool = _parse_bool_value(body.get("value", None))
+                        if not ok_bool:
+                            self._send_json({"ok": False, "message": "invalid toggle value (expected bool)"}, 400)
+                            return
+                        ok, msg = _RUNTIME._set_runtime_override(key, value)
+                        if ok:
+                            _RUNTIME._save_snapshot()
+                        self._send_json(
+                            {
+                                "ok": bool(ok),
+                                "message": str(msg),
+                                "ops_panel": _RUNTIME._ops_panel_status_payload(),
+                            },
+                            200 if ok else 400,
+                        )
+                        return
+
+                    if self.path.startswith("/api/ops/reset-all"):
+                        cleared = int(_RUNTIME._clear_all_runtime_overrides())
+                        _RUNTIME._save_snapshot()
+                        self._send_json(
+                            {
+                                "ok": True,
+                                "message": f"cleared {cleared} overrides",
+                                "cleared": cleared,
+                                "ops_panel": _RUNTIME._ops_panel_status_payload(),
+                            },
+                            200,
+                        )
+                        return
+
+                    if self.path.startswith("/api/ops/reset"):
+                        key = str(body.get("key", "")).strip().upper()
+                        if not key:
+                            self._send_json({"ok": False, "message": "toggle key required"}, 400)
+                            return
+                        ok, msg = _RUNTIME._clear_runtime_override(key)
+                        if ok:
+                            _RUNTIME._save_snapshot()
+                        self._send_json(
+                            {
+                                "ok": bool(ok),
+                                "message": str(msg),
+                                "ops_panel": _RUNTIME._ops_panel_status_payload(),
+                            },
+                            200 if ok else 400,
+                        )
+                        return
+
+                self._send_json({"ok": False, "message": "not found"}, 404)
+                return
+
+            if self.path.startswith("/api/churner/"):
+                if _RUNTIME is None:
+                    self._send_json({"ok": False, "message": "runtime not ready"}, 503)
+                    return
+                try:
+                    body = self._read_json()
+                except Exception:
+                    self._send_json({"ok": False, "message": "invalid request body"}, 400)
+                    return
+
+                with _RUNTIME.lock:
+                    if self.path.startswith("/api/churner/spawn"):
+                        try:
+                            slot_id = int(body.get("slot_id", -1))
+                        except (TypeError, ValueError):
+                            self._send_json({"ok": False, "message": "invalid slot_id"}, 400)
+                            return
+                        if slot_id < 0:
+                            self._send_json({"ok": False, "message": "invalid slot_id"}, 400)
+                            return
+                        position_id_raw = body.get("position_id", None)
+                        position_id: int | None = None
+                        if position_id_raw not in (None, ""):
+                            try:
+                                position_id = int(position_id_raw)
+                            except (TypeError, ValueError):
+                                self._send_json({"ok": False, "message": "invalid position_id"}, 400)
+                                return
+                            if position_id <= 0:
+                                self._send_json({"ok": False, "message": "invalid position_id"}, 400)
+                                return
+                        ok, msg = _RUNTIME._churner_spawn(slot_id=slot_id, position_id=position_id)
+                        if ok:
+                            _RUNTIME._save_snapshot()
+                        self._send_json(
+                            {
+                                "ok": bool(ok),
+                                "message": str(msg),
+                                "churner": _RUNTIME._churner_status_payload(),
+                            },
+                            200 if ok else 400,
+                        )
+                        return
+
+                    if self.path.startswith("/api/churner/kill"):
+                        try:
+                            slot_id = int(body.get("slot_id", -1))
+                        except (TypeError, ValueError):
+                            self._send_json({"ok": False, "message": "invalid slot_id"}, 400)
+                            return
+                        if slot_id < 0:
+                            self._send_json({"ok": False, "message": "invalid slot_id"}, 400)
+                            return
+                        ok, msg = _RUNTIME._churner_kill(slot_id=slot_id)
+                        if ok:
+                            _RUNTIME._save_snapshot()
+                        self._send_json(
+                            {
+                                "ok": bool(ok),
+                                "message": str(msg),
+                                "churner": _RUNTIME._churner_status_payload(),
+                            },
+                            200 if ok else 400,
+                        )
+                        return
+
+                    if self.path.startswith("/api/churner/config"):
+                        if "reserve_usd" not in body:
+                            self._send_json({"ok": False, "message": "reserve_usd required"}, 400)
+                            return
+                        try:
+                            reserve_usd = float(body.get("reserve_usd", 0.0))
+                        except (TypeError, ValueError):
+                            self._send_json({"ok": False, "message": "invalid reserve_usd"}, 400)
+                            return
+                        if not isfinite(reserve_usd):
+                            self._send_json({"ok": False, "message": "invalid reserve_usd"}, 400)
+                            return
+                        ok, msg = _RUNTIME._churner_update_runtime_config(reserve_usd=reserve_usd)
+                        if ok:
+                            _RUNTIME._save_snapshot()
+                        self._send_json(
+                            {
+                                "ok": bool(ok),
+                                "message": str(msg),
+                                "churner": _RUNTIME._churner_status_payload(),
+                            },
+                            200 if ok else 400,
+                        )
+                        return
+
+                self._send_json({"ok": False, "message": "not found"}, 404)
+                return
+
             if not self.path.startswith("/api/action"):
                 self._send_json({"ok": False, "message": "not found"}, 404)
                 return
@@ -14837,7 +16297,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
             action = (body.get("action") or "").strip()
             parsed: dict[str, float | int | str] = {}
-            sticky_mode_enabled = bool(config.STICKY_MODE_ENABLED)
+            flag_reader = getattr(_RUNTIME, "_flag_value", None)
+            if callable(flag_reader):
+                sticky_mode_enabled = bool(flag_reader("STICKY_MODE_ENABLED"))
+            else:
+                sticky_mode_enabled = bool(getattr(config, "STICKY_MODE_ENABLED", False))
             recovery_orders_enabled = _recovery_orders_enabled_flag()
             if sticky_mode_enabled and action in ("soft_close", "soft_close_next", "cancel_stale_recoveries"):
                 self._send_json(
@@ -15027,7 +16491,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
             self._send_json({"ok": bool(ok), "message": str(msg)}, 200 if ok else 400)
         except Exception:
-            logger.exception("Unhandled exception in /api/action")
+            logger.exception("Unhandled exception in API POST")
             self._send_json({"ok": False, "message": "internal server error"}, 500)
 
 

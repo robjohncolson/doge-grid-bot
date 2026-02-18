@@ -138,6 +138,55 @@ class BayesianIntelligenceTests(unittest.TestCase):
         self.assertEqual(action, "reprice_breakeven")
         self.assertGreaterEqual(conf, 0.7)
 
+    def test_manifold_score_matches_hand_calculation(self):
+        manifold = bayesian_engine.compute_manifold_score(
+            posterior_1m=[1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0],
+            posterior_15m=[1.0, 0.0, 0.0],
+            posterior_1h=[0.5, 0.5, 0.0],
+            p_switch_1m=0.20,
+            p_switch_15m=0.05,
+            p_switch_1h=0.01,
+            bocpd_change_prob=0.10,
+            bocpd_run_length=40.0,
+            throughput_multiplier=0.80,
+            age_pressure=0.50,
+            stuck_capital_pct=20.0,
+            entropy_consensus=0.20,
+            direction_score=-0.60,
+            enabled=True,
+        )
+
+        self.assertAlmostEqual(manifold.components.regime_clarity, 0.433333, places=5)
+        self.assertAlmostEqual(manifold.components.regime_stability, 0.864000, places=5)
+        self.assertAlmostEqual(manifold.components.throughput_efficiency, 0.720000, places=5)
+        self.assertAlmostEqual(manifold.components.signal_coherence, 0.750000, places=5)
+        self.assertAlmostEqual(manifold.mts, 0.670552, places=5)
+        self.assertEqual(manifold.band, "favorable")
+
+    def test_manifold_disabled_payload_shape(self):
+        manifold = bayesian_engine.compute_manifold_score(
+            posterior_1m=[0.0, 1.0, 0.0],
+            posterior_15m=[0.0, 1.0, 0.0],
+            posterior_1h=[0.0, 1.0, 0.0],
+            p_switch_1m=0.0,
+            p_switch_15m=0.0,
+            p_switch_1h=0.0,
+            bocpd_change_prob=0.0,
+            bocpd_run_length=0.0,
+            throughput_multiplier=1.0,
+            age_pressure=0.0,
+            stuck_capital_pct=0.0,
+            entropy_consensus=0.0,
+            direction_score=0.0,
+            enabled=False,
+        ).to_status_dict()
+
+        self.assertEqual(manifold["enabled"], False)
+        self.assertEqual(manifold["mts"], 0.0)
+        self.assertEqual(manifold["band"], "disabled")
+        self.assertIn("components", manifold)
+        self.assertIn("kernel_memory", manifold)
+
 
 @unittest.skipIf(hmm_regime_detector is None, f"hmm_regime_detector import failed: {_HMM_IMPORT_ERROR}")
 class RegimeDetectorMathTests(unittest.TestCase):

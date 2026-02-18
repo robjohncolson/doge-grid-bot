@@ -36,6 +36,50 @@ def _env(name, default, cast=str):
         return default
 
 
+def _env_float_list(name: str, default: list[float], expected_len: int) -> list[float]:
+    """
+    Read a float list from env. Accepts either JSON list or comma-separated text.
+    Falls back to default when parsing fails or length is incorrect.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        vals = list(default)
+    else:
+        parsed: list[float] = []
+        used_json = False
+        if raw.startswith("[") and raw.endswith("]"):
+            try:
+                loaded = _json.loads(raw)
+            except Exception:
+                loaded = None
+            if isinstance(loaded, list):
+                used_json = True
+                for item in loaded:
+                    try:
+                        parsed.append(float(item))
+                    except (TypeError, ValueError):
+                        parsed = []
+                        break
+        if not used_json:
+            for tok in raw.split(","):
+                tok = tok.strip()
+                if not tok:
+                    continue
+                try:
+                    parsed.append(float(tok))
+                except (TypeError, ValueError):
+                    parsed = []
+                    break
+        vals = parsed
+
+    clean = [max(0.0, float(v)) for v in vals if isinstance(v, (int, float))]
+    if len(clean) != int(expected_len):
+        return list(default)
+    if sum(clean) <= 1e-12:
+        return list(default)
+    return clean
+
+
 # ---------------------------------------------------------------------------
 # API Credentials  (NEVER hard-code these -- always use env vars)
 # ---------------------------------------------------------------------------
@@ -430,6 +474,12 @@ if CHURNER_MIN_HEADROOM < 0:
 CHURNER_RESERVE_USD: float = _env("CHURNER_RESERVE_USD", 5.0, float)
 if CHURNER_RESERVE_USD < 0:
     CHURNER_RESERVE_USD = 0.0
+CHURNER_MAX_ACTIVE: int = _env("CHURNER_MAX_ACTIVE", 5, int)
+if CHURNER_MAX_ACTIVE < 1:
+    CHURNER_MAX_ACTIVE = 1
+CHURNER_PROFIT_ROUTING: str = _env("CHURNER_PROFIT_ROUTING", "subsidy", str).strip().lower()
+if CHURNER_PROFIT_ROUTING not in {"subsidy", "slot"}:
+    CHURNER_PROFIT_ROUTING = "subsidy"
 
 # Dependency enforcement: churner/subsidy rely on ledger primitives.
 if CHURNER_ENABLED and not POSITION_LEDGER_ENABLED:
@@ -701,6 +751,42 @@ TP_UTIL_FLOOR: float = _env("TP_UTIL_FLOOR", 0.4, float)
 TP_RECENCY_HALFLIFE: int = _env("TP_RECENCY_HALFLIFE", 100, int)
 # Emit throughput summary logs at update cadence.
 TP_LOG_UPDATES: bool = _env("TP_LOG_UPDATES", True, bool)
+
+# ---------------------------------------------------------------------------
+# Manifold Trading Score (MTS)
+# ---------------------------------------------------------------------------
+
+MTS_ENABLED: bool = _env("MTS_ENABLED", True, bool)
+MTS_CLARITY_WEIGHTS: list[float] = _env_float_list("MTS_CLARITY_WEIGHTS", [0.2, 0.5, 0.3], 3)
+MTS_STABILITY_SWITCH_WEIGHTS: list[float] = _env_float_list(
+    "MTS_STABILITY_SWITCH_WEIGHTS",
+    [0.2, 0.5, 0.3],
+    3,
+)
+MTS_COHERENCE_WEIGHTS: list[float] = _env_float_list("MTS_COHERENCE_WEIGHTS", [0.5, 0.25, 0.25], 3)
+MTS_HISTORY_SIZE: int = _env("MTS_HISTORY_SIZE", 360, int)
+if MTS_HISTORY_SIZE < 1:
+    MTS_HISTORY_SIZE = 1
+MTS_ENTRY_THROTTLE_ENABLED: bool = _env("MTS_ENTRY_THROTTLE_ENABLED", False, bool)
+MTS_ENTRY_THROTTLE_FLOOR: float = _env("MTS_ENTRY_THROTTLE_FLOOR", 0.3, float)
+if MTS_ENTRY_THROTTLE_FLOOR < 0.0:
+    MTS_ENTRY_THROTTLE_FLOOR = 0.0
+if MTS_ENTRY_THROTTLE_FLOOR > 1.0:
+    MTS_ENTRY_THROTTLE_FLOOR = 1.0
+MTS_KERNEL_ENABLED: bool = _env("MTS_KERNEL_ENABLED", False, bool)
+MTS_KERNEL_MIN_SAMPLES: int = _env("MTS_KERNEL_MIN_SAMPLES", 200, int)
+if MTS_KERNEL_MIN_SAMPLES < 1:
+    MTS_KERNEL_MIN_SAMPLES = 1
+MTS_KERNEL_ALPHA_MAX: float = _env("MTS_KERNEL_ALPHA_MAX", 0.5, float)
+if MTS_KERNEL_ALPHA_MAX < 0.0:
+    MTS_KERNEL_ALPHA_MAX = 0.0
+if MTS_KERNEL_ALPHA_MAX > 1.0:
+    MTS_KERNEL_ALPHA_MAX = 1.0
+MTS_CHURNER_GATE: float = _env("MTS_CHURNER_GATE", 0.3, float)
+if MTS_CHURNER_GATE < 0.0:
+    MTS_CHURNER_GATE = 0.0
+if MTS_CHURNER_GATE > 1.0:
+    MTS_CHURNER_GATE = 1.0
 
 # Legacy Kelly toggle retained for backward compatibility only (dead config).
 KELLY_ENABLED: bool = _env("KELLY_ENABLED", False, bool)

@@ -618,6 +618,174 @@ class BotEventLogTests(unittest.TestCase):
                 self.assertEqual(len(bounded), 50)
             rt.end_loop()
 
+    def test_runtime_override_precedence_and_clear(self):
+        with mock.patch.object(config, "REBALANCE_ENABLED", False):
+            rt = bot.BotRuntime()
+            self.assertFalse(rt._flag_value("REBALANCE_ENABLED"))
+
+            ok, _msg = rt._set_runtime_override("REBALANCE_ENABLED", True)
+            self.assertTrue(ok)
+            self.assertTrue(rt._flag_value("REBALANCE_ENABLED"))
+
+            ok, _msg = rt._clear_runtime_override("REBALANCE_ENABLED")
+            self.assertTrue(ok)
+            self.assertFalse(rt._flag_value("REBALANCE_ENABLED"))
+
+    def test_runtime_override_dependency_blocks_churner_without_ledger(self):
+        rt = bot.BotRuntime()
+        ok, _msg = rt._set_runtime_override("POSITION_LEDGER_ENABLED", False)
+        self.assertTrue(ok)
+        self.assertFalse(rt._flag_value("POSITION_LEDGER_ENABLED"))
+
+        ok, msg = rt._set_runtime_override("CHURNER_ENABLED", True)
+        self.assertFalse(ok)
+        self.assertIn("POSITION_LEDGER_ENABLED", msg)
+        self.assertFalse(rt._flag_value("CHURNER_ENABLED"))
+
+    def test_runtime_overrides_are_not_persisted_or_restored(self):
+        rt = bot.BotRuntime()
+        ok, _msg = rt._set_runtime_override("REBALANCE_ENABLED", False)
+        self.assertTrue(ok)
+
+        snap = rt._global_snapshot()
+        self.assertNotIn("runtime_overrides", snap)
+        self.assertNotIn("_runtime_overrides", snap)
+        snap["runtime_overrides"] = {"REBALANCE_ENABLED": True}
+
+        restored = bot.BotRuntime()
+        with mock.patch("supabase_store.load_state", return_value=snap):
+            with mock.patch("supabase_store.load_max_event_id", return_value=0):
+                restored._load_snapshot()
+
+        self.assertEqual(restored._runtime_overrides, {})
+        self.assertEqual(
+            restored._flag_value("REBALANCE_ENABLED"),
+            bool(getattr(config, "REBALANCE_ENABLED", False)),
+        )
+
+    def test_toggle_side_effect_tp_rebuilds_runtime_object(self):
+        with mock.patch.object(config, "TP_ENABLED", False):
+            rt = bot.BotRuntime()
+            self.assertIsNone(rt._throughput)
+
+            ok, _msg = rt._set_runtime_override("TP_ENABLED", True)
+            self.assertTrue(ok)
+            self.assertIsNotNone(rt._throughput)
+
+            ok, _msg = rt._clear_runtime_override("TP_ENABLED")
+            self.assertTrue(ok)
+            self.assertIsNone(rt._throughput)
+
+    def test_runtime_override_accum_enabled_reflects_status_payload(self):
+        with mock.patch.object(config, "ACCUM_ENABLED", False):
+            rt = bot.BotRuntime()
+            self.assertFalse(rt._accumulation_status_payload()["enabled"])
+
+            ok, _msg = rt._set_runtime_override("ACCUM_ENABLED", True)
+            self.assertTrue(ok)
+            self.assertTrue(rt._accumulation_status_payload()["enabled"])
+
+    def test_toggle_registry_omits_grid_strategy_owned_flags(self):
+        rt = bot.BotRuntime()
+        self.assertNotIn("ENTRY_BACKOFF_ENABLED", rt._toggle_registry)
+        self.assertNotIn("VOLATILITY_AUTO_PROFIT", rt._toggle_registry)
+
+    def test_status_payload_includes_ops_panel_override_metadata(self):
+        with mock.patch.object(config, "REBALANCE_ENABLED", False):
+            rt = bot.BotRuntime()
+            rt.last_price = 0.1
+            rt.slots = {
+                0: bot.SlotRuntime(
+                    slot_id=0,
+                    state=sm.PairState(market_price=0.1, now=1000.0),
+                )
+            }
+            ok, _msg = rt._set_runtime_override("REBALANCE_ENABLED", True)
+            self.assertTrue(ok)
+
+            payload = rt.status_payload()
+
+        self.assertIn("ops_panel", payload)
+        panel = payload["ops_panel"]
+        self.assertEqual(int(panel["overrides_active"]), 1)
+        self.assertIn("REBALANCE_ENABLED", panel["overrides"])
+        row = panel["overrides"]["REBALANCE_ENABLED"]
+        self.assertTrue(bool(row["effective"]))
+        self.assertFalse(bool(row["config_default"]))
+        self.assertEqual(str(row["source"]), "runtime_override")
+
+    def test_status_payload_exposes_manifold_score_block(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        rt.last_price_ts = 2800.0
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(market_price=0.1, now=2800.0),
+            )
+        }
+        rt._manifold_score = bot.bayesian_engine.ManifoldScore(
+            enabled=True,
+            mts=0.58,
+            band="cautious",
+            band_color="#f0ad4e",
+            components=bot.bayesian_engine.ManifoldScoreComponents(
+                regime_clarity=0.50,
+                regime_stability=0.89,
+                throughput_efficiency=0.63,
+                signal_coherence=0.41,
+            ),
+            component_details={"age_drag": 0.947},
+        )
+        rt._manifold_history = deque([
+            (1000.0, 0.64, 0.52, 0.91, 0.70, 0.48),
+            (2800.0, 0.58, 0.50, 0.89, 0.63, 0.41),
+        ])
+
+        with mock.patch("bot._now", return_value=2800.0):
+            payload = rt.status_payload()
+        manifold = payload["manifold_score"]
+        self.assertTrue(manifold["enabled"])
+        self.assertEqual(manifold["history_sparkline"], [0.64, 0.58])
+        self.assertEqual(manifold["trend"], "falling")
+        self.assertAlmostEqual(float(manifold["mts_30m_ago"]), 0.64)
+
+    def test_entry_loop_cap_applies_mts_throttle_only_when_enabled(self):
+        with mock.patch.object(config, "MAX_ENTRY_ADDS_PER_LOOP", 5), mock.patch.object(
+            config, "MTS_ENABLED", True
+        ), mock.patch.object(config, "MTS_ENTRY_THROTTLE_ENABLED", False), mock.patch.object(
+            config, "MTS_ENTRY_THROTTLE_FLOOR", 0.3
+        ):
+            rt = bot.BotRuntime()
+            rt._manifold_score = bot.bayesian_engine.ManifoldScore(enabled=True, mts=0.40)
+
+            with mock.patch.object(rt, "_compute_capacity_health", return_value={"open_order_headroom": 100}):
+                self.assertEqual(rt._compute_entry_adds_loop_cap(), 5)
+
+            ok, _msg = rt._set_runtime_override("MTS_ENTRY_THROTTLE_ENABLED", True)
+            self.assertTrue(ok)
+            with mock.patch.object(rt, "_compute_capacity_health", return_value={"open_order_headroom": 100}):
+                self.assertEqual(rt._compute_entry_adds_loop_cap(), 2)
+
+            rt._manifold_score = bot.bayesian_engine.ManifoldScore(enabled=True, mts=0.20)
+            with mock.patch.object(rt, "_compute_capacity_health", return_value={"open_order_headroom": 100}):
+                self.assertEqual(rt._compute_entry_adds_loop_cap(), 0)
+
+    def test_update_manifold_score_tolerates_missing_signals(self):
+        rt = bot.BotRuntime()
+        ok, _msg = rt._set_runtime_override("MTS_ENABLED", True)
+        self.assertTrue(ok)
+        rt._belief_state = SimpleNamespace(enabled=True)
+        rt._bocpd_state = SimpleNamespace()
+        rt._throughput = None
+        rt._manifold_history.clear()
+
+        with mock.patch.object(rt, "_slot_vintage_metrics_locked", return_value={}):
+            rt._update_manifold_score(now=1234.0)
+
+        self.assertIsInstance(rt._manifold_score.to_status_dict(), dict)
+        self.assertEqual(len(rt._manifold_history), 1)
+
     def test_entry_scheduler_defers_and_drains_pending_entries(self):
         rt = bot.BotRuntime()
         rt.mode = "RUNNING"
@@ -2699,12 +2867,27 @@ class BotEventLogTests(unittest.TestCase):
         self.assertEqual(block["override"]["tier"], 1)
         self.assertEqual(len(block["history"]), 1)
 
-    def test_build_ai_regime_context_exposes_capital_and_accumulation_blocks(self):
+    def test_build_ai_regime_context_exposes_capital_accumulation_and_enriched_blocks(self):
         rt = bot.BotRuntime()
         rt._ai_regime_opinion = {
             "accumulation_signal": "accumulate_doge",
             "accumulation_conviction": 66,
         }
+        rt._manifold_score = bot.bayesian_engine.ManifoldScore(
+            enabled=True,
+            mts=0.58,
+            band="cautious",
+            components=bot.bayesian_engine.ManifoldScoreComponents(
+                regime_clarity=0.50,
+                regime_stability=0.89,
+                throughput_efficiency=0.63,
+                signal_coherence=0.41,
+            ),
+        )
+        rt._manifold_history = deque([
+            (0.0, 0.64, 0.52, 0.91, 0.70, 0.48),
+            (1000.0, 0.58, 0.50, 0.89, 0.63, 0.41),
+        ])
         rt._hmm_state.update({
             "available": True,
             "trained": True,
@@ -2713,11 +2896,36 @@ class BotEventLogTests(unittest.TestCase):
             "bias_signal": 0.0,
             "probabilities": {"bearish": 0.2, "ranging": 0.6, "bullish": 0.2},
         })
+        rt._throughput = SimpleNamespace(
+            status_payload=lambda: {
+                "active_regime": "ranging",
+                "age_pressure": 0.43,
+                "ranging_A": {"multiplier": 0.72, "median_fill_sec": 7000.0, "sufficient_data": True},
+                "ranging_B": {"multiplier": 0.62, "median_fill_sec": 7600.0, "sufficient_data": True},
+                "bearish_A": {"multiplier": 0.95, "median_fill_sec": 0.0, "sufficient_data": True},
+                "bearish_B": {"multiplier": 0.80, "median_fill_sec": 0.0, "sufficient_data": False},
+                "bullish_A": {"multiplier": 1.10, "median_fill_sec": 0.0, "sufficient_data": False},
+                "bullish_B": {"multiplier": 1.05, "median_fill_sec": 0.0, "sufficient_data": False},
+                "aggregate": {"median_fill_sec": 7300.0},
+            }
+        )
 
         with mock.patch.object(rt, "_available_free_balances", return_value=(120.0, 1800.0)):
             with mock.patch.object(rt, "_compute_doge_bias_scoreboard", return_value={"idle_usd": 45.0, "idle_usd_pct": 37.5}):
-                with mock.patch.object(config, "ACCUM_ENABLED", True):
-                    context = rt._build_ai_regime_context(now=1000.0)
+                with mock.patch.object(
+                    rt,
+                    "_self_healing_status_payload",
+                    return_value={
+                        "enabled": True,
+                        "age_bands": {"fresh": 2, "aging": 3, "stale": 4, "stuck": 1, "write_off": 0},
+                        "subsidy": {"balance": 0.25, "pending_needed": 0.40},
+                        "churner": {"enabled": True, "active_slots": 1, "reserve_available_usd": 4.75},
+                    },
+                ):
+                    with mock.patch.object(rt, "_slot_vintage_metrics_locked", return_value={"stuck_capital_pct": 12.4}):
+                        with mock.patch.object(rt, "_trade_beliefs_status_payload", return_value={"exits_with_negative_ev": 7}):
+                            with mock.patch.object(config, "ACCUM_ENABLED", True):
+                                context = rt._build_ai_regime_context(now=1000.0)
 
         self.assertIn("capital", context)
         self.assertAlmostEqual(float(context["capital"]["free_usd"]), 120.0)
@@ -2728,6 +2936,23 @@ class BotEventLogTests(unittest.TestCase):
         self.assertTrue(bool(context["accumulation"]["enabled"]))
         self.assertEqual(context["accumulation"]["signal"], "accumulate_doge")
         self.assertEqual(int(context["accumulation"]["conviction"]), 66)
+        self.assertIn("manifold", context)
+        self.assertAlmostEqual(float(context["manifold"]["mts"]), 0.58, places=6)
+        self.assertEqual(str(context["manifold"]["trend"]), "falling")
+        self.assertAlmostEqual(float(context["manifold"]["mts_30m_ago"]), 0.64, places=6)
+        self.assertIn("positions", context)
+        self.assertEqual(int(context["positions"]["age_bands"]["stale"]), 4)
+        self.assertAlmostEqual(float(context["positions"]["stuck_capital_pct"]), 12.4, places=6)
+        self.assertEqual(int(context["positions"]["negative_ev_count"]), 7)
+        self.assertIn("throughput", context)
+        self.assertEqual(str(context["throughput"]["active_regime"]), "ranging")
+        self.assertAlmostEqual(float(context["throughput"]["multiplier"]), 0.67, places=6)
+        self.assertAlmostEqual(float(context["throughput"]["age_pressure"]), 0.43, places=6)
+        self.assertIn("ranging_A", list(context["throughput"]["sufficient_data_regimes"]))
+        self.assertIn("churner", context)
+        self.assertTrue(bool(context["churner"]["enabled"]))
+        self.assertEqual(int(context["churner"]["active_slots"]), 1)
+        self.assertAlmostEqual(float(context["churner"]["reserve_usd"]), 4.75, places=6)
 
     def test_update_accumulation_arms_on_confirmed_tertiary_transition(self):
         rt = bot.BotRuntime()
@@ -4372,6 +4597,29 @@ class BotEventLogTests(unittest.TestCase):
         self.assertIn('id="accumAiSignal"', dashboard.DASHBOARD_HTML)
         self.assertIn('id="accumLastSession"', dashboard.DASHBOARD_HTML)
 
+    def test_dashboard_phase6_surfaces_present(self):
+        self.assertIn('id="opsDrawerBtn"', dashboard.DASHBOARD_HTML)
+        self.assertIn('id="opsDrawer"', dashboard.DASHBOARD_HTML)
+        self.assertIn('id="opsGroups"', dashboard.DASHBOARD_HTML)
+        self.assertIn('id="manifoldScore"', dashboard.DASHBOARD_HTML)
+        self.assertIn('id="manifoldSparkline"', dashboard.DASHBOARD_HTML)
+        self.assertIn('id="manifoldSimplex"', dashboard.DASHBOARD_HTML)
+        self.assertIn('id="regimeRibbon"', dashboard.DASHBOARD_HTML)
+        self.assertIn('id="slotChurnerStatus"', dashboard.DASHBOARD_HTML)
+        self.assertIn('id="slotChurnerSpawnBtn"', dashboard.DASHBOARD_HTML)
+        self.assertIn('id="slotChurnerKillBtn"', dashboard.DASHBOARD_HTML)
+
+    def test_dashboard_phase6_ops_and_churner_api_bindings_present(self):
+        self.assertIn("/api/ops/toggles", dashboard.DASHBOARD_HTML)
+        self.assertIn("/api/ops/toggle", dashboard.DASHBOARD_HTML)
+        self.assertIn("/api/ops/reset", dashboard.DASHBOARD_HTML)
+        self.assertIn("/api/ops/reset-all", dashboard.DASHBOARD_HTML)
+        self.assertIn("/api/churner/status", dashboard.DASHBOARD_HTML)
+        self.assertIn("/api/churner/candidates", dashboard.DASHBOARD_HTML)
+        self.assertIn("/api/churner/spawn", dashboard.DASHBOARD_HTML)
+        self.assertIn("/api/churner/kill", dashboard.DASHBOARD_HTML)
+        self.assertIn("/api/churner/config", dashboard.DASHBOARD_HTML)
+
     def test_auto_drain_recovery_backlog_prefers_furthest_then_oldest(self):
         rt = bot.BotRuntime()
         rt.mode = "RUNNING"
@@ -5201,6 +5449,41 @@ class DashboardApiHardeningTests(unittest.TestCase):
             self.self_heal_reprice_calls = []
             self.self_heal_close_calls = []
             self.self_heal_keep_calls = []
+            self.ops_toggle_calls = []
+            self.ops_reset_calls = []
+            self.ops_reset_all_calls = 0
+            self.ops_panel_payload = {"overrides_active": 0, "overrides": {}}
+            self.churner_spawn_calls = []
+            self.churner_kill_calls = []
+            self.churner_config_calls = []
+            self.churner_status_payload = {
+                "enabled": True,
+                "active_slots": 0,
+                "max_active": 5,
+                "reserve_available_usd": 5.0,
+                "reserve_config_usd": 5.0,
+                "cycles_today": 0,
+                "profit_today": 0.0,
+                "cycles_total": 0,
+                "profit_total": 0.0,
+                "mts": 0.6,
+                "mts_gate": 0.3,
+                "subsidy_balance": 0.0,
+                "subsidy_needed": 0.0,
+                "states": [],
+            }
+            self.churner_candidates_payload = {
+                "enabled": True,
+                "count": 1,
+                "candidates": [
+                    {
+                        "slot_id": 2,
+                        "position_id": 47,
+                        "trade_id": "B",
+                        "age_band": "stale",
+                    }
+                ],
+            }
 
         def pause(self, _reason):
             if self.raise_on_pause:
@@ -5269,12 +5552,86 @@ class DashboardApiHardeningTests(unittest.TestCase):
             self.self_heal_keep_calls.append((position_id, operator_reason, hold_sec))
             return True, "hold timer reset"
 
+        def _set_runtime_override(self, key, value):
+            self.ops_toggle_calls.append((key, value))
+            self.ops_panel_payload = {
+                "overrides_active": 1,
+                "overrides": {
+                    str(key): {
+                        "effective": bool(value),
+                        "config_default": False,
+                        "source": "runtime_override",
+                    }
+                },
+            }
+            return True, f"{key} override set to {bool(value)}"
+
+        def _clear_runtime_override(self, key):
+            self.ops_reset_calls.append(key)
+            self.ops_panel_payload = {"overrides_active": 0, "overrides": {}}
+            return True, f"{key} override cleared"
+
+        def _clear_all_runtime_overrides(self):
+            self.ops_reset_all_calls += 1
+            cleared = int(self.ops_panel_payload.get("overrides_active", 0) or 0)
+            self.ops_panel_payload = {"overrides_active": 0, "overrides": {}}
+            return cleared
+
+        def _ops_toggles_payload(self):
+            return {
+                "overrides_active": int(self.ops_panel_payload.get("overrides_active", 0)),
+                "groups": [
+                    {"group": "Regime Detection", "enabled": 1, "overridden": 0, "total": 1}
+                ],
+                "toggles": [
+                    {
+                        "key": "HMM_ENABLED",
+                        "group": "Regime Detection",
+                        "description": "Primary 1-minute regime detector",
+                        "dependencies": [],
+                        "effective": True,
+                        "config_default": True,
+                        "override_active": False,
+                        "source": "config_default",
+                    }
+                ],
+            }
+
+        def _ops_panel_status_payload(self):
+            return dict(self.ops_panel_payload)
+
         def _save_snapshot(self):
             return None
 
+        def _churner_status_payload(self):
+            return dict(self.churner_status_payload)
+
+        def _churner_candidates_payload(self):
+            return {
+                "enabled": bool(self.churner_candidates_payload.get("enabled", False)),
+                "count": int(self.churner_candidates_payload.get("count", 0)),
+                "candidates": list(self.churner_candidates_payload.get("candidates", [])),
+            }
+
+        def _churner_spawn(self, *, slot_id, position_id=None):
+            self.churner_spawn_calls.append((slot_id, position_id))
+            self.churner_status_payload["active_slots"] = 1
+            return True, "spawned churner"
+
+        def _churner_kill(self, *, slot_id):
+            self.churner_kill_calls.append(slot_id)
+            self.churner_status_payload["active_slots"] = 0
+            return True, "killed churner"
+
+        def _churner_update_runtime_config(self, *, reserve_usd=None):
+            self.churner_config_calls.append(reserve_usd)
+            self.churner_status_payload["reserve_available_usd"] = float(reserve_usd)
+            self.churner_status_payload["reserve_config_usd"] = float(reserve_usd)
+            return True, "updated churner config"
+
     class _HandlerStub:
-        def __init__(self, body_or_exc):
-            self.path = "/api/action"
+        def __init__(self, body_or_exc, path="/api/action"):
+            self.path = path
             self._body_or_exc = body_or_exc
             self.sent = []
 
@@ -5322,6 +5679,165 @@ class DashboardApiHardeningTests(unittest.TestCase):
         code, payload = handler.sent[0]
         self.assertEqual(code, 400)
         self.assertEqual(payload, {"ok": False, "message": "invalid request body"})
+
+    def test_api_ops_toggles_get_routes_ok(self):
+        bot._RUNTIME = self._RuntimeStub()
+        handler = self._GetHandlerStub("/api/ops/toggles")
+
+        bot.DashboardHandler.do_GET(handler)
+
+        self.assertEqual(len(handler.sent_json), 1)
+        code, payload = handler.sent_json[0]
+        self.assertEqual(code, 200)
+        self.assertIn("toggles", payload)
+        self.assertIn("groups", payload)
+        self.assertIn("overrides_active", payload)
+
+    def test_api_ops_toggle_routes_ok(self):
+        runtime = self._RuntimeStub()
+        bot._RUNTIME = runtime
+        handler = self._HandlerStub({"key": "HMM_ENABLED", "value": True}, path="/api/ops/toggle")
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(runtime.ops_toggle_calls, [("HMM_ENABLED", True)])
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 200)
+        self.assertTrue(payload.get("ok"))
+        self.assertEqual(payload.get("ops_panel", {}).get("overrides_active"), 1)
+
+    def test_api_ops_toggle_invalid_value_returns_json_400(self):
+        bot._RUNTIME = self._RuntimeStub()
+        handler = self._HandlerStub({"key": "HMM_ENABLED", "value": "maybe"}, path="/api/ops/toggle")
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 400)
+        self.assertEqual(payload, {"ok": False, "message": "invalid toggle value (expected bool)"})
+
+    def test_api_ops_reset_routes_ok(self):
+        runtime = self._RuntimeStub()
+        bot._RUNTIME = runtime
+        handler = self._HandlerStub({"key": "HMM_ENABLED"}, path="/api/ops/reset")
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(runtime.ops_reset_calls, ["HMM_ENABLED"])
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 200)
+        self.assertTrue(payload.get("ok"))
+        self.assertEqual(payload.get("ops_panel", {}).get("overrides_active"), 0)
+
+    def test_api_ops_reset_all_routes_ok(self):
+        runtime = self._RuntimeStub()
+        runtime.ops_panel_payload = {
+            "overrides_active": 2,
+            "overrides": {"A": {"effective": True, "config_default": False, "source": "runtime_override"}},
+        }
+        bot._RUNTIME = runtime
+        handler = self._HandlerStub({}, path="/api/ops/reset-all")
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(runtime.ops_reset_all_calls, 1)
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 200)
+        self.assertTrue(payload.get("ok"))
+        self.assertEqual(int(payload.get("cleared", 0)), 2)
+        self.assertEqual(payload.get("ops_panel", {}).get("overrides_active"), 0)
+
+    def test_api_churner_status_get_routes_ok(self):
+        bot._RUNTIME = self._RuntimeStub()
+        handler = self._GetHandlerStub("/api/churner/status")
+
+        bot.DashboardHandler.do_GET(handler)
+
+        self.assertEqual(len(handler.sent_json), 1)
+        code, payload = handler.sent_json[0]
+        self.assertEqual(code, 200)
+        self.assertIn("active_slots", payload)
+        self.assertIn("reserve_available_usd", payload)
+
+    def test_api_churner_candidates_get_routes_ok(self):
+        bot._RUNTIME = self._RuntimeStub()
+        handler = self._GetHandlerStub("/api/churner/candidates")
+
+        bot.DashboardHandler.do_GET(handler)
+
+        self.assertEqual(len(handler.sent_json), 1)
+        code, payload = handler.sent_json[0]
+        self.assertEqual(code, 200)
+        self.assertIn("candidates", payload)
+        self.assertEqual(int(payload.get("count", 0)), 1)
+
+    def test_api_churner_spawn_routes_ok(self):
+        runtime = self._RuntimeStub()
+        bot._RUNTIME = runtime
+        handler = self._HandlerStub({"slot_id": 2, "position_id": 47}, path="/api/churner/spawn")
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(runtime.churner_spawn_calls, [(2, 47)])
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 200)
+        self.assertTrue(payload.get("ok"))
+        self.assertEqual(payload.get("churner", {}).get("active_slots"), 1)
+
+    def test_api_churner_spawn_invalid_position_id_returns_json_400(self):
+        bot._RUNTIME = self._RuntimeStub()
+        handler = self._HandlerStub({"slot_id": 2, "position_id": "bad"}, path="/api/churner/spawn")
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 400)
+        self.assertEqual(payload, {"ok": False, "message": "invalid position_id"})
+
+    def test_api_churner_kill_routes_ok(self):
+        runtime = self._RuntimeStub()
+        bot._RUNTIME = runtime
+        handler = self._HandlerStub({"slot_id": 2}, path="/api/churner/kill")
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(runtime.churner_kill_calls, [2])
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 200)
+        self.assertTrue(payload.get("ok"))
+        self.assertEqual(payload.get("churner", {}).get("active_slots"), 0)
+
+    def test_api_churner_config_routes_ok(self):
+        runtime = self._RuntimeStub()
+        bot._RUNTIME = runtime
+        handler = self._HandlerStub({"reserve_usd": 12.5}, path="/api/churner/config")
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(runtime.churner_config_calls, [12.5])
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 200)
+        self.assertTrue(payload.get("ok"))
+        self.assertAlmostEqual(float(payload.get("churner", {}).get("reserve_config_usd", 0.0)), 12.5)
+
+    def test_api_churner_config_missing_reserve_returns_json_400(self):
+        bot._RUNTIME = self._RuntimeStub()
+        handler = self._HandlerStub({}, path="/api/churner/config")
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 400)
+        self.assertEqual(payload, {"ok": False, "message": "reserve_usd required"})
 
     def test_api_action_unknown_action_returns_json_400(self):
         bot._RUNTIME = self._RuntimeStub()

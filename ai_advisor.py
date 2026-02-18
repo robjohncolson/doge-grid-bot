@@ -108,6 +108,13 @@ _REGIME_SYSTEM_PROMPT = (
     '- "accumulate_doge": deploy idle USD into DOGE via DCA\n'
     '- "hold": no strategic accumulation change\n'
     '- "accumulate_usd": preserve cash / avoid DOGE accumulation\n\n'
+    "You also receive a Manifold Trading Score (MTS): 0.00-0.19 hostile, "
+    "0.20-0.39 defensive, 0.40-0.59 cautious, 0.60-0.79 favorable, "
+    "0.80-1.00 optimal. Use MTS to calibrate conviction and conservatism.\n"
+    "When MTS is low, avoid aggressive posture even if one timeframe is strong.\n"
+    "Position age distribution indicates stranded risk (stale/stuck/write-off), "
+    "and throughput buckets show which regime/side combinations are working in "
+    "practice. Use these to validate or challenge HMM-only narratives.\n\n"
     "Return ONLY a JSON object with these fields:\n"
     '- "recommended_tier": 0, 1, or 2\n'
     '- "recommended_direction": "symmetric", "long_bias", or "short_bias"\n'
@@ -646,6 +653,53 @@ def _build_regime_context(payload: dict) -> dict:
         100,
     )
 
+    manifold = payload.get("manifold")
+    if not isinstance(manifold, dict):
+        manifold = {}
+    manifold_components = manifold.get("components")
+    if not isinstance(manifold_components, dict):
+        manifold_components = {}
+    manifold_trend = _clip_text(str(manifold.get("trend", "stable")).strip().lower(), 24)
+    if manifold_trend not in {"rising", "falling", "stable"}:
+        manifold_trend = "stable"
+    manifold_mts_30m_raw = manifold.get("mts_30m_ago")
+    manifold_mts_30m = None
+    if manifold_mts_30m_raw not in (None, ""):
+        manifold_mts_30m = round(_safe_float(manifold_mts_30m_raw, 0.0, 0.0, 1.0), 4)
+
+    positions = payload.get("positions")
+    if not isinstance(positions, dict):
+        positions = {}
+    age_bands_raw = positions.get("age_bands")
+    if not isinstance(age_bands_raw, dict):
+        age_bands_raw = {}
+
+    throughput = payload.get("throughput")
+    if not isinstance(throughput, dict):
+        throughput = {}
+    throughput_regime = _clip_text(
+        str(throughput.get("active_regime", "ranging")).strip().lower(),
+        24,
+    )
+    if throughput_regime not in {"bearish", "ranging", "bullish"}:
+        throughput_regime = "ranging"
+    sufficient_buckets_raw = throughput.get("sufficient_data_regimes")
+    if not isinstance(sufficient_buckets_raw, list):
+        sufficient_buckets_raw = []
+    allowed_buckets = {"bearish_A", "bearish_B", "ranging_A", "ranging_B", "bullish_A", "bullish_B"}
+    sufficient_buckets = [
+        bucket
+        for bucket in [
+            _clip_text(str(item).strip(), 24)
+            for item in sufficient_buckets_raw
+        ]
+        if bucket in allowed_buckets
+    ]
+
+    churner = payload.get("churner")
+    if not isinstance(churner, dict):
+        churner = {}
+
     return {
         "hmm": {
             "primary_1m": _sanitize_hmm_state(primary),
@@ -745,6 +799,51 @@ def _build_regime_context(payload: dict) -> dict:
                 0,
                 0,
             ),
+        },
+        "manifold": {
+            "mts": round(_safe_float(manifold.get("mts"), 0.0, 0.0, 1.0), 4),
+            "band": _clip_text(str(manifold.get("band", "disabled")).strip().lower(), 24) or "disabled",
+            "components": {
+                "clarity": round(_safe_float(manifold_components.get("clarity"), 0.0, 0.0, 1.0), 4),
+                "stability": round(_safe_float(manifold_components.get("stability"), 0.0, 0.0, 1.0), 4),
+                "throughput": round(_safe_float(manifold_components.get("throughput"), 0.0, 0.0, 1.0), 4),
+                "coherence": round(_safe_float(manifold_components.get("coherence"), 0.0, 0.0, 1.0), 4),
+            },
+            "trend": manifold_trend,
+            "mts_30m_ago": manifold_mts_30m,
+        },
+        "positions": {
+            "total_open": _safe_int(positions.get("total_open"), 0, 0),
+            "age_bands": {
+                "fresh": _safe_int(age_bands_raw.get("fresh"), 0, 0),
+                "aging": _safe_int(age_bands_raw.get("aging"), 0, 0),
+                "stale": _safe_int(age_bands_raw.get("stale"), 0, 0),
+                "stuck": _safe_int(age_bands_raw.get("stuck"), 0, 0),
+                "write_off": _safe_int(age_bands_raw.get("write_off"), 0, 0),
+            },
+            "stuck_capital_pct": round(
+                _safe_float(positions.get("stuck_capital_pct"), 0.0, 0.0, 100.0),
+                4,
+            ),
+            "avg_distance_pct": round(
+                _safe_float(positions.get("avg_distance_pct"), 0.0, 0.0),
+                4,
+            ),
+            "negative_ev_count": _safe_int(positions.get("negative_ev_count"), 0, 0),
+        },
+        "throughput": {
+            "active_regime": throughput_regime,
+            "multiplier": round(_safe_float(throughput.get("multiplier"), 1.0, 0.0, 2.0), 4),
+            "age_pressure": round(_safe_float(throughput.get("age_pressure"), 1.0, 0.0, 1.0), 4),
+            "median_fill_sec": round(_safe_float(throughput.get("median_fill_sec"), 0.0, 0.0), 4),
+            "sufficient_data_regimes": sufficient_buckets,
+        },
+        "churner": {
+            "enabled": bool(churner.get("enabled", False)),
+            "active_slots": _safe_int(churner.get("active_slots"), 0, 0),
+            "reserve_usd": round(_safe_float(churner.get("reserve_usd"), 0.0, 0.0), 6),
+            "subsidy_balance": round(_safe_float(churner.get("subsidy_balance"), 0.0, 0.0), 6),
+            "subsidy_needed": round(_safe_float(churner.get("subsidy_needed"), 0.0, 0.0), 6),
         },
     }
 

@@ -1,29 +1,30 @@
 # DOGE State-Machine Bot v1
 
-Last updated: 2026-02-15 (rev 3)
-Primary code references: `bot.py`, `state_machine.py`, `config.py`, `dashboard.py`, `supabase_store.py`, `hmm_regime_detector.py`
+Last updated: 2026-02-17 (rev 4)
+Primary code references: `bot.py`, `state_machine.py`, `config.py`, `dashboard.py`, `supabase_store.py`, `hmm_regime_detector.py`, `throughput_sizer.py`, `ai_advisor.py`, `bayesian_engine.py`, `bocpd.py`, `survival_model.py`, `position_ledger.py`
 
 ## 1. Scope
 
 This document is the implementation contract for the current runtime.
 
 - Market: Kraken `XDGUSD` (`DOGE/USD`) only
-- Strategy: slot-based pair engine (`A` and `B` legs) with independent per-slot compounding
+- Strategy: slot-based pair engine (`A` and `B` legs) with A-side per-slot compounding, account-aware B-side quote allocation, and optional dust/quote-first allocation overlays
 - Persistence: Supabase-first (`bot_state`, `fills`, `price_history`, `ohlcv_candles`, `bot_events`, `exit_outcomes`, `regime_tier_transitions`)
-- Execution: fully rule-based reducer; HMM regime detector + directional regime system are advisory/actuation layers in `bot.py` runtime (no reducer modifications)
+- Execution: fully rule-based reducer; HMM/directional/AI/Bayesian/self-healing/throughput layers are runtime overlays in `bot.py` (no reducer modifications)
 - Control plane: dashboard + Telegram commands
 
 Out of scope for v1:
 
 - Multi-pair swarm (implemented but not active in production)
 - Factory visualization mode (specced in `docs/FACTORY_LENS_SPEC.md`, not implemented)
+- `pair_model.py` executable model effort (separate track)
 
 ## 2. System Overview
 
 Runtime is split into two layers.
 
 - `state_machine.py`: pure reducer (`transition`) and invariant checker (`check_invariants`)
-- `bot.py`: exchange I/O, reconciliation, bootstrap, loop budget, APIs, Telegram, persistence
+- `bot.py`: exchange I/O, reconciliation, bootstrap, loop budget, APIs, Telegram, persistence, and all advisory/actuation overlays
 
 Core data model (`PairState`) is per slot and contains:
 
@@ -38,17 +39,28 @@ Core data model (`PairState`) is per slot and contains:
 - Risk counters and cooldown timers
 - Mode flags (`long_only`, `short_only`, `mode_source`)
 
+Runtime helper modules (non-reducer):
+
+- `throughput_sizer.py`: fill-time throughput sizing
+- `ai_advisor.py`: AI regime advisor opinion pipeline + provider fallback
+- `bayesian_engine.py`: continuous belief state, trade-belief actions, manifold score
+- `bocpd.py`: online changepoint detector state
+- `survival_model.py`: fill-time survival modeling
+- `position_ledger.py`: self-healing ledger and subsidy accounting
+
 ## 3. Top-Level Lifecycle
 
 ```text
 START
-  -> INIT (logging, signals, Supabase writer, HMM runtime)
-  -> LOAD SNAPSHOT (Supabase key __v1__, restore HMM state)
+  -> INIT (logging, signals, Supabase writer, HMM runtime, Bayesian runtime, throughput/AI/ledger/churner runtime state)
+  -> LOAD SNAPSHOT (Supabase key __v1__, restore HMM/Bayesian/throughput/accumulation/self-healing state)
   -> FETCH CONSTRAINTS + FEES (Kraken)
   -> FETCH INITIAL PRICE (strict)
-  -> SYNC OHLCV + OPTIONAL BACKFILL + PRIME HMM (initial pull, warmup backfill, first train)
+  -> SYNC OHLCV + OPTIONAL BACKFILL + PRIME HMM (primary/secondary/tertiary as enabled)
+  -> STARTUP RECOVERY CLEANUP (when `RECOVERY_ORDERS_ENABLED=false`, cancel/clear stale recoveries)
   -> RECONCILE TRACKED ORDERS
   -> REPLAY MISSED FILLS (trade history)
+  -> POSITION LEDGER MIGRATION (if enabled and required)
   -> ENSURE BOOTSTRAP PER SLOT
   -> RUNNING LOOP
       -> PAUSED (operator, daily loss lock, or guardrail)
@@ -64,32 +76,49 @@ Runtime modes:
 
 ## 4. Main Loop (Every `POLL_INTERVAL_SECONDS`)
 
-Per iteration in `bot.py`:
+Per outer loop iteration in `run()`:
 
-1. `begin_loop()` enables private API budget accounting.
-2. `_refresh_price(strict=False)`.
-3. If price age exceeds `STALE_PRICE_MAX_AGE_SEC`, call `pause(...)`.
-4. **OHLCV sync** (`_sync_ohlcv_candles`): pull Kraken OHLC candles (default 1m + optional 15m secondary), queue upserts to Supabase (see §16).
-5. Compute volatility-adaptive runtime profit target.
-6. **Daily loss lock check** (`_update_daily_loss_lock`): auto-pauses if aggregate UTC-day loss exceeds `DAILY_LOSS_LIMIT`.
-7. **Rebalancer update** (`_update_rebalancer`): every `REBALANCE_INTERVAL_SEC`. Currently disabled (`REBALANCE_ENABLED=False`) — conflicts with directional regime system (see §18).
-8. **Regime tier evaluation** (`_update_regime_tier`): every `REGIME_EVAL_INTERVAL_SEC` (default 300s). Triggers `_update_hmm()` if HMM is stale, then evaluates tier 0/1/2 (see §18).
-9. **Tier 2 suppression** (`_apply_tier2_suppression`): runs every loop. Cancels against-trend entries in S0 slots when tier 2 is active and grace has elapsed (see §18.3).
-10. **Entry scheduler pre-tick drain**: drain up to `MAX_ENTRY_ADDS_PER_LOOP` deferred entries. Purges suppressed-side deferred entries during tier 2.
-11. For each slot:
-    - Apply `PriceTick`
-    - Apply `TimerTick`
-    - Call `_ensure_slot_bootstrapped(slot_id)` — respects regime suppression (see §18.4)
-    - Call `_auto_repair_degraded_slot(slot_id)` — skips slots with `mode_source="regime"` (see §18.5)
-12. Post-tick entry drain (`_drain_pending_entry_orders`).
-13. Poll status for all tracked order txids (`_poll_order_status`).
-14. Refresh pair open-order telemetry (`_refresh_open_order_telemetry`) when budget allows.
-15. **Auto soft-close** (`_auto_soft_close_if_capacity_pressure`): reprices farthest recoveries when utilization exceeds threshold.
-16. **Persistent open-order drift alert** (`_maybe_alert_persistent_open_order_drift`).
-17. Emit orphan-pressure notification at `ORPHAN_PRESSURE_WARN_AT` multiples.
-18. Persist snapshot (`save_state` to `bot_state`).
-19. Poll Telegram commands.
-20. `end_loop()` resets budget/cache.
+1. `begin_loop()` enables private API budget accounting and resets loop-local caches.
+2. `run_loop_once()` executes the trading lifecycle.
+3. `poll_telegram()` handles operator commands/callbacks.
+4. `end_loop()` resets budget counters and loop-local accumulators.
+
+Inside `run_loop_once()` in current order:
+
+1. `_refresh_price(strict=False)`.
+2. If price age exceeds `STALE_PRICE_MAX_AGE_SEC`, call `pause(...)`.
+3. `_sync_ohlcv_candles(loop_now)` (primary + optional secondary + optional tertiary OHLCV sync).
+4. `_update_daily_loss_lock(loop_now)`.
+5. `_update_rebalancer(loop_now)`.
+6. `_update_micro_features(loop_now)`.
+7. `_build_belief_state(loop_now)`.
+8. `_maybe_retrain_survival_model(loop_now)`.
+9. `_update_regime_tier(loop_now)` (includes HMM refresh path and tier evaluation).
+10. `_update_manifold_score(loop_now)`.
+11. `_maybe_schedule_ai_regime(loop_now)` (process pending AI result + debounce/schedule worker).
+12. `_update_accumulation(loop_now)`.
+13. `_apply_tier2_suppression(loop_now)`.
+14. `_clear_expired_regime_cooldown(loop_now)`.
+15. Pre-tick deferred entry drain (`_drain_pending_entry_orders(..., skip_stale=True)`).
+16. Capture initial balance baseline when absent.
+17. Conditional balance-intelligence flow polling (`_should_poll_flows` -> `_poll_external_flows`).
+18. Compute runtime profit target (`_volatility_profit_pct`).
+19. For each slot: apply `PriceTick`, apply `TimerTick`, `_ensure_slot_bootstrapped`, `_auto_repair_degraded_slot`.
+20. Post-tick deferred entry drain (`_drain_pending_entry_orders(..., skip_stale=False)`).
+21. `_poll_order_status()`.
+22. `_update_micro_features(_now())`.
+23. `_update_trade_beliefs(_now())`.
+24. `_run_self_healing_reprice(loop_now)`.
+25. `_run_churner_engine(loop_now)`.
+26. `_update_daily_loss_lock(_now())` (post-fill recalculation).
+27. `_refresh_open_order_telemetry()`.
+28. `_auto_drain_recovery_backlog()`.
+29. `_auto_soft_close_if_capacity_pressure()`.
+30. `_update_release_recon_gate_locked()` and `_auto_release_sticky_slots()`.
+31. Orphan pressure notification when count hits `ORPHAN_PRESSURE_WARN_AT` multiples.
+32. `_update_doge_eq_snapshot(loop_now)`.
+33. Optional equity series flush (`_should_flush_equity_ts` -> `_flush_equity_ts`).
+34. `_save_snapshot()`.
 
 ## 5. Pair Phases (`S0`, `S1a`, `S1b`, `S2`)
 
@@ -244,69 +273,66 @@ Order-size behavior:
 
 ## 9. Order Sizing (`_slot_order_size_usd`)
 
-Per-slot order size computation:
+Sizing is composed in runtime layers (no reducer changes):
 
-```
-base = max(ORDER_SIZE_USD, ORDER_SIZE_USD + slot.total_profit)
-layer_usd = effective_layers * CAPITAL_LAYER_DOGE_PER_ORDER * market_price
-base_with_layers = max(base, base + layer_usd)
-```
+1. **Base leg sizing**
+   - Trade `A`: `max(ORDER_SIZE_USD, ORDER_SIZE_USD + slot.total_profit)` (or fixed `ORDER_SIZE_USD` when sticky fixed compounding is enabled).
+   - Trade `B`: `_b_side_base_usd()` (account-aware quote sizing).
+2. **Capital layers overlay**
+   - `layer_usd = effective_layers * CAPITAL_LAYER_DOGE_PER_ORDER * mark_price`
+   - `base_with_layers = max(base, base + layer_usd)`
+3. **Dust sweep overlay (B-side only)**
+   - When `DUST_SWEEP_ENABLED=True` and `QUOTE_FIRST_ALLOCATION=False`, free-USD surplus is split across buy-ready slots and added as a bounded bump.
+4. **Throughput overlay**
+   - Applied by `ThroughputSizer.size_for_slot(...)`.
+5. **Belief/action-knob overlay**
+   - Aggression and against-trend suppression multipliers.
+6. **Rebalancer favored-side overlay**
+   - Size skew on favored side with fund guards.
 
-B-side sizing behavior:
+B-side account-aware behavior:
 
-- Base remains account-aware (`available_usd / slot_count`, floored by `ORDER_SIZE_USD`)
-- A dust dividend (when enabled) redistributes free-USD surplus across
-  buy-ready slots each loop so realized gains are absorbed instead of idling
+- Legacy quote split path (`QUOTE_FIRST_ALLOCATION=False`):
+  `base_b = max(ORDER_SIZE_USD, available_usd / slot_count)`.
+- Quote-first path (`QUOTE_FIRST_ALLOCATION=True`):
+  allocation uses only buy-ready slots, subtracts committed buy quote, applies safety buffer, and carries forward unallocated cents (`_quote_first_carry_usd`).
 
-Kelly criterion sizing (master toggle `KELLY_ENABLED`) is an advisory layer
-applied after `base_with_layers` and before rebalancer skew.
+Throughput sizing is the active advisory sizing model (`throughput_sizer.py`):
 
-Kelly integration contract:
+- Core objective: maximize realized `profit / time_locked` by regime and side.
+- Buckets: `aggregate`, plus 6 regime-side buckets (`bearish_A`, `bearish_B`, `ranging_A`, `ranging_B`, `bullish_A`, `bullish_B`).
+- Right-censored exits: open exits participate with `TP_CENSORED_WEIGHT`.
+- Bucket selection: prefer current `regime x trade` bucket when sufficient; fallback to aggregate.
+- Age pressure: uses open-exit age distribution (p90 reference) with penalty trigger against aggregate fill-time baseline.
+- Capital utilization penalty: throttles sizing when locked-capital ratio exceeds `TP_UTIL_THRESHOLD` (default `0.7`).
+- Final multiplier: `throughput_mult * age_pressure * util_penalty`, clamped to configured floor/ceiling.
+- Update cadence: `_update_throughput()` runs from regime evaluation cadence (`_update_regime_tier`).
+- Status surfacing: `/api/status -> throughput_sizer`.
 
-- Runtime component: `KellySizer` (`kelly_sizer.py`) initialized in `bot.py`
-  from `KellyConfig`.
-- Update cadence: `_update_kelly()` is called during regime evaluation cadence
-  (`_update_regime_tier`) and recomputes Kelly stats from slot
-  `completed_cycles`.
-- Data used per cycle: `net_profit`, `exit_time`, and `regime_at_entry`.
-- Buckets: `aggregate` plus regime-specific buckets (`bearish`, `ranging`,
-  `bullish`).
-- Sample gates:
-  - global gate (`KELLY_MIN_SAMPLES`) for aggregate Kelly activation
-  - per-regime gate (`KELLY_MIN_REGIME_SAMPLES`) for regime-specific Kelly activation
-- Sizing application (`KellySizer.size_for_slot`):
-  - prefer current regime bucket; fallback to aggregate
-  - if insufficient data, passthrough base size unchanged
-  - if no edge, use `KELLY_NEGATIVE_EDGE_MULT` (clamped by floor/ceiling)
-  - otherwise apply Kelly multiplier (clamped by floor/ceiling)
+See `docs/THROUGHPUT_SIZER_SPEC.md` for full model details.
 
-Detailed contracts and rollout guidance: `KELLY_SPEC.md`,
-`docs/KELLY_IMPLEMENTATION_PLAN.md`, `docs/KELLY_DEPLOY_CHECKLIST.md`.
-
-If rebalancer is enabled and skew is nonzero, the favored side is scaled up:
-
-```
-mult = min(MAX_SIZE_MULT, 1.0 + abs(skew) * REBALANCE_SIZE_SENSITIVITY)
-effective = base_with_layers * mult
-```
-
-Fund guard: scaling never exceeds available balance for the favored side.
-
-### 9.1 Kelly Config
+### 9.1 Throughput + Allocation Config
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `KELLY_ENABLED` | False | Master toggle for Kelly sizing |
-| `KELLY_FRACTION` | 0.25 | Fractional Kelly factor |
-| `KELLY_MIN_SAMPLES` | 30 | Minimum aggregate samples before activation |
-| `KELLY_MIN_REGIME_SAMPLES` | 15 | Minimum per-regime samples for regime-specific sizing |
-| `KELLY_LOOKBACK` | 500 | Rolling cycle lookback window |
-| `KELLY_FLOOR_MULT` | 0.5 | Minimum size multiplier clamp |
-| `KELLY_CEILING_MULT` | 2.0 | Maximum size multiplier clamp |
-| `KELLY_NEGATIVE_EDGE_MULT` | 0.5 | Multiplier when Kelly says no edge |
-| `KELLY_RECENCY_WEIGHTING` | True | Enable recency weighting |
-| `KELLY_RECENCY_HALFLIFE` | 100 | Recency weighting half-life (cycles) |
-| `KELLY_LOG_UPDATES` | True | Emit Kelly summary logs |
+| `TP_ENABLED` | False | Master throughput sizing toggle |
+| `TP_LOOKBACK_CYCLES` | 500 | Completed-cycle lookback window |
+| `TP_MIN_SAMPLES` | 20 | Aggregate sample gate |
+| `TP_MIN_SAMPLES_PER_BUCKET` | 10 | Regime-side bucket sample gate |
+| `TP_FULL_CONFIDENCE_SAMPLES` | 50 | Sample count for full bucket confidence |
+| `TP_FLOOR_MULT` | 0.5 | Minimum throughput multiplier clamp |
+| `TP_CEILING_MULT` | 2.0 | Maximum throughput multiplier clamp |
+| `TP_CENSORED_WEIGHT` | 0.5 | Weight for open/censored exits |
+| `TP_AGE_PRESSURE_TRIGGER` | 1.5 | Age pressure trigger vs aggregate fill-time baseline |
+| `TP_AGE_PRESSURE_SENSITIVITY` | 0.5 | Age pressure slope |
+| `TP_AGE_PRESSURE_FLOOR` | 0.3 | Minimum age-pressure multiplier |
+| `TP_UTIL_THRESHOLD` | 0.7 | Capital utilization throttle threshold |
+| `TP_UTIL_SENSITIVITY` | 0.8 | Utilization penalty slope |
+| `TP_UTIL_FLOOR` | 0.4 | Minimum utilization multiplier |
+| `TP_RECENCY_HALFLIFE` | 100 | Recency weighting half-life |
+| `TP_LOG_UPDATES` | True | Emit throughput update logs |
+| `DUST_SWEEP_ENABLED` | True | Enable B-side free-USD dust redistribution |
+| `QUOTE_FIRST_ALLOCATION` | False | Buy-ready-slot-only quote allocation path |
 
 ## 10. Invariants and Halt Policy
 
@@ -337,25 +363,34 @@ Three explicit runtime bypasses for recoverable startup gaps:
 
 ## 11. Recovery/Orphan Lifecycle
 
-Orphaning converts an active exit to a recovery order while keeping Kraken order alive.
+Recovery/orphan behavior is runtime-gated by `RECOVERY_ORDERS_ENABLED`.
 
-- Recovery orders are stored in `recovery_orders`
-- Recovery orders are not auto-cancelled by lifecycle logic
-- **Hard cap**: `MAX_RECOVERY_SLOTS` (default 2) per slot. When cap reached, oldest recovery is evicted with loss booked via `_book_cycle()` pseudo-order. Prevents unbounded orphan accumulation.
-- Pressure warning sent at `ORPHAN_PRESSURE_WARN_AT` multiples.
+Default contract:
 
-Auto soft-close (capacity governor):
+- `RECOVERY_ORDERS_ENABLED` inherits `RECOVERY_ENABLED` (effective default `True` in current config defaults).
+- Strategic-capital rollout mode explicitly sets `RECOVERY_ORDERS_ENABLED=False`.
 
-- When open-order utilization exceeds `AUTO_SOFT_CLOSE_CAPACITY_PCT` (default 95%), auto-reprices `AUTO_SOFT_CLOSE_BATCH` (default 2) farthest recoveries to near-market price.
-- Runs every main loop cycle.
-- Tracks lifetime total (`_auto_soft_close_total`).
+When recovery orders are enabled:
 
-Manual soft-close:
+- Orphaning converts an active exit to a `recovery_order` while keeping Kraken order alive.
+- Recovery orders remain on book until filled, manually soft-closed, or auto-soft-closed under capacity pressure.
+- Hard cap: `MAX_RECOVERY_SLOTS` per slot.
+- Pressure warning emitted at `ORPHAN_PRESSURE_WARN_AT` multiples.
+- Auto governors:
+  - `_auto_drain_recovery_backlog()` (small forced drains when pressure is high),
+  - `_auto_soft_close_if_capacity_pressure()` (near-market repricing under capacity stress).
 
-- Dashboard `soft_close` / `soft_close_next`
-- Dashboard `cancel_stale_recoveries` (bulk operation on distant recoveries)
-- Telegram `/soft_close` interactive picker or direct args
-- Soft-close reprices recovery toward market and updates txid
+When recovery orders are disabled (`RECOVERY_ORDERS_ENABLED=False`):
+
+- Runtime passes `s1_orphan_after_sec=inf` and `s2_orphan_after_sec=inf` into reducer config, so timer orphaning is effectively disabled.
+- Startup cleanup (`_cleanup_recovery_orders_on_startup`) cancels tracked recovery txids and clears `recovery_orders` state.
+- Dashboard actions `soft_close`, `soft_close_next`, and `cancel_stale_recoveries` are rejected.
+- Throughput/recovery accounting paths treat recoveries as disabled.
+
+Manual lifecycle controls (when enabled):
+
+- Dashboard `/api/action`: `soft_close`, `soft_close_next`, `cancel_stale_recoveries`
+- Telegram: `/soft_close` (picker or explicit args)
 
 ## 12. Entry Velocity Scheduler
 
@@ -369,6 +404,7 @@ Rate-limits entry order placement to prevent API budget exhaustion and order-boo
   - headroom < 10: cap = 2/loop
   - headroom < 20: cap = 3/loop
   - otherwise: configured default
+- Entry anti-loss widening remains separately gated by `ENTRY_BACKOFF_ENABLED`.
 
 ## 13. Daily Loss Lock
 
@@ -491,20 +527,17 @@ Three stages in strict order:
 
 ## 16. OHLCV Data Pipeline
 
-Persists interval-based OHLCV candles from Kraken into Supabase for HMM training and inference (default interval: 1 minute).
+Persists interval OHLCV candles from Kraken into Supabase for HMM training/inference across primary (1m), secondary (15m), and tertiary (1h) pipelines.
 
 ### 16.1 Collection
 
-- `_sync_ohlcv_candles()`: called every main loop iteration, rate-limited to `HMM_OHLCV_SYNC_INTERVAL_SEC` (default 60s).
-- Pulls one page from Kraken's OHLC endpoint (`get_ohlc_page`) using `HMM_OHLCV_INTERVAL_MIN` (default 1).
-- Normalizes rows, filters out the still-forming candle, and queues upserts to `ohlcv_candles` via `supabase_store.queue_ohlcv_candles()`.
-- Cursor (`_ohlcv_since_cursor`) is persisted in snapshot for incremental fetches across restarts.
-- Startup warmup: `_maybe_backfill_ohlcv_on_startup()` may call `backfill_ohlcv_history()` to queue additional historical candles when below target window.
-- Backfill pagination starts with `since=None` and advances only via Kraken's
-  returned `last` cursor.
-- Backfill stall breaker: if repeated backfills produce zero new unique candles,
-  attempts are blocked after `HMM_BACKFILL_MAX_STALLS` consecutive stalls until
-  operator/manual retry.
+- `_sync_ohlcv_candles()` is called each loop and dispatches to `_sync_ohlcv_candles_for_interval(...)` for enabled pipelines.
+- Primary pipeline uses `HMM_OHLCV_INTERVAL_MIN` (default `1`) and `HMM_OHLCV_SYNC_INTERVAL_SEC` (default `60s`).
+- Secondary pipeline uses `HMM_SECONDARY_INTERVAL_MIN` (default `15`) and `HMM_SECONDARY_SYNC_INTERVAL_SEC` (default `300s`) when `HMM_SECONDARY_OHLCV_ENABLED` or `HMM_MULTI_TIMEFRAME_ENABLED`.
+- Tertiary pipeline uses `HMM_TERTIARY_INTERVAL_MIN` (default `60`) and `HMM_TERTIARY_SYNC_INTERVAL_SEC` (default `3600s`) when `HMM_TERTIARY_ENABLED`.
+- Rows are normalized, still-forming candles are dropped, and upserts are queued via `supabase_store.queue_ohlcv_candles(...)`.
+- Per-pipeline cursors are snapshot-persisted (`ohlcv_since_cursor`, `ohlcv_secondary_since_cursor`, `ohlcv_tertiary_since_cursor`).
+- Startup warmup (`_maybe_backfill_ohlcv_on_startup`) can backfill all enabled pipelines; stall breaker blocks repeated zero-progress backfills after `HMM_BACKFILL_MAX_STALLS`.
 
 ### 16.2 Storage
 
@@ -516,13 +549,17 @@ Supabase table `ohlcv_candles`:
 
 ### 16.3 Data Access
 
-- `_fetch_training_candles(count)`: loads up to `HMM_TRAINING_CANDLES` (default 720) candles. Prefers Supabase; falls back to Kraken OHLC if Supabase has insufficient data.
-- `_fetch_recent_candles(count)`: loads `HMM_RECENT_CANDLES` (default 100) candles for inference.
-- Both return `(closes, volumes)` tuple of float lists.
+- `_fetch_training_candles(count, interval_min=...)` loads per-interval training windows.
+- `_fetch_recent_candles(count, interval_min=...)` loads per-interval inference windows.
+- Defaults in current config:
+  - primary training: `HMM_TRAINING_CANDLES=4000`
+  - secondary training: `HMM_SECONDARY_TRAINING_CANDLES=1440`
+  - tertiary training: `HMM_TERTIARY_TRAINING_CANDLES=500`
+- Both helpers return `(closes, volumes)` float lists.
 
 ### 16.4 Readiness Check
 
-`_hmm_data_readiness()` returns a cached diagnostic block:
+`_hmm_data_readiness(..., state_key=primary|secondary|tertiary)` returns a cached diagnostic block:
 
 - `samples`: current candle count in Supabase
 - `coverage_pct`: samples / training_target * 100
@@ -532,6 +569,12 @@ Supabase table `ohlcv_candles`:
 - `ready_for_min_train`: samples >= `HMM_MIN_TRAIN_SAMPLES` and fresh
 - `ready_for_target_window`: samples >= `HMM_TRAINING_CANDLES` and fresh
 - `gaps`: list of actionable gap descriptions
+
+Status surfaces:
+
+- `hmm_data_pipeline` (primary)
+- `hmm_data_pipeline_secondary`
+- `hmm_data_pipeline_tertiary`
 
 ### 16.5 Config
 
@@ -544,46 +587,65 @@ Supabase table `ohlcv_candles`:
 | `HMM_OHLCV_BACKFILL_ON_STARTUP` | True | Attempt warmup backfill on startup |
 | `HMM_OHLCV_BACKFILL_MAX_PAGES` | 40 | Max Kraken pages in one backfill run |
 | `HMM_BACKFILL_MAX_STALLS` | 3 | Consecutive zero-progress backfills before breaker opens |
-| `HMM_TRAINING_CANDLES` | 720 | Target training window size |
+| `HMM_TRAINING_CANDLES` | 4000 | Primary training window size |
 | `HMM_RECENT_CANDLES` | 100 | Inference window size |
 | `HMM_MIN_TRAIN_SAMPLES` | 500 | Minimum candles for training |
+| `HMM_SECONDARY_OHLCV_ENABLED` | False | Enable 15m collection |
+| `HMM_SECONDARY_INTERVAL_MIN` | 15 | Secondary candle interval |
+| `HMM_SECONDARY_SYNC_INTERVAL_SEC` | 300.0 | Secondary pull cadence |
+| `HMM_SECONDARY_TRAINING_CANDLES` | 1440 | Secondary training window |
+| `HMM_SECONDARY_MIN_TRAIN_SAMPLES` | 200 | Secondary min-train threshold |
+| `HMM_TERTIARY_ENABLED` | False | Enable 1h collection/detector |
+| `HMM_TERTIARY_INTERVAL_MIN` | 60 | Tertiary candle interval |
+| `HMM_TERTIARY_SYNC_INTERVAL_SEC` | 3600.0 | Tertiary pull cadence |
+| `HMM_TERTIARY_TRAINING_CANDLES` | 500 | Tertiary training window |
+| `HMM_TERTIARY_MIN_TRAIN_SAMPLES` | 150 | Tertiary min-train threshold |
 | `HMM_READINESS_CACHE_SEC` | 300.0 | Readiness check cache TTL |
 
 ## 17. HMM Regime Detector (Advisory Layer)
 
-Read-only regime classifier that sits alongside the trend detector (§15). Does **not** modify the reducer (§6), emit actions, or touch event transition rules. Lives entirely in `bot.py` runtime.
+Read-only regime classifier stack that sits alongside trend logic (§15). It does **not** modify the reducer (§6), emit reducer actions, or alter event transition rules directly.
 
 Module: `hmm_regime_detector.py` (requires `numpy`, `hmmlearn`).
 
 ### 17.1 Architecture
 
 ```
-Kraken OHLC → ohlcv_candles (§16) → FeatureExtractor → GaussianHMM → RegimeState
-                                                                          │
-                                          bias_signal ─── blend ──► §15 idle target
-                                                            ↑
-                                                       trend_score
+OHLCV (§16) -> RegimeDetector(1m) ----\
+OHLCV (§16) -> RegimeDetector(15m) ----> tactical policy source (primary or consensus)
+OHLCV (§16) -> RegimeDetector(1h) ----/  strategic context (AI advisor + accumulation)
+
+tactical source -> directional tiers (§18), throughput regime bucket (§9), trend blend (§15)
+tertiary source -> transition confirmation + accumulation gating (§29), AI context (§27)
 ```
 
-Three hidden states: `BEARISH` (0), `RANGING` (1), `BULLISH` (2). Labels assigned post-training by inspecting EMA-spread emission means.
+All detectors use three hidden states: `BEARISH` (0), `RANGING` (1), `BULLISH` (2).
 
 Four observation features: MACD histogram slope, EMA spread %, RSI zone, volume ratio.
 
 ### 17.2 Lifecycle
 
-1. **Init** (`_init_hmm_runtime`): imports `numpy` + `hmm_regime_detector` inside try/except. If import fails, logs warning and continues with trend-only logic. Also initializes secondary detector if `HMM_MULTI_TIMEFRAME_ENABLED=True`.
-2. **Training** (`_train_hmm` / `_train_hmm_secondary`): called on startup and when `needs_retrain()` returns true (daily by default). Uses `_fetch_training_candles()` from §16.
-3. **Inference** (`_update_hmm`): called from `_update_regime_tier()` every `REGIME_EVAL_INTERVAL_SEC` (default 300s). Also called from `_update_rebalancer()` when rebalancer is enabled. Uses `_fetch_recent_candles()`. Updates primary detector, then secondary if multi-timeframe enabled, then recomputes consensus.
-4. **Blend**: `signal = blend * trend_score + (1 - blend) * hmm_bias` feeds into §15.2 target mapping.
-5. **Persistence**: `_snapshot_hmm_state()` / `_restore_hmm_snapshot()` save/restore `RegimeState` and train timestamp. Model itself is **not** serialized — retrained from candle data on startup.
+1. **Init** (`_init_hmm_runtime`): initializes primary detector; conditionally initializes secondary and tertiary detectors.
+2. **Train paths**:
+   - primary: `_train_hmm(...)`
+   - secondary: `_train_hmm_secondary(...)`
+   - tertiary: `_train_hmm_tertiary(...)`
+3. **Inference path** (`_update_hmm`):
+   - updates enabled detectors,
+   - recomputes tactical consensus (1m+15m),
+   - updates tertiary transition tracking (`_update_hmm_tertiary_transition`).
+4. **Policy read path**:
+   - `_policy_hmm_source()` returns primary or tactical consensus only.
+   - tertiary is not part of tactical consensus; it is consumed by strategic layers.
+5. **Persistence**:
+   - detector state snapshots + training depth/consensus/transition metadata are persisted and restored.
 
 ### 17.3 Degradation Guarantees
 
-- If `HMM_ENABLED=false` (default): no init, no inference, zero overhead.
-- If `hmmlearn`/`numpy` not installed: graceful fallback to trend-only.
-- If training fails or data insufficient: stays in `RANGING` with zero bias.
-- `HMM_BLEND_WITH_TREND=1.0`: pure trend_score, HMM has zero influence (shadow mode).
-- Default `RegimeState`: `RANGING`, `bias_signal=0.0`, `confidence=0.0`.
+- If `HMM_ENABLED=False`, all detectors stay inert.
+- If `numpy`/`hmmlearn` import fails, runtime degrades gracefully.
+- If a detector is unavailable/untrained, policy reads degrade to available lower-tier sources (or neutral defaults).
+- Tactical policy source remains primary-only unless `HMM_MULTI_TIMEFRAME_ENABLED=True` and source mode is `consensus`.
 
 ### 17.4 Tuning Phases
 
@@ -594,63 +656,65 @@ Four observation features: MACD histogram slope, EMA spread %, RSI zone, volume 
 | Equal | 0.5 | Equal weight |
 | HMM-primary | 0.3 | 70% HMM, 30% trend |
 
-### 17.5 Config
+### 17.5 Tactical Multi-Timeframe (1m + 15m)
+
+- Tactical consensus combines primary and secondary only.
+- Policy source selector (`HMM_MULTI_TIMEFRAME_SOURCE`) accepts:
+  - `primary`
+  - `consensus`
+- Consensus agreement classes: `full`, `1m_cooling`, `15m_neutral`, `conflict`, `primary_only`.
+
+### 17.6 Tertiary 1h Detector (Strategic)
+
+- Tertiary detector is enabled by `HMM_TERTIARY_ENABLED`.
+- Default windows:
+  - `HMM_TERTIARY_TRAINING_CANDLES=500`
+  - `HMM_TERTIARY_MIN_TRAIN_SAMPLES=150`
+  - `HMM_TERTIARY_RECENT_CANDLES=30`
+- Transition state tracked in `hmm_tertiary_transition`:
+  `from_regime`, `to_regime`, `confirmation_count`, `confirmed`, `changed_at`, `transition_age_sec`.
+- Confirmation gate for strategic accumulation uses `ACCUM_CONFIRMATION_CANDLES` (default `2`).
+
+### 17.7 Training Depth and Confidence Modifier
+
+- Runtime tracks per-pipeline training depth (`training_depth_primary`, `training_depth_secondary`, `training_depth_tertiary`).
+- Quality tier output: `shallow`, `baseline`, `deep`, `full`.
+- Primary (4000-candle target) tier thresholds:
+  - `shallow`: `<1000`, modifier `0.70`
+  - `baseline`: `1000-2499`, modifier `0.85`
+  - `deep`: `2500-3999`, modifier `0.95`
+  - `full`: `>=4000`, modifier `1.00`
+- Effective confidence path in tier evaluation:
+  1. `_policy_hmm_signal()` produces `confidence_raw`
+  2. `_hmm_confidence_modifier_for_source(...)` selects modifier from active source depth
+  3. `_update_regime_tier()` computes `confidence_effective = confidence_raw * confidence_modifier`
+- Dashboard renders depth progress (`pct_complete`), quality tier color, modifier, and estimated full-window timestamp.
+
+### 17.8 Config
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `HMM_ENABLED` | False | Master enable |
+| `HMM_ENABLED` | False | Master HMM enable |
 | `HMM_N_STATES` | 3 | Hidden states |
 | `HMM_N_ITER` | 100 | Baum-Welch iterations |
-| `HMM_COVARIANCE_TYPE` | "diag" | Gaussian covariance structure |
-| `HMM_INFERENCE_WINDOW` | 50 | Observations per inference |
-| `HMM_CONFIDENCE_THRESHOLD` | 0.15 | Min confidence for non-zero bias |
-| `HMM_RETRAIN_INTERVAL_SEC` | 86400.0 | Retrain period (1 day) |
-| `HMM_BIAS_GAIN` | 1.0 | Scales bias magnitude |
-| `HMM_BLEND_WITH_TREND` | 0.5 | Blend ratio (0=HMM, 1=trend) |
-
-### 17.6 Multi-Timeframe HMM
-
-Dual-detector architecture: a fast primary (default 1m) and a slow secondary (default 15m) HMM run in parallel. A consensus function merges their signals for policy consumption.
-
-**Source selector** (`_policy_hmm_source`): all policy consumers (regime tier, rebalancer, trend blend) read from a single shared source determined by `HMM_MULTI_TIMEFRAME_SOURCE`:
-
-- `"primary"`: only primary HMM drives policy (secondary collects data but is not consumed)
-- `"consensus"`: merged consensus signal drives policy (requires `HMM_MULTI_TIMEFRAME_ENABLED=True`)
-
-**Consensus computation** (`_compute_hmm_consensus`):
-
-- If both HMMs agree on direction: full confidence, weighted blend of bias signals (15m weight 0.7, 1m weight 0.3)
-- If 1m is cooling (RANGING) but 15m is directional: 15m direction held with dampened confidence
-- If 15m is neutral: fall back to primary signal
-- If conflict (opposing directions): RANGING with zero bias (conservative)
-
-**Gated confirmation model**: the 15m sets *direction* (BULLISH/BEARISH gate), the 1m sets *timing* (confidence modulation). Agreement boosts confidence; disagreement forces neutral.
-
-**Secondary OHLCV pipeline**: separate `_sync_ohlcv_candles_secondary()` with its own cursor, sync interval, and backfill state. Uses `HMM_SECONDARY_INTERVAL_MIN` (default 15).
-
-**Activation phases** (config flips, no code changes):
-
-| Phase | Config | Effect |
-|-------|--------|--------|
-| A (Shadow) | `HMM_SECONDARY_OHLCV_ENABLED=True` | Collect 15m data, no policy influence |
-| B (Dual inference) | + `HMM_MULTI_TIMEFRAME_ENABLED=True` | Both HMMs run, consensus computed, source still primary |
-| C (Consensus policy) | + `HMM_MULTI_TIMEFRAME_SOURCE=consensus` | Consensus drives all policy consumers |
-
-### 17.7 Multi-Timeframe Config
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `HMM_MULTI_TIMEFRAME_ENABLED` | False | Enable secondary HMM detector |
-| `HMM_MULTI_TIMEFRAME_SOURCE` | "primary" | Policy source: "primary" or "consensus" |
-| `HMM_SECONDARY_INTERVAL_MIN` | 15 | Secondary candle interval |
-| `HMM_SECONDARY_OHLCV_ENABLED` | False | Enable secondary OHLCV collection |
-| `HMM_SECONDARY_SYNC_INTERVAL_SEC` | 300.0 | Secondary OHLCV pull cadence |
-| `HMM_SECONDARY_TRAINING_CANDLES` | 720 | Secondary training window |
-| `HMM_SECONDARY_RECENT_CANDLES` | 50 | Secondary inference window |
-| `HMM_SECONDARY_MIN_TRAIN_SAMPLES` | 200 | Minimum candles for secondary training |
-| `CONSENSUS_1M_WEIGHT` | 0.3 | 1m weight in consensus blend |
-| `CONSENSUS_15M_WEIGHT` | 0.7 | 15m weight in consensus blend |
-| `CONSENSUS_DAMPEN_FACTOR` | 0.5 | Confidence dampening on partial agreement |
+| `HMM_COVARIANCE_TYPE` | "diag" | Gaussian covariance type |
+| `HMM_INFERENCE_WINDOW` | 50 | Primary inference window |
+| `HMM_CONFIDENCE_THRESHOLD` | 0.15 | Min confidence gate |
+| `HMM_RETRAIN_INTERVAL_SEC` | 86400.0 | Retrain cadence |
+| `HMM_BIAS_GAIN` | 1.0 | Bias scaling |
+| `HMM_BLEND_WITH_TREND` | 0.5 | Trend/HMM blend |
+| `HMM_DEEP_DECAY_ENABLED` | False | Enable deep-window decay behavior |
+| `HMM_MULTI_TIMEFRAME_ENABLED` | False | Enable 15m tactical detector |
+| `HMM_MULTI_TIMEFRAME_SOURCE` | "primary" | Tactical policy source |
+| `HMM_SECONDARY_TRAINING_CANDLES` | 1440 | 15m training window |
+| `HMM_SECONDARY_RECENT_CANDLES` | 50 | 15m inference window |
+| `HMM_TERTIARY_ENABLED` | False | Enable 1h strategic detector |
+| `HMM_TERTIARY_TRAINING_CANDLES` | 500 | 1h training window |
+| `HMM_TERTIARY_RECENT_CANDLES` | 30 | 1h inference window |
+| `CONSENSUS_1M_WEIGHT` | 0.3 | Tactical 1m weight |
+| `CONSENSUS_15M_WEIGHT` | 0.7 | Tactical 15m weight |
+| `CONSENSUS_1H_WEIGHT` | 0.30 | Strategic context weight input |
+| `CONSENSUS_DAMPEN_FACTOR` | 0.5 | Tactical disagreement dampener |
 
 ## 18. Directional Regime System
 
@@ -823,12 +887,19 @@ Snapshot payload includes:
 - **trend state**: `_trend_fast_ema`, `_trend_slow_ema`, `_trend_score`, `_trend_dynamic_target`, `_trend_smoothed_target`, `_trend_target_locked_until`, `_trend_last_update_ts`
 - **daily loss lock state**: `_daily_loss_lock_active`, `_daily_loss_lock_utc_day`, `_daily_realized_loss_utc`
 - **capital layer state**: `target_layers`, `effective_layers`
-- **OHLCV pipeline state**: `ohlcv_since_cursor`, `ohlcv_last_sync_ts`, `ohlcv_last_candle_ts`
-- **HMM backfill state**: `hmm_backfill_last_at`, `hmm_backfill_last_rows`, `hmm_backfill_last_message`, `hmm_backfill_stall_count` (primary + secondary)
-- **HMM regime state**: `_hmm_regime_state` (RegimeState dict), `_hmm_last_train_ts`, `_hmm_trained`
-- **HMM secondary state**: `hmm_state_secondary`, `hmm_consensus` (multi-timeframe)
-- **Kelly state**: `kelly_state` (active regime, last sample count, cached results)
+- **OHLCV pipeline state**: primary + secondary + tertiary cursors/sync timestamps/last-rows fields
+- **HMM backfill state**: primary + secondary + tertiary backfill progress/stall counters
+- **HMM regime state**: primary snapshot plus `hmm_state_secondary`, `hmm_state_tertiary`, `hmm_consensus`, `hmm_tertiary_transition`
+- **HMM training depth**: primary/secondary/tertiary depth + quality metadata
+- **throughput state**: `throughput_sizer_state` snapshot when throughput is enabled
 - **Directional regime state**: `regime_tier`, `regime_tier_entered_at`, `regime_tier2_grace_start`, `regime_tier2_last_downgrade_at`, `regime_cooldown_suppressed_side`, `regime_tier_history`, `regime_side_suppressed`, `regime_last_eval_ts`, `regime_shadow_state`
+- **AI override state**: `ai_override_tier`, `ai_override_direction`, `ai_override_until`, `ai_override_applied_at`, `ai_override_source_conviction`
+- **accumulation state**: `accum_*` fields (`state`, trigger regime pair, budget/spend/acquired, timers, hold/cooldown/session summary)
+- **balance intelligence state**: `recon_baseline`, `flow_*`, `external_flows`, `baseline_adjustments`, equity-snapshot metadata
+- **Bayesian state**: `belief_state`, `belief_cycle_metadata`, `action_knobs`, micro-feature windows, `bocpd_state`, `bocpd_snapshot`, survival snapshot, trade-belief state
+- **self-healing state**: `self_heal_*` counters/summaries/hold-overrides
+- **position-ledger state**: `position_ledger_state`, exit-to-position maps, migration markers
+- **churner state**: reserve/day/cycle/profit counters and per-slot churner runtime state
 
 Fields absent from old snapshots default to safe values (backward compatible).
 
@@ -848,101 +919,112 @@ HTTP server:
 - `GET /factory` -> factory lens HTML (placeholder)
 - `GET /api/status` -> runtime payload
 - `GET /api/swarm/status` -> alias to `/api/status` (legacy poller compatibility)
-- `POST /api/action` -> control actions
+- `GET /api/ops/toggles` -> runtime toggle panel payload
+- `GET /api/churner/status` -> churner runtime status
+- `GET /api/churner/candidates` -> churner candidate list
+- `POST /api/action` -> operator actions
+- `POST /api/ops/toggle|reset|reset-all` -> runtime toggle control
+- `POST /api/churner/spawn|kill|config` -> churner runtime control
 
-Supported dashboard actions:
+Supported `/api/action` actions:
 
 - `pause`
 - `resume`
 - `add_slot`
-- `remove_slot` (by slot_id)
-- `remove_slots` (by count)
-- `add_layer` (with optional source: auto/doge/usd)
-- `remove_layer`
 - `set_entry_pct`
 - `set_profit_pct`
 - `soft_close` (specific recovery by slot_id + recovery_id)
 - `soft_close_next` (oldest recovery)
+- `release_slot` (sticky release by slot/exit selector)
+- `release_oldest_eligible` (sticky release helper)
 - `cancel_stale_recoveries` (bulk soft-close distant recoveries)
+- `remove_slot` (by slot_id)
+- `remove_slots` (by count)
+- `add_layer` (optional source: auto/doge/usd)
+- `remove_layer`
 - `reconcile_drift` (cancel Kraken-only orders not tracked internally)
 - `audit_pnl` (recompute P&L from completed cycles)
+- `ai_regime_override` (accept AI recommendation with TTL)
+- `ai_regime_revert` (cancel active AI override)
+- `ai_regime_dismiss` (dismiss disagreement recommendation)
+- `accum_stop` (manual stop for active accumulation session)
+- `self_heal_reprice_breakeven`
+- `self_heal_close_market`
+- `self_heal_keep_holding`
+
+Action gates:
+
+- In sticky mode, `soft_close`, `soft_close_next`, and `cancel_stale_recoveries` are blocked.
+- When `RECOVERY_ORDERS_ENABLED=false`, those same recovery actions are blocked.
 
 ### 23.1 `/api/status` Payload Blocks
 
-**`capacity_fill_health`**: manual scaling diagnostics:
+Top-level status includes bot-wide fields plus these contract blocks:
 
-- `open_orders_current`, `open_orders_source`, `open_orders_internal`, `open_orders_kraken`
-- `open_order_limit_configured`, `open_orders_safe_cap`, `open_order_headroom`
-- `open_order_utilization_pct`, `orders_per_slot_estimate`, `estimated_slots_remaining`
-- `partial_fill_open_events_1d`, `partial_fill_cancel_events_1d`
-- `median_fill_seconds_1d`, `p95_fill_seconds_1d`
-- `status_band` (`normal`, `caution`, `stop`)
-- `blocked_risk_hint` (string list)
+- `capacity_fill_health`
+- `balance_health`
+- `balance_recon`
+- `external_flows`
+- `equity_history`
+- `sticky_mode`
+- `self_healing`
+- `slot_vintage`
+- `hmm_data_pipeline`
+- `hmm_data_pipeline_secondary`
+- `hmm_data_pipeline_tertiary`
+- `hmm_regime`
+- `hmm_consensus`
+- `belief_state`
+- `bocpd`
+- `survival_model`
+- `trade_beliefs`
+- `action_knobs`
+- `manifold_score`
+- `ops_panel`
+- `regime_history_30m`
+- `throughput_sizer`
+- `dust_sweep`
+- `b_side_sizing`
+- `regime_directional`
+- `ai_regime_advisor`
+- `accumulation`
+- `release_health`
+- `doge_bias_scoreboard`
+- `rebalancer`
+- `trend`
+- `capital_layers`
 
-**`rebalancer`**: PD controller state:
+Operational fields retained at top level:
 
-- `target` (dynamic), `base_target` (static config), `skew`, `idle_ratio`
+- `pause_reason`
+- `top_phase`
+- `daily_loss_limit`
+- `daily_realized_loss_utc`
+- `daily_loss_lock_active`
+- `daily_loss_lock_utc_day`
+- `price_age_sec`
+- `stale_price_max_age_sec`
+- `reentry_base_cooldown_sec`
+- `total_round_trips`
+- `total_orphans`
+- `total_profit_doge`
+- `total_unrealized_profit`
+- `total_unrealized_doge`
+- `today_realized_loss`
+- `pnl_audit`
+- `pnl_reference_price`
+- `recovery_orders_enabled`
+- `slots` (per-slot state list)
 
-**`trend`**: trend detector state:
+Notable newer blocks:
 
-- `score`, `score_display`, `fast_ema`, `slow_ema`
-- `dynamic_idle_target`, `hysteresis_active`, `hysteresis_expires_in_sec`
-
-**`daily_loss_limit`**, **`daily_realized_loss_utc`**, **`daily_loss_lock_active`**, **`daily_loss_lock_utc_day`**: loss circuit breaker state.
-
-**`capital_layers`**: layer metrics including target, effective, gap, funding status.
-
-**`entry_scheduler`**: deferred/drained counts and current loop cap.
-
-**`open_order_drift_hint`**: persistent drift alert state.
-
-**`hmm_data_pipeline`**: OHLCV collection readiness (§16):
-
-- `enabled`, `source`, `interval_min`, `training_target`, `min_train_samples`, `samples`, `coverage_pct`
-- `ready_for_min_train`, `ready_for_target_window`, `gaps`
-- `freshness_sec`, `freshness_limit_sec`, `freshness_ok`, `volume_coverage_pct`, `span_hours`
-- `sync_interval_sec`, `last_sync_ts`, `last_sync_rows_queued`, `sync_cursor`
-- `backfill_last_at`, `backfill_last_rows`, `backfill_last_message`
-- Stall/breaker signals are surfaced via `backfill_last_message` tokens
-  (e.g., `stalls=N`, `backfill_circuit_open:...`)
-
-**`hmm_regime`**: HMM regime detector state (§17):
-
-- `enabled`, `available`, `trained`, `regime`, `regime_id`
-- `confidence`, `bias_signal`, `blend_factor`
-- `probabilities` (`bearish`, `ranging`, `bullish`)
-- `observation_count`, `last_update_ts`, `last_train_ts`, `error`
-- `source_mode` (`primary` or `consensus`), `multi_timeframe`, `agreement`
-- `primary`, `secondary`, `consensus` (nested sub-objects with per-detector state)
-
-**`hmm_consensus`**: multi-timeframe consensus state (§17.6):
-
-- `regime`, `confidence`, `bias_signal`, `agreement` (`full`, `1m_cooling`, `15m_neutral`, `conflict`, `primary_only`)
-- `source_mode`, `multi_timeframe`
-
-**`hmm_data_pipeline_secondary`**: secondary OHLCV pipeline (§16, 15m candles):
-
-- Same fields as `hmm_data_pipeline` but for the secondary interval
-
-**`kelly`**: Kelly sizing runtime state (§9):
-
-- `enabled`, `active_regime`, `last_update_n`, `kelly_fraction`
-- `aggregate`, `bullish`, `ranging`, `bearish` result blocks:
-  - `f_star`, `f_fractional`, `multiplier`, `win_rate`, `avg_win`, `avg_loss`,
-    `payoff_ratio`
-  - `n_total`, `n_wins`, `n_losses`, `edge`, `sufficient_data`, `reason`
-
-**`regime_directional`**: directional regime system state (§18):
-
-- `enabled`, `shadow_enabled`, `actuation_enabled`
-- `tier` (0/1/2), `tier_label` (`symmetric`/`biased`/`directional`)
-- `suppressed_side` (`A`/`B`/null), `favored_side` (`A`/`B`/null)
-- `regime`, `confidence`, `bias_signal`, `abs_bias`
-- `directional_ok_tier1`, `directional_ok_tier2`, `hmm_ready`
-- `dwell_sec`, `hysteresis_buffer`, `grace_remaining_sec`, `cooldown_remaining_sec`, `cooldown_suppressed_side`
-- `regime_suppressed_slots` (count of slots with `mode_source="regime"`)
-- `tier_history` (rolling transition history; capped)
-- `last_eval_ts`, `reason`
+- `throughput_sizer`: aggregate + regime-side throughput stats and multipliers.
+- `ai_regime_advisor`: last opinion, conviction, suggested TTL, override state, history, scheduler timings.
+- `accumulation`: state machine status (`IDLE|ARMED|ACTIVE|COMPLETED|STOPPED`), spend/budget/drawdown/session summary.
+- `self_healing`: subsidy accounting, cleanup queue, operator actions state, ledger-backed slot healing telemetry.
+- `bocpd`/`belief_state`/`survival_model`/`trade_beliefs`/`action_knobs`: Bayesian stack telemetry.
+- `hmm_data_pipeline_tertiary` + `hmm_regime.tertiary` + `hmm_regime.tertiary_transition`: 1h HMM observability.
+- `dust_sweep` and `b_side_sizing`: account-aware quote allocation observability.
 
 ### 23.2 `status_band` thresholds
 
@@ -968,6 +1050,10 @@ Supported commands:
 - `/soft_close [slot_id recovery_id]`
 - `/set_entry_pct <value>`
 - `/set_profit_pct <value>`
+
+Current Telegram surface is intentionally smaller than dashboard/API.
+AI override actions, accumulation stop, self-healing operator actions, ops toggles,
+and churner runtime controls are dashboard/API-only in current runtime.
 
 Callback format for interactive soft-close:
 
@@ -1001,14 +1087,330 @@ Signal handling:
 
 - `SIGTERM`, `SIGINT` (and `SIGBREAK` on Windows) trigger graceful shutdown
 
+Related guardrail toggles:
+
+- `AUTO_RECOVERY_DRAIN_ENABLED` (backlog pressure drain)
+- `PRIVATE_API_METRONOME_ENABLED` (private API pacing telemetry)
+
 ## 26. Developer Notes
 
 When updating behavior, update these files together:
 
 1. `state_machine.py` for reducer semantics and invariants
-2. `bot.py` for runtime side effects / bootstrap / guardrails
-3. `hmm_regime_detector.py` for HMM model / feature extraction / integration helpers
-4. `tests/test_hardening_regressions.py` for regression coverage
-5. `STATE_MACHINE.md` for contract parity
+2. `bot.py` for runtime side effects / bootstrap / guardrails / API contract
+3. `config.py` for runtime flag and default contract changes
+4. `hmm_regime_detector.py` for HMM model / feature extraction / integration helpers
+5. `throughput_sizer.py` for fill-time sizing model contract
+6. `ai_advisor.py` for AI regime advisor behavior contract
+7. `bayesian_engine.py`, `bocpd.py`, `survival_model.py` for Bayesian stack contract
+8. `position_ledger.py` for self-healing position/subsidy accounting contract
+9. `dashboard.py` for status/action rendering contract
+10. `tests/test_hardening_regressions.py` (+ subsystem tests) for regression coverage
+11. `STATE_MACHINE.md` for contract parity
+
+Auxiliary repository modules (outside core state-machine contract but present in root):
+
+- `kraken_client.py` (exchange client)
+- `notifier.py` and `telegram_menu.py` (Telegram transport/menu helpers)
+- `grid_strategy.py`, `stats_engine.py`, `pair_scanner.py`, `backtest_v1.py`, `state_machine_visual.py` (legacy/auxiliary tooling)
+- `factory_viz.py` (factory view HTML endpoint helper)
 
 This document is intentionally code-truth first: if this file and code diverge, code wins and doc must be updated in the same change.
+
+## 27. AI Regime Advisor
+
+`ai_advisor.py` provides a second-opinion layer on top of mechanical regime tiering.
+
+Runtime model:
+
+- `bot.py` builds AI context from 1m/15m/1h HMM state, consensus agreement, transition matrices, training depth, capacity state, and recent regime history.
+- `_maybe_schedule_ai_regime(...)` enforces periodic scheduling + debounce + event-triggered scheduling.
+- AI call runs on a daemon thread (`_ai_regime_worker`) and writes `_ai_regime_pending_result`.
+- Main loop ingests pending result on next cycle (`_process_ai_regime_pending_result`).
+- Dashboard actions can apply/revert/dismiss AI recommendations.
+
+Provider behavior:
+
+- Multi-provider panel is built from configured keys (`DEEPSEEK_API_KEY`, `SAMBANOVA_API_KEY`, `CEREBRAS_API_KEY`, `GROQ_API_KEY`, `NVIDIA_API_KEY`).
+- AI output includes `recommended_tier`, `recommended_direction`, `conviction`, `accumulation_signal`, `accumulation_conviction`, and `suggested_ttl_minutes`.
+- Suggested TTL is clamped to config min/max bounds before use.
+
+Config:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `AI_REGIME_ADVISOR_ENABLED` | False | Master AI advisor toggle |
+| `AI_REGIME_INTERVAL_SEC` | 300.0 | Periodic run cadence |
+| `AI_REGIME_DEBOUNCE_SEC` | 60.0 | Event-trigger debounce |
+| `AI_OVERRIDE_TTL_SEC` | 1800 | Default override TTL |
+| `AI_OVERRIDE_MIN_TTL_SEC` | 300 | Minimum allowed TTL |
+| `AI_OVERRIDE_MAX_TTL_SEC` | 3600 | Maximum allowed TTL |
+| `AI_OVERRIDE_MIN_CONVICTION` | 50 | Min conviction for override application |
+| `AI_REGIME_HISTORY_SIZE` | 12 | Opinion history buffer size |
+| `AI_REGIME_PREFER_REASONING` | True | Prefer reasoning-capable panel path |
+| `AI_REGIME_PREFER_DEEPSEEK_R1` | False | DeepSeek reasoning preference flag |
+
+Degradation guarantees:
+
+- If disabled or providers unavailable, advisor remains inactive and mechanical regime stays authoritative.
+- Failed/invalid AI responses do not halt loop; status reports error state.
+
+See `docs/AI_REGIME_ADVISOR_SPEC.md`, `docs/AI_MULTI_PROVIDER_SPEC.md`, and `docs/AI_SUGGESTED_TTL_SPEC.md` for full spec.
+
+## 28. 1h HMM (Tertiary Timeframe)
+
+The tertiary detector is a strategic 1h classifier, separate from tactical 1m/15m consensus.
+
+Behavior:
+
+- Enabled by `HMM_TERTIARY_ENABLED`.
+- Trained/inferred by `_train_hmm_tertiary` and `_update_hmm_tertiary`.
+- Bootstrap path can resample lower-interval candles (`_fetch_bootstrap_tertiary_candles`) when native 1h depth is limited.
+- Transition tracker (`_hmm_tertiary_transition`) records:
+  `from_regime`, `to_regime`, `confirmation_count`, `confirmed`, `changed_at`, `transition_age_sec`.
+
+Contract:
+
+- Tertiary regime is exposed in `hmm_regime.tertiary` and `hmm_regime.tertiary_transition`.
+- Tactical policy source remains primary/consensus (`_policy_hmm_source`); tertiary is consumed by strategic layers (AI context + accumulation gating).
+
+Config:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `HMM_TERTIARY_ENABLED` | False | Enable tertiary detector |
+| `HMM_TERTIARY_INTERVAL_MIN` | 60 | Tertiary candle interval |
+| `HMM_TERTIARY_TRAINING_CANDLES` | 500 | Tertiary training window |
+| `HMM_TERTIARY_MIN_TRAIN_SAMPLES` | 150 | Minimum training samples |
+| `HMM_TERTIARY_RECENT_CANDLES` | 30 | Inference window |
+| `HMM_TERTIARY_SYNC_INTERVAL_SEC` | 3600.0 | Sync cadence |
+
+Degradation guarantees:
+
+- If unavailable/untrained, transition output is neutral and strategic consumers degrade safely.
+
+See `docs/STRATEGIC_CAPITAL_DEPLOYMENT_SPEC.md` for full spec.
+
+## 29. DCA Accumulation Engine
+
+Strategic DOGE accumulation state machine driven by tertiary transition confirmation + AI conviction.
+
+Runtime states:
+
+- `IDLE`
+- `ARMED`
+- `ACTIVE`
+- `COMPLETED`
+- `STOPPED`
+
+Core flow:
+
+1. Arm on confirmed tertiary transition and available idle budget.
+2. Activate when AI signal is `accumulate_doge` and conviction meets threshold.
+3. Execute periodic market buys (`ordertype="market"`) in fixed USD chunks.
+4. Finalize on stop conditions (manual stop, transition invalidation/revert, hold streak, drawdown breach, budget depletion, buy failure, cooldown).
+
+Status/API:
+
+- `/api/status -> accumulation` includes state, trigger, budget/spend, buy counts, drawdown, and last session summary.
+- `/api/action -> accum_stop` performs controlled stop/finalize.
+
+Config:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `ACCUM_ENABLED` | False | Master accumulation toggle |
+| `ACCUM_MIN_CONVICTION` | 60 | AI conviction floor |
+| `ACCUM_RESERVE_USD` | 50.0 | Idle USD reserve floor |
+| `ACCUM_MAX_BUDGET_USD` | 50.0 | Max per-session budget |
+| `ACCUM_CHUNK_USD` | 2.0 | Per-buy chunk size |
+| `ACCUM_INTERVAL_SEC` | 120.0 | Buy cadence |
+| `ACCUM_MAX_DRAWDOWN_PCT` | 3.0 | Stop-loss drawdown guard |
+| `ACCUM_COOLDOWN_SEC` | 3600.0 | Post-session cooldown |
+| `ACCUM_CONFIRMATION_CANDLES` | 2 | Tertiary transition confirmation count |
+
+Degradation guarantees:
+
+- If disabled or prerequisites fail, state remains `IDLE`.
+- No accumulation order is placed without API budget and min-volume validation.
+
+See `docs/STRATEGIC_CAPITAL_DEPLOYMENT_SPEC.md` for full spec.
+
+## 30. Durable Profit Settlement
+
+Realized tracking uses dual fields on `PairState`:
+
+- `total_profit`: net cycle PnL estimate after fees
+- `total_settled_usd`: quote-balance settlement-oriented tracker
+
+Cycle accounting includes fee/settlement split fields in booked cycles:
+
+- `entry_fee`
+- `exit_fee`
+- `quote_fee`
+- `settled_usd`
+
+Sizing implications:
+
+- B-side quote allocation and quote-first logic consume quote-side availability and settlement-aware accounting.
+- This reduces drift between long-run PnL estimates and quote balance changes.
+
+Config:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `DURABLE_SETTLEMENT_ENABLED` | True | Enable durable quote-settlement accounting path |
+| `ROUNDING_RESIDUAL_ENABLED` | False | Enable residual rounding carry controls |
+
+See `docs/DURABLE_PROFIT_EXIT_ACCOUNTING_SPEC.md` for full spec.
+
+## 31. Balance Intelligence
+
+Balance intelligence is observability-first and does not directly change reducer semantics.
+
+Capabilities:
+
+1. External flow detection from Kraken ledger (`deposit` / `withdrawal`).
+2. Baseline auto-adjustment for detected external flows.
+3. Persistent DOGE-equivalent equity snapshots and sparkline history.
+
+Status surfaces:
+
+- `balance_recon`
+- `external_flows`
+- `equity_history`
+- `doge_bias_scoreboard` (derived performance/idle/runway/opportunity metrics)
+
+Config:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `FLOW_DETECTION_ENABLED` | True | Enable external-flow polling |
+| `FLOW_POLL_INTERVAL_SEC` | 300.0 | Flow poll cadence |
+| `FLOW_BASELINE_AUTO_ADJUST` | True | Auto-adjust recon baseline on external flows |
+| `EQUITY_TS_ENABLED` | True | Enable persistent equity series |
+| `EQUITY_SNAPSHOT_INTERVAL_SEC` | 300.0 | Snapshot cadence |
+| `EQUITY_SNAPSHOT_FLUSH_SEC` | 300.0 | Flush cadence |
+| `BALANCE_RECON_DRIFT_PCT` | 2.0 | Drift alert threshold |
+
+Degradation guarantees:
+
+- If flow/equity paths fail, trading loop continues and status reports degraded fields.
+
+See `docs/BALANCE_INTELLIGENCE_SPEC.md` for full spec.
+
+## 32. Self-Healing Slots
+
+Self-healing replaces timer-driven recovery churn for sticky exits with ledger-driven subsidy management.
+
+Core components:
+
+- `position_ledger.py` tracks immutable entry context, mutable exit intent, and append-only journal events.
+- Runtime derives age bands, subsidy needs, and opportunity-cost estimates per open position.
+- Repricing engine performs tighten and subsidy-backed repricing paths.
+- Operator controls exposed through `/api/action` self-heal actions.
+
+Churner integration:
+
+- Optional churner cycles can generate subsidy credits.
+- Churner runtime has dedicated endpoints and status payloads.
+
+Config:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `POSITION_LEDGER_ENABLED` | True | Enable ledger runtime |
+| `STICKY_MODE_ENABLED` | False | Enable sticky-slot lifecycle mode |
+| `SUBSIDY_ENABLED` | False | Enable subsidy repricing path |
+| `SUBSIDY_REPRICE_INTERVAL_SEC` | 3600 | Min interval between subsidy reprices |
+| `SUBSIDY_AUTO_REPRICE_BAND` | "stuck" | Minimum band for auto subsidy repricing |
+| `SUBSIDY_WRITE_OFF_AUTO` | False | Allow automatic write-off behavior |
+| `CHURNER_ENABLED` | False | Enable churner helper engine |
+| `CHURNER_MIN_HEADROOM` | 10 | Open-order headroom gate |
+| `CHURNER_RESERVE_USD` | 5.0 | Shared reserve pool |
+| `RELEASE_AUTO_ENABLED` | False | Enable sticky auto-release |
+| `RELEASE_RECON_HARD_GATE_ENABLED` | True | Require recon gate for release actions |
+
+Degradation guarantees:
+
+- If ledger/subsidy/churner features are disabled, bot falls back to non-self-healing paths without reducer changes.
+
+See `docs/SELF_HEALING_SLOTS_SPEC.md` for full spec.
+
+## 33. Bayesian Intelligence Stack
+
+Bayesian stack introduces continuous belief signals while preserving reducer purity.
+
+Modules:
+
+- `bocpd.py`: online changepoint detection (`change_prob`, run-length posterior).
+- `survival_model.py`: fill-time survival predictions with censoring support.
+- `bayesian_engine.py`: belief/posterior synthesis, trade-belief actions, action knobs, manifold components.
+
+Runtime outputs:
+
+- `belief_state`
+- `bocpd`
+- `survival_model`
+- `trade_beliefs`
+- `action_knobs`
+
+Integration:
+
+- Throughput/manifold/AI/self-healing consume Bayesian-derived telemetry.
+- Existing timer and safety guards remain active as backstops.
+
+Config (selected):
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `BOCPD_ENABLED` | False | Enable BOCPD updates |
+| `ENRICHED_FEATURES_ENABLED` | False | Enable enriched private microstructure feature vector |
+| `SURVIVAL_MODEL_ENABLED` | False | Enable survival model |
+| `SURVIVAL_SYNTHETIC_ENABLED` | False | Enable synthetic survival observations |
+| `BELIEF_TRACKER_ENABLED` | False | Enable per-trade belief actions |
+| `BELIEF_WIDEN_ENABLED` | False | Enable widen branch in belief action mapping |
+| `KNOB_MODE_ENABLED` | False | Enable continuous action knobs |
+| `BELIEF_STATE_LOGGING_ENABLED` | True | Belief instrumentation logging |
+
+Degradation guarantees:
+
+- Any disabled or unavailable Bayesian subsystem degrades to neutral defaults without halting loop.
+
+See `docs/BAYESIAN_INTELLIGENCE_SPEC.md` for full spec.
+
+## 34. Manifold Score, Ops Panel, and Churner
+
+This section documents current runtime wiring and scope boundaries.
+
+Manifold score (`manifold_score`):
+
+- Computed in `_update_manifold_score()`.
+- Uses regime clarity/stability, throughput efficiency, signal coherence, and BOCPD-related components.
+- Exposed in `/api/status` as score, components, history sparkline, and trend.
+
+Ops panel (`ops_panel`):
+
+- Runtime override surfaces exposed via `/api/ops/*`.
+- Supports feature-flag style runtime toggles with snapshot persistence.
+
+Churner:
+
+- Runtime status/candidate/read-write endpoints exist (`/api/churner/*`).
+- Integrated with self-healing and reserve controls.
+- Operates as optional auxiliary engine, not reducer core logic.
+
+Config (selected):
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `MTS_ENABLED` | True | Enable manifold score computation |
+| `MTS_ENTRY_THROTTLE_ENABLED` | False | Enable manifold-driven entry throttle |
+| `MTS_KERNEL_ENABLED` | False | Enable kernel-based MTS adaptation path |
+
+Status note:
+
+- Full concept surface (score orchestration + operations UX + churner strategy) is broader than currently active runtime behavior.
+- Document implemented contract here; detailed forward-looking design remains in spec docs.
+
+See `docs/MANIFOLD_SCORE_OPS_PANEL_CHURNER_SPEC.md` for full spec.

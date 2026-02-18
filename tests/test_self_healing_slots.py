@@ -353,7 +353,7 @@ class SelfHealingSlotsTests(unittest.TestCase):
         skipped = dict(last_summary.get("skipped") or {})
         self.assertGreaterEqual(int(skipped.get("cooldown", 0)), 1)
 
-    def test_churner_activation_requires_ranging_regime(self):
+    def test_churner_engine_does_not_auto_spawn_without_manual_activation(self):
         now_ts = 1_000_000.0
         entry_time = now_ts - (48 * 3600)
         rt, _position_id, _ = self._build_open_position_runtime(
@@ -366,7 +366,7 @@ class SelfHealingSlotsTests(unittest.TestCase):
 
         with (
             mock.patch.object(config, "CHURNER_ENABLED", True),
-            mock.patch.object(rt, "_policy_hmm_signal", return_value=("BULLISH", 0.0, 0.0, True, {})),
+            mock.patch.object(rt, "_policy_hmm_signal", return_value=("RANGING", 0.0, 0.0, True, {})),
             mock.patch.object(rt, "_compute_capacity_health", return_value={"open_order_headroom": 100}),
             mock.patch.object(rt, "_place_order", return_value="TX-CHURNER") as place_mock,
         ):
@@ -376,7 +376,54 @@ class SelfHealingSlotsTests(unittest.TestCase):
         churner = rt._churner_by_slot.get(0)
         self.assertIsNotNone(churner)
         self.assertFalse(bool(churner.active))
-        self.assertEqual(str(churner.last_error), "regime_not_ranging")
+
+    def test_churner_spawn_rejects_non_ranging_regime(self):
+        now_ts = 1_000_000.0
+        entry_time = now_ts - (48 * 3600)
+        rt, _position_id, _ = self._build_open_position_runtime(
+            now_ts=now_ts,
+            entry_time=entry_time,
+            entry_price=0.1000,
+            exit_price=0.1020,
+            target_profit_pct=1.0,
+        )
+        rt._manifold_score = bot.bayesian_engine.ManifoldScore(enabled=True, mts=0.70)
+        with (
+            mock.patch.object(config, "POSITION_LEDGER_ENABLED", True),
+            mock.patch.object(config, "CHURNER_ENABLED", True),
+            mock.patch.object(config, "MTS_CHURNER_GATE", 0.30),
+            mock.patch.object(rt, "_policy_hmm_signal", return_value=("BULLISH", 0.0, 0.0, True, {})),
+            mock.patch.object(rt, "_compute_capacity_health", return_value={"open_order_headroom": 100}),
+        ):
+            ok, msg = rt._churner_spawn(slot_id=0)
+        self.assertFalse(ok)
+        self.assertEqual(str(msg), "regime_not_ranging")
+
+    def test_churner_spawn_bypasses_mts_gate_when_mts_disabled(self):
+        now_ts = 1_000_000.0
+        entry_time = now_ts - (48 * 3600)
+        rt, _position_id, _ = self._build_open_position_runtime(
+            now_ts=now_ts,
+            entry_time=entry_time,
+            entry_price=0.1000,
+            exit_price=0.1020,
+            target_profit_pct=1.0,
+        )
+        with (
+            mock.patch.object(config, "POSITION_LEDGER_ENABLED", True),
+            mock.patch.object(config, "CHURNER_ENABLED", True),
+            mock.patch.object(config, "MTS_ENABLED", False),
+            mock.patch.object(config, "MTS_CHURNER_GATE", 0.30),
+            mock.patch.object(rt, "_policy_hmm_signal", return_value=("RANGING", 0.0, 0.0, True, {})),
+            mock.patch.object(rt, "_compute_capacity_health", return_value={"open_order_headroom": 100}),
+        ):
+            ok, msg = rt._churner_spawn(slot_id=0, now_ts=now_ts)
+        self.assertTrue(ok)
+        self.assertIn("spawned churner", str(msg))
+        state = rt._churner_by_slot.get(0)
+        self.assertIsNotNone(state)
+        self.assertTrue(bool(state.active))
+        self.assertEqual(str(state.stage), "idle")
 
     def test_churner_entry_timeout_cancels_and_resets(self):
         rt = bot.BotRuntime()
@@ -390,7 +437,7 @@ class SelfHealingSlotsTests(unittest.TestCase):
         with mock.patch.object(rt, "_cancel_order", return_value=True) as cancel_mock:
             rt._churner_timeout_tick(slot_id=0, state=state, now_ts=1400.0)
         self.assertEqual(cancel_mock.call_count, 1)
-        self.assertFalse(bool(state.active))
+        self.assertTrue(bool(state.active))
         self.assertEqual(str(state.stage), "idle")
         self.assertEqual(str(state.entry_txid), "")
 
@@ -492,7 +539,7 @@ class SelfHealingSlotsTests(unittest.TestCase):
         churner_row_closed = rt._position_ledger.get_position(churner_pid)
         self.assertIsNotNone(churner_row_closed)
         self.assertEqual(str(churner_row_closed["status"]), "closed")
-        self.assertFalse(bool(state.active))
+        self.assertTrue(bool(state.active))
         self.assertEqual(str(state.stage), "idle")
 
     def test_startup_migration_uses_sentinel_to_prevent_duplicate_import(self):
