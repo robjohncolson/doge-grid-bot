@@ -1434,6 +1434,8 @@ DASHBOARD_HTML = """<!doctype html>
       document.getElementById('confirmDialog').hidden = true;
     }
 
+    let videoBaseUrl = '';  // set from status payload (Supabase storage)
+
     const VIDEO_SCENES = [
       {track:'A',label:'Trading Mechanics',id:'S01',title:'Grid Concept',file:'S01GridConcept.mp4',dir:'scene_s01_grid'},
       {track:'A',label:'Trading Mechanics',id:'S02',title:'State Machine',file:'S02StateMachine.mp4',dir:'scene_s02_state_machine'},
@@ -1498,7 +1500,7 @@ DASHBOARD_HTML = """<!doctype html>
       const vid = document.getElementById('videoPlayer');
       const label = document.getElementById('videoNowPlaying');
       if (vid) {
-        vid.src = '/media/concept_animations/' + scene.dir + '/' + scene.file;
+        vid.src = videoBaseUrl ? (videoBaseUrl + '/' + scene.file) : ('/media/concept_animations/' + scene.dir + '/' + scene.file);
         vid.load();
         vid.play().catch(() => {});
       }
@@ -4465,6 +4467,7 @@ DASHBOARD_HTML = """<!doctype html>
           churnerCandidates = null;
         }
         state = nextState;
+        if (nextState && nextState.video_base_url) videoBaseUrl = nextState.video_base_url;
         lastRefreshError = '';
         if (kbMode === 'NORMAL') {
           renderAll(nextState);
