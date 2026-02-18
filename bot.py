@@ -2387,10 +2387,6 @@ class BotRuntime:
                 per_slot = floor((allocation_pool * 100.0) / buy_ready_slots) / 100.0
                 if not isfinite(per_slot) or per_slot < 0.0:
                     per_slot = 0.0
-                # Cap: never allocate more than 3x ORDER_SIZE_USD to a single B-side entry.
-                max_b = float(config.ORDER_SIZE_USD) * 3.0
-                if per_slot > max_b:
-                    per_slot = max_b
                 allocated = per_slot * buy_ready_slots
                 carry_out = max(0.0, allocation_pool - allocated)
             else:
@@ -17233,6 +17229,10 @@ class BotRuntime:
                     "cycling_slot_count": sum(1 for s in self.slots.values() if not getattr(s, "sticky", True)),
                     "pending_actions": self._herd_pending_action_preview(),
                 },
+                "video_base_url": (
+                    config.SUPABASE_URL.rstrip("/") + "/storage/v1/object/public/concept-animations"
+                    if config.SUPABASE_URL else ""
+                ),
                 "advisory": {
                     "throughput_recommended_a": (
                         self._throughput.size_for_slot(
