@@ -6281,7 +6281,7 @@ class BotRuntime:
                 txid="",
                 placed_at=float(now_ts),
             )
-            self.pause(f"self-heal reprice failed: slot={sid} local={local_id} replacement placement failed")
+            logger.error("self-heal reprice failed: slot=%s local=%s replacement placement failed", sid, local_id)
             return False, "place_failed"
 
         new_txid = str(replacement_txid).strip()
@@ -6760,9 +6760,7 @@ class BotRuntime:
                 txid="",
                 placed_at=float(now),
             )
-            self.pause(
-                f"self-heal write-off failed: slot={slot_id} local={local_id} market close placement failed"
-            )
+            logger.error("self-heal write-off failed: slot=%s local=%s market close placement failed", slot_id, local_id)
             return False, "market close failed and restore failed; bot paused"
 
         market_txid_norm = str(market_txid).strip()
@@ -6807,7 +6805,7 @@ class BotRuntime:
             )
         except Exception as e:
             logger.exception("self-heal write-off transition failed position=%s: %s", pid, e)
-            self.pause(f"self-heal write-off transition failed for position {pid}")
+            logger.error("self-heal write-off transition failed for position %s", pid)
             return False, f"market close placed but local transition failed: {e}"
 
         slot_after = self.slots.get(int(slot_id))
@@ -13568,7 +13566,7 @@ class BotRuntime:
                     slot.state = sm.remove_order(slot.state, action.local_id)
                     continue
                 if self._price_age_sec() > config.STALE_PRICE_MAX_AGE_SEC:
-                    self.pause("stale price data > 60s")
+                    logger.warning("stale price — skipping order placement for slot %s", slot_id)
                     slot.state = sm.remove_order(slot.state, action.local_id)
                     continue
 
@@ -13701,10 +13699,12 @@ class BotRuntime:
                     # switch slot mode to whichever side can keep running.
                     if "insufficient funds" in str(e).lower():
                         _mark_entry_fallback_for_insufficient_funds(action)
+                        # Insufficient funds is a business condition, not an API error.
+                    else:
+                        self.consecutive_api_errors += 1
+                        if self.consecutive_api_errors >= config.MAX_CONSECUTIVE_ERRORS:
+                            self.pause(f"{self.consecutive_api_errors} consecutive API errors")
                     self._normalize_slot_mode(slot_id)
-                    self.consecutive_api_errors += 1
-                    if self.consecutive_api_errors >= config.MAX_CONSECUTIVE_ERRORS:
-                        self.pause(f"{self.consecutive_api_errors} consecutive API errors")
 
             elif isinstance(action, sm.CancelOrderAction):
                 if action.txid:
@@ -15360,7 +15360,9 @@ class BotRuntime:
 
             self._refresh_price(strict=False)
             if self._price_age_sec() > config.STALE_PRICE_MAX_AGE_SEC:
-                self.pause("stale price data > 60s")
+                logger.warning("stale price data (%.1fs) — skipping loop cycle", self._price_age_sec())
+                self._save_snapshot()
+                return
             loop_now = _now()
             self._sync_ohlcv_candles(loop_now)
             self._update_daily_loss_lock(loop_now)

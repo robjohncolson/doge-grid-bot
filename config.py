@@ -313,7 +313,7 @@ GRID_DRIFT_RESET_PCT: float = _env("GRID_DRIFT_RESET_PCT", 5.0, float)
 
 # Maximum consecutive API errors before the bot gives up.
 # Protects against Kraken outages or network issues draining your rate limit.
-MAX_CONSECUTIVE_ERRORS: int = _env("MAX_CONSECUTIVE_ERRORS", 5, int)
+MAX_CONSECUTIVE_ERRORS: int = _env("MAX_CONSECUTIVE_ERRORS", 25, int)
 
 # ---------------------------------------------------------------------------
 # Timing
