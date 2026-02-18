@@ -2943,7 +2943,7 @@ DASHBOARD_HTML = """<!doctype html>
         dustDetailsEl.textContent = '';
       }
       // --- Herd Mode panel ---
-      const herd = d.herd_mode || {};
+      const herd = s.herd_mode || {};
       const herdEnabled = Boolean(herd.enabled);
       const herdStatusEl = document.getElementById('herdStatus');
       herdStatusEl.textContent = herdEnabled ? 'ON' : 'OFF';
@@ -2954,7 +2954,7 @@ DASHBOARD_HTML = """<!doctype html>
         `${stickyCount} sticky / ${cyclingCount} cycling`;
       const herdRange = herd.stuck_exit_range;
       document.getElementById('herdRange').textContent = herdRange
-        ? `$${fmt(herdRange[0], 6)} – $${fmt(herdRange[1], 6)}`
+        ? `$${fmt(herdRange[0], 6)} - $${fmt(herdRange[1], 6)}`
         : 'insufficient data';
       const herdAdvisoryEl = document.getElementById('herdAdvisory');
       const pendingActions = herd.pending_actions || [];
@@ -2965,7 +2965,7 @@ DASHBOARD_HTML = """<!doctype html>
       }
 
       // --- Advisory Intelligence panel ---
-      const advisory = d.advisory || {};
+      const advisory = s.advisory || {};
       const advisoryRegimeEl = document.getElementById('advisoryRegime');
       advisoryRegimeEl.textContent = String(advisory.regime_suggestion || 'neutral');
       advisoryRegimeEl.style.color = advisory.regime_suggestion === 'neutral' ? '' : 'var(--warn)';
