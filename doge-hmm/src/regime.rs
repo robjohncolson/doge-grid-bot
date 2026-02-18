@@ -4,8 +4,13 @@ use crate::math::baum_welch::normalize_probs;
 use crate::math::ema::clamp;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyAny;
 use pyo3::types::PyDict;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const TIER_SHALLOW_MAX: i32 = 999;
+const TIER_BASELINE_MAX: i32 = 2499;
+const TIER_DEEP_MAX: i32 = 3999;
 
 #[allow(non_camel_case_types)]
 #[pyclass(eq, eq_int)]
@@ -86,6 +91,89 @@ impl RegimeState {
     }
 }
 
+#[pyclass]
+#[derive(Clone, Debug)]
+pub struct TertiaryTransition {
+    #[pyo3(get, set)]
+    pub from_regime: i32,
+    #[pyo3(get, set)]
+    pub to_regime: i32,
+    #[pyo3(get, set)]
+    pub confirmation_count: i32,
+    #[pyo3(get, set)]
+    pub confirmed: bool,
+    #[pyo3(get, set)]
+    pub changed_at: f64,
+    #[pyo3(get, set)]
+    pub transition_age_sec: f64,
+}
+
+impl Default for TertiaryTransition {
+    fn default() -> Self {
+        Self {
+            from_regime: Regime::RANGING as i32,
+            to_regime: Regime::RANGING as i32,
+            confirmation_count: 0,
+            confirmed: false,
+            changed_at: 0.0,
+            transition_age_sec: 0.0,
+        }
+    }
+}
+
+#[pymethods]
+impl TertiaryTransition {
+    #[new]
+    #[pyo3(signature = (
+        from_regime=Regime::RANGING as i32,
+        to_regime=Regime::RANGING as i32,
+        confirmation_count=0,
+        confirmed=false,
+        changed_at=0.0,
+        transition_age_sec=0.0,
+    ))]
+    fn new(
+        from_regime: i32,
+        to_regime: i32,
+        confirmation_count: i32,
+        confirmed: bool,
+        changed_at: f64,
+        transition_age_sec: f64,
+    ) -> Self {
+        Self {
+            from_regime,
+            to_regime,
+            confirmation_count,
+            confirmed,
+            changed_at,
+            transition_age_sec,
+        }
+    }
+
+    fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let d = PyDict::new_bound(py);
+        d.set_item("from_regime", self.from_regime)?;
+        d.set_item("to_regime", self.to_regime)?;
+        d.set_item("confirmation_count", self.confirmation_count)?;
+        d.set_item("confirmed", self.confirmed)?;
+        d.set_item("changed_at", self.changed_at)?;
+        d.set_item("transition_age_sec", self.transition_age_sec)?;
+        Ok(d.unbind())
+    }
+
+    #[staticmethod]
+    fn from_dict(d: &Bound<'_, PyDict>) -> PyResult<Self> {
+        Ok(Self {
+            from_regime: dict_regime_i32(d, "from_regime", Regime::RANGING as i32),
+            to_regime: dict_regime_i32(d, "to_regime", Regime::RANGING as i32),
+            confirmation_count: dict_i32(d, "confirmation_count", 0).max(0),
+            confirmed: dict_bool(d, "confirmed", false),
+            changed_at: dict_f64(d, "changed_at", 0.0),
+            transition_age_sec: dict_f64(d, "transition_age_sec", 0.0).max(0.0),
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 struct HmmConfig {
     n_states: usize,
@@ -121,6 +209,9 @@ pub struct RegimeDetector {
     pub _trained: bool,
     #[pyo3(get)]
     pub _last_train_ts: f64,
+    #[pyo3(get)]
+    pub training_depth: i32,
+    tertiary_transition: TertiaryTransition,
 
     cfg: HmmConfig,
     extractor: FeatureExtractor,
@@ -163,6 +254,8 @@ impl RegimeDetector {
             },
             _trained: false,
             _last_train_ts: 0.0,
+            training_depth: 0,
+            tertiary_transition: TertiaryTransition::default(),
             cfg,
             extractor: FeatureExtractor::default(),
             model: None,
@@ -172,6 +265,7 @@ impl RegimeDetector {
 
     fn train(&mut self, closes: Vec<f64>, volumes: Vec<f64>) -> PyResult<bool> {
         let obs = self.extractor.extract_rows(&closes, &volumes)?;
+        self.training_depth = i32::try_from(obs.len()).unwrap_or(i32::MAX);
         if obs.len() < self.cfg.min_train_samples {
             self._trained = false;
             return Ok(false);
@@ -183,6 +277,7 @@ impl RegimeDetector {
         }
 
         self.label_map = hmm.label_map_by_feature(1).unwrap_or_else(|| vec![0, 1, 2]);
+        self.training_depth = i32::try_from(hmm.training_depth()).unwrap_or(i32::MAX);
         self.model = Some(hmm);
         self._trained = true;
         self._last_train_ts = now_ts();
@@ -226,15 +321,17 @@ impl RegimeDetector {
         } else {
             clamp((p[2] - p[0]) * self.cfg.bias_gain, -1.0, 1.0)
         };
+        let updated_at = now_ts();
 
         self.state = RegimeState {
             regime,
             probabilities: vec![p[0], p[1], p[2]],
             confidence: round4(confidence),
             bias_signal: round4(bias_signal),
-            last_update_ts: now_ts(),
+            last_update_ts: updated_at,
             observation_count: tail.len(),
         };
+        self.advance_tertiary_transition(regime, updated_at);
 
         Ok(self.state.clone())
     }
@@ -244,6 +341,61 @@ impl RegimeDetector {
             return true;
         }
         (now_ts() - self._last_train_ts) >= self.cfg.retrain_interval_sec
+    }
+
+    fn quality_tier(&self) -> String {
+        quality_tier_for_depth(self.training_depth).to_string()
+    }
+
+    fn confidence_modifier(&self) -> f64 {
+        confidence_modifier_for_depth(self.training_depth)
+    }
+
+    fn get_tertiary_transition(&self) -> TertiaryTransition {
+        self.tertiary_transition.clone()
+    }
+
+    fn set_tertiary_transition(&mut self, transition: TertiaryTransition) {
+        self.tertiary_transition = transition;
+    }
+}
+
+pub(crate) fn quality_tier_for_depth(depth: i32) -> &'static str {
+    let d = depth.max(0);
+    if d <= TIER_SHALLOW_MAX {
+        "shallow"
+    } else if d <= TIER_BASELINE_MAX {
+        "baseline"
+    } else if d <= TIER_DEEP_MAX {
+        "deep"
+    } else {
+        "full"
+    }
+}
+
+pub(crate) fn confidence_modifier_for_depth(depth: i32) -> f64 {
+    match quality_tier_for_depth(depth) {
+        "shallow" => 0.70,
+        "baseline" => 0.85,
+        "deep" => 0.95,
+        _ => 1.00,
+    }
+}
+
+pub(crate) fn confidence_modifier_for_source(
+    source: &str,
+    primary_depth: i32,
+    secondary_depth: i32,
+    tertiary_depth: i32,
+) -> f64 {
+    let normalized = source.trim().to_lowercase();
+    match normalized.as_str() {
+        "secondary" | "15m" => confidence_modifier_for_depth(secondary_depth),
+        "tertiary" | "1h" => confidence_modifier_for_depth(tertiary_depth),
+        "consensus" | "consensus_min" => {
+            confidence_modifier_for_depth(primary_depth).min(confidence_modifier_for_depth(secondary_depth))
+        }
+        _ => confidence_modifier_for_depth(primary_depth),
     }
 }
 
@@ -259,12 +411,57 @@ impl RegimeDetector {
         labeled
     }
 
+    fn advance_tertiary_transition(&mut self, regime: i32, now: f64) {
+        let norm_regime = normalize_regime_i32(regime).unwrap_or(Regime::RANGING as i32);
+        if self.tertiary_transition.changed_at <= 0.0 {
+            self.tertiary_transition = TertiaryTransition {
+                from_regime: norm_regime,
+                to_regime: norm_regime,
+                confirmation_count: 1,
+                confirmed: false,
+                changed_at: now,
+                transition_age_sec: 0.0,
+            };
+            return;
+        }
+
+        if norm_regime != self.tertiary_transition.to_regime {
+            self.tertiary_transition = TertiaryTransition {
+                from_regime: self.tertiary_transition.to_regime,
+                to_regime: norm_regime,
+                confirmation_count: 1,
+                confirmed: false,
+                changed_at: now,
+                transition_age_sec: 0.0,
+            };
+            return;
+        }
+
+        let next_count = (self.tertiary_transition.confirmation_count + 1).max(1);
+        let age_sec = (now - self.tertiary_transition.changed_at).max(0.0);
+        self.tertiary_transition.confirmation_count = next_count;
+        self.tertiary_transition.transition_age_sec = age_sec;
+        self.tertiary_transition.confirmed = self.tertiary_transition.from_regime != self.tertiary_transition.to_regime
+            && next_count >= 2;
+    }
+
     pub(crate) fn snapshot(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let state_dict = self.state.to_dict(py)?;
+        let tertiary_transition_dict = self.tertiary_transition.to_dict(py)?;
         let d = PyDict::new_bound(py);
         d.set_item("_hmm_regime_state", state_dict)?;
         d.set_item("_hmm_last_train_ts", self._last_train_ts)?;
         d.set_item("_hmm_trained", self._trained)?;
+        d.set_item("_hmm_training_depth", self.training_depth)?;
+        d.set_item(
+            "_hmm_quality_tier",
+            quality_tier_for_depth(self.training_depth),
+        )?;
+        d.set_item(
+            "_hmm_confidence_modifier",
+            confidence_modifier_for_depth(self.training_depth),
+        )?;
+        d.set_item("_hmm_tertiary_transition", tertiary_transition_dict)?;
         Ok(d.unbind())
     }
 
@@ -277,6 +474,12 @@ impl RegimeDetector {
 
         self._last_train_ts = dict_f64(snapshot, "_hmm_last_train_ts", self._last_train_ts);
         self._trained = dict_bool(snapshot, "_hmm_trained", self._trained);
+        self.training_depth = dict_i32(snapshot, "_hmm_training_depth", self.training_depth).max(0);
+        if let Ok(Some(transition_any)) = snapshot.get_item("_hmm_tertiary_transition") {
+            if let Ok(transition_dict) = transition_any.downcast::<PyDict>() {
+                self.tertiary_transition = TertiaryTransition::from_dict(&transition_dict)?;
+            }
+        }
         Ok(())
     }
 }
@@ -316,6 +519,13 @@ fn dict_i32(d: &Bound<'_, PyDict>, key: &str, default: i32) -> i32 {
     }
 }
 
+fn dict_regime_i32(d: &Bound<'_, PyDict>, key: &str, default: i32) -> i32 {
+    match d.get_item(key) {
+        Ok(Some(v)) => any_to_regime_i32(&v).unwrap_or(default),
+        _ => default,
+    }
+}
+
 fn dict_usize(d: &Bound<'_, PyDict>, key: &str, default: usize) -> usize {
     match d.get_item(key) {
         Ok(Some(v)) => v.extract::<usize>().unwrap_or(default),
@@ -334,5 +544,95 @@ fn dict_vec_f64(d: &Bound<'_, PyDict>, key: &str, default: Vec<f64>) -> Vec<f64>
     match d.get_item(key) {
         Ok(Some(v)) => v.extract::<Vec<f64>>().unwrap_or(default),
         _ => default,
+    }
+}
+
+fn normalize_regime_i32(value: i32) -> Option<i32> {
+    if (Regime::BEARISH as i32..=Regime::BULLISH as i32).contains(&value) {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn any_to_regime_i32(v: &Bound<'_, PyAny>) -> Option<i32> {
+    if let Ok(i) = v.extract::<i32>() {
+        return normalize_regime_i32(i);
+    }
+    if let Ok(f) = v.extract::<f64>() {
+        return normalize_regime_i32(f.trunc() as i32);
+    }
+    if let Ok(s) = v.extract::<String>() {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if let Ok(i) = trimmed.parse::<i32>() {
+            return normalize_regime_i32(i);
+        }
+        return match trimmed.to_ascii_uppercase().as_str() {
+            "BEARISH" => Some(Regime::BEARISH as i32),
+            "RANGING" => Some(Regime::RANGING as i32),
+            "BULLISH" => Some(Regime::BULLISH as i32),
+            _ => None,
+        };
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quality_tiers_match_depth_ranges() {
+        assert_eq!(quality_tier_for_depth(-10), "shallow");
+        assert_eq!(quality_tier_for_depth(0), "shallow");
+        assert_eq!(quality_tier_for_depth(999), "shallow");
+        assert_eq!(quality_tier_for_depth(1000), "baseline");
+        assert_eq!(quality_tier_for_depth(2499), "baseline");
+        assert_eq!(quality_tier_for_depth(2500), "deep");
+        assert_eq!(quality_tier_for_depth(3999), "deep");
+        assert_eq!(quality_tier_for_depth(4000), "full");
+    }
+
+    #[test]
+    fn confidence_modifiers_match_tiers() {
+        assert!((confidence_modifier_for_depth(500) - 0.70).abs() < 1e-9);
+        assert!((confidence_modifier_for_depth(1500) - 0.85).abs() < 1e-9);
+        assert!((confidence_modifier_for_depth(3000) - 0.95).abs() < 1e-9);
+        assert!((confidence_modifier_for_depth(5000) - 1.00).abs() < 1e-9);
+    }
+
+    #[test]
+    fn confidence_modifier_for_source_uses_requested_pipeline() {
+        let primary = 900;
+        let secondary = 2800;
+        let tertiary = 4200;
+        assert!((confidence_modifier_for_source("primary", primary, secondary, tertiary) - 0.70).abs() < 1e-9);
+        assert!((confidence_modifier_for_source("secondary", primary, secondary, tertiary) - 0.95).abs() < 1e-9);
+        assert!((confidence_modifier_for_source("tertiary", primary, secondary, tertiary) - 1.00).abs() < 1e-9);
+        assert!((confidence_modifier_for_source("consensus", primary, secondary, tertiary) - 0.70).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tertiary_transition_tracks_changes_and_confirmation() {
+        let mut detector = RegimeDetector::new(None);
+        detector.advance_tertiary_transition(Regime::RANGING as i32, 100.0);
+        assert_eq!(detector.tertiary_transition.from_regime, Regime::RANGING as i32);
+        assert_eq!(detector.tertiary_transition.to_regime, Regime::RANGING as i32);
+        assert_eq!(detector.tertiary_transition.confirmation_count, 1);
+        assert!(!detector.tertiary_transition.confirmed);
+
+        detector.advance_tertiary_transition(Regime::BULLISH as i32, 160.0);
+        assert_eq!(detector.tertiary_transition.from_regime, Regime::RANGING as i32);
+        assert_eq!(detector.tertiary_transition.to_regime, Regime::BULLISH as i32);
+        assert_eq!(detector.tertiary_transition.confirmation_count, 1);
+        assert!(!detector.tertiary_transition.confirmed);
+
+        detector.advance_tertiary_transition(Regime::BULLISH as i32, 220.0);
+        assert_eq!(detector.tertiary_transition.confirmation_count, 2);
+        assert!(detector.tertiary_transition.confirmed);
+        assert!(detector.tertiary_transition.transition_age_sec >= 60.0);
     }
 }

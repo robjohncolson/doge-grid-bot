@@ -1,5 +1,5 @@
 {
-  "name": "s2_timeout_orphans_worse_exit",
+  "name": "recovery_eviction_with_regime",
   "config": {
     "entry_pct": 0.2,
     "profit_pct": 1.0,
@@ -11,59 +11,71 @@
     "min_cost_usd": 0.0,
     "maker_fee_pct": 0.25,
     "s1_orphan_after_sec": 600.0,
-    "s2_orphan_after_sec": 300.0,
+    "s2_orphan_after_sec": 1800.0,
     "loss_backoff_start": 3,
     "loss_cooldown_start": 5,
     "loss_cooldown_sec": 900.0,
-    "max_recovery_slots": 2
+    "max_recovery_slots": 1
   },
   "initial_state": {
-    "market_price": 100.0,
-    "now": 900.0,
+    "market_price": 101.0,
+    "now": 2000.0,
     "orders": [
       {
         "local_id": 1,
         "side": "buy",
         "role": "exit",
-        "price": 80.0,
+        "price": 100.0,
         "volume": 13.0,
         "trade_id": "A",
         "cycle": 1,
         "txid": "TX-A-EXIT",
         "entry_price": 101.0,
         "entry_fee": 0.02,
-        "entry_filled_at": 600.0,
-        "regime_at_entry": null
+        "entry_filled_at": 800.0,
+        "regime_at_entry": 1
       },
       {
         "local_id": 2,
-        "side": "sell",
-        "role": "exit",
-        "price": 101.0,
+        "side": "buy",
+        "role": "entry",
+        "price": 99.8,
         "volume": 13.0,
         "trade_id": "B",
         "cycle": 1,
-        "txid": "TX-B-EXIT",
-        "entry_price": 99.0,
-        "entry_fee": 0.02,
-        "entry_filled_at": 600.0,
+        "txid": "TX-B-ENTRY",
+        "placed_at": 900.0,
         "regime_at_entry": null
       }
     ],
-    "recovery_orders": [],
+    "recovery_orders": [
+      {
+        "recovery_id": 1,
+        "side": "sell",
+        "price": 105.0,
+        "volume": 13.0,
+        "trade_id": "B",
+        "cycle": 1,
+        "entry_price": 99.0,
+        "orphaned_at": 1000.0,
+        "entry_fee": 0.03,
+        "entry_filled_at": 900.0,
+        "txid": "TX-REC-OLD",
+        "reason": "s1_timeout",
+        "regime_at_entry": 2
+      }
+    ],
     "completed_cycles": [],
     "cycle_a": 1,
     "cycle_b": 1,
     "next_order_id": 3,
-    "next_recovery_id": 1,
+    "next_recovery_id": 2,
     "total_profit": 0.0,
+    "total_settled_usd": 0.0,
     "total_fees": 0.0,
     "today_realized_loss": 0.0,
     "total_round_trips": 0,
-    "s2_entered_at": 600.0,
-    "long_only": true,
-    "profit_pct_runtime": 1.0,
-    "total_settled_usd": 0.0
+    "profit_pct_runtime": 1.0
   },
   "order_size_usd": 2.0,
   "order_sizes": null,
@@ -71,19 +83,23 @@
     {
       "type": "TimerTick",
       "payload": {
-        "timestamp": 1000.0
+        "timestamp": 2001.0
       }
     }
   ],
   "expected": {
-    "phase": "S1b",
+    "phase": "S0",
     "open_orders": 1,
     "recovery_orders": 1,
-    "round_trips": 0,
-    "completed_cycles": 0,
+    "completed_cycles": 1,
+    "round_trips": 1,
     "cycle_a": 2,
     "cycle_b": 1,
-    "s2_entered_at": null,
-    "invariants": []
+    "total_settled_usd": 22.7175,
+    "last_cycle_regime_at_entry": 2,
+    "recovery_regime_at_entry": 1,
+    "book_action_settled_usd": 22.7175,
+    "last_cycle_quote_fee": 3.2825,
+    "last_cycle_settled_usd": 22.7175
   }
 }

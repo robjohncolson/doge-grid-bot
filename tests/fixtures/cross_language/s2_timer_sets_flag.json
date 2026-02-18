@@ -31,7 +31,8 @@
         "txid": "TX-A-EXIT",
         "entry_price": 0.1005,
         "entry_fee": 0.01,
-        "entry_filled_at": 900.0
+        "entry_filled_at": 900.0,
+        "regime_at_entry": null
       },
       {
         "local_id": 2,
@@ -44,7 +45,8 @@
         "txid": "TX-B-EXIT",
         "entry_price": 0.0995,
         "entry_fee": 0.01,
-        "entry_filled_at": 900.0
+        "entry_filled_at": 900.0,
+        "regime_at_entry": null
       }
     ],
     "cycle_a": 1,
@@ -56,7 +58,10 @@
     "today_realized_loss": 0.0,
     "total_round_trips": 0,
     "s2_entered_at": null,
-    "profit_pct_runtime": 1.0
+    "profit_pct_runtime": 1.0,
+    "total_settled_usd": 0.0,
+    "recovery_orders": [],
+    "completed_cycles": []
   },
   "order_size_usd": 2.0,
   "order_sizes": null,
@@ -77,4 +82,3 @@
     "invariants": []
   }
 }
-

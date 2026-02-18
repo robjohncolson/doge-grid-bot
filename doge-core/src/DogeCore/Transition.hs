@@ -86,7 +86,8 @@ orphanExit st cfg order reason defaultOrderSizeUsd maybeOrderSizes =
         txid = orderTxid,
         entry_price = orderEntryPrice,
         entry_fee = orderEntryFee,
-        entry_filled_at = orderEntryFilledAt
+        entry_filled_at = orderEntryFilledAt,
+        regime_at_entry = orderRegimeAtEntry
       } = order
 
     maxRecoverySlots = max 1 (max_recovery_slots cfg)
@@ -110,7 +111,8 @@ orphanExit st cfg order reason defaultOrderSizeUsd maybeOrderSizes =
           entry_fee = orderEntryFee,
           entry_filled_at = orderEntryFilledAt,
           txid = orderTxid,
-          reason = reason
+          reason = reason,
+          regime_at_entry = orderRegimeAtEntry
         }
     stAfterMove =
       stAfterEvictions
@@ -191,7 +193,8 @@ evictRecoveriesForCap st cfg overflow =
                   orphaned_at = recOrphanedAt,
                   entry_fee = recEntryFee,
                   entry_filled_at = recEntryFilledAt,
-                  txid = recTxid
+                  txid = recTxid,
+                  regime_at_entry = recRegimeAtEntry
                 } = recovery
               maybeCancelAction =
                 if T.null recTxid
@@ -235,7 +238,8 @@ evictRecoveriesForCap st cfg overflow =
                     entry_filled_at =
                       if recEntryFilledAt > 0
                         then recEntryFilledAt
-                        else recOrphanedAt
+                        else recOrphanedAt,
+                    regime_at_entry = recRegimeAtEntry
                   }
               (stAfterBook, cycleRecord, bookAction) =
                 bookCycle stAcc pseudoOrder fillPrice fillFee (now stAcc) True
@@ -454,7 +458,13 @@ handleEntryFill :: PairState -> OrderState -> Double -> Double -> Double -> Doub
 handleEntryFill st order fillPrice fillVolume fillFee eventTimestamp cfg =
   (nextState, [ActPlaceOrder placeAction])
   where
-    OrderState {local_id = orderLocalId, side = orderSide, trade_id = orderTradeId, cycle = orderCycle} = order
+    OrderState
+      { local_id = orderLocalId,
+        side = orderSide,
+        trade_id = orderTradeId,
+        cycle = orderCycle,
+        regime_at_entry = orderRegimeAtEntry
+      } = order
     stWithoutFilledOrder = st {orders = removeOrderByLocalId (orders st) orderLocalId}
     stWithEntryFee = stWithoutFilledOrder {total_fees = total_fees stWithoutFilledOrder + fillFee}
     exitSide = oppositeSide orderSide
@@ -473,7 +483,8 @@ handleEntryFill st order fillPrice fillVolume fillFee eventTimestamp cfg =
           placed_at = eventTimestamp,
           entry_price = fillPrice,
           entry_fee = fillFee,
-          entry_filled_at = eventTimestamp
+          entry_filled_at = eventTimestamp,
+          regime_at_entry = orderRegimeAtEntry
         }
     withExitOrder =
       stWithEntryFee
@@ -591,7 +602,8 @@ newEntryOrder st cfg sideForOrder tradeId cycleValue orderSizeUsd reason =
               placed_at = now st,
               entry_price = 0.0,
               entry_fee = 0.0,
-              entry_filled_at = 0.0
+              entry_filled_at = 0.0,
+              regime_at_entry = Nothing
             }
         action =
           PlaceOrderAction
@@ -690,14 +702,22 @@ bookCycle st order fillPrice fillFee eventTimestamp fromRecovery =
         entry_price = orderEntryPrice,
         entry_fee = orderEntryFee,
         entry_filled_at = orderEntryFilledAt,
-        cycle = orderCycle
+        cycle = orderCycle,
+        regime_at_entry = orderRegimeAtEntry
       } = order
     grossProfit =
       case orderTradeId of
         TradeA -> (orderEntryPrice - fillPrice) * orderVolume
         TradeB -> (fillPrice - orderEntryPrice) * orderVolume
-    feesPaid = orderEntryFee + fillFee
+    entryFee = orderEntryFee
+    exitFee = fillFee
+    feesPaid = entryFee + exitFee
     netProfit = grossProfit - feesPaid
+    quoteFee =
+      case orderTradeId of
+        TradeA -> entryFee
+        TradeB -> exitFee
+    settledUsd = grossProfit - quoteFee
     cycleRecord =
       CycleRecord
         { trade_id = orderTradeId,
@@ -708,9 +728,14 @@ bookCycle st order fillPrice fillFee eventTimestamp fromRecovery =
           gross_profit = grossProfit,
           fees = feesPaid,
           net_profit = netProfit,
+          entry_fee = entryFee,
+          exit_fee = exitFee,
+          quote_fee = quoteFee,
+          settled_usd = settledUsd,
           entry_time = orderEntryFilledAt,
           exit_time = eventTimestamp,
-          from_recovery = fromRecovery
+          from_recovery = fromRecovery,
+          regime_at_entry = orderRegimeAtEntry
         }
     totalLoss =
       if netProfit < 0
@@ -719,6 +744,7 @@ bookCycle st order fillPrice fillFee eventTimestamp fromRecovery =
     nextState =
       st
         { total_profit = total_profit st + netProfit,
+          total_settled_usd = total_settled_usd st + settledUsd,
           total_fees = total_fees st + fillFee,
           today_realized_loss = totalLoss,
           total_round_trips = total_round_trips st + 1,
@@ -731,6 +757,7 @@ bookCycle st order fillPrice fillFee eventTimestamp fromRecovery =
           net_profit = netProfit,
           gross_profit = grossProfit,
           fees = feesPaid,
+          settled_usd = settledUsd,
           from_recovery = fromRecovery
         }
 
@@ -784,7 +811,8 @@ handleRecoveryFillEvent st RecoveryFillEvent {recovery_id = recoveryId, price = 
             entry_price = recEntryPrice,
             orphaned_at = recOrphanedAt,
             entry_fee = recEntryFee,
-            entry_filled_at = recEntryFilledAt
+            entry_filled_at = recEntryFilledAt,
+            regime_at_entry = recRegimeAtEntry
           } = recovery
         stWithoutRecovery = stWithNow {recovery_orders = removeRecoveryById (recovery_orders stWithNow) recId}
         pseudoOrder =
@@ -803,7 +831,8 @@ handleRecoveryFillEvent st RecoveryFillEvent {recovery_id = recoveryId, price = 
               entry_filled_at =
                 if recEntryFilledAt > 0
                   then recEntryFilledAt
-                  else recOrphanedAt
+                  else recOrphanedAt,
+              regime_at_entry = recRegimeAtEntry
             }
         (stAfterBook, cycleRecord, bookAction) = bookCycle stWithoutRecovery pseudoOrder fillPrice fillFee eventTimestamp True
         CycleRecord {net_profit = cycleNetProfit} = cycleRecord

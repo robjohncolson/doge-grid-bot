@@ -6,7 +6,10 @@ mod regime;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use regime::{RegimeDetector, RegimeState};
+use regime::{
+    confidence_modifier_for_source as confidence_modifier_for_source_impl, RegimeDetector,
+    RegimeState, TertiaryTransition,
+};
 
 #[pyfunction]
 fn compute_blended_idle_target(
@@ -66,10 +69,22 @@ fn restore_from_snapshot(detector: &mut RegimeDetector, snapshot: &Bound<'_, PyD
     detector.restore_snapshot(snapshot)
 }
 
+#[pyfunction]
+#[pyo3(signature = (source, primary_depth, secondary_depth, tertiary_depth))]
+fn confidence_modifier_for_source(
+    source: &str,
+    primary_depth: i32,
+    secondary_depth: i32,
+    tertiary_depth: i32,
+) -> f64 {
+    confidence_modifier_for_source_impl(source, primary_depth, secondary_depth, tertiary_depth)
+}
+
 #[pymodule]
 fn doge_hmm(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<regime::Regime>()?;
     m.add_class::<regime::RegimeState>()?;
+    m.add_class::<TertiaryTransition>()?;
     m.add_class::<features::FeatureExtractor>()?;
     m.add_class::<regime::RegimeDetector>()?;
 
@@ -77,6 +92,7 @@ fn doge_hmm(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_grid_bias, m)?)?;
     m.add_function(wrap_pyfunction!(serialize_for_snapshot, m)?)?;
     m.add_function(wrap_pyfunction!(restore_from_snapshot, m)?)?;
+    m.add_function(wrap_pyfunction!(confidence_modifier_for_source, m)?)?;
 
     Ok(())
 }

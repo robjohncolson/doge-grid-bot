@@ -45,7 +45,7 @@ def _fixture_paths() -> list[Path]:
 class CrossLanguageParityTests(unittest.TestCase):
     def test_fixtures_exist(self) -> None:
         paths = _fixture_paths()
-        self.assertGreaterEqual(len(paths), 12)
+        self.assertGreaterEqual(len(paths), 20)
 
     def _run_parity_with_fixtures(self) -> None:
         for path in _fixture_paths():
@@ -54,7 +54,10 @@ class CrossLanguageParityTests(unittest.TestCase):
             with self.subTest(fixture=name):
                 cfg = sm.EngineConfig(**fixture["config"])
                 py_state = sm.from_dict(fixture["initial_state"])
-                dc_state = sm.from_dict(fixture["initial_state"])
+                if fixture.get("dc_raw_state_on_haskell") and os.environ.get("DOGE_CORE_BACKEND") == "haskell":
+                    dc_state = fixture["initial_state"]
+                else:
+                    dc_state = sm.from_dict(fixture["initial_state"])
                 order_size_usd = float(fixture["order_size_usd"])
                 raw_order_sizes = fixture.get("order_sizes")
                 order_sizes = None
@@ -62,6 +65,7 @@ class CrossLanguageParityTests(unittest.TestCase):
                     order_sizes = {str(k): float(v) for k, v in raw_order_sizes.items()}
 
                 events = [_build_event(raw) for raw in fixture["events"]]
+                last_py_actions: list[sm.Action] = []
                 for idx, event in enumerate(events):
                     py_state, py_actions = sm.transition(
                         py_state,
@@ -93,6 +97,7 @@ class CrossLanguageParityTests(unittest.TestCase):
                         dc.check_invariants(dc_state),
                         f"{name}: invariant results diverged at event index {idx}",
                     )
+                    last_py_actions = py_actions
 
                 expected = fixture.get("expected", {})
                 if "phase" in expected:
@@ -154,6 +159,52 @@ class CrossLanguageParityTests(unittest.TestCase):
                     self.assertEqual(py_state.last_refresh_direction_b, expected["last_refresh_direction_b"], name)
                 if "invariants" in expected:
                     self.assertEqual(sm.check_invariants(py_state), list(expected["invariants"]), name)
+                if "exit_regime_at_entry" in expected:
+                    exit_orders = [o for o in py_state.orders if o.role == "exit"]
+                    self.assertGreaterEqual(len(exit_orders), 1, name)
+                    self.assertEqual(exit_orders[0].regime_at_entry, expected["exit_regime_at_entry"], name)
+                if "recovery_regime_at_entry" in expected:
+                    self.assertGreaterEqual(len(py_state.recovery_orders), 1, name)
+                    self.assertEqual(py_state.recovery_orders[-1].regime_at_entry, expected["recovery_regime_at_entry"], name)
+                if "total_settled_usd" in expected:
+                    self.assertAlmostEqual(
+                        float(py_state.total_settled_usd),
+                        float(expected["total_settled_usd"]),
+                        places=9,
+                        msg=name,
+                    )
+                if "last_cycle_quote_fee" in expected:
+                    self.assertGreaterEqual(len(py_state.completed_cycles), 1, name)
+                    self.assertAlmostEqual(
+                        float(py_state.completed_cycles[-1].quote_fee),
+                        float(expected["last_cycle_quote_fee"]),
+                        places=9,
+                        msg=name,
+                    )
+                if "last_cycle_settled_usd" in expected:
+                    self.assertGreaterEqual(len(py_state.completed_cycles), 1, name)
+                    self.assertAlmostEqual(
+                        float(py_state.completed_cycles[-1].settled_usd),
+                        float(expected["last_cycle_settled_usd"]),
+                        places=9,
+                        msg=name,
+                    )
+                if "last_cycle_regime_at_entry" in expected:
+                    self.assertGreaterEqual(len(py_state.completed_cycles), 1, name)
+                    self.assertEqual(
+                        py_state.completed_cycles[-1].regime_at_entry,
+                        expected["last_cycle_regime_at_entry"],
+                        name,
+                    )
+                if "book_action_settled_usd" in expected:
+                    book_actions = [a for a in last_py_actions if isinstance(a, sm.BookCycleAction)]
+                    self.assertGreaterEqual(len(book_actions), 1, name)
+                    self.assertAlmostEqual(
+                        float(book_actions[-1].settled_usd),
+                        float(expected["book_action_settled_usd"]),
+                        places=9,
+                        msg=name,
+                    )
 
     def test_transition_parity_with_fixtures(self) -> None:
         self._run_parity_with_fixtures()

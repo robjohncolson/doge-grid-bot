@@ -6,6 +6,7 @@ pub struct GaussianHmm {
     n_states: usize,
     n_features: usize,
     trained: bool,
+    training_depth: usize,
     initial_probs: Vec<f64>,
     transition_matrix: Vec<Vec<f64>>,
     means: Vec<Vec<f64>>,
@@ -21,6 +22,7 @@ impl GaussianHmm {
             n_states: states,
             n_features: features,
             trained: false,
+            training_depth: 0,
             initial_probs: vec![1.0 / states as f64; states],
             transition_matrix: Self::default_transition(states),
             means: vec![vec![0.0; features]; states],
@@ -63,6 +65,7 @@ impl GaussianHmm {
         }
 
         self.trained = true;
+        self.training_depth = observations.len();
         Ok(())
     }
 
@@ -100,6 +103,10 @@ impl GaussianHmm {
 
     pub fn is_trained(&self) -> bool {
         self.trained
+    }
+
+    pub fn training_depth(&self) -> usize {
+        self.training_depth
     }
 
     fn default_probs(&self) -> Vec<f64> {

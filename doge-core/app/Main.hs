@@ -12,7 +12,7 @@ import Data.ByteString.Lazy qualified as BL
 import Data.Text qualified as T
 import DogeCore.Invariants (checkInvariants)
 import DogeCore.Transition (nativeTransition)
-import DogeCore.Types (Action, EngineConfig, Event (..), PairState, TradeId (..))
+import DogeCore.Types (Action, EngineConfig, Event (..), OrderState (..), PairState (..), TradeId (..), normalizeRegimeId)
 import System.Environment (getArgs)
 import System.Exit (ExitCode (..), exitWith)
 import System.IO (hFlush, hPutStr, isEOF, stderr, stdout)
@@ -56,6 +56,7 @@ handleRequest :: A.Object -> Either String BL.ByteString
 handleRequest obj = case KM.lookup "method" obj of
   Just (A.String "check_invariants") -> handleCheckInvariants obj
   Just (A.String "transition") -> handleTransition obj
+  Just (A.String "apply_order_regime_at_entry") -> handleApplyOrderRegimeAtEntry obj
   Just (A.String methodName) -> Left ("unsupported method: " <> T.unpack methodName)
   _ -> Left "missing method field"
 
@@ -71,6 +72,20 @@ handleTransition obj = do
   let (nextState, actions) = nativeTransition state event cfg orderSizeUsd orderSizes
   Right (encodeTransitionResponse nextState actions)
 
+handleApplyOrderRegimeAtEntry :: A.Object -> Either String BL.ByteString
+handleApplyOrderRegimeAtEntry obj = do
+  payloadObj <- parseParamsObject obj
+  state <- parseRequired "state" payloadObj
+  localId <- parseRequired "local_id" payloadObj
+  regimeRaw <- parseRequired "regime_at_entry" payloadObj
+  let normalizedRegime = normalizeRegimeId regimeRaw
+      patchedOrders =
+        map
+          (\order@OrderState {local_id = orderLocalId} -> if orderLocalId == localId then order {regime_at_entry = normalizedRegime} else order)
+          (orders state)
+      patchedState = state {orders = patchedOrders}
+  Right (A.encode (A.object ["state" A..= patchedState]))
+
 parseTransitionRequest :: A.Object -> Either String (PairState, Event, EngineConfig, Double, Maybe [(TradeId, Double)])
 parseTransitionRequest obj = do
   state <- parseRequired "state" obj
@@ -79,6 +94,13 @@ parseTransitionRequest obj = do
   orderSizeUsd <- parseRequired "order_size_usd" obj
   orderSizes <- parseOrderSizes obj
   pure (state, event, cfg, orderSizeUsd, orderSizes)
+
+parseParamsObject :: A.Object -> Either String A.Object
+parseParamsObject obj = case KM.lookup "params" obj of
+  Nothing -> Right obj
+  Just A.Null -> Left "invalid params payload: must be an object"
+  Just (A.Object payloadObj) -> Right payloadObj
+  Just _ -> Left "invalid params payload: must be an object"
 
 parseRequired :: A.FromJSON a => K.Key -> A.Object -> Either String a
 parseRequired key obj = case KM.lookup key obj of

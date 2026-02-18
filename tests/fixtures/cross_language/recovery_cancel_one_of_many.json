@@ -29,7 +29,8 @@
         "trade_id": "A",
         "cycle": 1,
         "txid": "TX-A-ENTRY",
-        "placed_at": 900.0
+        "placed_at": 900.0,
+        "regime_at_entry": null
       },
       {
         "local_id": 2,
@@ -40,7 +41,8 @@
         "trade_id": "B",
         "cycle": 1,
         "txid": "TX-B-ENTRY",
-        "placed_at": 900.0
+        "placed_at": 900.0,
+        "regime_at_entry": null
       }
     ],
     "recovery_orders": [
@@ -56,7 +58,8 @@
         "entry_fee": 0.01,
         "entry_filled_at": 760.0,
         "txid": "TX-REC-1",
-        "reason": "s1_timeout"
+        "reason": "s1_timeout",
+        "regime_at_entry": null
       },
       {
         "recovery_id": 2,
@@ -70,7 +73,8 @@
         "entry_fee": 0.01,
         "entry_filled_at": 770.0,
         "txid": "TX-REC-2",
-        "reason": "s2_timeout"
+        "reason": "s2_timeout",
+        "regime_at_entry": null
       }
     ],
     "cycle_a": 1,
@@ -81,7 +85,9 @@
     "total_fees": 0.0,
     "today_realized_loss": 0.0,
     "total_round_trips": 0,
-    "profit_pct_runtime": 1.0
+    "profit_pct_runtime": 1.0,
+    "total_settled_usd": 0.0,
+    "completed_cycles": []
   },
   "order_size_usd": 2.0,
   "order_sizes": null,
@@ -104,4 +110,3 @@
     "invariants": []
   }
 }
-

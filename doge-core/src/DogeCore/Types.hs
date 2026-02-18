@@ -23,14 +23,17 @@ module DogeCore.Types
     OrphanOrderAction (..),
     BookCycleAction (..),
     Action (..),
+    normalizeRegimeId,
   )
 where
 
 import Data.Aeson
 import Data.Aeson.KeyMap qualified as KM
 import Data.Aeson.Types (Parser)
+import Data.Char (isDigit)
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Read qualified as TR
 import GHC.Generics (Generic)
 
 data PairPhase = S0 | S1a | S1b | S2
@@ -215,7 +218,8 @@ data OrderState = OrderState
     placed_at :: Double,
     entry_price :: Double,
     entry_fee :: Double,
-    entry_filled_at :: Double
+    entry_filled_at :: Double,
+    regime_at_entry :: Maybe Int
   }
   deriving (Eq, Show, Generic)
 
@@ -236,6 +240,8 @@ instance FromJSON OrderState where
     entry_price <- withDefault o "entry_price" 0.0
     entry_fee <- withDefault o "entry_fee" 0.0
     entry_filled_at <- withDefault o "entry_filled_at" 0.0
+    regimeRaw <- withDefault o "regime_at_entry" Null
+    let regime_at_entry = normalizeRegimeId regimeRaw
     pure
       OrderState
         { local_id = local_id,
@@ -249,7 +255,8 @@ instance FromJSON OrderState where
           placed_at = placed_at,
           entry_price = entry_price,
           entry_fee = entry_fee,
-          entry_filled_at = entry_filled_at
+          entry_filled_at = entry_filled_at,
+          regime_at_entry = regime_at_entry
         }
 
 data RecoveryOrder = RecoveryOrder
@@ -264,7 +271,8 @@ data RecoveryOrder = RecoveryOrder
     entry_fee :: Double,
     entry_filled_at :: Double,
     txid :: Text,
-    reason :: Text
+    reason :: Text,
+    regime_at_entry :: Maybe Int
   }
   deriving (Eq, Show, Generic)
 
@@ -285,6 +293,8 @@ instance FromJSON RecoveryOrder where
     entry_filled_at <- withDefault o "entry_filled_at" 0.0
     txid <- withDefault o "txid" ""
     reason <- withDefault o "reason" "stale"
+    regimeRaw <- withDefault o "regime_at_entry" Null
+    let regime_at_entry = normalizeRegimeId regimeRaw
     pure
       RecoveryOrder
         { recovery_id = recovery_id,
@@ -298,7 +308,8 @@ instance FromJSON RecoveryOrder where
           entry_fee = entry_fee,
           entry_filled_at = entry_filled_at,
           txid = txid,
-          reason = reason
+          reason = reason,
+          regime_at_entry = regime_at_entry
         }
 
 data CycleRecord = CycleRecord
@@ -310,9 +321,14 @@ data CycleRecord = CycleRecord
     gross_profit :: Double,
     fees :: Double,
     net_profit :: Double,
+    entry_fee :: Double,
+    exit_fee :: Double,
+    quote_fee :: Double,
+    settled_usd :: Double,
     entry_time :: Double,
     exit_time :: Double,
-    from_recovery :: Bool
+    from_recovery :: Bool,
+    regime_at_entry :: Maybe Int
   }
   deriving (Eq, Show, Generic)
 
@@ -329,9 +345,15 @@ instance FromJSON CycleRecord where
     gross_profit <- withRequired o "gross_profit"
     fees <- withRequired o "fees"
     net_profit <- withRequired o "net_profit"
+    entry_fee <- withDefault o "entry_fee" 0.0
+    exit_fee <- withDefault o "exit_fee" 0.0
+    quote_fee <- withDefault o "quote_fee" 0.0
+    settled_usd <- withDefault o "settled_usd" 0.0
     entry_time <- withDefault o "entry_time" 0.0
     exit_time <- withDefault o "exit_time" 0.0
     from_recovery <- withDefault o "from_recovery" False
+    regimeRaw <- withDefault o "regime_at_entry" Null
+    let regime_at_entry = normalizeRegimeId regimeRaw
     pure
       CycleRecord
         { trade_id = trade_id,
@@ -342,9 +364,14 @@ instance FromJSON CycleRecord where
           gross_profit = gross_profit,
           fees = fees,
           net_profit = net_profit,
+          entry_fee = entry_fee,
+          exit_fee = exit_fee,
+          quote_fee = quote_fee,
+          settled_usd = settled_usd,
           entry_time = entry_time,
           exit_time = exit_time,
-          from_recovery = from_recovery
+          from_recovery = from_recovery,
+          regime_at_entry = regime_at_entry
         }
 
 data PairState = PairState
@@ -358,6 +385,7 @@ data PairState = PairState
     next_order_id :: Int,
     next_recovery_id :: Int,
     total_profit :: Double,
+    total_settled_usd :: Double,
     total_fees :: Double,
     today_realized_loss :: Double,
     total_round_trips :: Int,
@@ -400,6 +428,7 @@ instance FromJSON PairState where
     next_order_id <- withDefault o "next_order_id" 1
     next_recovery_id <- withDefault o "next_recovery_id" 1
     total_profit <- withDefault o "total_profit" 0.0
+    total_settled_usd <- withDefault o "total_settled_usd" total_profit
     total_fees <- withDefault o "total_fees" 0.0
     today_realized_loss <- withDefault o "today_realized_loss" 0.0
     total_round_trips <- withDefault o "total_round_trips" 0
@@ -430,6 +459,7 @@ instance FromJSON PairState where
           next_order_id = next_order_id,
           next_recovery_id = next_recovery_id,
           total_profit = total_profit,
+          total_settled_usd = total_settled_usd,
           total_fees = total_fees,
           today_realized_loss = today_realized_loss,
           total_round_trips = total_round_trips,
@@ -645,6 +675,7 @@ data BookCycleAction = BookCycleAction
     net_profit :: Double,
     gross_profit :: Double,
     fees :: Double,
+    settled_usd :: Double,
     from_recovery :: Bool
   }
   deriving (Eq, Show, Generic)
@@ -659,6 +690,7 @@ instance FromJSON BookCycleAction where
     net_profit <- withRequired o "net_profit"
     gross_profit <- withRequired o "gross_profit"
     fees <- withRequired o "fees"
+    settled_usd <- withDefault o "settled_usd" 0.0
     from_recovery <- withDefault o "from_recovery" False
     pure
       BookCycleAction
@@ -667,6 +699,7 @@ instance FromJSON BookCycleAction where
           net_profit = net_profit,
           gross_profit = gross_profit,
           fees = fees,
+          settled_usd = settled_usd,
           from_recovery = from_recovery
         }
 
@@ -698,6 +731,34 @@ instance FromJSON Action where
                 if has "local_id" && has "txid"
                   then ActCancelOrder <$> parseJSON (Object o)
                   else fail "Unable to decode Action from payload fields"
+
+normalizeRegimeId :: Value -> Maybe Int
+normalizeRegimeId raw = case raw of
+  Null -> Nothing
+  Number _ ->
+    case fromJSON raw of
+      Success d -> normalizeRegimeInt (truncate (d :: Double))
+      Error _ -> Nothing
+  String t ->
+    let s = T.strip t
+     in if T.null s
+          then Nothing
+          else
+            case T.toUpper s of
+              "BEARISH" -> Just 0
+              "RANGING" -> Just 1
+              "BULLISH" -> Just 2
+              _ ->
+                if T.all isDigit s
+                  then case TR.decimal s of
+                    Right (value, rest) | T.null rest -> normalizeRegimeInt value
+                    _ -> Nothing
+                  else Nothing
+  _ -> Nothing
+  where
+    normalizeRegimeInt value
+      | value `elem` [0, 1, 2] = Just value
+      | otherwise = Nothing
 
 withRequired :: FromJSON a => Object -> Key -> Parser a
 withRequired o k = o .: k

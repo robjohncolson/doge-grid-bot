@@ -479,6 +479,7 @@ def _action_from_dict(raw: dict[str, Any]) -> Action:
             net_profit=float(raw["net_profit"]),
             gross_profit=float(raw["gross_profit"]),
             fees=float(raw["fees"]),
+            settled_usd=float(raw.get("settled_usd", 0.0)),
             from_recovery=bool(raw.get("from_recovery", False)),
         )
 
@@ -542,6 +543,59 @@ def _actions_payload(actions: list[Action]) -> list[dict[str, Any]]:
     return payload
 
 
+def _shadow_state_focus_payload(state: PairState) -> dict[str, Any]:
+    return {
+        "total_settled_usd": float(state.total_settled_usd),
+        "orders": [
+            {
+                "local_id": int(o.local_id),
+                "trade_id": str(o.trade_id),
+                "cycle": int(o.cycle),
+                "regime_at_entry": o.regime_at_entry,
+            }
+            for o in state.orders
+        ],
+        "recovery_orders": [
+            {
+                "recovery_id": int(r.recovery_id),
+                "trade_id": str(r.trade_id),
+                "cycle": int(r.cycle),
+                "regime_at_entry": r.regime_at_entry,
+            }
+            for r in state.recovery_orders
+        ],
+        "completed_cycles": [
+            {
+                "trade_id": str(c.trade_id),
+                "cycle": int(c.cycle),
+                "entry_fee": float(c.entry_fee),
+                "exit_fee": float(c.exit_fee),
+                "quote_fee": float(c.quote_fee),
+                "settled_usd": float(c.settled_usd),
+                "regime_at_entry": c.regime_at_entry,
+            }
+            for c in state.completed_cycles
+        ],
+    }
+
+
+def _shadow_actions_focus_payload(actions: list[Action]) -> list[dict[str, Any]]:
+    focus: list[dict[str, Any]] = []
+    for action in actions:
+        if isinstance(action, BookCycleAction):
+            focus.append(
+                {
+                    "kind": "BookCycleAction",
+                    "trade_id": str(action.trade_id),
+                    "cycle": int(action.cycle),
+                    "fees": float(action.fees),
+                    "settled_usd": float(action.settled_usd),
+                    "from_recovery": bool(action.from_recovery),
+                }
+            )
+    return focus
+
+
 def transition(
     state: PairState,
     event: Event,
@@ -562,7 +616,16 @@ def transition(
             response = _call_haskell("transition", payload)
             hs_state = _parse_state(response["state"])
             hs_actions = _parse_actions(response.get("actions", []))
-            if py_state != hs_state or py_actions != hs_actions:
+            py_focus_state = _shadow_state_focus_payload(py_state)
+            hs_focus_state = _shadow_state_focus_payload(hs_state)
+            py_focus_actions = _shadow_actions_focus_payload(py_actions)
+            hs_focus_actions = _shadow_actions_focus_payload(hs_actions)
+            if (
+                py_state != hs_state
+                or py_actions != hs_actions
+                or py_focus_state != hs_focus_state
+                or py_focus_actions != hs_focus_actions
+            ):
                 _record_shadow_divergence("transition", type(event).__name__)
                 logger.warning(
                     "Shadow divergence in transition for event=%s",
@@ -572,6 +635,10 @@ def transition(
                 logger.debug("shadow haskell state=%s", to_dict(hs_state))
                 logger.debug("shadow python actions=%s", _actions_payload(py_actions))
                 logger.debug("shadow haskell actions=%s", _actions_payload(hs_actions))
+                logger.debug("shadow python focus state=%s", py_focus_state)
+                logger.debug("shadow haskell focus state=%s", hs_focus_state)
+                logger.debug("shadow python focus actions=%s", py_focus_actions)
+                logger.debug("shadow haskell focus actions=%s", hs_focus_actions)
         except Exception as exc:
             _record_shadow_failure(exc)
             logger.warning("Haskell shadow transition failed: %s", exc)
@@ -629,6 +696,55 @@ def check_invariants(state: PairState) -> list[str]:
         return _sm.check_invariants(state)
 
 
+def apply_order_regime_at_entry(
+    state: PairState,
+    local_id: int,
+    regime_at_entry: int | None,
+) -> PairState:
+    """
+    Patch helper that sets regime_at_entry for an in-flight order by local_id.
+    """
+    local_id_value = int(local_id)
+    payload = {
+        "params": {
+            "state": _state_payload(state),
+            "local_id": local_id_value,
+            "regime_at_entry": regime_at_entry,
+        }
+    }
+
+    shadow_mode = _shadow_enabled() and _haskell_executable_available()
+    if shadow_mode:
+        py_state = _sm.apply_order_regime_at_entry(state, local_id_value, regime_at_entry)
+        try:
+            response = _call_haskell("apply_order_regime_at_entry", payload)
+            hs_state = _parse_state(response["state"])
+            if py_state != hs_state:
+                _record_shadow_divergence("transition", "apply_order_regime_at_entry")
+                logger.warning("Shadow divergence in apply_order_regime_at_entry")
+                logger.debug("shadow python state=%s", to_dict(py_state))
+                logger.debug("shadow haskell state=%s", to_dict(hs_state))
+                logger.debug("shadow python focus state=%s", _shadow_state_focus_payload(py_state))
+                logger.debug("shadow haskell focus state=%s", _shadow_state_focus_payload(hs_state))
+        except Exception as exc:
+            _record_shadow_failure(exc)
+            logger.warning("Haskell shadow apply_order_regime_at_entry failed: %s", exc)
+        return py_state
+
+    if not _haskell_enabled():
+        return _sm.apply_order_regime_at_entry(state, local_id_value, regime_at_entry)
+
+    try:
+        response = _call_haskell("apply_order_regime_at_entry", payload)
+        return _parse_state(response["state"])
+    except Exception as exc:
+        logger.warning(
+            "Falling back to Python apply_order_regime_at_entry backend after Haskell failure: %s",
+            exc,
+        )
+        return _sm.apply_order_regime_at_entry(state, local_id_value, regime_at_entry)
+
+
 __all__ = [
     "Side",
     "Role",
@@ -658,6 +774,7 @@ __all__ = [
     "get_shadow_metrics",
     "reset_shadow_metrics",
     "add_entry_order",
+    "apply_order_regime_at_entry",
     "apply_order_txid",
     "remove_order",
     "remove_recovery",
