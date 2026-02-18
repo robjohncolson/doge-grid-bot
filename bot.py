@@ -13337,7 +13337,8 @@ class BotRuntime:
             market,
             sorted(balance.keys()),
         )
-        self.pause(f"slot {slot_id} cannot bootstrap: insufficient USD and DOGE")
+        # Don't pause the entire bot — just skip this slot and let others run.
+        logger.info("slot %s bootstrap deferred (insufficient funds, will retry next cycle)", slot_id)
 
     def _auto_repair_degraded_slot(self, slot_id: int) -> None:
         if self.mode != "RUNNING":
