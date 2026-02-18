@@ -4880,7 +4880,9 @@ class BotRuntime:
             slot_aliases = slot_aliases if isinstance(slot_aliases, dict) else {}
             slot_sticky_raw = snap.get("slot_sticky", {})
             slot_sticky_raw = slot_sticky_raw if isinstance(slot_sticky_raw, dict) else {}
-            legacy_default_sticky = bool(self._flag_value("STICKY_MODE_ENABLED"))
+            # Pre-herd snapshots lack slot_sticky; default True to preserve
+            # existing patient-exit behaviour and prevent orphan burst on upgrade.
+            legacy_default_sticky = True if not slot_sticky_raw else bool(self._flag_value("STICKY_MODE_ENABLED"))
             for sid_text, raw_state in (snap.get("slots", {}) or {}).items():
                 sid = int(sid_text)
                 alias = str(slot_aliases.get(str(sid)) or slot_aliases.get(sid) or "").strip().lower()

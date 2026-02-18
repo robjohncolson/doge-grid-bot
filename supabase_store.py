@@ -202,7 +202,14 @@ def _request(method: str, path: str, body: dict = None,
 
     data = None
     if body is not None:
-        data = json.dumps(body).encode("utf-8")
+        try:
+            data = json.dumps(body, allow_nan=False).encode("utf-8")
+        except ValueError:
+            # Snapshot contains float('inf') or float('nan') which are
+            # non-standard JSON tokens.  Serialize permissively then replace.
+            raw = json.dumps(body)
+            raw = raw.replace("-Infinity", "null").replace("Infinity", "null").replace("NaN", "null")
+            data = raw.encode("utf-8")
 
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
 
