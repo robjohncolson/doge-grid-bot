@@ -4260,6 +4260,32 @@ class BotEventLogTests(unittest.TestCase):
         self.assertIsNone(rt._ai_override_applied_at)
         self.assertIsNone(rt._ai_override_source_conviction)
 
+    def test_load_snapshot_clears_transient_halted_state_from_signal(self):
+        rt = bot.BotRuntime()
+        snap = rt._global_snapshot()
+        snap["mode"] = "HALTED"
+        snap["pause_reason"] = "signal 15"
+
+        with mock.patch("supabase_store.load_state", return_value=snap):
+            with mock.patch("supabase_store.load_max_event_id", return_value=0):
+                rt._load_snapshot()
+
+        self.assertEqual(rt.mode, "INIT")
+        self.assertEqual(rt.pause_reason, "")
+
+    def test_load_snapshot_preserves_non_transient_halted_state(self):
+        rt = bot.BotRuntime()
+        snap = rt._global_snapshot()
+        snap["mode"] = "HALTED"
+        snap["pause_reason"] = "slot 4 invariant violation: S1 has mismatched side"
+
+        with mock.patch("supabase_store.load_state", return_value=snap):
+            with mock.patch("supabase_store.load_max_event_id", return_value=0):
+                rt._load_snapshot()
+
+        self.assertEqual(rt.mode, "HALTED")
+        self.assertIn("invariant violation", rt.pause_reason)
+
     def test_daily_loss_lock_pauses_on_aggregate_utc_threshold(self):
         rt = bot.BotRuntime()
         rt.mode = "RUNNING"

@@ -4099,6 +4099,13 @@ class BotRuntime:
         supabase_store.save_state(snap, pair="__v1__")
         self._save_local_runtime_snapshot(snap)
 
+    @staticmethod
+    def _is_transient_halt_reason(reason: str) -> bool:
+        text = str(reason or "").strip().lower()
+        if not text:
+            return False
+        return text.startswith("signal ") or text == "process exit"
+
     def _load_snapshot(self) -> None:
         try:
             snap = supabase_store.load_state(pair="__v1__") or {}
@@ -4108,8 +4115,17 @@ class BotRuntime:
         if not snap:
             snap = self._load_local_runtime_snapshot()
         if snap:
-            self.mode = snap.get("mode", "INIT")
-            self.pause_reason = snap.get("pause_reason", "")
+            self.mode = str(snap.get("mode", "INIT") or "INIT")
+            self.pause_reason = str(snap.get("pause_reason", "") or "")
+            # Graceful shutdowns (signals/process exit) should not permanently
+            # latch HALTED across restarts; hard safety halts remain sticky.
+            if str(self.mode).upper() == "HALTED" and self._is_transient_halt_reason(self.pause_reason):
+                logger.info(
+                    "Snapshot restored transient HALTED state (%s); clearing to INIT for startup",
+                    self.pause_reason,
+                )
+                self.mode = "INIT"
+                self.pause_reason = ""
             self.entry_pct = float(snap.get("entry_pct", self.entry_pct))
             self.profit_pct = float(snap.get("profit_pct", self.profit_pct))
             self.next_slot_id = int(snap.get("next_slot_id", 1))
