@@ -5327,18 +5327,100 @@ class BotEventLogTests(unittest.TestCase):
         self.assertEqual(len(rt._partial_fill_cancel_events), 1)
         self.assertEqual(len(rt.slots[0].state.orders), 0)
 
-    def test_legacy_manual_recovery_actions_disabled_in_sticky_mode(self):
+    def test_soft_close_next_skips_sticky_and_targets_non_sticky(self):
         rt = bot.BotRuntime()
-        with mock.patch.object(config, "STICKY_MODE_ENABLED", True):
-            ok_close, msg_close = rt.soft_close(1, 1)
-            ok_next, msg_next = rt.soft_close_next()
-            ok_stale, msg_stale = rt.cancel_stale_recoveries()
-        self.assertFalse(ok_close)
-        self.assertIn("disabled in sticky mode", msg_close)
-        self.assertFalse(ok_next)
-        self.assertIn("disabled in sticky mode", msg_next)
-        self.assertFalse(ok_stale)
-        self.assertIn("disabled in sticky mode", msg_stale)
+        rt.last_price = 0.1
+        rt.slots = {
+            1: bot.SlotRuntime(
+                slot_id=1,
+                sticky=True,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    recovery_orders=(
+                        sm.RecoveryOrder(
+                            recovery_id=11,
+                            side="sell",
+                            price=0.12,
+                            volume=13.0,
+                            trade_id="A",
+                            cycle=1,
+                            entry_price=0.1,
+                            entry_fee=0.0,
+                            entry_filled_at=900.0,
+                            orphaned_at=900.0,
+                            txid="TXS",
+                            reason="s1_timeout",
+                            regime_at_entry=1,
+                        ),
+                    ),
+                ),
+            ),
+            2: bot.SlotRuntime(
+                slot_id=2,
+                sticky=False,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    recovery_orders=(
+                        sm.RecoveryOrder(
+                            recovery_id=22,
+                            side="sell",
+                            price=0.11,
+                            volume=13.0,
+                            trade_id="A",
+                            cycle=2,
+                            entry_price=0.1,
+                            entry_fee=0.0,
+                            entry_filled_at=950.0,
+                            orphaned_at=950.0,
+                            txid="TXN",
+                            reason="s1_timeout",
+                            regime_at_entry=1,
+                        ),
+                    ),
+                ),
+            ),
+        }
+        with mock.patch.object(rt, "soft_close", return_value=(True, "ok")) as soft_close_mock:
+            ok, msg = rt.soft_close_next()
+        self.assertTrue(ok)
+        self.assertEqual(msg, "ok")
+        soft_close_mock.assert_called_once_with(2, 22)
+
+    def test_soft_close_next_suggests_toggling_sticky_slot_when_none_non_sticky(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        rt.slots = {
+            5: bot.SlotRuntime(
+                slot_id=5,
+                sticky=True,
+                state=sm.PairState(
+                    market_price=0.1,
+                    now=1000.0,
+                    recovery_orders=(
+                        sm.RecoveryOrder(
+                            recovery_id=51,
+                            side="sell",
+                            price=0.12,
+                            volume=13.0,
+                            trade_id="A",
+                            cycle=1,
+                            entry_price=0.1,
+                            entry_fee=0.0,
+                            entry_filled_at=900.0,
+                            orphaned_at=900.0,
+                            txid="TXS",
+                            reason="s1_timeout",
+                            regime_at_entry=1,
+                        ),
+                    ),
+                ),
+            )
+        }
+        ok, msg = rt.soft_close_next()
+        self.assertFalse(ok)
+        self.assertIn("toggle slot 5 to CYCLE", msg)
 
     def test_recovery_actions_disabled_when_recovery_orders_disabled(self):
         rt = bot.BotRuntime()
@@ -5537,6 +5619,7 @@ class DashboardApiHardeningTests(unittest.TestCase):
             self.ai_revert_calls = 0
             self.ai_dismiss_calls = 0
             self.accum_stop_calls = 0
+            self.toggle_sticky_calls = []
             self.self_heal_reprice_calls = []
             self.self_heal_close_calls = []
             self.self_heal_keep_calls = []
@@ -5644,6 +5727,13 @@ class DashboardApiHardeningTests(unittest.TestCase):
 
         def soft_close_next(self):
             return True, "ok"
+
+        def cancel_stale_recoveries(self, _min_distance_pct=3.0, _max_batch=8):
+            return True, "ok"
+
+        def toggle_slot_sticky(self, slot_id, sticky=None):
+            self.toggle_sticky_calls.append((slot_id, sticky))
+            return True, "slot mode updated"
 
         def audit_pnl(self):
             return True, "audit ok"
@@ -6218,16 +6308,36 @@ class DashboardApiHardeningTests(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertEqual(payload, {"ok": True, "message": "released eligible"})
 
-    def test_api_action_soft_close_rejected_when_sticky_enabled(self):
-        bot._RUNTIME = self._RuntimeStub()
+    def test_api_action_toggle_sticky_routes_ok(self):
+        runtime = self._RuntimeStub()
+        bot._RUNTIME = runtime
+        handler = self._HandlerStub({"action": "toggle_sticky", "slot_id": 7})
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(runtime.toggle_sticky_calls, [(7, None)])
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 200)
+        self.assertEqual(payload, {"ok": True, "message": "slot mode updated"})
+
+    def test_api_action_soft_close_surfaces_runtime_sticky_guidance(self):
+        runtime = self._RuntimeStub()
+        runtime.soft_close = lambda _slot_id, _recovery_id: (
+            False,
+            "slot 1 is sticky; try non-sticky slot 2 recovery 7",
+        )
+        bot._RUNTIME = runtime
         handler = self._HandlerStub({"action": "soft_close", "slot_id": 1, "recovery_id": 1})
-        with mock.patch.object(config, "STICKY_MODE_ENABLED", True):
-            bot.DashboardHandler.do_POST(handler)
+        bot.DashboardHandler.do_POST(handler)
 
         self.assertEqual(len(handler.sent), 1)
         code, payload = handler.sent[0]
         self.assertEqual(code, 400)
-        self.assertEqual(payload, {"ok": False, "message": "soft_close disabled in sticky mode; use release_slot"})
+        self.assertEqual(
+            payload,
+            {"ok": False, "message": "slot 1 is sticky; try non-sticky slot 2 recovery 7"},
+        )
 
     def test_api_action_soft_close_rejected_when_recovery_orders_disabled(self):
         bot._RUNTIME = self._RuntimeStub()
@@ -6243,18 +6353,22 @@ class DashboardApiHardeningTests(unittest.TestCase):
             {"ok": False, "message": "soft_close disabled when RECOVERY_ORDERS_ENABLED=false"},
         )
 
-    def test_api_action_cancel_stale_rejected_when_sticky_enabled(self):
-        bot._RUNTIME = self._RuntimeStub()
+    def test_api_action_cancel_stale_surfaces_runtime_non_sticky_guidance(self):
+        runtime = self._RuntimeStub()
+        runtime.cancel_stale_recoveries = lambda _dist=3.0, _batch=8: (
+            False,
+            "no non-sticky stale recoveries; toggle slot 5 to CYCLE and retry",
+        )
+        bot._RUNTIME = runtime
         handler = self._HandlerStub({"action": "cancel_stale_recoveries"})
-        with mock.patch.object(config, "STICKY_MODE_ENABLED", True):
-            bot.DashboardHandler.do_POST(handler)
+        bot.DashboardHandler.do_POST(handler)
 
         self.assertEqual(len(handler.sent), 1)
         code, payload = handler.sent[0]
         self.assertEqual(code, 400)
         self.assertEqual(
             payload,
-            {"ok": False, "message": "cancel_stale_recoveries disabled in sticky mode; use release_slot"},
+            {"ok": False, "message": "no non-sticky stale recoveries; toggle slot 5 to CYCLE and retry"},
         )
 
     def test_api_action_cancel_stale_rejected_when_recovery_orders_disabled(self):

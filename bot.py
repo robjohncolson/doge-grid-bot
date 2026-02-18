@@ -979,6 +979,7 @@ class SlotRuntime:
     slot_id: int
     state: sm.PairState
     alias: str = ""
+    sticky: bool = True
 
 
 @dataclass
@@ -2032,7 +2033,7 @@ class BotRuntime:
             backoff_factor=float(config.ENTRY_BACKOFF_FACTOR),
             backoff_max_multiplier=float(config.ENTRY_BACKOFF_MAX_MULTIPLIER),
             max_recovery_slots=max(1, int(config.MAX_RECOVERY_SLOTS)),
-            sticky_mode_enabled=self._flag_value("STICKY_MODE_ENABLED"),
+            sticky_mode_enabled=bool(getattr(slot, "sticky", True)),
         )
 
     def _allocate_slot_alias(self, used_aliases: set[str] | None = None) -> str:
@@ -3797,6 +3798,7 @@ class BotRuntime:
             "slot_alias_fallback_counter": int(self.slot_alias_fallback_counter),
             "slots": {str(sid): sm.to_dict(slot.state) for sid, slot in self.slots.items()},
             "slot_aliases": {str(sid): str(slot.alias or "").strip().lower() for sid, slot in self.slots.items()},
+            "slot_sticky": {str(sid): bool(getattr(slot, "sticky", True)) for sid, slot in self.slots.items()},
             "recon_baseline": self._recon_baseline,
             "flow_detection_active": bool(self._flow_detection_active),
             "flow_last_poll_ts": float(self._flow_last_poll_ts),
@@ -4961,10 +4963,25 @@ class BotRuntime:
             self.slots = {}
             slot_aliases = snap.get("slot_aliases", {})
             slot_aliases = slot_aliases if isinstance(slot_aliases, dict) else {}
+            slot_sticky_raw = snap.get("slot_sticky", {})
+            slot_sticky_raw = slot_sticky_raw if isinstance(slot_sticky_raw, dict) else {}
+            legacy_default_sticky = bool(self._flag_value("STICKY_MODE_ENABLED"))
             for sid_text, raw_state in (snap.get("slots", {}) or {}).items():
                 sid = int(sid_text)
                 alias = str(slot_aliases.get(str(sid)) or slot_aliases.get(sid) or "").strip().lower()
-                self.slots[sid] = SlotRuntime(slot_id=sid, state=sm.from_dict(raw_state), alias=alias)
+                sticky_raw = slot_sticky_raw.get(str(sid), slot_sticky_raw.get(sid, legacy_default_sticky))
+                sticky = bool(sticky_raw) if isinstance(sticky_raw, bool) else str(sticky_raw).strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }
+                self.slots[sid] = SlotRuntime(
+                    slot_id=sid,
+                    state=sm.from_dict(raw_state),
+                    alias=alias,
+                    sticky=sticky,
+                )
 
             self._sanitize_slot_alias_state()
             self._reconcile_churner_state()
@@ -5630,10 +5647,16 @@ class BotRuntime:
             self._position_ledger.enabled
         )
 
-    def _slot_mode_for_position(self, *, churner: bool = False) -> str:
+    def _is_slot_sticky(self, slot_id: int) -> bool:
+        slot = self.slots.get(int(slot_id))
+        if slot is None:
+            return True
+        return bool(getattr(slot, "sticky", True))
+
+    def _slot_mode_for_position(self, slot_id: int, *, churner: bool = False) -> str:
         if churner:
             return "churner"
-        if self._flag_value("STICKY_MODE_ENABLED"):
+        if self._is_slot_sticky(int(slot_id)):
             return "sticky"
         return "legacy"
 
@@ -5762,7 +5785,7 @@ class BotRuntime:
             position_id = self._position_ledger.open_position(
                 slot_id=int(slot_id),
                 trade_id=str(entry_order.trade_id),
-                slot_mode=self._slot_mode_for_position(churner=False),
+                slot_mode=self._slot_mode_for_position(int(slot_id), churner=False),
                 cycle=int(entry_order.cycle),
                 entry_data={
                     "entry_price": float(fill_price),
@@ -5787,7 +5810,7 @@ class BotRuntime:
                     "entry_price": float(fill_price),
                     "exit_price": float(chosen.price),
                     "regime": regime_label,
-                    "slot_mode": self._slot_mode_for_position(churner=False),
+                    "slot_mode": self._slot_mode_for_position(int(slot_id), churner=False),
                 },
                 timestamp=float(fill_timestamp),
             )
@@ -14374,14 +14397,56 @@ class BotRuntime:
         self._save_snapshot()
         return True, f"profit_pct set to {self.profit_pct:.3f}%"
 
+    def _oldest_recovery_slot(self, *, sticky: bool | None = None) -> tuple[int, sm.RecoveryOrder] | None:
+        oldest: tuple[int, sm.RecoveryOrder] | None = None
+        for sid, slot in self.slots.items():
+            slot_sticky = self._is_slot_sticky(int(sid))
+            if sticky is not None and slot_sticky != bool(sticky):
+                continue
+            for rec in slot.state.recovery_orders:
+                if oldest is None or float(rec.orphaned_at) < float(oldest[1].orphaned_at):
+                    oldest = (int(sid), rec)
+        return oldest
+
+    def _suggest_nonsticky_recovery_slot(self) -> str:
+        candidate = self._oldest_recovery_slot(sticky=False)
+        if candidate is not None:
+            sid, rec = candidate
+            return f"try non-sticky slot {sid} recovery {int(rec.recovery_id)}"
+
+        sticky_candidate = self._oldest_recovery_slot(sticky=True)
+        if sticky_candidate is not None:
+            sid, rec = sticky_candidate
+            return (
+                "no non-sticky recovery orders; "
+                f"oldest recovery is slot {sid} id {int(rec.recovery_id)}. "
+                f"toggle slot {sid} to CYCLE and retry"
+            )
+
+        nonsticky_slots = [int(sid) for sid in sorted(self.slots.keys()) if not self._is_slot_sticky(int(sid))]
+        if nonsticky_slots:
+            return f"no recovery orders on non-sticky slots {nonsticky_slots}"
+        return "no non-sticky slots configured"
+
+    def toggle_slot_sticky(self, slot_id: int, sticky: bool | None = None) -> tuple[bool, str]:
+        sid = int(slot_id)
+        slot = self.slots.get(sid)
+        if slot is None:
+            return False, f"unknown slot {sid}"
+        target = (not bool(getattr(slot, "sticky", True))) if sticky is None else bool(sticky)
+        slot.sticky = bool(target)
+        self._save_snapshot()
+        return True, f"slot {sid} mode set to {'STICKY' if slot.sticky else 'CYCLE'}"
+
     def soft_close(self, slot_id: int, recovery_id: int) -> tuple[bool, str]:
         if not self._recovery_orders_enabled():
             return False, _recovery_disabled_message("soft_close")
-        if self._flag_value("STICKY_MODE_ENABLED"):
-            return False, "soft_close disabled in sticky mode; use release_slot"
-        slot = self.slots.get(slot_id)
+        sid = int(slot_id)
+        slot = self.slots.get(sid)
         if not slot:
-            return False, f"unknown slot {slot_id}"
+            return False, f"unknown slot {sid}"
+        if self._is_slot_sticky(sid):
+            return False, f"slot {sid} is sticky; {self._suggest_nonsticky_recovery_slot()}"
 
         rec = next((r for r in slot.state.recovery_orders if r.recovery_id == recovery_id), None)
         if not rec:
@@ -14405,7 +14470,7 @@ class BotRuntime:
                 side=side,
                 volume=rec.volume,
                 price=new_price,
-                userref=(slot_id * 1_000_000 + 900_000 + recovery_id),
+                userref=(sid * 1_000_000 + 900_000 + recovery_id),
             )
             if not txid:
                 return False, "soft-close skipped: API loop budget exceeded"
@@ -14425,15 +14490,9 @@ class BotRuntime:
     def soft_close_next(self) -> tuple[bool, str]:
         if not self._recovery_orders_enabled():
             return False, _recovery_disabled_message("soft_close_next")
-        if self._flag_value("STICKY_MODE_ENABLED"):
-            return False, "soft_close_next disabled in sticky mode; use release_slot"
-        oldest: tuple[int, sm.RecoveryOrder] | None = None
-        for sid, slot in self.slots.items():
-            for r in slot.state.recovery_orders:
-                if oldest is None or r.orphaned_at < oldest[1].orphaned_at:
-                    oldest = (sid, r)
+        oldest = self._oldest_recovery_slot(sticky=False)
         if not oldest:
-            return False, "no recovery orders"
+            return False, self._suggest_nonsticky_recovery_slot()
         return self.soft_close(oldest[0], oldest[1].recovery_id)
 
     def remove_slot(self, slot_id: int) -> tuple[bool, str]:
@@ -14544,6 +14603,8 @@ class BotRuntime:
             return
         candidates: list[tuple[float, int, sm.RecoveryOrder]] = []
         for sid in self.slots:
+            if self._is_slot_sticky(int(sid)):
+                continue
             for r in self.slots[sid].state.recovery_orders:
                 dist = abs(r.price - self.last_price) / self.last_price * 100.0
                 candidates.append((dist, sid, r))
@@ -14651,6 +14712,8 @@ class BotRuntime:
 
         candidates: list[tuple[float, float, int, int, sm.RecoveryOrder]] = []
         for sid in sorted(self.slots.keys()):
+            if self._is_slot_sticky(int(sid)):
+                continue
             st = self.slots[sid].state
             for rec in st.recovery_orders:
                 dist = abs(float(rec.price) - float(self.last_price)) / float(self.last_price)
@@ -14731,8 +14794,6 @@ class BotRuntime:
         """
         if not self._recovery_orders_enabled():
             return False, _recovery_disabled_message("cancel_stale_recoveries")
-        if self._flag_value("STICKY_MODE_ENABLED"):
-            return False, "cancel_stale_recoveries disabled in sticky mode; use release_slot"
         if self.last_price <= 0:
             return False, "no market price"
 
@@ -14740,13 +14801,20 @@ class BotRuntime:
 
         # Collect all stale recoveries across slots.
         stale: list[tuple[int, sm.RecoveryOrder]] = []
+        sticky_stale_count = 0
         for sid in sorted(self.slots.keys()):
+            slot_sticky = self._is_slot_sticky(int(sid))
             for r in self.slots[sid].state.recovery_orders:
                 distance_pct = abs(r.price - self.last_price) / self.last_price * 100.0
                 if distance_pct >= min_distance_pct:
-                    stale.append((sid, r))
+                    if slot_sticky:
+                        sticky_stale_count += 1
+                    else:
+                        stale.append((sid, r))
 
         if not stale:
+            if sticky_stale_count > 0:
+                return False, f"no non-sticky stale recoveries; {self._suggest_nonsticky_recovery_slot()}"
             return True, "no stale recoveries"
 
         batch = stale[:max_batch]
@@ -16640,6 +16708,8 @@ class BotRuntime:
                     "slot_id": sid,
                     "slot_alias": self._slot_label(self.slots[sid]),
                     "slot_label": self._slot_label(self.slots[sid]),
+                    "sticky": self._is_slot_sticky(int(sid)),
+                    "slot_mode": ("sticky" if self._is_slot_sticky(int(sid)) else "cycle"),
                     "phase": phase,
                     "long_only": st.long_only,
                     "short_only": st.short_only,
@@ -17392,18 +17462,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
             action = (body.get("action") or "").strip()
             parsed: dict[str, float | int | str] = {}
-            flag_reader = getattr(_RUNTIME, "_flag_value", None)
-            if callable(flag_reader):
-                sticky_mode_enabled = bool(flag_reader("STICKY_MODE_ENABLED"))
-            else:
-                sticky_mode_enabled = bool(getattr(config, "STICKY_MODE_ENABLED", False))
             recovery_orders_enabled = _recovery_orders_enabled_flag()
-            if sticky_mode_enabled and action in ("soft_close", "soft_close_next", "cancel_stale_recoveries"):
-                self._send_json(
-                    {"ok": False, "message": f"{action} disabled in sticky mode; use release_slot"},
-                    400,
-                )
-                return
             if not recovery_orders_enabled and action in ("soft_close", "soft_close_next", "cancel_stale_recoveries"):
                 self._send_json({"ok": False, "message": _recovery_disabled_message(action)}, 400)
                 return
@@ -17423,6 +17482,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 except (TypeError, ValueError):
                     self._send_json({"ok": False, "message": "invalid slot/recovery id"}, 400)
                     return
+            elif action == "toggle_sticky":
+                try:
+                    parsed["slot_id"] = int(body.get("slot_id", 0))
+                except (TypeError, ValueError):
+                    self._send_json({"ok": False, "message": "invalid slot_id"}, 400)
+                    return
+                sticky_raw = body.get("sticky", body.get("value", None))
+                if sticky_raw not in (None, ""):
+                    if isinstance(sticky_raw, bool):
+                        parsed["sticky"] = "true" if sticky_raw else "false"
+                    elif isinstance(sticky_raw, (int, float)) and float(sticky_raw) in (0.0, 1.0):
+                        parsed["sticky"] = "true" if int(float(sticky_raw)) == 1 else "false"
+                    else:
+                        txt = str(sticky_raw).strip().lower()
+                        if txt in {"1", "true", "yes", "on"}:
+                            parsed["sticky"] = "true"
+                        elif txt in {"0", "false", "no", "off"}:
+                            parsed["sticky"] = "false"
+                        else:
+                            self._send_json({"ok": False, "message": "invalid sticky value (expected bool)"}, 400)
+                            return
             elif action == "release_slot":
                 try:
                     parsed["slot_id"] = int(body.get("slot_id", 0))
@@ -17535,6 +17615,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     ok, msg = _RUNTIME.set_profit_pct(float(parsed["value"]))
                 elif action == "soft_close":
                     ok, msg = _RUNTIME.soft_close(int(parsed["slot_id"]), int(parsed["recovery_id"]))
+                elif action == "toggle_sticky":
+                    sticky = None
+                    if "sticky" in parsed:
+                        sticky = str(parsed["sticky"]).strip().lower() in {"1", "true", "yes", "on"}
+                    ok, msg = _RUNTIME.toggle_slot_sticky(int(parsed["slot_id"]), sticky=sticky)
                 elif action == "release_slot":
                     local_id = int(parsed["local_id"]) if "local_id" in parsed else None
                     trade_id = str(parsed["trade_id"]) if "trade_id" in parsed else None

@@ -162,6 +162,11 @@ DASHBOARD_HTML = """<!doctype html>
       font-size: 11px;
       background: rgba(0,255,200,.08);
     }
+    .sticky-badge {
+      color: var(--good);
+      font-size: 11px;
+      background: rgba(46,160,67,.14);
+    }
     .ranger-badge {
       display: inline-flex;
       align-items: center;
@@ -640,6 +645,7 @@ DASHBOARD_HTML = """<!doctype html>
           <button id=\"resumeBtn\">Resume</button>
           <button id=\"addSlotBtn\">Add Slot</button>
           <button id=\"removeSlotBtn\" style=\"background:#c0392b\">Remove Slot</button>
+          <button id=\"toggleStickyBtn\" style=\"background:#265e9a\">Toggle Sticky/Cycle</button>
           <button id=\"releaseEligibleBtn\" style=\"display:none\">Release Oldest Eligible</button>
           <button id=\"releaseBtn\" style=\"display:none\">Release Exit</button>
           <button id=\"accumStopBtn\" style=\"display:none;background:#8f3a2f\">Stop Accumulation</button>
@@ -1270,7 +1276,7 @@ DASHBOARD_HTML = """<!doctype html>
     }
 
     function commandCompletions() {
-      if (!isStickyModeEnabled() && isRecoveryOrdersEnabled()) return COMMAND_COMPLETIONS;
+      if (isRecoveryOrdersEnabled()) return COMMAND_COMPLETIONS;
       return COMMAND_COMPLETIONS.filter((cmd) => cmd !== 'close' && cmd !== 'stale');
     }
 
@@ -1416,7 +1422,6 @@ DASHBOARD_HTML = """<!doctype html>
       if (verb === 'drift') return {type: 'action', action: 'reconcile_drift', payload: {}};
       if (verb === 'stale') {
         if (!isRecoveryOrdersEnabled()) return {error: 'stale disabled when recovery orders are disabled'};
-        if (isStickyModeEnabled()) return {error: 'stale disabled in sticky mode; use :release'};
         let minDistancePct = 3.0;
         let maxBatch = 8;
         if (tokens.length >= 2) {
@@ -1477,7 +1482,6 @@ DASHBOARD_HTML = """<!doctype html>
 
       if (verb === 'close') {
         if (!isRecoveryOrdersEnabled()) return {error: 'close disabled when recovery orders are disabled'};
-        if (isStickyModeEnabled()) return {error: 'close disabled in sticky mode; use :release'};
         if (tokens.length === 1) return {type: 'action', action: 'soft_close_next', payload: {}};
         if (tokens.length < 3) return {error: 'usage: :close <slot> <rid>'};
         const slotId = parseNonNegativeInt(tokens[1]);
@@ -3653,8 +3657,8 @@ DASHBOARD_HTML = """<!doctype html>
       const releaseBtn = document.getElementById('releaseBtn');
       const releaseEligibleBtn = document.getElementById('releaseEligibleBtn');
       const accumStopBtn = document.getElementById('accumStopBtn');
-      softCloseBtn.style.display = stickyEnabled || !recoveryOrdersEnabled ? 'none' : '';
-      cancelStaleBtn.style.display = stickyEnabled || !recoveryOrdersEnabled ? 'none' : '';
+      softCloseBtn.style.display = !recoveryOrdersEnabled ? 'none' : '';
+      cancelStaleBtn.style.display = !recoveryOrdersEnabled ? 'none' : '';
       releaseBtn.style.display = stickyEnabled ? '' : 'none';
       releaseEligibleBtn.style.display = stickyEnabled ? '' : 'none';
       const accumState = String(((s.accumulation || {}).state) || 'IDLE').toUpperCase();
@@ -3994,7 +3998,11 @@ DASHBOARD_HTML = """<!doctype html>
         const b = document.createElement('button');
         b.className = 'slot' + (slot.slot_id === selectedSlot ? ' active' : '');
         const alias = slot.slot_alias || slot.slot_label || `slot-${slot.slot_id}`;
-        b.textContent = `${alias} ${slot.phase}`;
+        const slotMode = (slot && typeof slot.slot_mode === 'string')
+          ? String(slot.slot_mode).toLowerCase()
+          : (slot && slot.sticky === false ? 'cycle' : 'sticky');
+        const modeTag = slotMode === 'cycle' ? '[CYCLE]' : '[STICKY]';
+        b.textContent = `${alias} ${slot.phase} ${modeTag}`;
         b.title = `slot #${slot.slot_id}`;
         b.onclick = () => {
           selectedSlot = slot.slot_id;
@@ -4018,11 +4026,17 @@ DASHBOARD_HTML = """<!doctype html>
 
       const sb = document.getElementById('stateBar');
       const alias = slot.slot_alias || slot.slot_label || `slot-${slot.slot_id}`;
+      const slotSticky = slot && slot.sticky !== false;
+      const toggleStickyBtn = document.getElementById('toggleStickyBtn');
+      if (toggleStickyBtn) {
+        toggleStickyBtn.textContent = slotSticky ? 'Set CYCLE' : 'Set STICKY';
+      }
       const slotChurner = runtimeChurnerState(slot.slot_id);
       const churnerActive = Boolean(slotChurner && slotChurner.active);
       const churnerStage = churnerActive ? churnerStageLabel(slotChurner.stage) : '';
       sb.innerHTML = `
         <span class=\"statepill ${slot.phase}\">${slot.phase}</span>
+        <span class=\"statepill ${slotSticky ? 'sticky-badge' : 'churner-badge'}\">${slotSticky ? 'STICKY' : 'CYCLE'}</span>
         <span class=\"tiny\">${alias} (#${slot.slot_id})</span>
         <span class=\"tiny\">price $${fmt(slot.market_price, 6)}</span>
         <span class=\"tiny\">A.${slot.cycle_a} / B.${slot.cycle_b}</span>
@@ -4445,6 +4459,16 @@ DASHBOARD_HTML = """<!doctype html>
     document.getElementById('resumeBtn').onclick = () => { void dispatchAction('resume'); };
     document.getElementById('addSlotBtn').onclick = () => { void dispatchAction('add_slot'); };
     document.getElementById('removeSlotBtn').onclick = () => requestRemoveSlot();
+    document.getElementById('toggleStickyBtn').onclick = async () => {
+      const slots = getSlots();
+      if (!slots.length) { showToast('no slots available', 'error'); return; }
+      const slotId = selectedSlot || slots[0].slot_id;
+      try {
+        await dispatchAction('toggle_sticky', {slot_id: slotId});
+      } catch (err) {
+        showToast(String((err && err.message) || err || 'toggle sticky failed'), 'error');
+      }
+    };
     document.getElementById('releaseEligibleBtn').onclick = () => {
       const slots = getSlots();
       if (!slots.length) { showToast('no slots available', 'error'); return; }
