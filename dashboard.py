@@ -162,6 +162,34 @@ DASHBOARD_HTML = """<!doctype html>
       font-size: 11px;
       background: rgba(0,255,200,.08);
     }
+    .ranger-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      padding: 2px 8px;
+      font-size: 11px;
+      font-weight: 700;
+      margin: 2px 4px 0 0;
+      background: rgba(255,255,255,.03);
+      color: var(--muted);
+    }
+    .ranger-badge.active {
+      color: var(--good);
+      border-color: rgba(63,185,80,.45);
+      background: rgba(63,185,80,.12);
+    }
+    .ranger-badge.idle {
+      color: var(--muted);
+      border-color: var(--line);
+      background: rgba(255,255,255,.02);
+    }
+    .ranger-badge.warn {
+      color: var(--warn);
+      border-color: rgba(210,153,34,.55);
+      background: rgba(210,153,34,.12);
+    }
     .S0 { color: var(--accent); }
     .S1a, .S1b { color: var(--warn); }
     .S2 { color: var(--bad); }
@@ -632,6 +660,11 @@ DASHBOARD_HTML = """<!doctype html>
           <div id=\"shChurnerActiveList\" class=\"tiny mono-scroll\"></div>
         </details>
         <div id=\"shMigration\" class=\"tiny\"></div>
+
+        <h3 style=\"margin-top:14px\">Rangers</h3>
+        <div class=\"row\"><span class=\"k\">Status</span><span id=\"rangerStatus\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Today</span><span id=\"rangerToday\" class=\"v\"></span></div>
+        <div id=\"rangerSlots\" class=\"tiny\"></div>
 
         <h3 style=\"margin-top:14px\">HMM Regime</h3>
         <div class=\"row\"><span class=\"k\">Status</span><span id=\"hmmStatus\" class=\"v\"></span></div>
@@ -1917,6 +1950,14 @@ DASHBOARD_HTML = """<!doctype html>
       return 'IDLE';
     }
 
+    function rangerStageLabel(stage) {
+      const key = String(stage || 'idle').toLowerCase();
+      if (key === 'entry_open') return 'ENTRY';
+      if (key === 'exit_open') return 'EXIT';
+      if (key === 'cooldown') return 'COOLDOWN';
+      return 'IDLE';
+    }
+
     function openConfirmDialog(text, onConfirm) {
       closeCommandBarUi();
       closeHelpUi();
@@ -2515,6 +2556,84 @@ DASHBOARD_HTML = """<!doctype html>
       }
     }
 
+    function renderRangers(s, nowSec) {
+      const payload = s && typeof s.rangers === 'object' ? s.rangers : {};
+      const statusEl = document.getElementById('rangerStatus');
+      const todayEl = document.getElementById('rangerToday');
+      const slotsEl = document.getElementById('rangerSlots');
+      if (!statusEl || !todayEl || !slotsEl) return;
+
+      const enabled = Boolean(payload.enabled);
+      const active = Number(payload.active || 0);
+      const maxSlots = Number(
+        payload.max_slots != null
+          ? payload.max_slots
+          : (Array.isArray(payload.slots) ? payload.slots.length : 0),
+      );
+      const regimeOk = Boolean(payload.regime_ok);
+      const regime = String(payload.regime || '');
+      const pausedReason = String(payload.paused_reason || '');
+
+      if (!enabled) {
+        statusEl.textContent = 'OFF';
+        statusEl.style.color = 'var(--muted)';
+      } else if (!regimeOk) {
+        const reason = pausedReason || (regime ? `regime ${regime}` : 'non-ranging');
+        statusEl.textContent = `paused (${reason})`;
+        statusEl.style.color = 'var(--warn)';
+      } else {
+        statusEl.textContent = `${active}/${maxSlots} active`;
+        statusEl.style.color = active > 0 ? 'var(--good)' : '';
+      }
+
+      const cyclesToday = Number(payload.cycles_today || 0);
+      const profitToday = Number(payload.profit_today || 0);
+      const orphansToday = Number(payload.orphans_today || 0);
+      const orphanExposureUsd = Number(payload.orphan_exposure_usd || 0);
+      const todayText = `${cyclesToday} cycles, $${fmt(profitToday, 3)}, ${orphansToday} orphans`;
+      todayEl.textContent = orphanExposureUsd > 0
+        ? `${todayText} ($${fmt(orphanExposureUsd, 2)} exposure)`
+        : todayText;
+
+      if (!enabled) {
+        slotsEl.innerHTML = '';
+        return;
+      }
+
+      const rows = Array.isArray(payload.slots) ? payload.slots : [];
+      if (!rows.length) {
+        slotsEl.textContent = 'No ranger slots configured';
+        return;
+      }
+
+      const exitTimeoutSec = Number(payload.exit_timeout_sec || 1350);
+      const bits = [];
+      for (const row of rows) {
+        const rangerId = Number(row && row.ranger_id || 0);
+        const stageKey = String(row && row.stage || 'idle').toLowerCase();
+        const stageLabel = rangerStageLabel(stageKey);
+        const ageSec = Number(row && row.age_sec || 0);
+        const nearTimeout = stageKey === 'exit_open'
+          && Number.isFinite(exitTimeoutSec)
+          && exitTimeoutSec > 0
+          && ageSec >= (exitTimeoutSec * 0.8);
+        let klass = 'active';
+        if (stageKey === 'idle') {
+          klass = 'idle';
+        } else if (nearTimeout) {
+          klass = 'warn';
+        }
+        const err = String(row && row.last_error || '').trim();
+        const title = err ? `last_error: ${err}` : '';
+        bits.push(
+          `<span class=\"ranger-badge ${klass}\"${title ? ` title=\"${escHtml(title)}\"` : ''}>`
+          + `${escHtml(`#${rangerId} ${stageLabel} ${fmtAgeSeconds(ageSec)}`)}`
+          + `</span>`,
+        );
+      }
+      slotsEl.innerHTML = bits.join('');
+    }
+
     function renderTop(s) {
       const nowSec = Date.now() / 1000;
       const mode = document.getElementById('mode');
@@ -2650,6 +2769,7 @@ DASHBOARD_HTML = """<!doctype html>
         releaseGateBlocked ? String(release.recon_hard_gate_reason || '') : '';
 
       renderSelfHealing(s, nowSec);
+      renderRangers(s, nowSec);
 
       const hmm = s.hmm_regime || {};
       const hmmConsensus = s.hmm_consensus || {};

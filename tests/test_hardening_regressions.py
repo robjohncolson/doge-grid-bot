@@ -4592,6 +4592,45 @@ class BotEventLogTests(unittest.TestCase):
 
         self.assertEqual(payload["capital_layers"]["max_target_layers"], 17)
 
+    def test_status_payload_exposes_rangers_block(self):
+        rt = bot.BotRuntime()
+        rt.last_price = 0.1
+        rt._ranger_cleanup_pending = False
+        rt.slots = {
+            0: bot.SlotRuntime(
+                slot_id=0,
+                state=sm.PairState(market_price=0.1, now=1000.0),
+            )
+        }
+        ranger = rt._ensure_ranger_state(0)
+        ranger.stage = "exit_open"
+        ranger.entry_price = 0.101
+        ranger.exit_price = 0.100
+        ranger.entry_volume = 20.0
+        ranger.stage_entered_at = 900.0
+        ranger.last_error = ""
+
+        with (
+            mock.patch.object(config, "RANGER_ENABLED", True),
+            mock.patch.object(config, "RANGER_MAX_SLOTS", 2),
+            mock.patch.object(rt, "_policy_hmm_signal", return_value=("RANGING", 0.0, 0.0, True, {})),
+        ):
+            payload = rt.status_payload()
+
+        self.assertIn("rangers", payload)
+        rangers = payload["rangers"]
+        self.assertTrue(rangers["enabled"])
+        self.assertTrue(rangers["regime_ok"])
+        self.assertEqual(rangers["active"], 1)
+        self.assertEqual(rangers["max_slots"], 2)
+        self.assertIn("slots", rangers)
+        rows = {int(row["ranger_id"]): row for row in rangers["slots"]}
+        self.assertIn(0, rows)
+        self.assertEqual(rows[0]["stage"], "exit_open")
+        self.assertAlmostEqual(float(rows[0]["entry_price"]), 0.101, places=6)
+        self.assertAlmostEqual(float(rows[0]["exit_price"]), 0.100, places=6)
+        self.assertAlmostEqual(float(rows[0]["entry_volume"]), 20.0, places=6)
+
     def test_dashboard_layer_source_not_synced_from_backend_default(self):
         self.assertNotIn("layerSourceSelect.value = sourceDefault", dashboard.DASHBOARD_HTML)
 
@@ -4652,6 +4691,14 @@ class BotEventLogTests(unittest.TestCase):
 
     def test_dashboard_churner_reserve_label_updated(self):
         self.assertIn("Churner Reserve", dashboard.DASHBOARD_HTML)
+
+    def test_dashboard_ranger_panel_markup_present(self):
+        self.assertIn('id="rangerStatus"', dashboard.DASHBOARD_HTML)
+        self.assertIn('id="rangerToday"', dashboard.DASHBOARD_HTML)
+        self.assertIn('id="rangerSlots"', dashboard.DASHBOARD_HTML)
+        self.assertIn(".ranger-badge", dashboard.DASHBOARD_HTML)
+        self.assertIn("function rangerStageLabel(stage)", dashboard.DASHBOARD_HTML)
+        self.assertIn("renderRangers(s, nowSec);", dashboard.DASHBOARD_HTML)
 
     def test_auto_drain_recovery_backlog_prefers_furthest_then_oldest(self):
         rt = bot.BotRuntime()

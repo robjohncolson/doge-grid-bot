@@ -1006,6 +1006,20 @@ class ChurnerRuntimeState:
     last_state_change_at: float = 0.0
 
 
+@dataclass
+class RangerRuntimeState:
+    ranger_id: int = 0
+    stage: str = "idle"  # idle | entry_open | exit_open | cooldown
+    entry_txid: str = ""
+    exit_txid: str = ""
+    entry_price: float = 0.0
+    entry_volume: float = 0.0
+    exit_price: float = 0.0
+    entry_filled_at: float = 0.0
+    stage_entered_at: float = 0.0
+    last_error: str = ""
+
+
 @dataclass(frozen=True)
 class ExternalFlow:
     ledger_id: str
@@ -1476,6 +1490,13 @@ class BotRuntime:
         self._churner_profit_today: float = 0.0
         self._churner_cycles_total: int = 0
         self._churner_profit_total: float = 0.0
+        self._rangers: dict[int, RangerRuntimeState] = {}
+        self._ranger_day_key: str = self._utc_day_key()
+        self._ranger_cycles_today: int = 0
+        self._ranger_profit_today: float = 0.0
+        self._ranger_orphans_today: int = 0
+        self._ranger_orphan_exposure_usd: float = 0.0
+        self._ranger_cleanup_pending: bool = True
         self._throughput: ThroughputSizer | None = None
         if self._flag_value("TP_ENABLED"):
             self._throughput = self._new_throughput_sizer()
@@ -1632,6 +1653,11 @@ class BotRuntime:
                 group="Position Management",
                 description="Regime-gated churner helper cycles",
                 dependencies=("POSITION_LEDGER_ENABLED",),
+            ),
+            RuntimeToggleSpec(
+                key="RANGER_ENABLED",
+                group="Position Management",
+                description="Standalone DOGE ranger micro-cyclers",
             ),
             RuntimeToggleSpec(
                 key="POSITION_LEDGER_ENABLED",
@@ -6994,6 +7020,652 @@ class BotRuntime:
             self._self_heal_reprice_total += int(summary["repriced"])
             self._self_heal_reprice_last_at = float(now)
         self._self_heal_reprice_last_summary = summary
+
+    def _ranger_enabled(self) -> bool:
+        return self._flag_value("RANGER_ENABLED")
+
+    @staticmethod
+    def _ranger_userref(ranger_id: int) -> int:
+        rid = max(0, int(ranger_id))
+        return 980_000 + rid
+
+    @staticmethod
+    def _is_ranger_userref(userref: int | None) -> bool:
+        if userref is None:
+            return False
+        try:
+            val = int(userref)
+        except (TypeError, ValueError):
+            return False
+        return 980_000 <= val < 990_000
+
+    @staticmethod
+    def _extract_order_userref(row: dict[str, Any]) -> int | None:
+        if not isinstance(row, dict):
+            return None
+
+        candidates = [row.get("userref"), row.get("user_ref"), row.get("userRef")]
+        descr = row.get("descr")
+        if isinstance(descr, dict):
+            candidates.extend((descr.get("userref"), descr.get("user_ref"), descr.get("userRef")))
+
+        for raw in candidates:
+            if raw in (None, ""):
+                continue
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def _ensure_ranger_state(self, ranger_id: int) -> RangerRuntimeState:
+        rid = max(0, int(ranger_id))
+        state = self._rangers.get(rid)
+        if state is None:
+            state = RangerRuntimeState(ranger_id=rid)
+            self._rangers[rid] = state
+        return state
+
+    def _reconcile_ranger_state(self) -> None:
+        max_slots = max(1, int(getattr(config, "RANGER_MAX_SLOTS", 3)))
+        valid_ids = set(range(max_slots))
+        for rid in list(self._rangers.keys()):
+            if int(rid) in valid_ids:
+                continue
+            self._rangers.pop(int(rid), None)
+        for rid in range(max_slots):
+            self._ensure_ranger_state(rid)
+
+    def _ranger_roll_day(self, now_ts: float) -> None:
+        day_key = self._utc_day_key(float(now_ts))
+        if day_key == str(self._ranger_day_key or ""):
+            return
+        self._ranger_day_key = day_key
+        self._ranger_cycles_today = 0
+        self._ranger_profit_today = 0.0
+        self._ranger_orphans_today = 0
+        self._ranger_orphan_exposure_usd = 0.0
+
+    def _ranger_reset_state(
+        self,
+        state: RangerRuntimeState,
+        *,
+        now_ts: float,
+        stage: str = "idle",
+        reason: str = "",
+        clear_prices: bool = False,
+    ) -> None:
+        state.stage = str(stage or "idle")
+        state.entry_txid = ""
+        state.exit_txid = ""
+        if clear_prices or state.stage == "idle":
+            state.entry_price = 0.0
+            state.entry_volume = 0.0
+            state.exit_price = 0.0
+            state.entry_filled_at = 0.0
+        state.stage_entered_at = float(now_ts)
+        state.last_error = str(reason or "")
+
+    def _ranger_entry_target_price(self, market: float) -> float:
+        if market <= 0:
+            return 0.0
+        pct = max(0.0, float(getattr(config, "RANGER_ENTRY_PCT", 0.15))) / 100.0
+        return round(
+            market * (1.0 + pct),
+            max(0, int(self.constraints.get("price_decimals", 6))),
+        )
+
+    def _ranger_exit_target_price(self, entry_price: float) -> float:
+        if entry_price <= 0:
+            return 0.0
+        target_pct = max(0.0, float(getattr(config, "RANGER_PROFIT_PCT", 1.20)))
+        floor_pct = max(0.0, float(getattr(config, "ROUND_TRIP_FEE_PCT", 0.0))) + 0.20
+        margin = max(target_pct, floor_pct) / 100.0
+        return round(
+            entry_price * (1.0 - margin),
+            max(0, int(self.constraints.get("price_decimals", 6))),
+        )
+
+    def _ranger_engine_cfg(self) -> sm.EngineConfig:
+        return sm.EngineConfig(
+            entry_pct=float(self.entry_pct),
+            profit_pct=float(self.profit_pct),
+            refresh_pct=float(getattr(config, "PAIR_REFRESH_PCT", 1.0)),
+            order_size_usd=float(getattr(config, "RANGER_ORDER_SIZE_USD", 2.0)),
+            price_decimals=int(self.constraints.get("price_decimals", 6)),
+            volume_decimals=int(self.constraints.get("volume_decimals", 0)),
+            min_volume=float(self.constraints.get("min_volume", 13.0)),
+            min_cost_usd=float(self.constraints.get("min_cost_usd", 0.0)),
+            maker_fee_pct=float(self.maker_fee_pct),
+            stale_price_max_age_sec=float(config.STALE_PRICE_MAX_AGE_SEC),
+            s1_orphan_after_sec=float(config.S1_ORPHAN_AFTER_SEC),
+            s2_orphan_after_sec=float(config.S2_ORPHAN_AFTER_SEC),
+        )
+
+    def _ranger_cleanup_open_orders_once(self, *, now_ts: float) -> None:
+        if not bool(self._ranger_cleanup_pending):
+            return
+
+        try:
+            open_orders = self._get_open_orders()
+        except Exception as e:
+            logger.warning("ranger startup cleanup: failed to fetch open orders: %s", e)
+            return
+
+        cancelled = 0
+        failed = 0
+        for txid, row in open_orders.items():
+            if not isinstance(row, dict):
+                continue
+            if not self._order_matches_runtime_pair(row):
+                continue
+            userref = self._extract_order_userref(row)
+            if not self._is_ranger_userref(userref):
+                continue
+            try:
+                ok = self._cancel_order(str(txid))
+            except Exception:
+                ok = False
+            if ok:
+                cancelled += 1
+            else:
+                failed += 1
+
+        if cancelled > 0 or failed > 0:
+            logger.info(
+                "ranger startup cleanup: cancelled=%d failed=%d",
+                cancelled,
+                failed,
+            )
+
+        for state in self._rangers.values():
+            self._ranger_reset_state(state, now_ts=float(now_ts), stage="idle", reason="startup_cleanup", clear_prices=True)
+
+        self._ranger_cleanup_pending = False
+
+    def _ranger_gate_check(
+        self,
+        *,
+        now_ts: float,
+        headroom: int,
+    ) -> tuple[bool, str, float, float]:
+        regime_name, _conf, _bias, _ready, _source = self._policy_hmm_signal()
+        if str(regime_name or "").strip().upper() != "RANGING":
+            return False, "regime_not_ranging", 0.0, 0.0
+
+        min_headroom = max(0, int(getattr(config, "RANGER_MIN_HEADROOM", 0)))
+        if int(headroom) < min_headroom:
+            return False, "headroom_low", 0.0, 0.0
+
+        market = float(self.last_price)
+        if market <= 0:
+            return False, "market_unavailable", 0.0, 0.0
+
+        cfg = self._ranger_engine_cfg()
+        entry_price = self._ranger_entry_target_price(market)
+        if entry_price <= 0:
+            return False, "invalid_entry_price", 0.0, 0.0
+
+        order_size_usd = max(0.0, float(getattr(config, "RANGER_ORDER_SIZE_USD", 2.0)))
+        volume = sm.compute_order_volume(float(entry_price), cfg, float(order_size_usd))
+        if volume is None:
+            return False, "below_min_size", 0.0, 0.0
+
+        entry_volume = max(0.0, float(volume))
+        _free_usd, free_doge = self._available_free_balances(prefer_fresh=False)
+        reserve = max(0.0, float(getattr(config, "RANGER_DOGE_RESERVE", 100.0)))
+        if float(free_doge) - entry_volume < reserve - 1e-12:
+            return False, "doge_reserve", 0.0, 0.0
+
+        return True, "ok", float(entry_price), float(entry_volume)
+
+    def _ranger_mark_orphan(
+        self,
+        *,
+        state: RangerRuntimeState,
+        now_ts: float,
+        reason: str,
+        cooldown: bool,
+    ) -> None:
+        self._ranger_roll_day(float(now_ts))
+        exposure = max(0.0, float(state.entry_price)) * max(0.0, float(state.entry_volume))
+        self._ranger_orphans_today += 1
+        self._ranger_orphan_exposure_usd += float(exposure)
+
+        state.entry_txid = ""
+        state.exit_txid = ""
+        state.stage = "cooldown" if bool(cooldown) else "idle"
+        state.stage_entered_at = float(now_ts)
+        state.last_error = str(reason or "orphan")
+        if state.stage == "idle":
+            state.entry_price = 0.0
+            state.entry_volume = 0.0
+            state.exit_price = 0.0
+            state.entry_filled_at = 0.0
+
+    def _ranger_on_entry_fill(
+        self,
+        *,
+        ranger_id: int,
+        txid: str,
+        fill_price: float,
+        fill_volume: float,
+        fill_fee: float,
+        fill_cost: float,
+        fill_ts: float,
+    ) -> None:
+        state = self._rangers.get(max(0, int(ranger_id)))
+        if state is None:
+            return
+
+        txid_norm = str(txid or "").strip()
+        if str(state.stage) != "entry_open" or txid_norm != str(state.entry_txid or "").strip():
+            return
+
+        volume = max(0.0, float(fill_volume if fill_volume > 0 else state.entry_volume))
+        if volume <= 0:
+            self._ranger_reset_state(
+                state,
+                now_ts=float(fill_ts),
+                stage="idle",
+                reason="invalid_fill_volume",
+                clear_prices=True,
+            )
+            return
+
+        entry_fill_price = max(0.0, float(fill_price if fill_price > 0 else state.entry_price))
+        if entry_fill_price <= 0:
+            self._ranger_mark_orphan(
+                state=state,
+                now_ts=float(fill_ts),
+                reason="invalid_fill_price",
+                cooldown=True,
+            )
+            return
+
+        exit_price = self._ranger_exit_target_price(entry_fill_price)
+        if exit_price <= 0:
+            self._ranger_mark_orphan(
+                state=state,
+                now_ts=float(fill_ts),
+                reason="invalid_exit_price",
+                cooldown=True,
+            )
+            return
+
+        reserved = self._try_reserve_loop_funds(side="buy", volume=float(volume), price=float(exit_price))
+        txid_new: str | None = None
+        try:
+            txid_new = self._place_order(
+                side="buy",
+                volume=float(volume),
+                price=float(exit_price),
+                userref=self._ranger_userref(int(state.ranger_id)),
+            )
+        except Exception:
+            txid_new = None
+
+        if not txid_new:
+            if reserved:
+                self._release_loop_reservation(side="buy", volume=float(volume), price=float(exit_price))
+            self._ranger_mark_orphan(
+                state=state,
+                now_ts=float(fill_ts),
+                reason="exit_place_failed",
+                cooldown=True,
+            )
+            return
+
+        state.entry_txid = ""
+        state.exit_txid = str(txid_new)
+        state.entry_price = float(entry_fill_price)
+        state.entry_volume = float(volume)
+        state.exit_price = float(exit_price)
+        state.entry_filled_at = float(fill_ts)
+        state.stage = "exit_open"
+        state.stage_entered_at = float(fill_ts)
+        state.last_error = ""
+        self.ledger.commit_order("buy", float(exit_price), float(volume))
+        del fill_fee, fill_cost
+
+    def _ranger_on_exit_fill(
+        self,
+        *,
+        ranger_id: int,
+        txid: str,
+        fill_price: float,
+        fill_volume: float,
+        fill_fee: float,
+        fill_cost: float,
+        fill_ts: float,
+    ) -> None:
+        state = self._rangers.get(max(0, int(ranger_id)))
+        if state is None:
+            return
+
+        txid_norm = str(txid or "").strip()
+        if str(state.stage) != "exit_open" or txid_norm != str(state.exit_txid or "").strip():
+            return
+
+        volume = max(0.0, float(fill_volume if fill_volume > 0 else state.entry_volume))
+        if volume <= 0:
+            self._ranger_reset_state(
+                state,
+                now_ts=float(fill_ts),
+                stage="idle",
+                reason="invalid_exit_volume",
+                clear_prices=True,
+            )
+            return
+
+        exit_fill_price = max(0.0, float(fill_price if fill_price > 0 else state.exit_price))
+        entry_price = max(0.0, float(state.entry_price))
+        if entry_price <= 0 or exit_fill_price <= 0:
+            self._ranger_reset_state(
+                state,
+                now_ts=float(fill_ts),
+                stage="idle",
+                reason="invalid_exit_price",
+                clear_prices=True,
+            )
+            return
+
+        gross = (entry_price - exit_fill_price) * volume
+        entry_fee_est = max(0.0, entry_price * volume * (max(0.0, float(self.maker_fee_pct)) / 100.0))
+        fees = entry_fee_est + max(0.0, float(fill_fee))
+        net_profit = float(gross - fees)
+        self._ranger_roll_day(float(fill_ts))
+        self._ranger_cycles_today += 1
+        self._ranger_profit_today += float(net_profit)
+
+        state.exit_txid = ""
+        state.exit_price = float(exit_fill_price)
+        state.stage = "cooldown"
+        state.stage_entered_at = float(fill_ts)
+        state.last_error = ""
+        del fill_cost
+
+    def _ranger_on_order_canceled(
+        self,
+        *,
+        ranger_id: int,
+        kind: str,
+        txid: str,
+        now_ts: float,
+    ) -> None:
+        state = self._rangers.get(max(0, int(ranger_id)))
+        if state is None:
+            return
+        txid_norm = str(txid or "").strip()
+        if kind == "ranger_entry" and txid_norm == str(state.entry_txid or "").strip():
+            self._ranger_reset_state(
+                state,
+                now_ts=float(now_ts),
+                stage="idle",
+                reason="entry_canceled",
+                clear_prices=True,
+            )
+            return
+        if kind == "ranger_exit" and txid_norm == str(state.exit_txid or "").strip():
+            self._ranger_mark_orphan(
+                state=state,
+                now_ts=float(now_ts),
+                reason="exit_canceled",
+                cooldown=True,
+            )
+
+    def _ranger_timeout_tick(
+        self,
+        *,
+        state: RangerRuntimeState,
+        now_ts: float,
+    ) -> None:
+        now = float(now_ts)
+        if str(state.stage) == "entry_open" and state.stage_entered_at > 0:
+            timeout_sec = max(60.0, float(getattr(config, "RANGER_ENTRY_TIMEOUT_SEC", 300)))
+            if now - float(state.stage_entered_at) >= timeout_sec:
+                txid = str(state.entry_txid or "").strip()
+                if txid:
+                    try:
+                        ok = self._cancel_order(txid)
+                    except Exception:
+                        ok = False
+                    if not ok:
+                        state.last_error = "entry_timeout_cancel_failed"
+                        return
+                self._ranger_reset_state(
+                    state,
+                    now_ts=now,
+                    stage="idle",
+                    reason="entry_timeout",
+                    clear_prices=True,
+                )
+            return
+
+        if str(state.stage) == "exit_open" and state.stage_entered_at > 0:
+            timeout_sec = max(
+                float(getattr(config, "RANGER_ENTRY_TIMEOUT_SEC", 300)),
+                float(getattr(config, "RANGER_EXIT_TIMEOUT_SEC", 1350)),
+            )
+            if now - float(state.stage_entered_at) >= timeout_sec:
+                txid = str(state.exit_txid or "").strip()
+                if txid:
+                    try:
+                        ok = self._cancel_order(txid)
+                    except Exception:
+                        ok = False
+                    if not ok:
+                        state.last_error = "exit_timeout_cancel_failed"
+                        return
+                self._ranger_mark_orphan(
+                    state=state,
+                    now_ts=now,
+                    reason="exit_timeout",
+                    cooldown=True,
+                )
+
+    def _run_ranger_engine(self, now_ts: float | None = None) -> None:
+        now = float(now_ts if now_ts is not None else _now())
+        self._reconcile_ranger_state()
+        self._ranger_roll_day(now)
+        self._ranger_cleanup_open_orders_once(now_ts=now)
+
+        if not self._ranger_enabled():
+            for state in self._rangers.values():
+                txids = [str(state.entry_txid or "").strip(), str(state.exit_txid or "").strip()]
+                for txid in txids:
+                    if not txid:
+                        continue
+                    try:
+                        self._cancel_order(txid)
+                    except Exception:
+                        pass
+                if str(state.stage) == "exit_open":
+                    self._ranger_mark_orphan(
+                        state=state,
+                        now_ts=now,
+                        reason="ranger_disabled",
+                        cooldown=False,
+                    )
+                else:
+                    self._ranger_reset_state(
+                        state,
+                        now_ts=now,
+                        stage="idle",
+                        reason="ranger_disabled",
+                        clear_prices=True,
+                    )
+            return
+
+        regime_name, _conf, _bias, _ready, _source = self._policy_hmm_signal()
+        regime_ok = str(regime_name or "").strip().upper() == "RANGING"
+        capacity = self._compute_capacity_health(now)
+        headroom = int(capacity.get("open_order_headroom") or 0)
+        min_headroom = max(0, int(getattr(config, "RANGER_MIN_HEADROOM", 0)))
+        cooldown_sec = max(0.0, float(getattr(config, "RANGER_COOLDOWN_SEC", 30)))
+
+        for rid in sorted(self._rangers.keys()):
+            state = self._ensure_ranger_state(int(rid))
+            stage = str(state.stage or "idle")
+
+            if stage == "cooldown":
+                if not regime_ok:
+                    self._ranger_reset_state(
+                        state,
+                        now_ts=now,
+                        stage="idle",
+                        reason="regime_not_ranging",
+                        clear_prices=True,
+                    )
+                    continue
+                if cooldown_sec <= 0.0 or (now - float(state.stage_entered_at or now)) >= cooldown_sec:
+                    self._ranger_reset_state(state, now_ts=now, stage="idle", reason="", clear_prices=True)
+                continue
+
+            if not regime_ok:
+                if stage == "entry_open":
+                    txid = str(state.entry_txid or "").strip()
+                    if txid:
+                        try:
+                            ok = self._cancel_order(txid)
+                        except Exception:
+                            ok = False
+                        if not ok:
+                            state.last_error = "entry_regime_cancel_failed"
+                            continue
+                    self._ranger_reset_state(
+                        state,
+                        now_ts=now,
+                        stage="idle",
+                        reason="regime_shift",
+                        clear_prices=True,
+                    )
+                elif stage == "exit_open":
+                    txid = str(state.exit_txid or "").strip()
+                    if txid:
+                        try:
+                            ok = self._cancel_order(txid)
+                        except Exception:
+                            ok = False
+                        if not ok:
+                            state.last_error = "exit_regime_cancel_failed"
+                            continue
+                    self._ranger_mark_orphan(
+                        state=state,
+                        now_ts=now,
+                        reason="regime_shift",
+                        cooldown=False,
+                    )
+                else:
+                    state.last_error = "regime_not_ranging"
+                continue
+
+            if stage in {"entry_open", "exit_open"}:
+                self._ranger_timeout_tick(state=state, now_ts=now)
+                continue
+
+            if int(headroom) < min_headroom:
+                state.last_error = "headroom_low"
+                continue
+
+            ok, reason, entry_price, volume = self._ranger_gate_check(now_ts=now, headroom=headroom)
+            if not ok:
+                state.last_error = str(reason)
+                continue
+
+            reserved = self._try_reserve_loop_funds(side="sell", volume=float(volume), price=float(entry_price))
+            txid_new: str | None = None
+            try:
+                txid_new = self._place_order(
+                    side="sell",
+                    volume=float(volume),
+                    price=float(entry_price),
+                    userref=self._ranger_userref(int(rid)),
+                )
+            except Exception:
+                txid_new = None
+
+            if not txid_new:
+                if reserved:
+                    self._release_loop_reservation(
+                        side="sell",
+                        volume=float(volume),
+                        price=float(entry_price),
+                    )
+                state.last_error = "entry_place_failed"
+                continue
+
+            state.stage = "entry_open"
+            state.entry_txid = str(txid_new)
+            state.exit_txid = ""
+            state.entry_price = float(entry_price)
+            state.entry_volume = float(volume)
+            state.exit_price = 0.0
+            state.entry_filled_at = 0.0
+            state.stage_entered_at = float(now)
+            state.last_error = ""
+            self.ledger.commit_order("sell", float(entry_price), float(volume))
+
+    def _ranger_status_payload(self, now_ts: float | None = None) -> dict[str, Any]:
+        now = float(now_ts if now_ts is not None else _now())
+        self._reconcile_ranger_state()
+
+        regime_name, _conf, _bias, _ready, _source = self._policy_hmm_signal()
+        regime = str(regime_name or "").strip().upper()
+        regime_ok = regime == "RANGING"
+
+        rows: list[dict[str, Any]] = []
+        active = 0
+        for rid in sorted(self._rangers.keys()):
+            state = self._ensure_ranger_state(int(rid))
+            stage = str(state.stage or "idle").strip().lower() or "idle"
+            if stage != "idle":
+                active += 1
+            stage_entered_at = float(state.stage_entered_at or 0.0)
+            age_sec = max(0.0, now - stage_entered_at) if stage_entered_at > 0 else 0.0
+            rows.append(
+                {
+                    "ranger_id": int(rid),
+                    "stage": stage,
+                    "entry_price": float(state.entry_price or 0.0),
+                    "exit_price": float(state.exit_price or 0.0),
+                    "entry_volume": float(state.entry_volume or 0.0),
+                    "age_sec": float(age_sec),
+                    "last_error": str(state.last_error or ""),
+                }
+            )
+
+        enabled = bool(self._ranger_enabled())
+        paused_reason = ""
+        if not enabled:
+            paused_reason = "disabled"
+        elif not regime_ok:
+            paused_reason = "regime_not_ranging"
+        elif int(active) <= 0:
+            paused_reason = "idle"
+
+        return {
+            "enabled": enabled,
+            "active": int(active),
+            "max_slots": max(1, int(getattr(config, "RANGER_MAX_SLOTS", 3))),
+            "regime_ok": bool(regime_ok),
+            "regime": str(regime or ""),
+            "paused_reason": str(paused_reason),
+            "cycles_today": int(self._ranger_cycles_today),
+            "profit_today": float(self._ranger_profit_today),
+            "orphans_today": int(self._ranger_orphans_today),
+            "orphan_exposure_usd": float(self._ranger_orphan_exposure_usd),
+            "doge_reserve": float(getattr(config, "RANGER_DOGE_RESERVE", 100.0)),
+            "entry_timeout_sec": int(max(60, int(getattr(config, "RANGER_ENTRY_TIMEOUT_SEC", 300)))),
+            "exit_timeout_sec": int(
+                max(
+                    int(getattr(config, "RANGER_ENTRY_TIMEOUT_SEC", 300)),
+                    int(getattr(config, "RANGER_EXIT_TIMEOUT_SEC", 1350)),
+                )
+            ),
+            "cooldown_sec": int(max(0, int(getattr(config, "RANGER_COOLDOWN_SEC", 30)))),
+            "slots": rows,
+        }
 
     def _churner_enabled(self) -> bool:
         return self._flag_value("CHURNER_ENABLED") and self._position_ledger_enabled()
@@ -13143,6 +13815,13 @@ class BotRuntime:
             exit_txid = str(state.exit_txid or "").strip()
             if exit_txid:
                 tx_map[exit_txid] = (int(sid), "churner_exit", 0)
+        for rid, state in self._rangers.items():
+            entry_txid = str(state.entry_txid or "").strip()
+            if entry_txid:
+                tx_map[entry_txid] = (int(rid), "ranger_entry", 0)
+            exit_txid = str(state.exit_txid or "").strip()
+            if exit_txid:
+                tx_map[exit_txid] = (int(rid), "ranger_exit", 0)
 
         if not tx_map:
             return
@@ -13312,6 +13991,28 @@ class BotRuntime:
                         fill_ts=float(_now()),
                     )
                     self.seen_fill_txids.add(txid)
+                elif kind == "ranger_entry":
+                    self._ranger_on_entry_fill(
+                        ranger_id=int(sid),
+                        txid=str(txid),
+                        fill_price=float(price),
+                        fill_volume=float(volume),
+                        fill_fee=float(fee),
+                        fill_cost=float(fill_cost),
+                        fill_ts=float(_now()),
+                    )
+                    self.seen_fill_txids.add(txid)
+                elif kind == "ranger_exit":
+                    self._ranger_on_exit_fill(
+                        ranger_id=int(sid),
+                        txid=str(txid),
+                        fill_price=float(price),
+                        fill_volume=float(volume),
+                        fill_fee=float(fee),
+                        fill_cost=float(fill_cost),
+                        fill_ts=float(_now()),
+                    )
+                    self.seen_fill_txids.add(txid)
 
             elif status == "open":
                 vol_exec = _to_float(row.get("vol_exec"))
@@ -13346,6 +14047,13 @@ class BotRuntime:
                 elif kind in {"churner_entry", "churner_exit"}:
                     self._churner_on_order_canceled(
                         slot_id=int(sid),
+                        kind=str(kind),
+                        txid=str(txid),
+                        now_ts=float(_now()),
+                    )
+                elif kind in {"ranger_entry", "ranger_exit"}:
+                    self._ranger_on_order_canceled(
+                        ranger_id=int(sid),
                         kind=str(kind),
                         txid=str(txid),
                         now_ts=float(_now()),
@@ -14610,6 +15318,7 @@ class BotRuntime:
             self._update_trade_beliefs(_now())
             self._run_self_healing_reprice(loop_now)
             self._run_churner_engine(loop_now)
+            self._run_ranger_engine(loop_now)
             self._update_daily_loss_lock(_now())
             # Refresh pair open-order telemetry (Kraken source of truth) when budget allows.
             self._refresh_open_order_telemetry()
@@ -15935,6 +16644,7 @@ class BotRuntime:
                     "compounding_mode": str(getattr(config, "STICKY_COMPOUNDING_MODE", "legacy_profit")),
                     "auto_release_enabled": self._flag_value("RELEASE_AUTO_ENABLED"),
                 },
+                "rangers": self._ranger_status_payload(now),
                 "self_healing": self._self_healing_status_payload(now),
                 "slot_vintage": slot_vintage,
                 "hmm_data_pipeline": hmm_data_pipeline,
