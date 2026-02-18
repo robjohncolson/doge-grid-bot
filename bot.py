@@ -1426,6 +1426,8 @@ class BotRuntime:
         self._digest_interpretation_last_attempt_ts: float = 0.0
         self._digest_interpretation_last_trigger: str = ""
         self._digest_interpretation_last_error: str = ""
+        self._digest_interpretation_thread_alive: bool = False
+        self._digest_interpretation_pending: dict[str, Any] | None = None
         # Strategic accumulation engine runtime state.
         self._accum_state: str = "IDLE"  # IDLE | ARMED | ACTIVE | COMPLETED | STOPPED
         self._accum_direction: str | None = None
@@ -3945,6 +3947,7 @@ class BotRuntime:
             "digest_interpretation_last_attempt_ts": float(self._digest_interpretation_last_attempt_ts),
             "digest_interpretation_last_trigger": str(self._digest_interpretation_last_trigger or ""),
             "digest_interpretation_last_error": str(self._digest_interpretation_last_error or ""),
+            "digest_interpretation_thread_alive": False,  # never persist thread state
             "accum_state": str(self._accum_state),
             "accum_direction": self._accum_direction,
             "accum_trigger_from_regime": str(self._accum_trigger_from_regime),
@@ -4733,6 +4736,8 @@ class BotRuntime:
             self._digest_interpretation_last_error = str(
                 snap.get("digest_interpretation_last_error", self._digest_interpretation_last_error) or ""
             )
+            self._digest_interpretation_thread_alive = False  # always clean on restore
+            self._digest_interpretation_pending = None
             raw_accum_state = str(snap.get("accum_state", self._accum_state) or "IDLE").strip().upper()
             if raw_accum_state not in {"IDLE", "ARMED", "ACTIVE", "COMPLETED", "STOPPED"}:
                 raw_accum_state = "IDLE"
@@ -15492,6 +15497,7 @@ class BotRuntime:
             self._auto_release_sticky_slots()
             # Rule-based signal digest runs every loop; interpretation layer is separate.
             self._run_signal_digest(loop_now)
+            self._maybe_schedule_digest_interpretation(loop_now)
 
             # Pressure notice for orphan growth.
             total_orphans = sum(len(s.state.recovery_orders) for s in self.slots.values())
@@ -16425,17 +16431,133 @@ class BotRuntime:
             self._digest_last_error = str(e)
             logger.warning("Signal digest evaluation failed: %s", e)
 
+    def _digest_interpretation_worker(self, context: dict[str, Any], trigger: str, requested_at: float) -> None:
+        try:
+            result = ai_advisor.get_digest_interpretation(context)
+            self._digest_interpretation_pending = {
+                "result": dict(result or {}),
+                "trigger": str(trigger),
+                "requested_at": float(requested_at),
+                "completed_at": float(_now()),
+            }
+        except Exception as e:
+            self._digest_interpretation_pending = {
+                "result": {
+                    "narrative": "", "key_insight": "", "watch_for": "",
+                    "config_assessment": "borderline", "config_suggestion": "",
+                    "panelist": "", "provider": "", "model": "",
+                    "error": str(e),
+                },
+                "trigger": str(trigger),
+                "requested_at": float(requested_at),
+                "completed_at": float(_now()),
+            }
+        finally:
+            self._digest_interpretation_thread_alive = False
+
+    def _start_digest_interpretation(self, now: float, trigger: str) -> None:
+        if not self._flag_value("DIGEST_ENABLED"):
+            return
+        if not self._flag_value("DIGEST_INTERPRETATION_ENABLED"):
+            return
+        if self._digest_interpretation_thread_alive:
+            return
+        context = self._build_signal_digest_context(float(now))
+        # Inject current light/top_concern into context for the LLM prompt
+        context["digest_light"] = str(self._digest_light or "green")
+        context["digest_top_concern"] = str(self._digest_top_concern or "All diagnostic checks nominal.")
+        self._digest_interpretation_last_attempt_ts = float(now)
+        self._digest_interpretation_last_trigger = str(trigger)
+        self._digest_interpretation_thread_alive = True
+        thread = threading.Thread(
+            target=self._digest_interpretation_worker,
+            args=(context, str(trigger), float(now)),
+            daemon=True,
+            name="digest-interpreter",
+        )
+        try:
+            thread.start()
+        except Exception:
+            self._digest_interpretation_thread_alive = False
+            raise
+
+    def _process_digest_interpretation_pending(self, now: float) -> None:
+        pending = self._digest_interpretation_pending
+        if not isinstance(pending, dict):
+            return
+        self._digest_interpretation_pending = None
+
+        result = pending.get("result", {})
+        if not isinstance(result, dict):
+            result = {}
+        error = str(result.get("error", "") or "").strip()
+        if error:
+            self._digest_interpretation_last_error = error
+            logger.warning("Digest interpretation failed: %s", error)
+            return  # Keep prior interpretation on failure (stale fallback)
+
+        # Success — update interpretation
+        self._digest_interpretation = {
+            "narrative": str(result.get("narrative", "") or "")[:500],
+            "key_insight": str(result.get("key_insight", "") or "")[:200],
+            "watch_for": str(result.get("watch_for", "") or "")[:200],
+            "config_assessment": str(result.get("config_assessment", "borderline") or "borderline"),
+            "config_suggestion": str(result.get("config_suggestion", "") or "")[:200],
+            "panelist": str(result.get("panelist", "") or ""),
+            "ts": float(now),
+        }
+        self._digest_interpretation_last_error = ""
+        logger.info(
+            "Digest interpretation updated (trigger=%s, panelist=%s)",
+            pending.get("trigger", "?"),
+            result.get("panelist", "?"),
+        )
+
+    def _maybe_schedule_digest_interpretation(self, now: float) -> None:
+        if not self._flag_value("DIGEST_ENABLED"):
+            return
+        if not self._flag_value("DIGEST_INTERPRETATION_ENABLED"):
+            return
+        if self._digest_interpretation_thread_alive:
+            return
+
+        self._process_digest_interpretation_pending(now)
+
+        last_attempt = float(self._digest_interpretation_last_attempt_ts or 0.0)
+        elapsed = now - last_attempt if last_attempt > 0.0 else float("inf")
+        debounce_sec = max(1.0, float(getattr(config, "DIGEST_INTERPRETATION_DEBOUNCE_SEC", 120.0)))
+        interval_sec = max(1.0, float(getattr(config, "DIGEST_INTERPRETATION_INTERVAL_SEC", 600.0)))
+        if elapsed < debounce_sec:
+            return
+
+        periodic_due = elapsed >= interval_sec
+        # Event trigger: light changed since last interpretation
+        interp_ts = 0.0
+        try:
+            interp_ts = float((self._digest_interpretation or {}).get("ts", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            interp_ts = 0.0
+        light_changed_at = float(self._digest_light_changed_at or 0.0)
+        light_change_event = light_changed_at > interp_ts and light_changed_at > last_attempt
+
+        if not (periodic_due or light_change_event):
+            return
+
+        trigger = "periodic" if periodic_due else "light_change"
+        self._start_digest_interpretation(now, trigger)
+
     def trigger_signal_digest_interpretation(self) -> tuple[bool, str]:
         now = float(_now())
         self._digest_interpretation_requested_at = now
-        self._digest_interpretation_last_attempt_ts = now
         self._digest_interpretation_last_trigger = "manual"
         if not self._flag_value("DIGEST_ENABLED"):
             return False, "signal digest disabled"
         if not self._flag_value("DIGEST_INTERPRETATION_ENABLED"):
             return False, "digest interpretation disabled"
-        # Phase D wires the actual worker; Phase B only provides endpoint/state plumbing.
-        return True, "digest interpretation trigger accepted (LLM interpreter not wired yet)"
+        if self._digest_interpretation_thread_alive:
+            return True, "digest interpretation already running"
+        self._start_digest_interpretation(now, "manual")
+        return True, "digest interpretation triggered"
 
     def _signal_digest_status_payload(self, now_ts: float | None = None) -> dict[str, Any]:
         now = float(now_ts if now_ts is not None else _now())

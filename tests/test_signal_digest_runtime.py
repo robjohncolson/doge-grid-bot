@@ -100,9 +100,103 @@ class SignalDigestRuntimeTests(unittest.TestCase):
             with mock.patch.object(config, "DIGEST_INTERPRETATION_ENABLED", True):
                 ok, msg = rt.trigger_signal_digest_interpretation()
         self.assertTrue(ok)
-        self.assertIn("accepted", msg.lower())
+        self.assertIn("triggered", msg.lower())
         self.assertEqual(rt._digest_interpretation_last_trigger, "manual")
         self.assertGreater(rt._digest_interpretation_requested_at, 0.0)
+
+    def test_maybe_schedule_periodic_trigger(self):
+        """Scheduler fires periodic trigger when interval elapsed."""
+        rt = self._runtime()
+        with mock.patch.object(config, "DIGEST_ENABLED", True):
+            with mock.patch.object(config, "DIGEST_INTERPRETATION_ENABLED", True):
+                with mock.patch.object(config, "DIGEST_INTERPRETATION_INTERVAL_SEC", 600.0):
+                    with mock.patch.object(config, "DIGEST_INTERPRETATION_DEBOUNCE_SEC", 120.0):
+                        rt._run_signal_digest(1000.0)
+                        # Simulate time passing beyond interval
+                        rt._digest_interpretation_last_attempt_ts = 0.0
+                        with mock.patch.object(rt, "_start_digest_interpretation") as mock_start:
+                            rt._maybe_schedule_digest_interpretation(1000.0)
+                            mock_start.assert_called_once()
+                            args = mock_start.call_args[0]
+                            self.assertEqual(args[1], "periodic")
+
+    def test_maybe_schedule_debounce_blocks(self):
+        """Scheduler respects debounce — no trigger if too recent."""
+        rt = self._runtime()
+        with mock.patch.object(config, "DIGEST_ENABLED", True):
+            with mock.patch.object(config, "DIGEST_INTERPRETATION_ENABLED", True):
+                with mock.patch.object(config, "DIGEST_INTERPRETATION_DEBOUNCE_SEC", 120.0):
+                    rt._run_signal_digest(1000.0)
+                    rt._digest_interpretation_last_attempt_ts = 999.0  # 1 second ago
+                    with mock.patch.object(rt, "_start_digest_interpretation") as mock_start:
+                        rt._maybe_schedule_digest_interpretation(1000.0)
+                        mock_start.assert_not_called()
+
+    def test_maybe_schedule_light_change_trigger(self):
+        """Scheduler fires light_change trigger when light changed after last interpretation."""
+        rt = self._runtime()
+        with mock.patch.object(config, "DIGEST_ENABLED", True):
+            with mock.patch.object(config, "DIGEST_INTERPRETATION_ENABLED", True):
+                with mock.patch.object(config, "DIGEST_INTERPRETATION_DEBOUNCE_SEC", 1.0):
+                    with mock.patch.object(config, "DIGEST_INTERPRETATION_INTERVAL_SEC", 99999.0):
+                        rt._run_signal_digest(1000.0)
+                        rt._digest_light_changed_at = 999.0
+                        rt._digest_interpretation = {"ts": 500.0}
+                        rt._digest_interpretation_last_attempt_ts = 500.0
+                        with mock.patch.object(rt, "_start_digest_interpretation") as mock_start:
+                            rt._maybe_schedule_digest_interpretation(1000.0)
+                            mock_start.assert_called_once()
+                            args = mock_start.call_args[0]
+                            self.assertEqual(args[1], "light_change")
+
+    def test_process_pending_success_updates_interpretation(self):
+        """Successful pending result updates interpretation fields."""
+        rt = self._runtime()
+        rt._digest_interpretation_pending = {
+            "result": {
+                "narrative": "Ranging stable.",
+                "key_insight": "Grid optimal.",
+                "watch_for": "RSI drop.",
+                "config_assessment": "well-suited",
+                "config_suggestion": "",
+                "panelist": "DeepSeek-Chat",
+                "provider": "deepseek",
+                "model": "deepseek-chat",
+                "error": "",
+            },
+            "trigger": "periodic",
+            "requested_at": 990.0,
+            "completed_at": 995.0,
+        }
+        rt._process_digest_interpretation_pending(1000.0)
+        self.assertEqual(rt._digest_interpretation.get("narrative"), "Ranging stable.")
+        self.assertEqual(rt._digest_interpretation.get("panelist"), "DeepSeek-Chat")
+        self.assertEqual(rt._digest_interpretation_last_error, "")
+
+    def test_process_pending_error_preserves_prior(self):
+        """Failed pending result keeps prior interpretation intact."""
+        rt = self._runtime()
+        rt._digest_interpretation = {"narrative": "Prior.", "ts": 800.0}
+        rt._digest_interpretation_pending = {
+            "result": {"error": "http_429"},
+            "trigger": "periodic",
+            "requested_at": 990.0,
+            "completed_at": 995.0,
+        }
+        rt._process_digest_interpretation_pending(1000.0)
+        self.assertEqual(rt._digest_interpretation.get("narrative"), "Prior.")
+        self.assertEqual(rt._digest_interpretation_last_error, "http_429")
+
+    def test_trigger_manual_starts_worker(self):
+        """Manual trigger now dispatches actual worker instead of placeholder."""
+        rt = self._runtime()
+        with mock.patch.object(config, "DIGEST_ENABLED", True):
+            with mock.patch.object(config, "DIGEST_INTERPRETATION_ENABLED", True):
+                with mock.patch.object(rt, "_start_digest_interpretation") as mock_start:
+                    ok, msg = rt.trigger_signal_digest_interpretation()
+                    self.assertTrue(ok)
+                    self.assertIn("triggered", msg.lower())
+                    mock_start.assert_called_once()
 
 
 if __name__ == "__main__":

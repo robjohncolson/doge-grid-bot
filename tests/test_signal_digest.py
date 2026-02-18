@@ -98,5 +98,56 @@ class HMMObservationExposureTests(unittest.TestCase):
         self.assertAlmostEqual(detector.last_volume_ratio, 1.18, places=8)
 
 
+class DigestInterpretationParsingTests(unittest.TestCase):
+    def test_parse_valid_json_response(self):
+        """Valid JSON with all fields should parse cleanly."""
+        response = '{"narrative": "Market is ranging.", "key_insight": "Grid conditions ideal.", "watch_for": "RSI dropping below 30.", "config_assessment": "well-suited", "config_suggestion": ""}'
+        from ai_advisor import _parse_digest_interpretation
+        parsed, err = _parse_digest_interpretation(response)
+        self.assertEqual(err, "")
+        self.assertEqual(parsed["narrative"], "Market is ranging.")
+        self.assertEqual(parsed["config_assessment"], "well-suited")
+
+    def test_parse_json_with_think_tags(self):
+        """Reasoning models wrap answer in <think>...</think> tags."""
+        response = '<think>Let me analyze...</think>\n{"narrative": "Ranging market.", "key_insight": "Stable.", "watch_for": "MACD turn.", "config_assessment": "borderline", "config_suggestion": "reduce slots"}'
+        from ai_advisor import _parse_digest_interpretation
+        parsed, err = _parse_digest_interpretation(response)
+        self.assertEqual(err, "")
+        self.assertEqual(parsed["narrative"], "Ranging market.")
+        self.assertEqual(parsed["config_suggestion"], "reduce slots")
+
+    def test_parse_invalid_config_assessment_defaults_borderline(self):
+        """Unknown config_assessment should default to borderline."""
+        response = '{"narrative": "Test.", "key_insight": "x", "watch_for": "y", "config_assessment": "INVALID", "config_suggestion": ""}'
+        from ai_advisor import _parse_digest_interpretation
+        parsed, err = _parse_digest_interpretation(response)
+        self.assertEqual(err, "")
+        self.assertEqual(parsed["config_assessment"], "borderline")
+
+    def test_parse_empty_response_returns_error(self):
+        """Empty response should return parse error."""
+        from ai_advisor import _parse_digest_interpretation
+        parsed, err = _parse_digest_interpretation("")
+        self.assertNotEqual(err, "")
+
+    def test_parse_no_json_heuristic_fallback(self):
+        """Plain text without JSON should use heuristic extraction."""
+        response = "The market is ranging with stable conditions. RSI is neutral. Watch for MACD divergence."
+        from ai_advisor import _parse_digest_interpretation
+        parsed, err = _parse_digest_interpretation(response)
+        # Heuristic should still populate narrative
+        self.assertTrue(len(parsed.get("narrative", "")) > 0)
+
+    def test_parse_clips_long_strings(self):
+        """Narrative should be clipped to 500 chars."""
+        long_text = "A" * 600
+        response = f'{{"narrative": "{long_text}", "key_insight": "x", "watch_for": "y", "config_assessment": "well-suited", "config_suggestion": ""}}'
+        from ai_advisor import _parse_digest_interpretation
+        parsed, err = _parse_digest_interpretation(response)
+        self.assertEqual(err, "")
+        self.assertLessEqual(len(parsed["narrative"]), 500)
+
+
 if __name__ == "__main__":
     unittest.main()

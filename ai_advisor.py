@@ -1522,6 +1522,327 @@ def format_recommendation(parsed: dict) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Digest interpretation (Phase D)
+# ---------------------------------------------------------------------------
+
+_DIGEST_SYSTEM_PROMPT = (
+    "You are a trading systems analyst monitoring a DOGE/USD grid trading bot. "
+    "Analyze the current signal state and provide a concise interpretation.\n\n"
+    "INSTRUCTIONS:\n"
+    "- Explain what the technical indicators mean TOGETHER, not individually\n"
+    "- Use trading language (e.g., 'momentum fading', 'mean reversion setup')\n"
+    "- Identify the dominant market narrative from the signals\n"
+    "- Flag any signal conflicts or divergences\n"
+    "- Assess whether current grid configuration suits the market conditions\n"
+    "- Be specific about what to watch for next\n"
+    "- Keep it under 150 words\n\n"
+    "Return ONLY a JSON object with these fields:\n"
+    '- "narrative": 1-3 sentence market story\n'
+    '- "key_insight": single most important takeaway\n'
+    '- "watch_for": what could change the picture\n'
+    '- "config_assessment": "well-suited" or "mismatched" or "borderline"\n'
+    '- "config_suggestion": optional, what to adjust (empty string if none)'
+)
+
+
+def _build_digest_prompt(context: dict) -> str:
+    """Build the user prompt for digest interpretation from the signal digest context."""
+    if not isinstance(context, dict):
+        context = {}
+
+    # Price
+    price = _safe_float(context.get("price", 0.0), 0.0)
+
+    # Regime
+    hmm_regime = context.get("hmm_regime")
+    if not isinstance(hmm_regime, dict):
+        hmm_regime = {}
+    regime = _clip_text(hmm_regime.get("regime", "RANGING"), 24) or "RANGING"
+    confidence = _safe_float(
+        hmm_regime.get("confidence", context.get("hmm_regime.confidence", 0.0)),
+        0.0, 0.0, 1.0,
+    )
+    confidence_pct = round(confidence * 100.0, 1)
+
+    # Consensus
+    hmm_consensus = context.get("hmm_consensus")
+    if not isinstance(hmm_consensus, dict):
+        hmm_consensus = {}
+    agreement = _clip_text(
+        hmm_consensus.get("agreement", "primary_only"), 40,
+    ) or "primary_only"
+
+    # Observation
+    hmm_obs = context.get("hmm_observation")
+    if not isinstance(hmm_obs, dict):
+        hmm_obs = {}
+    macd_slope = _safe_float(hmm_obs.get("macd_hist_slope", 0.0), 0.0)
+    macd_direction = "rising" if macd_slope > 0 else ("falling" if macd_slope < 0 else "flat")
+    rsi_zone = _safe_float(hmm_obs.get("rsi_zone", 0.0), 0.0, -1.0, 1.0)
+    rsi_raw = _safe_float(hmm_obs.get("rsi_raw", 50.0), 50.0, 0.0, 100.0)
+    ema_spread = _safe_float(hmm_obs.get("ema_spread_pct", 0.0), 0.0)
+    volume_ratio = _safe_float(hmm_obs.get("volume_ratio", 1.0), 1.0, 0.0)
+
+    # Trend score
+    trend_score = _safe_float(context.get("trend_score", 0.0), 0.0)
+
+    # Boundary risk
+    boundary_risk = _clip_text(context.get("boundary_risk", "low"), 24) or "low"
+    p_switch = _safe_float(context.get("p_switch", 0.0), 0.0, 0.0, 100.0)
+
+    # Headroom
+    headroom = _safe_int(context.get("headroom", 0), 0, 0)
+
+    # Age bands
+    age_bands = context.get("age_bands")
+    if not isinstance(age_bands, dict):
+        self_healing = context.get("self_healing")
+        if isinstance(self_healing, dict):
+            age_bands = self_healing.get("age_bands", {})
+        if not isinstance(age_bands, dict):
+            age_bands = {}
+    fresh = _safe_int(age_bands.get("fresh", 0), 0, 0)
+    aging = _safe_int(age_bands.get("aging", 0), 0, 0)
+    stale = _safe_int(age_bands.get("stale", 0), 0, 0)
+    stuck = _safe_int(age_bands.get("stuck", 0), 0, 0)
+    write_off = _safe_int(age_bands.get("write_off", 0), 0, 0)
+
+    # Rangers
+    rangers = context.get("rangers")
+    if not isinstance(rangers, dict):
+        rangers = {}
+    ranger_active = _safe_int(rangers.get("active", 0), 0, 0)
+    ranger_enabled = bool(rangers.get("enabled", False))
+    ranger_status = f"{ranger_active} active" if ranger_enabled else "disabled"
+
+    # Capital utilization
+    util_ratio = _safe_float(context.get("capital_util_ratio", 0.0), 0.0, 0.0, 1.0)
+    util_pct = round(util_ratio * 100.0, 1)
+
+    # Manifold
+    manifold_score = context.get("manifold_score")
+    if not isinstance(manifold_score, dict):
+        manifold_score = {}
+    mts = _safe_float(
+        manifold_score.get("mts", context.get("mts", 0.0)),
+        0.0, 0.0, 1.0,
+    )
+    mts_band = _clip_text(
+        context.get("mts_band", manifold_score.get("band", "")), 24,
+    ) or "unknown"
+    mts_trend = _clip_text(
+        context.get("mts_trend", manifold_score.get("trend", "stable")), 24,
+    ) or "stable"
+
+    # Diagnostic traffic light
+    digest_light = _clip_text(context.get("digest_light", "green"), 24) or "green"
+    digest_top_concern = _clip_text(
+        context.get("digest_top_concern", "All diagnostic checks nominal."), 200,
+    ) or "All diagnostic checks nominal."
+
+    return (
+        f"CURRENT STATE:\n"
+        f"- Price: ${price:.6f}\n"
+        f"- Regime: {regime} (confidence: {confidence_pct}%)\n"
+        f"- Timeframe agreement: {agreement}\n"
+        f"- MACD histogram slope: {macd_slope:.4f} ({macd_direction})\n"
+        f"- RSI zone: {rsi_zone:.2f} (raw RSI: {rsi_raw:.1f})\n"
+        f"- EMA spread: {ema_spread:.4f}% (trend score: {trend_score:.4f})\n"
+        f"- Volume ratio: {volume_ratio:.2f}x average\n"
+        f"- Boundary risk: {boundary_risk} (p_switch: {p_switch:.1f}%)\n"
+        f"\n"
+        f"OPERATIONAL STATE:\n"
+        f"- Headroom: {headroom} open order slots remaining\n"
+        f"- Age bands: {fresh} fresh, {aging} aging, {stale} stale, {stuck} stuck, {write_off} write-off\n"
+        f"- Rangers: {ranger_status}\n"
+        f"- Capital utilization: {util_pct}%\n"
+        f"- Manifold score: {mts:.4f} ({mts_band}, {mts_trend})\n"
+        f"\n"
+        f"DIAGNOSTIC TRAFFIC LIGHT: {digest_light} — {digest_top_concern}"
+    )
+
+
+def _parse_digest_interpretation(response: str) -> tuple:
+    """
+    Parse the LLM response for digest interpretation.
+
+    Returns (parsed_dict, error_string). On success error is "".
+    """
+    if not response:
+        return ({}, "empty_response")
+
+    stripped = response.strip()
+
+    # Strip </think> blocks (reasoning models)
+    think_end = stripped.rfind("</think>")
+    if think_end >= 0:
+        stripped = stripped[think_end + len("</think>"):].strip()
+
+    # Try to find JSON object
+    json_start = stripped.find("{")
+    json_end = stripped.rfind("}")
+
+    if json_start >= 0 and json_end > json_start:
+        try:
+            parsed = json.loads(stripped[json_start:json_end + 1])
+        except Exception:
+            parsed = None
+
+        if isinstance(parsed, dict):
+            # Validate config_assessment
+            config_assessment = str(parsed.get("config_assessment", "borderline") or "borderline").strip().lower()
+            if config_assessment not in ("well-suited", "mismatched", "borderline"):
+                config_assessment = "borderline"
+
+            result = {
+                "narrative": _clip_text(parsed.get("narrative", ""), 500),
+                "key_insight": _clip_text(parsed.get("key_insight", ""), 200),
+                "watch_for": _clip_text(parsed.get("watch_for", ""), 200),
+                "config_assessment": config_assessment,
+                "config_suggestion": _clip_text(parsed.get("config_suggestion", ""), 200),
+            }
+            return (result, "")
+
+    # Heuristic fallback: split into sentences
+    sentences = [s.strip() for s in stripped.replace("\n", " ").split(".") if s.strip()]
+    narrative = _clip_text(sentences[0] + "." if sentences else "", 500)
+    key_insight = _clip_text(sentences[1] + "." if len(sentences) > 1 else "", 200)
+    watch_for = _clip_text(sentences[-1] + "." if len(sentences) > 2 else "", 200)
+
+    result = {
+        "narrative": narrative,
+        "key_insight": key_insight,
+        "watch_for": watch_for,
+        "config_assessment": "borderline",
+        "config_suggestion": "",
+    }
+    return (result, "heuristic_parse")
+
+
+def _default_digest_interpretation(error: str = "") -> dict:
+    """Return a dict with all digest interpretation fields defaulted."""
+    return {
+        "narrative": "",
+        "key_insight": "",
+        "watch_for": "",
+        "config_assessment": "borderline",
+        "config_suggestion": "",
+        "panelist": "",
+        "provider": "",
+        "model": "",
+        "error": _clip_text(error, 200),
+    }
+
+
+def get_digest_interpretation(context: dict) -> dict:
+    """
+    Query the LLM provider chain for a digest interpretation.
+
+    Uses the same DeepSeek primary / Groq fallback chain as get_regime_opinion.
+
+    Returns a validated dict and never raises.
+    """
+    try:
+        providers = _build_regime_provider_chain()
+        if not providers:
+            return _default_digest_interpretation("no_providers")
+
+        messages = [
+            {"role": "system", "content": _DIGEST_SYSTEM_PROMPT},
+            {"role": "user", "content": _build_digest_prompt(context)},
+        ]
+
+        last_error = "all_digest_providers_failed"
+        for provider in providers:
+            name = str(provider.get("name", "")).strip() or "unknown"
+            provider_name = str(provider.get("provider", "panel")).strip().lower() or "panel"
+            model_name = str(provider.get("model", "")).strip()
+            provider_key = str(
+                provider.get("panelist_id")
+                or f"{provider.get('url', '')}|{provider.get('model', '')}"
+                or name
+            )
+
+            now = time.time()
+            skip_until = float(_panelist_skip_until.get(provider_key, 0) or 0)
+            if now < skip_until:
+                remaining = int(skip_until - now)
+                logger.info(
+                    "Digest interpretation: provider %s skipped (cooldown, %ds remaining)",
+                    name,
+                    remaining,
+                )
+                continue
+
+            logger.info("Digest interpretation: querying %s/%s...", provider_name, model_name or name)
+
+            response, err = _call_panelist_messages(messages, provider)
+            if not response:
+                reason = _clip_text(err or "empty_response", 120)
+                last_error = f"{name}:{reason}"
+                fails = int(_panelist_consecutive_fails.get(provider_key, 0) or 0) + 1
+                _panelist_consecutive_fails[provider_key] = fails
+                if fails >= SKIP_THRESHOLD:
+                    _panelist_skip_until[provider_key] = now + SKIP_COOLDOWN
+                    logger.warning(
+                        "Digest interpretation: provider %s hit %d consecutive failures -- skipping for %ds",
+                        name,
+                        fails,
+                        SKIP_COOLDOWN,
+                    )
+                logger.warning(
+                    "Digest interpretation: provider %s failed (%s), trying next",
+                    name,
+                    reason,
+                )
+                continue
+
+            parsed, parse_err = _parse_digest_interpretation(response)
+            if parse_err and not parsed:
+                last_error = f"{name}:{parse_err}"
+                fails = int(_panelist_consecutive_fails.get(provider_key, 0) or 0) + 1
+                _panelist_consecutive_fails[provider_key] = fails
+                if fails >= SKIP_THRESHOLD:
+                    _panelist_skip_until[provider_key] = now + SKIP_COOLDOWN
+                    logger.warning(
+                        "Digest interpretation: provider %s hit %d consecutive failures -- skipping for %ds",
+                        name,
+                        fails,
+                        SKIP_COOLDOWN,
+                    )
+                logger.warning(
+                    "Digest interpretation: provider %s returned unparseable response (%s), trying next",
+                    name,
+                    parse_err,
+                )
+                continue
+
+            # Success (JSON or heuristic)
+            _panelist_consecutive_fails[provider_key] = 0
+            result = _default_digest_interpretation("")
+            result.update(parsed)
+            result["panelist"] = name
+            result["provider"] = provider_name
+            result["model"] = model_name
+            if parse_err:
+                result["error"] = parse_err
+            logger.info(
+                "Digest interpretation: %s/%s -> %s (%s)",
+                provider_name,
+                model_name or name,
+                result["config_assessment"],
+                _clip_text(result["narrative"], 80),
+            )
+            return result
+
+        return _default_digest_interpretation(last_error)
+
+    except Exception as e:
+        logger.exception("Digest interpretation failed")
+        return _default_digest_interpretation(str(e))
+
+
 def analyze_trade(cycle_data: dict) -> dict:
     """
     Ask the first available AI panelist why a trade lost money.
