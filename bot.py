@@ -1651,9 +1651,14 @@ class BotRuntime:
                 dependencies=("MTS_ENABLED",),
             ),
             RuntimeToggleSpec(
+                key="HERD_MODE_ENABLED",
+                group="Position Management",
+                description="Herd mode: intelligence manages exit lifecycle + slot modes",
+            ),
+            RuntimeToggleSpec(
                 key="STICKY_MODE_ENABLED",
                 group="Position Management",
-                description="Keep exits waiting indefinitely",
+                description="Keep exits waiting indefinitely (deprecated: use per-slot sticky)",
             ),
             RuntimeToggleSpec(
                 key="RECOVERY_ORDERS_ENABLED",
@@ -1996,29 +2001,24 @@ class BotRuntime:
         return self._flag_value("RECOVERY_ORDERS_ENABLED")
 
     def _engine_cfg(self, slot: SlotRuntime) -> sm.EngineConfig:
-        spacing_mult_a, spacing_mult_b = self._regime_entry_spacing_multipliers()
         base_entry_pct = float(self.entry_pct)
         recovery_orders_enabled = self._recovery_orders_enabled()
-        knob_cadence = 1.0
-        if self._flag_value("KNOB_MODE_ENABLED") and bool(getattr(self._action_knobs, "enabled", False)):
-            knob_cadence = max(0.05, float(getattr(self._action_knobs, "cadence_mult", 1.0) or 1.0))
-        s1_orphan_after_sec = (
-            float(config.S1_ORPHAN_AFTER_SEC) * knob_cadence
-            if recovery_orders_enabled
-            else float("inf")
-        )
-        s2_orphan_after_sec = (
-            float(config.S2_ORPHAN_AFTER_SEC) * knob_cadence
-            if recovery_orders_enabled
-            else float("inf")
-        )
-        if self._slot_has_active_belief_override(int(slot.slot_id), now=_now()):
+        # Symmetric spacing: both sides use entry_pct (no intelligence asymmetry).
+        slot_sticky = bool(getattr(slot, "sticky", True))
+        # Orphan timers: sticky slots never orphan by time; cycling slots use config.
+        if slot_sticky:
+            s1_orphan_after_sec = float("inf")
+            s2_orphan_after_sec = float("inf")
+        elif recovery_orders_enabled:
+            s1_orphan_after_sec = float(config.S1_ORPHAN_AFTER_SEC)
+            s2_orphan_after_sec = float(config.S2_ORPHAN_AFTER_SEC)
+        else:
             s1_orphan_after_sec = float("inf")
             s2_orphan_after_sec = float("inf")
         return sm.EngineConfig(
             entry_pct=base_entry_pct,
-            entry_pct_a=base_entry_pct * spacing_mult_a,
-            entry_pct_b=base_entry_pct * spacing_mult_b,
+            entry_pct_a=base_entry_pct,
+            entry_pct_b=base_entry_pct,
             profit_pct=self.profit_pct,
             refresh_pct=config.PAIR_REFRESH_PCT,
             order_size_usd=self._slot_order_size_usd(slot),
@@ -2037,7 +2037,7 @@ class BotRuntime:
             backoff_factor=float(config.ENTRY_BACKOFF_FACTOR),
             backoff_max_multiplier=float(config.ENTRY_BACKOFF_MAX_MULTIPLIER),
             max_recovery_slots=max(1, int(config.MAX_RECOVERY_SLOTS)),
-            sticky_mode_enabled=bool(getattr(slot, "sticky", True)),
+            sticky_mode_enabled=slot_sticky,
         )
 
     def _allocate_slot_alias(self, used_aliases: set[str] | None = None) -> str:
@@ -2421,15 +2421,20 @@ class BotRuntime:
         price_override: float | None = None,
         include_dust: bool = True,
     ) -> float:
+        """Core engine sizing: simple bilateral, no intelligence gates.
+
+        A-side: ORDER_SIZE_USD + slot profit compounding
+        B-side: quote-first allocation (available USD / buy-ready slots)
+        + capital layers + dust sweep + entry floor guard
+        """
         base_order = float(config.ORDER_SIZE_USD)
         if trade_id == "B":
-            # Account-aware: divide available USD evenly across all slots.
+            # Account-aware: divide available USD evenly across buy-ready slots.
             base = self._b_side_base_usd()
-        elif self._flag_value("STICKY_MODE_ENABLED") and str(getattr(config, "STICKY_COMPOUNDING_MODE", "legacy_profit")).strip().lower() == "fixed":
-            base = max(base_order, base_order)
         else:
-            # Independent compounding per slot (A-side and baseline queries).
+            # A-side: independent compounding per slot.
             base = max(base_order, base_order + slot.state.total_profit)
+        # Capital layers (manual/config-driven, not intelligence).
         layer_metrics = self._current_layer_metrics(mark_price=self._layer_mark_price(slot))
         effective_layers = int(layer_metrics.get("effective_layers", 0))
         layer_usd = 0.0
@@ -2439,43 +2444,11 @@ class BotRuntime:
         if layer_price > 0:
             layer_usd = effective_layers * max(0.0, float(config.CAPITAL_LAYER_DOGE_PER_ORDER)) * layer_price
         base_with_layers = max(base, base + layer_usd)
-        # Dust sweep for B-side: allocate current free-USD surplus across slots
-        # that are actively waiting for a fresh buy entry this loop.
+        # Dust sweep for B-side (only when quote-first allocation is off).
         if include_dust and trade_id == "B" and not bool(getattr(config, "QUOTE_FIRST_ALLOCATION", False)):
             dust_bump = self._dust_bump_usd(slot, trade_id=trade_id)
             base_with_layers = max(0.0, base_with_layers + dust_bump)
-        knobs_active = self._flag_value("KNOB_MODE_ENABLED") and bool(
-            getattr(self._action_knobs, "enabled", False)
-        )
-        aggression_mult = 1.0
-        suppression_mult = 1.0
-        if knobs_active:
-            aggression_mult = max(0.0, float(getattr(self._action_knobs, "aggression", 1.0) or 1.0))
-            direction = float(getattr(self._belief_state, "direction_score", 0.0) or 0.0)
-            suppress = max(0.0, min(1.0, float(getattr(self._action_knobs, "suppression_strength", 0.0) or 0.0)))
-            t = str(trade_id or "").strip().upper()
-            against_trend = (direction > 1e-9 and t == "A") or (direction < -1e-9 and t == "B")
-            if against_trend:
-                suppression_mult = max(0.0, 1.0 - suppress)
-        if self._throughput is not None:
-            if knobs_active:
-                throughput_usd, _ = self._throughput.size_for_slot(
-                    base_with_layers,
-                    regime_label=self._regime_label(self._current_regime_id()),
-                    trade_id=trade_id,
-                    aggression_mult=aggression_mult,
-                )
-            else:
-                throughput_usd, _ = self._throughput.size_for_slot(
-                    base_with_layers,
-                    regime_label=self._regime_label(self._current_regime_id()),
-                    trade_id=trade_id,
-                )
-            base_with_layers = max(0.0, float(throughput_usd))
-        elif knobs_active:
-            base_with_layers *= aggression_mult
-        base_with_layers *= suppression_mult
-        # --- Entry floor guard: clamp to exchange minimum volume ---
+        # Entry floor guard: clamp to exchange minimum volume.
         if self._flag_value("ENTRY_FLOOR_ENABLED"):
             market = float(price_override) if price_override else self._layer_mark_price(slot)
             if market > 0:
@@ -2488,46 +2461,7 @@ class BotRuntime:
                     self._entry_floor_applied_sides[side_key] = (
                         self._entry_floor_applied_sides.get(side_key, 0) + 1
                     )
-        if trade_id is None or not self._flag_value("REBALANCE_ENABLED"):
-            return base_with_layers
-
-        skew = float(self._rebalancer_current_skew)
-        if abs(skew) <= 1e-12:
-            return base_with_layers
-
-        favored = (skew > 0 and trade_id == "B") or (skew < 0 and trade_id == "A")
-        if not favored:
-            return base_with_layers
-
-        sensitivity = max(0.0, float(config.REBALANCE_SIZE_SENSITIVITY))
-        max_mult = max(1.0, float(config.REBALANCE_MAX_SIZE_MULT))
-        mult = min(max_mult, 1.0 + abs(skew) * sensitivity)
-        effective = base_with_layers * mult
-
-        # Fund guard: scaling should not make an already-viable side non-viable.
-        if skew > 0 and trade_id == "B":
-            available_usd: float | None = None
-            if self._loop_available_usd is not None:
-                available_usd = float(self._loop_available_usd)
-            elif self.ledger._synced:
-                available_usd = float(self.ledger.available_usd)
-            if available_usd is not None:
-                max_safe = max(base_with_layers, available_usd - base_with_layers)
-                effective = min(effective, max_safe)
-        elif skew < 0 and trade_id == "A":
-            price = float(slot.state.market_price or self.last_price)
-            if price > 0:
-                available_doge: float | None = None
-                if self._loop_available_doge is not None:
-                    available_doge = float(self._loop_available_doge)
-                elif self.ledger._synced:
-                    available_doge = float(self.ledger.available_doge)
-                if available_doge is not None:
-                    base_doge = base_with_layers / price
-                    max_safe_doge = max(base_doge, available_doge - base_doge)
-                    effective = min(effective, max_safe_doge * price)
-
-        return max(base_with_layers, effective)
+        return base_with_layers
 
     def _minimum_bootstrap_requirements(self, market_price: float) -> tuple[float, float]:
         min_vol = float(self.constraints.get("min_volume", 13.0))
@@ -2650,21 +2584,9 @@ class BotRuntime:
         else:
             cap = base_cap
 
-        if not (
-            self._flag_value("MTS_ENABLED")
-            and self._flag_value("MTS_ENTRY_THROTTLE_ENABLED")
-        ):
-            return int(cap)
-
-        if not bool(getattr(self._manifold_score, "enabled", False)):
-            return int(cap)
-
-        mts_floor = max(0.0, min(1.0, float(getattr(config, "MTS_ENTRY_THROTTLE_FLOOR", 0.3))))
-        mts_value = max(0.0, min(1.0, float(getattr(self._manifold_score, "mts", 0.0) or 0.0)))
-        if mts_value < mts_floor:
-            return 0
-        scaled = int(floor(float(cap) * mts_value))
-        return max(1, min(int(cap), scaled))
+        # MTS entry throttle disconnected from entries (herd mode decoupling).
+        # MTS still computes for advisory display.
+        return int(cap)
 
     def _defer_entry_due_scheduler(self, slot_id: int, action: sm.PlaceOrderAction, source: str) -> None:
         self._entry_adds_deferred_total += 1
@@ -2693,33 +2615,6 @@ class BotRuntime:
         pending = self._pending_entry_orders()
         if not pending:
             return
-
-        # Purge suppressed-side deferred entries during Tier 2 after grace.
-        if self._flag_value("REGIME_DIRECTIONAL_ENABLED") and self._regime_grace_elapsed(_now()):
-            suppressed = self._regime_side_suppressed
-            if suppressed in ("A", "B"):
-                suppressed_side = "sell" if suppressed == "A" else "buy"
-                purged = 0
-                kept: list[tuple[int, sm.OrderState]] = []
-                for sid, order in pending:
-                    if order.side == suppressed_side:
-                        slot = self.slots.get(sid)
-                        if slot is not None:
-                            current = sm.find_order(slot.state, order.local_id)
-                            if current is not None and current.role == "entry" and not current.txid:
-                                slot.state = sm.remove_order(slot.state, order.local_id)
-                        purged += 1
-                    else:
-                        kept.append((sid, order))
-                if purged > 0:
-                    logger.info(
-                        "entry_scheduler: purged %d suppressed-side (%s) deferred entries",
-                        purged,
-                        suppressed,
-                    )
-                pending = kept
-                if not pending:
-                    return
 
         drained = 0
         for sid, order in pending:
@@ -5230,6 +5125,7 @@ class BotRuntime:
         self._load_equity_ts_history()
         self._sanitize_slot_alias_state()
         self._cleanup_recovery_orders_on_startup()
+        self._transition_to_dual_mode()
 
         # Ensure at least slot 0 exists.
         if not self.slots:
@@ -6980,6 +6876,106 @@ class BotRuntime:
         self.seen_fill_txids.add(market_txid_norm)
         return True, f"position {pid}: closed at market @ ${fill_price:.6f}"
 
+    # ------------------------------------------------------------------
+    # Herd Mode — decoupled intelligence + dual-mode slot management
+    # ------------------------------------------------------------------
+
+    def _transition_to_dual_mode(self) -> None:
+        """One-time migration: existing slots keep their sticky state, new slots default cycling."""
+        transitioned = 0
+        for sid, slot in self.slots.items():
+            if not hasattr(slot, "sticky"):
+                # Existing slots with exits: keep sticky. Empty slots: cycling.
+                has_exit = any(o.role == "exit" and o.txid for o in slot.state.orders)
+                slot.sticky = has_exit
+                transitioned += 1
+        if transitioned:
+            logger.info("HERD: transitioned %d slots to dual-mode (existing exits kept sticky)", transitioned)
+
+    def _compute_stuck_exit_range(self) -> tuple[float, float] | None:
+        """Derive the implied ranging band from sticky exit prices."""
+        sticky_exits: list[float] = []
+        for slot in self.slots.values():
+            if not getattr(slot, "sticky", False):
+                continue
+            for o in slot.state.orders:
+                if o.role == "exit" and o.txid and o.price > 0:
+                    sticky_exits.append(float(o.price))
+        if len(sticky_exits) < 3:
+            return None
+        return (min(sticky_exits), max(sticky_exits))
+
+    def _herd_update_slot_modes(self, now: float) -> None:
+        """Decide cycling vs sticky per slot based on stuck exit range + capital pressure."""
+        range_band = self._compute_stuck_exit_range()
+        if range_band is None:
+            return
+
+        low, high = range_band
+        market = float(self.last_price)
+        if market <= 0:
+            return
+
+        # Market is "inside range" if between 2% inward of the boundaries.
+        inside_range = low * 1.02 < market < high * 0.98
+
+        # Capital pressure: too much idle USD → bias toward cycling.
+        min_b = self._minimum_b_entry_usd()
+        usd_pressure = False
+        if self.ledger._synced and min_b > 0:
+            usd_pressure = float(self.ledger.available_usd) > min_b * 3
+
+        for sid in sorted(self.slots.keys()):
+            slot = self.slots[sid]
+            currently_sticky = getattr(slot, "sticky", True)
+
+            if currently_sticky and inside_range and usd_pressure:
+                slot.sticky = False
+                logger.info(
+                    "HERD: slot %d → cycling (market %.6f inside range [%.6f, %.6f])",
+                    sid, market, low, high,
+                )
+            elif not currently_sticky and not inside_range:
+                slot.sticky = True
+                logger.info(
+                    "HERD: slot %d → sticky (market %.6f outside range [%.6f, %.6f])",
+                    sid, market, low, high,
+                )
+
+    def _minimum_b_entry_usd(self) -> float:
+        """Minimum USD needed for a single B-side entry at current price."""
+        market = float(self.last_price)
+        if market <= 0:
+            return float(config.ORDER_SIZE_USD)
+        min_vol = float(self.constraints.get("min_volume", 13.0))
+        return max(float(config.ORDER_SIZE_USD), min_vol * market * 1.01)
+
+    def _herd_pending_action_preview(self) -> list[dict]:
+        """Preview of actions herd mode would take (for status payload when herd is OFF)."""
+        actions: list[dict] = []
+        range_band = self._compute_stuck_exit_range()
+        if range_band is None:
+            return actions
+        low, high = range_band
+        market = float(self.last_price)
+        if market <= 0:
+            return actions
+        inside_range = low * 1.02 < market < high * 0.98
+        for sid in sorted(self.slots.keys()):
+            slot = self.slots[sid]
+            currently_sticky = getattr(slot, "sticky", True)
+            if currently_sticky and inside_range:
+                actions.append({"slot_id": sid, "action": "switch_to_cycling"})
+            elif not currently_sticky and not inside_range:
+                actions.append({"slot_id": sid, "action": "switch_to_sticky"})
+        return actions
+
+    def _run_herd_mode(self, now: float) -> None:
+        """Herd mode main tick: mode selection + exit management + supplemental strategies."""
+        if not self._flag_value("HERD_MODE_ENABLED"):
+            return
+        self._herd_update_slot_modes(now)
+
     def _run_self_healing_reprice(self, now_ts: float | None = None) -> None:
         now = float(now_ts if now_ts is not None else _now())
         if not self._position_ledger_enabled():
@@ -7160,6 +7156,8 @@ class BotRuntime:
         self._self_heal_reprice_last_summary = summary
 
     def _ranger_enabled(self) -> bool:
+        if not self._flag_value("HERD_MODE_ENABLED"):
+            return False
         return self._flag_value("RANGER_ENABLED")
 
     @staticmethod
@@ -7806,6 +7804,8 @@ class BotRuntime:
         }
 
     def _churner_enabled(self) -> bool:
+        if not self._flag_value("HERD_MODE_ENABLED"):
+            return False
         return self._flag_value("CHURNER_ENABLED") and self._position_ledger_enabled()
 
     def _ensure_churner_state(self, slot_id: int) -> ChurnerRuntimeState:
@@ -13253,75 +13253,7 @@ class BotRuntime:
 
         cfg = self._engine_cfg(slot)
 
-        now_ts = _now()
-        suppressed = None
-        cooldown_suppressed = (
-            self._regime_cooldown_suppressed_side
-            if self._regime_cooldown_suppressed_side in ("A", "B")
-            else None
-        )
-        if self._flag_value("REGIME_DIRECTIONAL_ENABLED"):
-            if int(self._regime_tier) == 2 and self._regime_grace_elapsed(now_ts):
-                if self._regime_side_suppressed in ("A", "B"):
-                    suppressed = self._regime_side_suppressed
-            elif (
-                self._regime_tier2_last_downgrade_at > 0
-                and cooldown_suppressed in ("A", "B")
-            ):
-                cooldown_sec = max(0.0, float(getattr(config, "REGIME_TIER2_REENTRY_COOLDOWN_SEC", 600.0)))
-                elapsed = now_ts - self._regime_tier2_last_downgrade_at
-                if elapsed < cooldown_sec:
-                    suppressed = cooldown_suppressed
-
-        if suppressed == "A":
-            if usd >= min_cost:
-                st = replace(slot.state, long_only=True, short_only=False, mode_source="regime")
-                st, action = sm.add_entry_order(
-                    st,
-                    cfg,
-                    side="buy",
-                    trade_id="B",
-                    cycle=st.cycle_b,
-                    order_size_usd=self._slot_order_size_usd(slot, trade_id="B"),
-                    reason="bootstrap_regime_long_only",
-                )
-                self.slots[slot_id].state = st
-                if action:
-                    self._execute_actions(slot_id, [action], "bootstrap_regime")
-                else:
-                    logger.info("slot %s bootstrap_regime waiting: buy entry below minimum", slot_id)
-            else:
-                logger.info(
-                    "slot %s bootstrap waiting: regime suppresses A, insufficient USD for B",
-                    slot_id,
-                )
-            return
-
-        if suppressed == "B":
-            if doge >= min_vol:
-                st = replace(slot.state, short_only=True, long_only=False, mode_source="regime")
-                st, action = sm.add_entry_order(
-                    st,
-                    cfg,
-                    side="sell",
-                    trade_id="A",
-                    cycle=st.cycle_a,
-                    order_size_usd=self._slot_order_size_usd(slot),
-                    reason="bootstrap_regime_short_only",
-                )
-                self.slots[slot_id].state = st
-                if action:
-                    self._execute_actions(slot_id, [action], "bootstrap_regime")
-                else:
-                    logger.info("slot %s bootstrap_regime waiting: sell entry below minimum", slot_id)
-            else:
-                logger.info(
-                    "slot %s bootstrap waiting: regime suppresses B, insufficient DOGE for A",
-                    slot_id,
-                )
-            return
-
-        # Normal bootstrap: both sides available.
+        # Always bilateral bootstrap (regime suppression disconnected from entries).
         if doge >= min_vol and usd >= min_cost:
             st = slot.state
             actions: list[sm.Action] = []
@@ -13414,28 +13346,8 @@ class BotRuntime:
         if not (st.long_only or st.short_only):
             return
 
-        if str(getattr(st, "mode_source", "none")) == "regime":
-            # Check if the regime still requires suppression.
-            # If suppression has lapsed (tier dropped, cooldown expired),
-            # clear mode_source and fall through to attempt normal repair.
-            still_suppressed = False
-            if self._flag_value("REGIME_DIRECTIONAL_ENABLED"):
-                now_ts = _now()
-                if int(self._regime_tier) == 2 and self._regime_grace_elapsed(now_ts):
-                    if self._regime_side_suppressed in ("A", "B"):
-                        still_suppressed = True
-                elif self._regime_tier2_last_downgrade_at > 0:
-                    cd_side = (
-                        self._regime_cooldown_suppressed_side
-                        if self._regime_cooldown_suppressed_side in ("A", "B")
-                        else None
-                    )
-                    if cd_side:
-                        cd_sec = max(0.0, float(getattr(config, "REGIME_TIER2_REENTRY_COOLDOWN_SEC", 600.0)))
-                        if now_ts - self._regime_tier2_last_downgrade_at < cd_sec:
-                            still_suppressed = True
-            if still_suppressed:
-                return
+        # Regime-forced one-sided mode no longer blocks repair (intelligence
+        # disconnected from entries). Only balance-driven degradation persists.
 
         phase = sm.derive_phase(st)
         entries = [o for o in st.orders if o.role == "entry"]
@@ -15457,7 +15369,8 @@ class BotRuntime:
             self._update_manifold_score(loop_now)
             self._maybe_schedule_ai_regime(loop_now)
             self._update_accumulation(loop_now)
-            self._apply_tier2_suppression(loop_now)
+            # Tier-2 suppression disconnected from entries (herd mode decoupling).
+            # Intelligence still computes regime tiers for advisory display.
             self._clear_expired_regime_cooldown(loop_now)
             # Prioritize older deferred entries each loop, while avoiding stale placements
             # that the upcoming price tick is likely to refresh anyway.
@@ -15499,6 +15412,7 @@ class BotRuntime:
             self._poll_order_status()
             self._update_micro_features(_now())
             self._update_trade_beliefs(_now())
+            self._run_herd_mode(loop_now)
             self._run_self_healing_reprice(loop_now)
             self._run_churner_engine(loop_now)
             self._run_ranger_engine(loop_now)
@@ -17302,6 +17216,37 @@ class BotRuntime:
                     "gap_doge_now": float(layer_metrics.get("gap_doge_now", 0.0) or 0.0),
                     "gap_usd_now": float(layer_metrics.get("gap_usd_now", 0.0) or 0.0),
                     "last_add_layer_event": self.layer_last_add_event,
+                },
+                "herd_mode": {
+                    "enabled": self._flag_value("HERD_MODE_ENABLED"),
+                    "stuck_exit_range": self._compute_stuck_exit_range(),
+                    "sticky_slot_count": sum(1 for s in self.slots.values() if getattr(s, "sticky", True)),
+                    "cycling_slot_count": sum(1 for s in self.slots.values() if not getattr(s, "sticky", True)),
+                    "pending_actions": self._herd_pending_action_preview(),
+                },
+                "advisory": {
+                    "throughput_recommended_a": (
+                        self._throughput.size_for_slot(
+                            float(config.ORDER_SIZE_USD),
+                            regime_label=self._regime_label(self._current_regime_id()),
+                            trade_id="A",
+                        )[0] if self._throughput is not None else None
+                    ),
+                    "throughput_recommended_b": (
+                        self._throughput.size_for_slot(
+                            float(config.ORDER_SIZE_USD),
+                            regime_label=self._regime_label(self._current_regime_id()),
+                            trade_id="B",
+                        )[0] if self._throughput is not None else None
+                    ),
+                    "rebalancer_skew": float(self._rebalancer_current_skew),
+                    "regime_suggestion": (
+                        f"suppress {'B' if self._regime_side_suppressed == 'B' else 'A'}"
+                        if self._flag_value("REGIME_DIRECTIONAL_ENABLED")
+                        and int(self._regime_tier) >= 2
+                        and self._regime_side_suppressed in ("A", "B")
+                        else "neutral"
+                    ),
                 },
                 "slots": slots,
             }

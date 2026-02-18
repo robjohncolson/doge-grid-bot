@@ -720,6 +720,18 @@ DASHBOARD_HTML = """<!doctype html>
         <div id=\"dustSweepRow\" class=\"row\" style=\"display:none\"><span class=\"k\">Dust Sweep</span><span id=\"dustSweep\" class=\"v\"></span></div>
         <div id=\"dustSweepDetails\" class=\"tiny\" style=\"display:none\"></div>
 
+        <h3 style=\"margin-top:14px\">Herd Mode</h3>
+        <div class=\"row\"><span class=\"k\">Status</span><span id=\"herdStatus\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Slot Mix</span><span id=\"herdSlotMix\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Stuck Exit Range</span><span id=\"herdRange\" class=\"v\"></span></div>
+        <div id=\"herdAdvisory\" class=\"tiny\"></div>
+
+        <h3 style=\"margin-top:14px\">Advisory Intelligence</h3>
+        <div class=\"row\"><span class=\"k\">Regime Suggestion</span><span id=\"advisoryRegime\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Rebalancer Skew</span><span id=\"advisorySkew\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Throughput Rec A</span><span id=\"advisoryTpA\" class=\"v\"></span></div>
+        <div class=\"row\"><span class=\"k\">Throughput Rec B</span><span id=\"advisoryTpB\" class=\"v\"></span></div>
+
         <h3 style=\"margin-top:14px\">Sticky Vintage</h3>
         <div class=\"row\"><span class=\"k\">Sticky Mode</span><span id=\"stickyModeStatus\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Waiting Exits</span><span id=\"vintageWaiting\" class=\"v\"></span></div>
@@ -2930,6 +2942,39 @@ DASHBOARD_HTML = """<!doctype html>
         dustValueEl.textContent = '';
         dustDetailsEl.textContent = '';
       }
+      // --- Herd Mode panel ---
+      const herd = d.herd_mode || {};
+      const herdEnabled = Boolean(herd.enabled);
+      const herdStatusEl = document.getElementById('herdStatus');
+      herdStatusEl.textContent = herdEnabled ? 'ON' : 'OFF';
+      herdStatusEl.style.color = herdEnabled ? 'var(--good)' : 'var(--muted)';
+      const stickyCount = Number(herd.sticky_slot_count || 0);
+      const cyclingCount = Number(herd.cycling_slot_count || 0);
+      document.getElementById('herdSlotMix').textContent =
+        `${stickyCount} sticky / ${cyclingCount} cycling`;
+      const herdRange = herd.stuck_exit_range;
+      document.getElementById('herdRange').textContent = herdRange
+        ? `$${fmt(herdRange[0], 6)} – $${fmt(herdRange[1], 6)}`
+        : 'insufficient data';
+      const herdAdvisoryEl = document.getElementById('herdAdvisory');
+      const pendingActions = herd.pending_actions || [];
+      if (!herdEnabled && pendingActions.length > 0) {
+        herdAdvisoryEl.textContent = `Would: ${pendingActions.map(a => a.action.replace('_', ' ')).join(', ')}`;
+      } else {
+        herdAdvisoryEl.textContent = '';
+      }
+
+      // --- Advisory Intelligence panel ---
+      const advisory = d.advisory || {};
+      const advisoryRegimeEl = document.getElementById('advisoryRegime');
+      advisoryRegimeEl.textContent = String(advisory.regime_suggestion || 'neutral');
+      advisoryRegimeEl.style.color = advisory.regime_suggestion === 'neutral' ? '' : 'var(--warn)';
+      document.getElementById('advisorySkew').textContent = fmt(advisory.rebalancer_skew, 4);
+      document.getElementById('advisoryTpA').textContent =
+        advisory.throughput_recommended_a != null ? `$${fmt(advisory.throughput_recommended_a, 2)}` : '—';
+      document.getElementById('advisoryTpB').textContent =
+        advisory.throughput_recommended_b != null ? `$${fmt(advisory.throughput_recommended_b, 2)}` : '—';
+
       document.getElementById('stickyModeStatus').textContent = stickyEnabled
         ? `ON (${String(sticky.compounding_mode || 'legacy_profit')})`
         : 'OFF';

@@ -264,19 +264,17 @@ DURABLE_SETTLEMENT_ENABLED: bool = _env("DURABLE_SETTLEMENT_ENABLED", True, bool
 DURABLE_PROFIT_DERIVATION: bool = _env("DURABLE_PROFIT_DERIVATION", False, bool)
 
 # Quote-first B-side allocation cutover (bot.py allocator path).
-# Default OFF until shadow comparisons are stable.
-QUOTE_FIRST_ALLOCATION: bool = _env("QUOTE_FIRST_ALLOCATION", False, bool)
+QUOTE_FIRST_ALLOCATION: bool = _env("QUOTE_FIRST_ALLOCATION", True, bool)
 
 # Recycle per-side rounding residual into subsequent entry sizing.
-# Default OFF for staged rollout.
-ROUNDING_RESIDUAL_ENABLED: bool = _env("ROUNDING_RESIDUAL_ENABLED", False, bool)
+ROUNDING_RESIDUAL_ENABLED: bool = _env("ROUNDING_RESIDUAL_ENABLED", True, bool)
 
 # Auto-detect effective maker fee tier from observed (actual_fee / actual_cost).
 # Default OFF to keep fallback strictly config-driven unless enabled.
 FEE_TIER_AUTO_DETECT: bool = _env("FEE_TIER_AUTO_DETECT", False, bool)
 
 # Reserve this much USD from deployable quote to avoid overshoot on rounding/slippage.
-ALLOCATION_SAFETY_BUFFER_USD: float = _env("ALLOCATION_SAFETY_BUFFER_USD", 0.50, float)
+ALLOCATION_SAFETY_BUFFER_USD: float = _env("ALLOCATION_SAFETY_BUFFER_USD", 0.10, float)
 
 # Rolling window for observed fee-rate samples when auto-detect is enabled.
 FEE_OBSERVATION_WINDOW: int = _env("FEE_OBSERVATION_WINDOW", 100, int)
@@ -429,9 +427,17 @@ S1_ORPHAN_AFTER_SEC: int = _env("S1_ORPHAN_AFTER_SEC", 1350, int)  # 22.5 min
 S2_ORPHAN_AFTER_SEC: int = _env("S2_ORPHAN_AFTER_SEC", 1800, int)  # 30 min
 
 # Sticky slots mode: keep exits waiting (no timer orphaning in reducer path).
+# DEPRECATED: per-slot `sticky` attribute replaces this global flag.
+# Retained for backward compat; herd mode manages the per-slot mix.
 STICKY_MODE_ENABLED: bool = _env("STICKY_MODE_ENABLED", False, bool)
 STICKY_TARGET_SLOTS: int = _env("STICKY_TARGET_SLOTS", 80, int)
 STICKY_MAX_TARGET_SLOTS: int = _env("STICKY_MAX_TARGET_SLOTS", 100, int)
+
+# Herd Mode: decoupled intelligence + dual-mode slots.
+# When ON, intelligence manages orphans/exits and decides which slots are
+# sticky vs cycling based on stuck exit range detection + regime signals.
+# When OFF, all slots run in their current per-slot mode (no auto switching).
+HERD_MODE_ENABLED: bool = _env("HERD_MODE_ENABLED", False, bool)
 
 # Self-healing position ledger (local-first, optional Supabase replication).
 POSITION_LEDGER_ENABLED: bool = _env("POSITION_LEDGER_ENABLED", True, bool)

@@ -366,6 +366,7 @@ class SelfHealingSlotsTests(unittest.TestCase):
 
         with (
             mock.patch.object(config, "CHURNER_ENABLED", True),
+            mock.patch.object(config, "HERD_MODE_ENABLED", True),
             mock.patch.object(rt, "_policy_hmm_signal", return_value=("RANGING", 0.0, 0.0, True, {})),
             mock.patch.object(rt, "_compute_capacity_health", return_value={"open_order_headroom": 100}),
             mock.patch.object(rt, "_place_order", return_value="TX-CHURNER") as place_mock,
@@ -391,6 +392,7 @@ class SelfHealingSlotsTests(unittest.TestCase):
         with (
             mock.patch.object(config, "POSITION_LEDGER_ENABLED", True),
             mock.patch.object(config, "CHURNER_ENABLED", True),
+            mock.patch.object(config, "HERD_MODE_ENABLED", True),
             mock.patch.object(config, "MTS_CHURNER_GATE", 0.30),
             mock.patch.object(rt, "_policy_hmm_signal", return_value=("BULLISH", 0.0, 0.0, True, {})),
             mock.patch.object(rt, "_compute_capacity_health", return_value={"open_order_headroom": 100}),
@@ -412,6 +414,7 @@ class SelfHealingSlotsTests(unittest.TestCase):
         with (
             mock.patch.object(config, "POSITION_LEDGER_ENABLED", True),
             mock.patch.object(config, "CHURNER_ENABLED", True),
+            mock.patch.object(config, "HERD_MODE_ENABLED", True),
             mock.patch.object(config, "MTS_ENABLED", False),
             mock.patch.object(config, "MTS_CHURNER_GATE", 0.30),
             mock.patch.object(rt, "_policy_hmm_signal", return_value=("RANGING", 0.0, 0.0, True, {})),
@@ -517,6 +520,7 @@ class SelfHealingSlotsTests(unittest.TestCase):
         with (
             mock.patch.object(config, "POSITION_LEDGER_ENABLED", True),
             mock.patch.object(config, "CHURNER_ENABLED", True),
+            mock.patch.object(config, "HERD_MODE_ENABLED", True),
             mock.patch.object(rt, "_policy_hmm_signal", return_value=("RANGING", 0.0, 0.0, True, {})),
             mock.patch.object(rt, "_compute_capacity_health", return_value={"open_order_headroom": 100}),
             mock.patch.object(rt, "_churner_gate_check", return_value=(True, "ok", 0.1002, 20.0, 2.004, "sell")),

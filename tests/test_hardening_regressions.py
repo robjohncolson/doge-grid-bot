@@ -750,26 +750,25 @@ class BotEventLogTests(unittest.TestCase):
         self.assertEqual(manifold["trend"], "falling")
         self.assertAlmostEqual(float(manifold["mts_30m_ago"]), 0.64)
 
-    def test_entry_loop_cap_applies_mts_throttle_only_when_enabled(self):
+    def test_entry_loop_cap_ignores_mts_after_herd_decoupling(self):
+        """After herd-mode decoupling, MTS throttle no longer reduces
+        the entry loop cap — entries always use the config cap."""
         with mock.patch.object(config, "MAX_ENTRY_ADDS_PER_LOOP", 5), mock.patch.object(
             config, "MTS_ENABLED", True
-        ), mock.patch.object(config, "MTS_ENTRY_THROTTLE_ENABLED", False), mock.patch.object(
+        ), mock.patch.object(config, "MTS_ENTRY_THROTTLE_ENABLED", True), mock.patch.object(
             config, "MTS_ENTRY_THROTTLE_FLOOR", 0.3
         ):
             rt = bot.BotRuntime()
             rt._manifold_score = bot.bayesian_engine.ManifoldScore(enabled=True, mts=0.40)
 
             with mock.patch.object(rt, "_compute_capacity_health", return_value={"open_order_headroom": 100}):
+                # MTS no longer throttles — always returns config cap
                 self.assertEqual(rt._compute_entry_adds_loop_cap(), 5)
-
-            ok, _msg = rt._set_runtime_override("MTS_ENTRY_THROTTLE_ENABLED", True)
-            self.assertTrue(ok)
-            with mock.patch.object(rt, "_compute_capacity_health", return_value={"open_order_headroom": 100}):
-                self.assertEqual(rt._compute_entry_adds_loop_cap(), 2)
 
             rt._manifold_score = bot.bayesian_engine.ManifoldScore(enabled=True, mts=0.20)
             with mock.patch.object(rt, "_compute_capacity_health", return_value={"open_order_headroom": 100}):
-                self.assertEqual(rt._compute_entry_adds_loop_cap(), 0)
+                # Even with very low MTS, cap is unchanged
+                self.assertEqual(rt._compute_entry_adds_loop_cap(), 5)
 
     def test_update_manifold_score_tolerates_missing_signals(self):
         rt = bot.BotRuntime()
@@ -912,7 +911,9 @@ class BotEventLogTests(unittest.TestCase):
         self.assertEqual(rt._entry_adds_deferred_total, 1)
         self.assertEqual(len(rt._pending_entry_orders()), 1)
 
-    def test_deferred_entries_purged_for_suppressed_side(self):
+    def test_deferred_entries_kept_despite_regime_suppression(self):
+        """After herd-mode decoupling, deferred entries are never purged
+        based on regime suppression — both sides always drain."""
         rt = bot.BotRuntime()
         rt.mode = "RUNNING"
         now = bot._now()
@@ -961,13 +962,15 @@ class BotEventLogTests(unittest.TestCase):
                 with mock.patch.object(rt, "_execute_actions") as exec_actions:
                     rt._drain_pending_entry_orders("unit_test_regime_drain", skip_stale=False)
 
-        self.assertIsNone(sm.find_order(rt.slots[0].state, 1))
+        # Both entries kept — no regime-based purging
+        self.assertIsNotNone(sm.find_order(rt.slots[0].state, 1))
         self.assertIsNotNone(sm.find_order(rt.slots[0].state, 2))
-        exec_actions.assert_called_once()
-        action = exec_actions.call_args.args[1][0]
-        self.assertEqual(action.side, "buy")
+        # Both sides should be drained (placed)
+        self.assertEqual(exec_actions.call_count, 2)
 
-    def test_engine_cfg_regime_spacing_bias_gated_by_actuation_toggle(self):
+    def test_engine_cfg_symmetric_spacing_after_herd_decoupling(self):
+        """After herd-mode decoupling, _engine_cfg always uses symmetric spacing
+        regardless of regime state or toggle — intelligence no longer biases entries."""
         rt = bot.BotRuntime()
         rt.entry_pct = 0.35
         rt._regime_tier = 1
@@ -989,12 +992,15 @@ class BotEventLogTests(unittest.TestCase):
         self.assertAlmostEqual(float(cfg_shadow.entry_pct_a), 0.35)
         self.assertAlmostEqual(float(cfg_shadow.entry_pct_b), 0.35)
 
+        # Even with REGIME_DIRECTIONAL_ENABLED=True, spacing stays symmetric
         with mock.patch.object(config, "REGIME_DIRECTIONAL_ENABLED", True):
             cfg_active = rt._engine_cfg(slot)
-        self.assertAlmostEqual(float(cfg_active.entry_pct_a), 0.525)
-        self.assertAlmostEqual(float(cfg_active.entry_pct_b), 0.245)
+        self.assertAlmostEqual(float(cfg_active.entry_pct_a), 0.35)
+        self.assertAlmostEqual(float(cfg_active.entry_pct_b), 0.35)
 
-    def test_slot_order_size_usd_applies_throughput_multiplier(self):
+    def test_slot_order_size_usd_throughput_decoupled(self):
+        """After herd-mode decoupling, throughput sizer is advisory only —
+        it no longer modifies the A-side sizing pipeline."""
         rt = bot.BotRuntime()
         rt._throughput = mock.Mock()
         rt._throughput.size_for_slot.return_value = (3.5, "tp_aggregate")
@@ -1011,11 +1017,12 @@ class BotEventLogTests(unittest.TestCase):
             with mock.patch.object(config, "REBALANCE_ENABLED", False):
                 with mock.patch.object(rt, "_recompute_effective_layers", return_value={"effective_layers": 0}):
                     with mock.patch.object(rt, "_layer_mark_price", return_value=0.1):
-                        with mock.patch.object(rt, "_current_regime_id", return_value=2):
-                            out = rt._slot_order_size_usd(slot, trade_id="A")
+                        out = rt._slot_order_size_usd(slot, trade_id="A")
 
-        self.assertAlmostEqual(out, 3.5)
-        rt._throughput.size_for_slot.assert_called_once_with(2.0, regime_label="bullish", trade_id="A")
+        # A-side: max(ORDER_SIZE_USD, ORDER_SIZE_USD + total_profit) = max(2.0, 2.0) = 2.0
+        self.assertAlmostEqual(out, 2.0)
+        # Throughput sizer not called during sizing (advisory only)
+        rt._throughput.size_for_slot.assert_not_called()
 
     def test_dust_dividend_zero_when_no_surplus(self):
         rt = bot.BotRuntime()
@@ -1091,10 +1098,11 @@ class BotEventLogTests(unittest.TestCase):
         rt._loop_available_usd = 10.0
         rt._loop_dust_dividend = None
 
-        with mock.patch.object(config, "ORDER_SIZE_USD", 2.0):
-            with mock.patch.object(rt, "_recompute_effective_layers", return_value={"effective_layers": 0}):
-                with mock.patch.object(rt, "_layer_mark_price", return_value=0.1):
-                    out = rt._compute_dust_dividend()
+        with mock.patch.object(config, "QUOTE_FIRST_ALLOCATION", False):
+            with mock.patch.object(config, "ORDER_SIZE_USD", 2.0):
+                with mock.patch.object(rt, "_recompute_effective_layers", return_value={"effective_layers": 0}):
+                    with mock.patch.object(rt, "_layer_mark_price", return_value=0.1):
+                        out = rt._compute_dust_dividend()
 
         # Base split across 4 slots = 2.5. Two slots are buy-ready, so reserve=5.0.
         # Surplus=10.0-5.0 -> 5.0, dividend=2.5.
@@ -1130,12 +1138,13 @@ class BotEventLogTests(unittest.TestCase):
         rt._loop_dust_dividend = None
         rt._loop_b_side_base = None
 
-        with mock.patch.object(config, "ORDER_SIZE_USD", 2.0):
-            with mock.patch.object(config, "REBALANCE_ENABLED", False):
-                with mock.patch.object(rt, "_recompute_effective_layers", return_value={"effective_layers": 0}):
-                    with mock.patch.object(rt, "_layer_mark_price", return_value=0.1):
-                        size_ready = rt._slot_order_size_usd(rt.slots[0], trade_id="B")
-                        size_not_ready = rt._slot_order_size_usd(rt.slots[2], trade_id="B")
+        with mock.patch.object(config, "QUOTE_FIRST_ALLOCATION", False):
+            with mock.patch.object(config, "ORDER_SIZE_USD", 2.0):
+                with mock.patch.object(config, "REBALANCE_ENABLED", False):
+                    with mock.patch.object(rt, "_recompute_effective_layers", return_value={"effective_layers": 0}):
+                        with mock.patch.object(rt, "_layer_mark_price", return_value=0.1):
+                            size_ready = rt._slot_order_size_usd(rt.slots[0], trade_id="B")
+                            size_not_ready = rt._slot_order_size_usd(rt.slots[2], trade_id="B")
 
         # Base = 10/4 = 2.5. Surplus goes only to two buy-ready slots (+2.5 each).
         self.assertAlmostEqual(size_ready, 5.0, places=8)
@@ -1154,10 +1163,11 @@ class BotEventLogTests(unittest.TestCase):
         rt._loop_b_side_base = None
 
         with mock.patch.object(config, "ORDER_SIZE_USD", 2.0):
-            with mock.patch.object(config, "REBALANCE_ENABLED", False):
-                with mock.patch.object(rt, "_recompute_effective_layers", return_value={"effective_layers": 0}):
-                    with mock.patch.object(rt, "_layer_mark_price", return_value=0.1):
-                        out = rt._slot_order_size_usd(slot, trade_id="B")
+            with mock.patch.object(config, "QUOTE_FIRST_ALLOCATION", False):
+                with mock.patch.object(config, "REBALANCE_ENABLED", False):
+                    with mock.patch.object(rt, "_recompute_effective_layers", return_value={"effective_layers": 0}):
+                        with mock.patch.object(rt, "_layer_mark_price", return_value=0.1):
+                            out = rt._slot_order_size_usd(slot, trade_id="B")
 
         # max(ORDER_SIZE_USD, available / slots) = max(2.0, 7.0/1) = 7.0
         self.assertAlmostEqual(out, 7.0, places=8)
@@ -1173,12 +1183,13 @@ class BotEventLogTests(unittest.TestCase):
         rt._loop_dust_dividend = None
         rt._dust_sweep_enabled = False
 
-        with mock.patch.object(config, "ORDER_SIZE_USD", 2.0):
-            with mock.patch.object(config, "REBALANCE_ENABLED", False):
-                with mock.patch.object(rt, "_recompute_effective_layers", return_value={"effective_layers": 0}):
-                    with mock.patch.object(rt, "_layer_mark_price", return_value=0.1):
-                        out = rt._slot_order_size_usd(slot, trade_id="B")
-                        dividend = rt._compute_dust_dividend()
+        with mock.patch.object(config, "QUOTE_FIRST_ALLOCATION", False):
+            with mock.patch.object(config, "ORDER_SIZE_USD", 2.0):
+                with mock.patch.object(config, "REBALANCE_ENABLED", False):
+                    with mock.patch.object(rt, "_recompute_effective_layers", return_value={"effective_layers": 0}):
+                        with mock.patch.object(rt, "_layer_mark_price", return_value=0.1):
+                            out = rt._slot_order_size_usd(slot, trade_id="B")
+                            dividend = rt._compute_dust_dividend()
 
         # B-side still uses account-aware base even with dust disabled.
         # max(2.0, 7.0/1) = 7.0
@@ -1197,12 +1208,13 @@ class BotEventLogTests(unittest.TestCase):
         rt._dust_sweep_enabled = True
         rt._dust_min_threshold_usd = 0.50
 
-        with mock.patch.object(config, "ORDER_SIZE_USD", 2.0):
-            with mock.patch.object(config, "REBALANCE_ENABLED", False):
-                with mock.patch.object(rt, "_recompute_effective_layers", return_value={"effective_layers": 0}):
-                    with mock.patch.object(rt, "_layer_mark_price", return_value=0.1):
-                        out = rt._slot_order_size_usd(slot, trade_id="B")
-                        dividend = rt._compute_dust_dividend()
+        with mock.patch.object(config, "QUOTE_FIRST_ALLOCATION", False):
+            with mock.patch.object(config, "ORDER_SIZE_USD", 2.0):
+                with mock.patch.object(config, "REBALANCE_ENABLED", False):
+                    with mock.patch.object(rt, "_recompute_effective_layers", return_value={"effective_layers": 0}):
+                        with mock.patch.object(rt, "_layer_mark_price", return_value=0.1):
+                            out = rt._slot_order_size_usd(slot, trade_id="B")
+                            dividend = rt._compute_dust_dividend()
 
         self.assertAlmostEqual(dividend, 0.0, places=8)
         # B-side: max(2.0, 2.3/1) = 2.3
@@ -1240,7 +1252,9 @@ class BotEventLogTests(unittest.TestCase):
 
         self.assertAlmostEqual(out, 0.0, places=8)
 
-    def test_dust_interacts_with_throughput(self):
+    def test_dust_throughput_decoupled_from_sizing(self):
+        """After herd-mode decoupling, throughput sizer is advisory only —
+        it no longer modifies the B-side sizing pipeline."""
         rt = bot.BotRuntime()
         rt._throughput = mock.Mock()
         rt._throughput.size_for_slot.return_value = (4.0, "tp_aggregate")
@@ -1254,21 +1268,21 @@ class BotEventLogTests(unittest.TestCase):
         rt._dust_sweep_enabled = True
         rt._dust_max_bump_pct = 25.0
 
-        with mock.patch.object(config, "ORDER_SIZE_USD", 2.0):
-            with mock.patch.object(config, "REBALANCE_ENABLED", False):
-                with mock.patch.object(rt, "_recompute_effective_layers", return_value={"effective_layers": 0}):
-                    with mock.patch.object(rt, "_layer_mark_price", return_value=0.1):
-                        with mock.patch.object(rt, "_current_regime_id", return_value=2):
+        with mock.patch.object(config, "QUOTE_FIRST_ALLOCATION", False):
+            with mock.patch.object(config, "ORDER_SIZE_USD", 2.0):
+                with mock.patch.object(config, "REBALANCE_ENABLED", False):
+                    with mock.patch.object(rt, "_recompute_effective_layers", return_value={"effective_layers": 0}):
+                        with mock.patch.object(rt, "_layer_mark_price", return_value=0.1):
                             out = rt._slot_order_size_usd(slot, trade_id="B")
 
-        # B-side base = max(2.0, 10.0/1) = 10.0, throughput returns 4.0, no dust bump
-        self.assertAlmostEqual(out, 4.0, places=8)
-        self.assertIn(
-            mock.call(10.0, regime_label="bullish", trade_id="B"),
-            rt._throughput.size_for_slot.call_args_list,
-        )
+        # B-side base = max(2.0, 10.0/1) = 10.0, throughput NOT applied (advisory only)
+        self.assertAlmostEqual(out, 10.0, places=8)
+        # Throughput sizer is not called during sizing
+        rt._throughput.size_for_slot.assert_not_called()
 
     def test_dust_fund_guard_clamp(self):
+        """After herd-mode decoupling, rebalancer skew no longer applied
+        in sizing pipeline — fund guard still caps at available USD."""
         rt = bot.BotRuntime()
         slot = bot.SlotRuntime(
             slot_id=0,
@@ -1281,16 +1295,15 @@ class BotEventLogTests(unittest.TestCase):
         rt._dust_max_bump_pct = 25.0
         rt._rebalancer_current_skew = 0.5
 
-        with mock.patch.object(config, "ORDER_SIZE_USD", 2.0):
-            with mock.patch.object(config, "REBALANCE_ENABLED", True):
-                with mock.patch.object(config, "REBALANCE_SIZE_SENSITIVITY", 1.0):
-                    with mock.patch.object(config, "REBALANCE_MAX_SIZE_MULT", 2.0):
-                        with mock.patch.object(rt, "_recompute_effective_layers", return_value={"effective_layers": 0}):
-                            with mock.patch.object(rt, "_layer_mark_price", return_value=0.1):
-                                out = rt._slot_order_size_usd(slot, trade_id="B")
+        with mock.patch.object(config, "QUOTE_FIRST_ALLOCATION", False):
+            with mock.patch.object(config, "ORDER_SIZE_USD", 2.0):
+                with mock.patch.object(config, "REBALANCE_ENABLED", True):
+                    with mock.patch.object(rt, "_recompute_effective_layers", return_value={"effective_layers": 0}):
+                        with mock.patch.object(rt, "_layer_mark_price", return_value=0.1):
+                            out = rt._slot_order_size_usd(slot, trade_id="B")
 
-        # B-side base = max(2.0, 3.0/1) = 3.0, rebalancer 1.5x = 4.5,
-        # fund guard caps at max(3.0, 3.0-3.0) = 3.0
+        # B-side base = max(2.0, 3.0/1) = 3.0, rebalancer NOT applied (decoupled),
+        # fund guard caps at available_usd = 3.0
         self.assertAlmostEqual(out, 3.0, places=8)
 
     @mock.patch("supabase_store.save_fill")
@@ -1352,10 +1365,11 @@ class BotEventLogTests(unittest.TestCase):
             )
         }
         with mock.patch.object(config, "ORDER_SIZE_USD", 0.5):
-            self.assertTrue(rt._is_min_size_wait_state(0, ["S0 must be exactly A sell entry + B buy entry"]))
-            with mock.patch.object(rt, "halt") as halt_mock:
-                rt._validate_slot(0)
-                halt_mock.assert_not_called()
+            with mock.patch.object(config, "ENTRY_FLOOR_ENABLED", False):
+                self.assertTrue(rt._is_min_size_wait_state(0, ["S0 must be exactly A sell entry + B buy entry"]))
+                with mock.patch.object(rt, "halt") as halt_mock:
+                    rt._validate_slot(0)
+                    halt_mock.assert_not_called()
 
     def test_bootstrap_pending_state_does_not_halt(self):
         rt = bot.BotRuntime()
@@ -1623,8 +1637,12 @@ class BotEventLogTests(unittest.TestCase):
         self.assertFalse(rt.slots[0].state.long_only)
         self.assertFalse(rt.slots[0].state.short_only)
 
-    def test_auto_repair_skips_regime_mode_source_while_suppressed(self):
-        """Repair is skipped when regime suppression is still active (Tier 2)."""
+    def test_auto_repair_proceeds_despite_regime_suppression(self):
+        """Herd mode decoupling: regime suppression no longer blocks auto-repair.
+
+        With intelligence disconnected from entries, repair always proceeds
+        to restore bilateral operation regardless of regime tier/suppression.
+        """
         rt = bot.BotRuntime()
         rt.mode = "RUNNING"
         rt.last_price = 0.1
@@ -1636,7 +1654,7 @@ class BotEventLogTests(unittest.TestCase):
         }
         rt._regime_tier = 2
         rt._regime_side_suppressed = "A"
-        rt._regime_tier2_grace_start = 1.0  # old timestamp so grace has elapsed
+        rt._regime_tier2_grace_start = 1.0
         rt._regime_tier_entered_at = 1.0
         rt.slots = {
             0: bot.SlotRuntime(
@@ -1668,14 +1686,12 @@ class BotEventLogTests(unittest.TestCase):
         saved = config.REGIME_DIRECTIONAL_ENABLED
         try:
             config.REGIME_DIRECTIONAL_ENABLED = True
-            with mock.patch.object(rt, "_safe_balance") as safe_balance:
+            with mock.patch.object(rt, "_safe_balance", return_value={"ZUSD": "50.0", "XXDG": "1000.0"}) as safe_balance:
                 with mock.patch.object(rt, "_execute_actions") as exec_actions:
                     rt._auto_repair_degraded_slot(0)
 
-            safe_balance.assert_not_called()
-            exec_actions.assert_not_called()
-            self.assertTrue(rt.slots[0].state.long_only)
-            self.assertEqual(rt.slots[0].state.mode_source, "regime")
+            # Repair now proceeds (regime no longer gates entries).
+            safe_balance.assert_called()
         finally:
             config.REGIME_DIRECTIONAL_ENABLED = saved
 
@@ -1729,8 +1745,12 @@ class BotEventLogTests(unittest.TestCase):
         self.assertIn("sell", sides)
         self.assertFalse(rt.slots[0].state.long_only)
 
-    def test_auto_repair_skips_during_cooldown(self):
-        """Repair remains blocked while Tier2 re-entry cooldown is active."""
+    def test_auto_repair_proceeds_despite_regime_cooldown(self):
+        """Herd mode decoupling: regime cooldown no longer blocks auto-repair.
+
+        Intelligence is disconnected from entries, so repair always attempts
+        to restore bilateral operation regardless of regime state.
+        """
         rt = bot.BotRuntime()
         rt.mode = "RUNNING"
         rt.last_price = 0.1
@@ -1773,14 +1793,12 @@ class BotEventLogTests(unittest.TestCase):
         with mock.patch.object(config, "REGIME_DIRECTIONAL_ENABLED", True):
             with mock.patch.object(config, "REGIME_TIER2_REENTRY_COOLDOWN_SEC", 600.0):
                 with mock.patch("bot._now", return_value=1000.0):
-                    with mock.patch.object(rt, "_safe_balance") as safe_balance:
+                    with mock.patch.object(rt, "_safe_balance", return_value={"ZUSD": "10.0", "XXDG": "100.0"}) as safe_balance:
                         with mock.patch.object(rt, "_execute_actions") as exec_actions:
                             rt._auto_repair_degraded_slot(0)
 
-        safe_balance.assert_not_called()
-        exec_actions.assert_not_called()
-        self.assertTrue(rt.slots[0].state.long_only)
-        self.assertEqual(rt.slots[0].state.mode_source, "regime")
+        # Repair now proceeds (regime no longer gates entries).
+        safe_balance.assert_called()
 
     def test_auto_repair_degraded_s1a_adds_missing_entry(self):
         rt = bot.BotRuntime()
@@ -3432,7 +3450,9 @@ class BotEventLogTests(unittest.TestCase):
         self.assertTrue(rt.slots[0].state.long_only)
         self.assertEqual(rt.slots[0].state.mode_source, "regime")
 
-    def test_bootstrap_only_places_favored_side_during_tier2(self):
+    def test_bootstrap_places_bilateral_entries_despite_tier2(self):
+        """After herd-mode decoupling, bootstrap always places both sides
+        regardless of regime tier or suppression state."""
         rt = bot.BotRuntime()
         rt.last_price = 0.1
         rt.constraints = {
@@ -3458,13 +3478,10 @@ class BotEventLogTests(unittest.TestCase):
                         rt._ensure_slot_bootstrapped(0)
 
         entries = [o for o in rt.slots[0].state.orders if o.role == "entry"]
-        self.assertEqual(len(entries), 1)
-        self.assertEqual(entries[0].side, "buy")
-        self.assertTrue(rt.slots[0].state.long_only)
-        self.assertFalse(rt.slots[0].state.short_only)
-        self.assertEqual(rt.slots[0].state.mode_source, "regime")
-        exec_actions.assert_called_once()
-        self.assertEqual(exec_actions.call_args.args[1][0].side, "buy")
+        self.assertEqual(len(entries), 2)
+        sides = {e.side for e in entries}
+        self.assertEqual(sides, {"buy", "sell"})
+        exec_actions.assert_called()
 
     def test_tier_downgrade_clears_mode_source_regime(self):
         rt = bot.BotRuntime()
@@ -3613,7 +3630,9 @@ class BotEventLogTests(unittest.TestCase):
         self.assertEqual(rt._regime_tier2_last_downgrade_at, 0.0)
         self.assertIsNone(rt._regime_cooldown_suppressed_side)
 
-    def test_bootstrap_respects_cooldown_suppression(self):
+    def test_bootstrap_places_bilateral_despite_cooldown_suppression(self):
+        """After herd-mode decoupling, bootstrap always places both sides
+        regardless of cooldown suppression state."""
         rt = bot.BotRuntime()
         rt.last_price = 0.1
         rt.constraints = {
@@ -3639,13 +3658,10 @@ class BotEventLogTests(unittest.TestCase):
                         rt._ensure_slot_bootstrapped(0)
 
         entries = [o for o in rt.slots[0].state.orders if o.role == "entry"]
-        self.assertEqual(len(entries), 1)
-        self.assertEqual(entries[0].side, "sell")
-        self.assertTrue(rt.slots[0].state.short_only)
-        self.assertFalse(rt.slots[0].state.long_only)
-        self.assertEqual(rt.slots[0].state.mode_source, "regime")
-        exec_actions.assert_called_once()
-        self.assertEqual(exec_actions.call_args.args[1][0].side, "sell")
+        self.assertEqual(len(entries), 2)
+        sides = {e.side for e in entries}
+        self.assertEqual(sides, {"buy", "sell"})
+        exec_actions.assert_called()
 
     def test_tier_history_buffer_max_20(self):
         rt = bot.BotRuntime()
@@ -4412,7 +4428,9 @@ class BotEventLogTests(unittest.TestCase):
             next_order_id=3,
             next_recovery_id=3,
         )
-        rt.slots = {0: bot.SlotRuntime(slot_id=0, state=st)}
+        slot0 = bot.SlotRuntime(slot_id=0, state=st)
+        slot0.sticky = False
+        rt.slots = {0: slot0}
         with mock.patch.object(rt, "_cancel_order"):
             with mock.patch.object(rt, "_place_order", return_value="TX-NEW"):
                 rt._apply_event(0, sm.TimerTick(timestamp=now_ts), "timer_tick", {})
@@ -4613,6 +4631,7 @@ class BotEventLogTests(unittest.TestCase):
         with (
             mock.patch.object(config, "RANGER_ENABLED", True),
             mock.patch.object(config, "RANGER_MAX_SLOTS", 2),
+            mock.patch.object(config, "HERD_MODE_ENABLED", True),
             mock.patch.object(rt, "_policy_hmm_signal", return_value=("RANGING", 0.0, 0.0, True, {})),
         ):
             payload = rt.status_payload()
@@ -4722,8 +4741,7 @@ class BotEventLogTests(unittest.TestCase):
             "min_volume": 13.0,
             "min_cost_usd": 0.0,
         }
-        rt.slots = {
-            0: bot.SlotRuntime(
+        slot0 = bot.SlotRuntime(
                 slot_id=0,
                 state=sm.PairState(
                     market_price=100.0,
@@ -4784,7 +4802,8 @@ class BotEventLogTests(unittest.TestCase):
                     ),
                 ),
             )
-        }
+        slot0.sticky = False  # Drain skips sticky slots; mark as cycling
+        rt.slots = {0: slot0}
 
         with mock.patch.object(config, "AUTO_RECOVERY_DRAIN_ENABLED", True):
             with mock.patch.object(config, "AUTO_RECOVERY_DRAIN_MAX_PER_LOOP", 1):
@@ -5075,8 +5094,9 @@ class BotEventLogTests(unittest.TestCase):
 
         with mock.patch.object(config, "ORDER_SIZE_USD", 2.0):
             with mock.patch.object(config, "CAPITAL_LAYER_DOGE_PER_ORDER", 1.0):
-                with_override = rt._slot_order_size_usd(slot, price_override=0.1)
-                without_override = rt._slot_order_size_usd(slot)
+                with mock.patch.object(config, "ENTRY_FLOOR_ENABLED", False):
+                    with_override = rt._slot_order_size_usd(slot, price_override=0.1)
+                    without_override = rt._slot_order_size_usd(slot)
 
         self.assertAlmostEqual(with_override, 2.1, places=8)
         self.assertAlmostEqual(without_override, 2.2, places=8)
