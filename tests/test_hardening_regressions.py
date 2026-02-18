@@ -4700,6 +4700,17 @@ class BotEventLogTests(unittest.TestCase):
         self.assertIn("function rangerStageLabel(stage)", dashboard.DASHBOARD_HTML)
         self.assertIn("renderRangers(s, nowSec);", dashboard.DASHBOARD_HTML)
 
+    def test_dashboard_signal_digest_panel_markup_present(self):
+        self.assertIn('id="digestLight"', dashboard.DASHBOARD_HTML)
+        self.assertIn('id="digestTopConcern"', dashboard.DASHBOARD_HTML)
+        self.assertIn('id="digestChecks"', dashboard.DASHBOARD_HTML)
+        self.assertIn('id="digestInterpretation"', dashboard.DASHBOARD_HTML)
+        self.assertIn('id="digestInterpretBtn"', dashboard.DASHBOARD_HTML)
+        self.assertIn(".digest-light-pill", dashboard.DASHBOARD_HTML)
+        self.assertIn("function renderSignalDigest(s, nowSec)", dashboard.DASHBOARD_HTML)
+        self.assertIn("renderSignalDigest(s, nowSec);", dashboard.DASHBOARD_HTML)
+        self.assertIn("/api/digest/interpret", dashboard.DASHBOARD_HTML)
+
     def test_auto_drain_recovery_backlog_prefers_furthest_then_oldest(self):
         rt = bot.BotRuntime()
         rt.mode = "RUNNING"
@@ -5564,6 +5575,39 @@ class DashboardApiHardeningTests(unittest.TestCase):
                     }
                 ],
             }
+            self.digest_trigger_calls = 0
+            self.digest_trigger_result = (
+                True,
+                "digest interpretation trigger accepted (LLM interpreter not wired yet)",
+            )
+            self.signal_digest_payload = {
+                "enabled": True,
+                "light": "amber",
+                "top_concern": "Momentum weakens while age pressure rises.",
+                "checks": [
+                    {
+                        "signal": "ema_trend",
+                        "severity": "amber",
+                        "title": "EMA trend",
+                        "detail": "Trend flattening",
+                        "value": 0.0,
+                        "threshold": "amber<=0.003",
+                    }
+                ],
+                "interpretation": {
+                    "narrative": "Range still tradeable.",
+                    "key_insight": "Cycle quality slipped.",
+                    "watch_for": "Volume collapse",
+                    "config_assessment": "borderline",
+                    "config_suggestion": "",
+                    "panelist": "DeepSeek-Chat",
+                    "ts": 1000.0,
+                    "age_sec": 5.0,
+                },
+                "interpretation_stale": False,
+                "last_run_ts": 1005.0,
+                "last_error": "",
+            }
 
         def pause(self, _reason):
             if self.raise_on_pause:
@@ -5708,6 +5752,16 @@ class DashboardApiHardeningTests(unittest.TestCase):
             self.churner_status_payload["reserve_available_usd"] = float(reserve_usd)
             self.churner_status_payload["reserve_config_usd"] = float(reserve_usd)
             return True, "updated churner config"
+
+        def trigger_signal_digest_interpretation(self):
+            self.digest_trigger_calls += 1
+            return self.digest_trigger_result
+
+        def _signal_digest_status_payload(self, _now_ts=None):
+            payload = dict(self.signal_digest_payload)
+            payload["checks"] = list(self.signal_digest_payload.get("checks", []))
+            payload["interpretation"] = dict(self.signal_digest_payload.get("interpretation", {}))
+            return payload
 
     class _HandlerStub:
         def __init__(self, body_or_exc, path="/api/action"):
@@ -5918,6 +5972,37 @@ class DashboardApiHardeningTests(unittest.TestCase):
         code, payload = handler.sent[0]
         self.assertEqual(code, 400)
         self.assertEqual(payload, {"ok": False, "message": "reserve_usd required"})
+
+    def test_api_digest_interpret_routes_ok(self):
+        runtime = self._RuntimeStub()
+        bot._RUNTIME = runtime
+        handler = self._HandlerStub({}, path="/api/digest/interpret")
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(runtime.digest_trigger_calls, 1)
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 200)
+        self.assertTrue(payload.get("ok"))
+        self.assertIn("signal_digest", payload)
+        self.assertEqual(payload["signal_digest"].get("light"), "amber")
+
+    def test_api_digest_interpret_failure_returns_json_400(self):
+        runtime = self._RuntimeStub()
+        runtime.digest_trigger_result = (False, "digest interpretation disabled")
+        bot._RUNTIME = runtime
+        handler = self._HandlerStub({}, path="/api/digest/interpret")
+
+        bot.DashboardHandler.do_POST(handler)
+
+        self.assertEqual(runtime.digest_trigger_calls, 1)
+        self.assertEqual(len(handler.sent), 1)
+        code, payload = handler.sent[0]
+        self.assertEqual(code, 400)
+        self.assertEqual(payload.get("ok"), False)
+        self.assertEqual(payload.get("message"), "digest interpretation disabled")
+        self.assertIn("signal_digest", payload)
 
     def test_api_action_unknown_action_returns_json_400(self):
         bot._RUNTIME = self._RuntimeStub()

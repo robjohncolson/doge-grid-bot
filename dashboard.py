@@ -190,6 +190,89 @@ DASHBOARD_HTML = """<!doctype html>
       border-color: rgba(210,153,34,.55);
       background: rgba(210,153,34,.12);
     }
+    .digest-light-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 2px 8px;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: .04em;
+      color: var(--muted);
+      background: rgba(255,255,255,.03);
+      text-transform: uppercase;
+    }
+    .digest-light-pill.green {
+      color: var(--good);
+      border-color: rgba(63,185,80,.45);
+      background: rgba(63,185,80,.12);
+    }
+    .digest-light-pill.amber {
+      color: var(--warn);
+      border-color: rgba(210,153,34,.55);
+      background: rgba(210,153,34,.12);
+    }
+    .digest-light-pill.red {
+      color: var(--bad);
+      border-color: rgba(248,81,73,.55);
+      background: rgba(248,81,73,.12);
+    }
+    .digest-light-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: currentColor;
+      box-shadow: 0 0 10px currentColor;
+      flex: 0 0 auto;
+    }
+    .digest-checks {
+      margin-top: 6px;
+      margin-bottom: 6px;
+    }
+    .digest-check-row {
+      display: flex;
+      gap: 6px;
+      align-items: baseline;
+      margin: 4px 0;
+    }
+    .digest-check-sev {
+      min-width: 42px;
+      text-align: center;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 1px 6px;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      color: var(--muted);
+      background: rgba(255,255,255,.02);
+      flex: 0 0 auto;
+    }
+    .digest-check-sev.green {
+      color: var(--good);
+      border-color: rgba(63,185,80,.45);
+      background: rgba(63,185,80,.08);
+    }
+    .digest-check-sev.amber {
+      color: var(--warn);
+      border-color: rgba(210,153,34,.55);
+      background: rgba(210,153,34,.1);
+    }
+    .digest-check-sev.red {
+      color: var(--bad);
+      border-color: rgba(248,81,73,.55);
+      background: rgba(248,81,73,.1);
+    }
+    .digest-check-body {
+      line-height: 1.25;
+      word-break: break-word;
+    }
+    .digest-interpretation.stale {
+      color: var(--warn);
+    }
     .S0 { color: var(--accent); }
     .S1a, .S1b { color: var(--warn); }
     .S2 { color: var(--bad); }
@@ -665,6 +748,21 @@ DASHBOARD_HTML = """<!doctype html>
         <div class=\"row\"><span class=\"k\">Status</span><span id=\"rangerStatus\" class=\"v\"></span></div>
         <div class=\"row\"><span class=\"k\">Today</span><span id=\"rangerToday\" class=\"v\"></span></div>
         <div id=\"rangerSlots\" class=\"tiny\"></div>
+
+        <h3 style=\"margin-top:14px\">Signal Digest</h3>
+        <div class=\"row\">
+          <span class=\"k\">Light</span>
+          <span id=\"digestLight\" class=\"v digest-light-pill\">
+            <span class=\"digest-light-dot\"></span><span id=\"digestLightText\">OFF</span>
+          </span>
+        </div>
+        <div class=\"row\"><span class=\"k\">Last Run</span><span id=\"digestAge\" class=\"v\">-</span></div>
+        <div class=\"row\"><span class=\"k\">Top Concern</span><span id=\"digestTopConcern\" class=\"v\">-</span></div>
+        <div id=\"digestLastError\" class=\"tiny\"></div>
+        <div id=\"digestChecks\" class=\"tiny digest-checks\"></div>
+        <div id=\"digestInterpretation\" class=\"tiny\"></div>
+        <div style=\"height:6px\"></div>
+        <button id=\"digestInterpretBtn\" class=\"wide\" type=\"button\">Interpret Digest</button>
 
         <h3 style=\"margin-top:14px\">HMM Regime</h3>
         <div class=\"row\"><span class=\"k\">Status</span><span id=\"hmmStatus\" class=\"v\"></span></div>
@@ -1774,6 +1872,22 @@ DASHBOARD_HTML = """<!doctype html>
       }
     }
 
+    async function requestDigestInterpretation() {
+      try {
+        const out = await api('/api/digest/interpret', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({}),
+        });
+        showToast(out.message || 'digest interpretation requested', 'success');
+        await refresh();
+        return true;
+      } catch (err) {
+        showToast(err && err.message ? err.message : 'digest interpretation request failed', 'error');
+        return false;
+      }
+    }
+
     function manifoldBandColor(band) {
       const b = String(band || '').toLowerCase();
       if (b === 'optimal') return '#5cb85c';
@@ -2634,6 +2748,106 @@ DASHBOARD_HTML = """<!doctype html>
       slotsEl.innerHTML = bits.join('');
     }
 
+    function renderSignalDigest(s, nowSec) {
+      const digest = s && typeof s.signal_digest === 'object' ? s.signal_digest : {};
+      const enabled = Boolean(digest.enabled);
+      const lightRaw = String(digest.light || 'green').toLowerCase();
+      const light = (lightRaw === 'green' || lightRaw === 'amber' || lightRaw === 'red') ? lightRaw : 'green';
+      const lightEl = document.getElementById('digestLight');
+      const lightTextEl = document.getElementById('digestLightText');
+      const ageEl = document.getElementById('digestAge');
+      const topConcernEl = document.getElementById('digestTopConcern');
+      const errEl = document.getElementById('digestLastError');
+      const checksEl = document.getElementById('digestChecks');
+      const interpEl = document.getElementById('digestInterpretation');
+      const interpretBtn = document.getElementById('digestInterpretBtn');
+
+      if (!enabled) {
+        if (lightEl) lightEl.className = 'v digest-light-pill';
+        if (lightTextEl) lightTextEl.textContent = 'OFF';
+        if (ageEl) ageEl.textContent = '-';
+        if (topConcernEl) topConcernEl.textContent = 'Signal digest disabled';
+        if (errEl) {
+          errEl.textContent = '';
+          errEl.style.color = '';
+        }
+        if (checksEl) checksEl.textContent = '';
+        if (interpEl) {
+          interpEl.className = 'tiny';
+          interpEl.textContent = '';
+        }
+        if (interpretBtn) interpretBtn.disabled = true;
+        return;
+      }
+
+      if (lightEl) lightEl.className = `v digest-light-pill ${light}`;
+      if (lightTextEl) lightTextEl.textContent = light.toUpperCase();
+      if (interpretBtn) interpretBtn.disabled = false;
+
+      const lastRunTs = Number(digest.last_run_ts || 0.0);
+      const runAgeSec = lastRunTs > 0 ? Math.max(0, nowSec - lastRunTs) : NaN;
+      if (ageEl) ageEl.textContent = Number.isFinite(runAgeSec) ? fmtAgo(runAgeSec) : 'n/a';
+
+      const topConcern = String(digest.top_concern || 'All diagnostic checks nominal.');
+      if (topConcernEl) topConcernEl.textContent = topConcern;
+
+      const lastError = String(digest.last_error || '').trim();
+      if (errEl) {
+        errEl.textContent = lastError ? `Digest error: ${lastError}` : '';
+        errEl.style.color = lastError ? 'var(--bad)' : '';
+      }
+
+      const checks = Array.isArray(digest.checks) ? digest.checks : [];
+      if (checksEl) {
+        if (!checks.length) {
+          checksEl.textContent = 'No diagnostic checks available.';
+        } else {
+          const maxRows = 6;
+          const rows = checks.slice(0, maxRows).map((row) => {
+            const sevRaw = String(row && row.severity || 'green').toLowerCase();
+            const sev = (sevRaw === 'green' || sevRaw === 'amber' || sevRaw === 'red') ? sevRaw : 'green';
+            const title = String(row && row.title || row && row.signal || '').trim();
+            const detail = String(row && row.detail || '').trim();
+            const body = detail ? `${title}: ${detail}` : title;
+            return (
+              `<div class=\"digest-check-row\">`
+              + `<span class=\"digest-check-sev ${sev}\">${escHtml(sev)}</span>`
+              + `<span class=\"digest-check-body\">${escHtml(body || 'n/a')}</span>`
+              + `</div>`
+            );
+          });
+          if (checks.length > maxRows) {
+            rows.push(`<div class=\"tiny\">+${checks.length - maxRows} more checks</div>`);
+          }
+          checksEl.innerHTML = rows.join('');
+        }
+      }
+
+      const interpretation = digest && typeof digest.interpretation === 'object' ? digest.interpretation : {};
+      const stale = Boolean(digest.interpretation_stale);
+      const panelist = String(interpretation.panelist || '').trim();
+      const narrative = String(interpretation.narrative || '').trim();
+      const keyInsight = String(interpretation.key_insight || '').trim();
+      const watchFor = String(interpretation.watch_for || '').trim();
+      const interpAgeRaw = Number(interpretation.age_sec);
+      const interpAge = Number.isFinite(interpAgeRaw) && interpAgeRaw >= 0 ? fmtAgo(interpAgeRaw) : '';
+      if (interpEl) {
+        interpEl.className = stale ? 'tiny digest-interpretation stale' : 'tiny digest-interpretation';
+        if (!(narrative || keyInsight || watchFor || panelist)) {
+          interpEl.textContent = stale ? 'Interpretation is stale.' : 'No interpretation yet.';
+        } else {
+          const leadBits = [];
+          if (panelist) leadBits.push(`by ${panelist}`);
+          if (interpAge) leadBits.push(interpAge);
+          const lead = leadBits.length ? `Interpretation (${leadBits.join(', ')}): ` : 'Interpretation: ';
+          const detailBits = [narrative];
+          if (keyInsight) detailBits.push(`insight ${keyInsight}`);
+          if (watchFor) detailBits.push(`watch ${watchFor}`);
+          interpEl.textContent = `${lead}${detailBits.filter(Boolean).join(' | ')}`;
+        }
+      }
+    }
+
     function renderTop(s) {
       const nowSec = Date.now() / 1000;
       const mode = document.getElementById('mode');
@@ -2770,6 +2984,7 @@ DASHBOARD_HTML = """<!doctype html>
 
       renderSelfHealing(s, nowSec);
       renderRangers(s, nowSec);
+      renderSignalDigest(s, nowSec);
 
       const hmm = s.hmm_regime || {};
       const hmmConsensus = s.hmm_consensus || {};
@@ -4307,6 +4522,7 @@ DASHBOARD_HTML = """<!doctype html>
       const value = Number(input && input.value);
       void requestChurnerReserveUpdate(value);
     };
+    document.getElementById('digestInterpretBtn').onclick = () => { void requestDigestInterpretation(); };
 
     document.getElementById('confirmOkBtn').onclick = () => { void confirmAccept(); };
     document.getElementById('confirmCancelBtn').onclick = () => confirmCancel();

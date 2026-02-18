@@ -34,6 +34,7 @@ from position_ledger import PositionLedger
 from throughput_sizer import ThroughputConfig, ThroughputSizer
 import notifier
 import ai_advisor
+import signal_digest
 import state_machine as sm
 import supabase_store
 
@@ -1412,6 +1413,18 @@ class BotRuntime:
         self._ai_override_until: float | None = None
         self._ai_override_applied_at: float | None = None
         self._ai_override_source_conviction: int | None = None
+        # Signal digest (Layer 1: rule engine, Layer 2: interpretation placeholder).
+        self._digest_light: str = "green"
+        self._digest_light_changed_at: float = 0.0
+        self._digest_top_concern: str = "All diagnostic checks nominal."
+        self._digest_checks: list[signal_digest.DiagnosticCheck] = []
+        self._digest_last_run_ts: float = 0.0
+        self._digest_last_error: str = ""
+        self._digest_interpretation: dict[str, Any] = {}
+        self._digest_interpretation_requested_at: float = 0.0
+        self._digest_interpretation_last_attempt_ts: float = 0.0
+        self._digest_interpretation_last_trigger: str = ""
+        self._digest_interpretation_last_error: str = ""
         # Strategic accumulation engine runtime state.
         self._accum_state: str = "IDLE"  # IDLE | ARMED | ACTIVE | COMPLETED | STOPPED
         self._accum_direction: str | None = None
@@ -3916,6 +3929,20 @@ class BotRuntime:
             "ai_override_until": self._ai_override_until,
             "ai_override_applied_at": self._ai_override_applied_at,
             "ai_override_source_conviction": self._ai_override_source_conviction,
+            "digest_light": str(self._digest_light or "green"),
+            "digest_light_changed_at": float(self._digest_light_changed_at),
+            "digest_top_concern": str(self._digest_top_concern or ""),
+            "digest_checks": [
+                self._serialize_digest_check(check)
+                for check in list(self._digest_checks or [])
+            ],
+            "digest_last_run_ts": float(self._digest_last_run_ts),
+            "digest_last_error": str(self._digest_last_error or ""),
+            "digest_interpretation": dict(self._digest_interpretation or {}),
+            "digest_interpretation_requested_at": float(self._digest_interpretation_requested_at),
+            "digest_interpretation_last_attempt_ts": float(self._digest_interpretation_last_attempt_ts),
+            "digest_interpretation_last_trigger": str(self._digest_interpretation_last_trigger or ""),
+            "digest_interpretation_last_error": str(self._digest_interpretation_last_error or ""),
             "accum_state": str(self._accum_state),
             "accum_direction": self._accum_direction,
             "accum_trigger_from_regime": str(self._accum_trigger_from_regime),
@@ -4638,6 +4665,72 @@ class BotRuntime:
                 self._ai_override_source_conviction = None
             if self._ai_override_until is not None and float(self._ai_override_until) <= _now():
                 self._clear_ai_override()
+            raw_digest_light = str(snap.get("digest_light", self._digest_light) or "green").strip().lower()
+            if raw_digest_light not in {"green", "amber", "red"}:
+                raw_digest_light = "green"
+            self._digest_light = raw_digest_light
+            self._digest_light_changed_at = max(
+                0.0,
+                float(snap.get("digest_light_changed_at", self._digest_light_changed_at) or 0.0),
+            )
+            self._digest_top_concern = str(
+                snap.get("digest_top_concern", self._digest_top_concern) or "All diagnostic checks nominal."
+            )
+            self._digest_last_run_ts = max(
+                0.0,
+                float(snap.get("digest_last_run_ts", self._digest_last_run_ts) or 0.0),
+            )
+            self._digest_last_error = str(snap.get("digest_last_error", self._digest_last_error) or "")
+            self._digest_checks = []
+            raw_digest_checks = snap.get("digest_checks", [])
+            if isinstance(raw_digest_checks, list):
+                for row in raw_digest_checks:
+                    if not isinstance(row, dict):
+                        continue
+                    try:
+                        severity = str(row.get("severity", "green") or "green").strip().lower()
+                        if severity not in {"green", "amber", "red"}:
+                            severity = "green"
+                        self._digest_checks.append(
+                            signal_digest.DiagnosticCheck(
+                                signal=str(row.get("signal", "") or ""),
+                                severity=severity,
+                                title=str(row.get("title", "") or ""),
+                                detail=str(row.get("detail", "") or ""),
+                                value=float(row.get("value", 0.0) or 0.0),
+                                threshold=str(row.get("threshold", "") or ""),
+                            )
+                        )
+                    except (TypeError, ValueError):
+                        continue
+            raw_digest_interp = snap.get("digest_interpretation", self._digest_interpretation)
+            self._digest_interpretation = dict(raw_digest_interp) if isinstance(raw_digest_interp, dict) else {}
+            self._digest_interpretation_requested_at = max(
+                0.0,
+                float(
+                    snap.get(
+                        "digest_interpretation_requested_at",
+                        self._digest_interpretation_requested_at,
+                    )
+                    or 0.0
+                ),
+            )
+            self._digest_interpretation_last_attempt_ts = max(
+                0.0,
+                float(
+                    snap.get(
+                        "digest_interpretation_last_attempt_ts",
+                        self._digest_interpretation_last_attempt_ts,
+                    )
+                    or 0.0
+                ),
+            )
+            self._digest_interpretation_last_trigger = str(
+                snap.get("digest_interpretation_last_trigger", self._digest_interpretation_last_trigger) or ""
+            )
+            self._digest_interpretation_last_error = str(
+                snap.get("digest_interpretation_last_error", self._digest_interpretation_last_error) or ""
+            )
             raw_accum_state = str(snap.get("accum_state", self._accum_state) or "IDLE").strip().upper()
             if raw_accum_state not in {"IDLE", "ARMED", "ACTIVE", "COMPLETED", "STOPPED"}:
                 raw_accum_state = "IDLE"
@@ -15329,6 +15422,8 @@ class BotRuntime:
             # Keep release hard-gate status fresh and run sticky auto-release tiers.
             self._update_release_recon_gate_locked()
             self._auto_release_sticky_slots()
+            # Rule-based signal digest runs every loop; interpretation layer is separate.
+            self._run_signal_digest(loop_now)
 
             # Pressure notice for orphan growth.
             total_orphans = sum(len(s.state.recovery_orders) for s in self.slots.values())
@@ -16079,6 +16174,236 @@ class BotRuntime:
             ref_val = series[0][1]
         return float(latest_val - ref_val)
 
+    def _signal_digest_config(self) -> dict[str, float | int]:
+        return {
+            "DIGEST_EMA_AMBER_THRESHOLD": float(getattr(config, "DIGEST_EMA_AMBER_THRESHOLD", 0.003)),
+            "DIGEST_EMA_RED_THRESHOLD": float(getattr(config, "DIGEST_EMA_RED_THRESHOLD", 0.01)),
+            "DIGEST_RSI_AMBER_ZONE": float(getattr(config, "DIGEST_RSI_AMBER_ZONE", 0.2)),
+            "DIGEST_RSI_RED_ZONE": float(getattr(config, "DIGEST_RSI_RED_ZONE", 0.4)),
+            "DIGEST_AGE_AMBER_PCT": float(getattr(config, "DIGEST_AGE_AMBER_PCT", 30.0)),
+            "DIGEST_AGE_RED_PCT": float(getattr(config, "DIGEST_AGE_RED_PCT", 60.0)),
+            "DIGEST_EXIT_AMBER_PCT": float(getattr(config, "DIGEST_EXIT_AMBER_PCT", 3.0)),
+            "DIGEST_EXIT_RED_PCT": float(getattr(config, "DIGEST_EXIT_RED_PCT", 8.0)),
+            "DIGEST_HEADROOM_AMBER": int(getattr(config, "DIGEST_HEADROOM_AMBER", 50)),
+            "DIGEST_HEADROOM_RED": int(getattr(config, "DIGEST_HEADROOM_RED", 20)),
+        }
+
+    @staticmethod
+    def _serialize_digest_check(check: signal_digest.DiagnosticCheck | dict[str, Any]) -> dict[str, Any]:
+        if isinstance(check, signal_digest.DiagnosticCheck):
+            return asdict(check)
+        if isinstance(check, dict):
+            return {
+                "signal": str(check.get("signal", "") or ""),
+                "severity": str(check.get("severity", "green") or "green"),
+                "title": str(check.get("title", "") or ""),
+                "detail": str(check.get("detail", "") or ""),
+                "value": float(check.get("value", 0.0) or 0.0),
+                "threshold": str(check.get("threshold", "") or ""),
+            }
+        return {
+            "signal": "",
+            "severity": "green",
+            "title": "",
+            "detail": "",
+            "value": 0.0,
+            "threshold": "",
+        }
+
+    def _build_signal_digest_context(self, now: float) -> dict[str, Any]:
+        capacity = self._compute_capacity_health(now)
+        throughput_payload = self._throughput.status_payload() if self._throughput is not None else {"enabled": False}
+        self_heal_payload = self._self_healing_status_payload(now)
+        ranger_payload = self._ranger_status_payload(now)
+        consensus = dict(self._hmm_consensus or self._compute_hmm_consensus())
+        primary = dict(self._hmm_state or self._hmm_default_state())
+        secondary = dict(
+            self._hmm_state_secondary
+            or self._hmm_default_state(
+                enabled=self._flag_value("HMM_ENABLED")
+                and self._flag_value("HMM_MULTI_TIMEFRAME_ENABLED"),
+                interval_min=max(1, int(getattr(config, "HMM_SECONDARY_INTERVAL_MIN", 15))),
+            )
+        )
+        tertiary = dict(
+            self._hmm_state_tertiary
+            or self._hmm_default_state(
+                enabled=self._flag_value("HMM_ENABLED")
+                and self._flag_value("HMM_TERTIARY_ENABLED"),
+                interval_min=max(1, int(getattr(config, "HMM_TERTIARY_INTERVAL_MIN", 60))),
+            )
+        )
+        source = dict(self._policy_hmm_source() or primary)
+        belief_payload = self._belief_state.to_status_dict()
+        manifold_payload = self._manifold_score.to_status_dict()
+        slot_vintage = self._slot_vintage_metrics_locked(now)
+
+        obs_payload: dict[str, Any] = {}
+        detector_obs = getattr(self._hmm_detector, "last_observation", None)
+        if detector_obs is not None:
+            try:
+                rsi_zone = float(getattr(detector_obs, "rsi_zone", 0.0) or 0.0)
+                obs_payload = {
+                    "macd_hist_slope": float(getattr(detector_obs, "macd_hist_slope", 0.0) or 0.0),
+                    "ema_spread_pct": float(getattr(detector_obs, "ema_spread_pct", 0.0) or 0.0),
+                    "rsi_zone": float(rsi_zone),
+                    "rsi_raw": float(50.0 + (rsi_zone * 50.0)),
+                    "volume_ratio": float(getattr(detector_obs, "volume_ratio", 1.0) or 1.0),
+                }
+            except Exception:
+                obs_payload = {}
+
+        belief_positions: list[dict[str, Any]] = []
+        for belief in self._trade_beliefs.values():
+            side = str(getattr(belief, "side", "") or "").strip().lower()
+            trade_id = str(getattr(belief, "trade_id", "") or "")
+            if side not in {"buy", "sell"}:
+                side = "buy" if trade_id.upper() == "B" else "sell"
+            belief_positions.append(
+                {
+                    "side": side,
+                    "trade_id": trade_id,
+                    "distance_from_market_pct": float(
+                        getattr(belief, "distance_from_market_pct", 0.0) or 0.0
+                    ),
+                }
+            )
+
+        out: dict[str, Any] = {
+            "trend_score": float(self._trend_score),
+            "hmm_regime": {
+                "regime": str(source.get("regime", "RANGING") or "RANGING"),
+                "confidence": float(source.get("confidence", 0.0) or 0.0),
+                "confidence_effective": float(
+                    consensus.get("effective_confidence", source.get("confidence", 0.0)) or 0.0
+                ),
+                "primary": {"regime": str(primary.get("regime", "RANGING") or "RANGING")},
+                "secondary": {"regime": str(secondary.get("regime", "RANGING") or "RANGING")},
+                "tertiary": {"regime": str(tertiary.get("regime", "RANGING") or "RANGING")},
+            },
+            "hmm_consensus": {
+                "agreement": str(consensus.get("agreement", "primary_only") or "primary_only"),
+                "effective_regime": str(
+                    consensus.get("effective_regime", consensus.get("regime", "RANGING")) or "RANGING"
+                ),
+                "effective_confidence": float(
+                    consensus.get("effective_confidence", consensus.get("confidence", 0.0)) or 0.0
+                ),
+                "effective_bias": float(
+                    consensus.get("effective_bias", consensus.get("bias_signal", 0.0)) or 0.0
+                ),
+            },
+            "timeframes": {
+                "1m": str(primary.get("regime", "RANGING") or "RANGING"),
+                "15m": str(secondary.get("regime", "") or ""),
+                "1h": str(tertiary.get("regime", "") or ""),
+            },
+            "belief_state": {
+                "boundary_risk": str(belief_payload.get("boundary_risk", "low") or "low"),
+                "p_switch_consensus": float(belief_payload.get("p_switch_consensus", 0.0) or 0.0),
+            },
+            "boundary_risk": str(belief_payload.get("boundary_risk", "low") or "low"),
+            "p_switch": float(belief_payload.get("p_switch_consensus", 0.0) or 0.0),
+            "self_healing": self_heal_payload,
+            "age_bands": (
+                dict(self_heal_payload.get("age_bands", {}))
+                if isinstance(self_heal_payload, dict)
+                else {}
+            ),
+            "capacity_fill_health": capacity,
+            "headroom": int(capacity.get("open_order_headroom", 0) or 0),
+            "rangers": ranger_payload,
+            "throughput_sizer": throughput_payload if isinstance(throughput_payload, dict) else {"enabled": False},
+            "capital_util_ratio": float(
+                (throughput_payload if isinstance(throughput_payload, dict) else {}).get("util_ratio", 0.0) or 0.0
+            ),
+            "slot_vintage": {
+                "stuck_capital_pct": float(slot_vintage.get("stuck_capital_pct", 0.0) or 0.0),
+            },
+            "manifold_score": {
+                "mts": float(manifold_payload.get("mts", 0.0) or 0.0),
+                "band": str(manifold_payload.get("band", "") or ""),
+                "trend": str(manifold_payload.get("trend", "stable") or "stable"),
+            },
+            "mts": float(manifold_payload.get("mts", 0.0) or 0.0),
+            "mts_band": str(manifold_payload.get("band", "") or ""),
+            "mts_trend": str(manifold_payload.get("trend", "stable") or "stable"),
+            "trade_beliefs": {"positions": belief_positions},
+        }
+        if obs_payload:
+            out["hmm_observation"] = dict(obs_payload)
+            out.update(obs_payload)
+        return out
+
+    def _run_signal_digest(self, now_ts: float) -> None:
+        if not self._flag_value("DIGEST_ENABLED"):
+            return
+        try:
+            snapshot = self._build_signal_digest_context(float(now_ts))
+            result = signal_digest.evaluate_signal_digest(
+                snapshot=snapshot,
+                cfg=self._signal_digest_config(),
+            )
+            prev_light = str(self._digest_light or "green")
+            self._digest_checks = list(result.checks or [])
+            self._digest_light = str(result.light or "green").strip().lower() or "green"
+            self._digest_top_concern = str(result.top_concern or "All diagnostic checks nominal.")
+            self._digest_last_run_ts = float(now_ts)
+            if self._digest_light_changed_at <= 0.0 or self._digest_light != prev_light:
+                self._digest_light_changed_at = float(now_ts)
+            self._digest_last_error = ""
+        except Exception as e:
+            self._digest_last_run_ts = float(now_ts)
+            self._digest_last_error = str(e)
+            logger.warning("Signal digest evaluation failed: %s", e)
+
+    def trigger_signal_digest_interpretation(self) -> tuple[bool, str]:
+        now = float(_now())
+        self._digest_interpretation_requested_at = now
+        self._digest_interpretation_last_attempt_ts = now
+        self._digest_interpretation_last_trigger = "manual"
+        if not self._flag_value("DIGEST_ENABLED"):
+            return False, "signal digest disabled"
+        if not self._flag_value("DIGEST_INTERPRETATION_ENABLED"):
+            return False, "digest interpretation disabled"
+        # Phase D wires the actual worker; Phase B only provides endpoint/state plumbing.
+        return True, "digest interpretation trigger accepted (LLM interpreter not wired yet)"
+
+    def _signal_digest_status_payload(self, now_ts: float | None = None) -> dict[str, Any]:
+        now = float(now_ts if now_ts is not None else _now())
+        enabled = bool(self._flag_value("DIGEST_ENABLED"))
+        checks_payload = [self._serialize_digest_check(check) for check in list(self._digest_checks or [])]
+        interp_raw = dict(self._digest_interpretation or {})
+        interp_ts = 0.0
+        try:
+            interp_ts = float(interp_raw.get("ts", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            interp_ts = 0.0
+        age_sec = max(0.0, now - interp_ts) if interp_ts > 0.0 else None
+        stale_cutoff = max(60.0, float(getattr(config, "DIGEST_INTERPRETATION_INTERVAL_SEC", 600.0)))
+        stale = bool(age_sec is not None and age_sec > stale_cutoff)
+        interpretation = {
+            "narrative": str(interp_raw.get("narrative", "") or ""),
+            "key_insight": str(interp_raw.get("key_insight", "") or ""),
+            "watch_for": str(interp_raw.get("watch_for", "") or ""),
+            "config_assessment": str(interp_raw.get("config_assessment", "borderline") or "borderline"),
+            "config_suggestion": str(interp_raw.get("config_suggestion", "") or ""),
+            "panelist": str(interp_raw.get("panelist", "") or ""),
+            "ts": float(interp_ts),
+            "age_sec": age_sec,
+        }
+        return {
+            "enabled": enabled,
+            "light": str(self._digest_light or "green"),
+            "light_changed_at": float(self._digest_light_changed_at or 0.0),
+            "top_concern": str(self._digest_top_concern or "All diagnostic checks nominal."),
+            "checks": checks_payload,
+            "interpretation": interpretation,
+            "interpretation_stale": bool(stale),
+            "last_run_ts": float(self._digest_last_run_ts or 0.0),
+            "last_error": str(self._digest_last_error or ""),
+        }
+
     def _equity_history_status_payload(self, now: float) -> dict:
         if not self._equity_ts_enabled:
             return {"enabled": False}
@@ -16537,6 +16862,7 @@ class BotRuntime:
             manifold_payload["history_sparkline"] = history_sparkline
             manifold_payload["trend"] = trend
             manifold_payload["mts_30m_ago"] = mts_30m_ago
+            signal_digest_payload = self._signal_digest_status_payload(now)
 
             return {
                 "mode": self.mode,
@@ -16658,6 +16984,7 @@ class BotRuntime:
                 "trade_beliefs": trade_beliefs_payload,
                 "action_knobs": action_knobs_payload,
                 "manifold_score": manifold_payload,
+                "signal_digest": signal_digest_payload,
                 "ops_panel": self._ops_panel_status_payload(),
                 "regime_history_30m": list(self._regime_history_30m),
                 "throughput_sizer": (
@@ -17032,6 +17359,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         return
 
                 self._send_json({"ok": False, "message": "not found"}, 404)
+                return
+
+            if self.path.startswith("/api/digest/interpret"):
+                if _RUNTIME is None:
+                    self._send_json({"ok": False, "message": "runtime not ready"}, 503)
+                    return
+                with _RUNTIME.lock:
+                    ok, msg = _RUNTIME.trigger_signal_digest_interpretation()
+                    if ok:
+                        _RUNTIME._save_snapshot()
+                    payload = {
+                        "ok": bool(ok),
+                        "message": str(msg),
+                        "signal_digest": _RUNTIME._signal_digest_status_payload(_now()),
+                    }
+                self._send_json(payload, 200 if ok else 400)
                 return
 
             if not self.path.startswith("/api/action"):

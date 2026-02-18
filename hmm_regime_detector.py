@@ -283,6 +283,13 @@ class RegimeDetector:
             enriched_features_enabled=bool(self.cfg.get("ENRICHED_FEATURES_ENABLED", False))
         )
         self.state = RegimeState()
+        # Keep the most recent raw observation row so downstream diagnostics can
+        # read MACD/EMA/RSI/volume features without recomputing indicators.
+        self.last_observation: Optional[IndicatorSnapshot] = None
+        self.last_macd_hist_slope: float = 0.0
+        self.last_ema_spread_pct: float = 0.0
+        self.last_rsi_zone: float = 0.0
+        self.last_volume_ratio: float = 0.0
         self._state_label_map: dict[int, Regime] = {}
         self._last_train_ts: float = 0.0
         self._trained = False
@@ -435,11 +442,25 @@ class RegimeDetector:
         Uses the last HMM_INFERENCE_WINDOW observations for the forward pass.
         Returns updated RegimeState.
         """
+        obs = self.extractor.extract(closes, volumes)
+        if len(obs) > 0:
+            latest = obs[-1]
+            snap = IndicatorSnapshot(
+                macd_hist_slope=float(latest[0]),
+                ema_spread_pct=float(latest[1]),
+                rsi_zone=float(latest[2]),
+                volume_ratio=float(latest[3]),
+            )
+            self.last_observation = snap
+            self.last_macd_hist_slope = float(snap.macd_hist_slope)
+            self.last_ema_spread_pct = float(snap.ema_spread_pct)
+            self.last_rsi_zone = float(snap.rsi_zone)
+            self.last_volume_ratio = float(snap.volume_ratio)
+
         if not self._trained or self.model is None:
             logger.debug("HMM not trained yet, returning default RANGING state")
             return self.state
 
-        obs = self.extractor.extract(closes, volumes)
         if len(obs) == 0:
             return self.state
 
