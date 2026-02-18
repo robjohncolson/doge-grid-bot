@@ -624,7 +624,7 @@ DASHBOARD_HTML = """<!doctype html>
     .video-modal-overlay {
       position: fixed; inset: 0; z-index: 9000;
       background: rgba(0,0,0,.75);
-      display: flex; align-items: center; justify-content: center;
+      display: none; align-items: center; justify-content: center;
     }
     .video-modal {
       background: var(--card); border: 1px solid var(--border);
@@ -1458,7 +1458,7 @@ DASHBOARD_HTML = """<!doctype html>
     function openVideoModal() {
       videoModalOpen = true;
       const modal = document.getElementById('videoModal');
-      if (modal) modal.hidden = false;
+      if (modal) modal.style.display = 'flex';
       renderVideoTrackList();
       setKbMode('VIDEO');
     }
@@ -1466,7 +1466,7 @@ DASHBOARD_HTML = """<!doctype html>
     function closeVideoModal() {
       videoModalOpen = false;
       const modal = document.getElementById('videoModal');
-      if (modal) modal.hidden = true;
+      if (modal) modal.style.display = 'none';
       const vid = document.getElementById('videoPlayer');
       if (vid) vid.pause();
     }
