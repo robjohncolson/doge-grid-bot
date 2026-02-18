@@ -425,6 +425,111 @@ class SelfHealingSlotsTests(unittest.TestCase):
         self.assertTrue(bool(state.active))
         self.assertEqual(str(state.stage), "idle")
 
+    def test_churner_gate_check_uses_opposite_side_when_preferred_lacks_capital(self):
+        now_ts = 1_000_000.0
+        entry_time = now_ts - (48 * 3600)
+        rt, position_id, parent_order = self._build_open_position_runtime(
+            now_ts=now_ts,
+            entry_time=entry_time,
+            entry_price=0.1000,
+            exit_price=0.1020,
+            target_profit_pct=1.0,
+        )
+        state = rt._ensure_churner_state(0)
+        parent = dict(rt._position_ledger.get_position(position_id) or {})
+        self.assertTrue(parent)
+        with (
+            mock.patch.object(rt, "_policy_hmm_signal", return_value=("RANGING", 0.0, 0.0, True, {})),
+            mock.patch.object(rt, "_compute_capacity_health", return_value={"open_order_headroom": 100}),
+            mock.patch.object(rt, "_available_free_balances", return_value=(0.0, 1_000_000.0)),
+            mock.patch.object(
+                rt,
+                "_churner_entry_target_price",
+                side_effect=lambda side, market: 0.1001 if str(side) == "buy" else 0.1002,
+            ),
+            mock.patch.object(bot.sm, "compute_order_volume", return_value=20.0),
+        ):
+            ok, reason, entry_price, _volume, _required_usd, chosen_side = rt._churner_gate_check(
+                slot_id=0,
+                state=state,
+                parent=parent,
+                parent_order=parent_order,
+                now_ts=now_ts,
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(str(reason), "ok")
+        self.assertEqual(str(chosen_side), "sell")
+        self.assertAlmostEqual(float(entry_price), 0.1002, places=8)
+
+    def test_churner_gate_check_prefers_parent_side_when_both_sides_have_capital(self):
+        now_ts = 1_000_000.0
+        entry_time = now_ts - (48 * 3600)
+        rt, position_id, parent_order = self._build_open_position_runtime(
+            now_ts=now_ts,
+            entry_time=entry_time,
+            entry_price=0.1000,
+            exit_price=0.1020,
+            target_profit_pct=1.0,
+        )
+        state = rt._ensure_churner_state(0)
+        parent = dict(rt._position_ledger.get_position(position_id) or {})
+        self.assertTrue(parent)
+        with (
+            mock.patch.object(rt, "_policy_hmm_signal", return_value=("RANGING", 0.0, 0.0, True, {})),
+            mock.patch.object(rt, "_compute_capacity_health", return_value={"open_order_headroom": 100}),
+            mock.patch.object(rt, "_available_free_balances", return_value=(1_000.0, 1_000_000.0)),
+            mock.patch.object(
+                rt,
+                "_churner_entry_target_price",
+                side_effect=lambda side, market: 0.1001 if str(side) == "buy" else 0.1002,
+            ),
+            mock.patch.object(bot.sm, "compute_order_volume", return_value=20.0),
+        ):
+            ok, reason, entry_price, _volume, _required_usd, chosen_side = rt._churner_gate_check(
+                slot_id=0,
+                state=state,
+                parent=parent,
+                parent_order=parent_order,
+                now_ts=now_ts,
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(str(reason), "ok")
+        self.assertEqual(str(chosen_side), "buy")
+        self.assertAlmostEqual(float(entry_price), 0.1001, places=8)
+
+    def test_run_churner_engine_places_entry_with_gate_chosen_side(self):
+        now_ts = 1_000_000.0
+        entry_time = now_ts - (48 * 3600)
+        rt, position_id, _ = self._build_open_position_runtime(
+            now_ts=now_ts,
+            entry_time=entry_time,
+            entry_price=0.1000,
+            exit_price=0.1020,
+            target_profit_pct=1.0,
+        )
+        state = rt._ensure_churner_state(0)
+        state.active = True
+        state.stage = "idle"
+        state.parent_position_id = int(position_id)
+        state.parent_trade_id = "B"
+        with (
+            mock.patch.object(config, "POSITION_LEDGER_ENABLED", True),
+            mock.patch.object(config, "CHURNER_ENABLED", True),
+            mock.patch.object(rt, "_policy_hmm_signal", return_value=("RANGING", 0.0, 0.0, True, {})),
+            mock.patch.object(rt, "_compute_capacity_health", return_value={"open_order_headroom": 100}),
+            mock.patch.object(rt, "_churner_gate_check", return_value=(True, "ok", 0.1002, 20.0, 2.004, "sell")),
+            mock.patch.object(rt, "_try_reserve_loop_funds", return_value=True),
+            mock.patch.object(rt, "_place_order", return_value="TX-CHURNER-ENTRY") as place_mock,
+        ):
+            rt._run_churner_engine(now_ts)
+
+        self.assertEqual(place_mock.call_count, 1)
+        self.assertEqual(str(place_mock.call_args.kwargs.get("side", "")), "sell")
+        self.assertEqual(str(state.entry_side), "sell")
+        self.assertEqual(str(state.stage), "entry_open")
+
     def test_churner_entry_timeout_cancels_and_resets(self):
         rt = bot.BotRuntime()
         state = rt._ensure_churner_state(0)

@@ -7401,29 +7401,24 @@ class BotRuntime:
         parent: dict[str, Any],
         parent_order: sm.OrderState,
         now_ts: float,
-    ) -> tuple[bool, str, float, float, float]:
+    ) -> tuple[bool, str, float, float, float, str]:
         sid = int(slot_id)
         slot = self.slots.get(sid)
         if slot is None:
-            return False, "slot_missing", 0.0, 0.0, 0.0
+            return False, "slot_missing", 0.0, 0.0, 0.0, ""
         regime_name, _confidence, _bias, _ready, _source = self._policy_hmm_signal()
         if str(regime_name or "").strip().upper() != "RANGING":
-            return False, "regime_not_ranging", 0.0, 0.0, 0.0
+            return False, "regime_not_ranging", 0.0, 0.0, 0.0, ""
 
         capacity = self._compute_capacity_health(now_ts)
         headroom = int(capacity.get("open_order_headroom") or 0)
         min_headroom = max(0, int(getattr(config, "CHURNER_MIN_HEADROOM", 0)))
         if headroom < min_headroom:
-            return False, "headroom_low", 0.0, 0.0, 0.0
+            return False, "headroom_low", 0.0, 0.0, 0.0, ""
 
         market = float(slot.state.market_price if slot.state.market_price > 0 else self.last_price)
         if market <= 0:
-            return False, "market_unavailable", 0.0, 0.0, 0.0
-
-        entry_side = self._churner_entry_side_for_trade(str(parent.get("trade_id") or parent_order.trade_id))
-        entry_price = self._churner_entry_target_price(side=entry_side, market=market)
-        if entry_price <= 0:
-            return False, "invalid_entry_price", 0.0, 0.0, 0.0
+            return False, "market_unavailable", 0.0, 0.0, 0.0, ""
 
         base_order_size_usd = max(
             0.0,
@@ -7431,18 +7426,45 @@ class BotRuntime:
         )
         order_size_usd = max(base_order_size_usd, base_order_size_usd + float(state.compound_usd))
         cfg = self._engine_cfg(slot)
+        preferred_side = self._churner_entry_side_for_trade(str(parent.get("trade_id") or parent_order.trade_id))
+        opposite_side = "sell" if preferred_side == "buy" else "buy"
+
+        chosen_side = ""
+        chosen_price = 0.0
+        chosen_volume = 0.0
+        chosen_required_usd = 0.0
+        for try_side in (preferred_side, opposite_side):
+            try_price = self._churner_entry_target_price(side=try_side, market=market)
+            if try_price <= 0:
+                continue
+            try_volume = sm.compute_order_volume(float(try_price), cfg, float(order_size_usd))
+            if try_volume is None:
+                continue
+            try_volume = float(try_volume)
+            try_required_usd = max(0.0, try_volume * float(try_price))
+            free_usd, free_doge = self._available_free_balances(prefer_fresh=False)
+            has_capital = (try_side == "buy" and free_usd >= try_required_usd - 1e-12) or (
+                try_side == "sell" and free_doge >= try_volume - 1e-12
+            )
+            if has_capital:
+                chosen_side = str(try_side)
+                chosen_price = float(try_price)
+                chosen_volume = float(try_volume)
+                chosen_required_usd = float(try_required_usd)
+                break
+
+        if chosen_side:
+            return True, "ok", chosen_price, chosen_volume, chosen_required_usd, chosen_side
+
+        entry_side = preferred_side
+        entry_price = self._churner_entry_target_price(side=entry_side, market=market)
+        if entry_price <= 0:
+            return False, "invalid_entry_price", 0.0, 0.0, 0.0, ""
         volume = sm.compute_order_volume(float(entry_price), cfg, float(order_size_usd))
         if volume is None:
-            return False, "below_min_size", 0.0, 0.0, 0.0
+            return False, "below_min_size", 0.0, 0.0, 0.0, ""
         volume = float(volume)
         required_usd = max(0.0, float(volume) * float(entry_price))
-
-        free_usd, free_doge = self._available_free_balances(prefer_fresh=False)
-        has_capital = (entry_side == "buy" and free_usd >= required_usd - 1e-12) or (
-            entry_side == "sell" and free_doge >= volume - 1e-12
-        )
-        if has_capital:
-            return True, "ok", float(entry_price), float(volume), float(required_usd)
 
         # Reserve backstop: one-order-size cap per slot.
         max_slot_reserve = max(base_order_size_usd, 0.0)
@@ -7451,12 +7473,12 @@ class BotRuntime:
             already_alloc = max_slot_reserve
         alloc_needed = min(max_slot_reserve - already_alloc, required_usd)
         if alloc_needed <= 1e-12:
-            return False, "capital_unavailable", 0.0, 0.0, 0.0
+            return False, "capital_unavailable", 0.0, 0.0, 0.0, ""
         if self._churner_reserve_available_usd + 1e-12 < alloc_needed:
-            return False, "reserve_exhausted", 0.0, 0.0, 0.0
+            return False, "reserve_exhausted", 0.0, 0.0, 0.0, ""
         state.reserve_allocated_usd = already_alloc + alloc_needed
         self._churner_reserve_available_usd = max(0.0, self._churner_reserve_available_usd - alloc_needed)
-        return True, "ok_reserve", float(entry_price), float(volume), float(required_usd)
+        return True, "ok_reserve", float(entry_price), float(volume), float(required_usd), str(entry_side)
 
     def _churner_open_position_on_entry_fill(
         self,
@@ -7960,7 +7982,7 @@ class BotRuntime:
                 state.parent_position_id = int(parent.get("position_id", 0) or 0)
                 state.parent_trade_id = str(parent.get("trade_id") or parent_order.trade_id)
 
-            ok, gate_reason, entry_price, volume, _required_usd = self._churner_gate_check(
+            ok, gate_reason, entry_price, volume, _required_usd, chosen_side = self._churner_gate_check(
                 slot_id=int(sid),
                 state=state,
                 parent=parent,
@@ -7981,7 +8003,11 @@ class BotRuntime:
                 )
                 + max(0.0, float(state.compound_usd)),
             )
-            state.entry_side = self._churner_entry_side_for_trade(state.parent_trade_id)
+            state.entry_side = (
+                str(chosen_side)
+                if str(chosen_side).strip()
+                else self._churner_entry_side_for_trade(state.parent_trade_id)
+            )
             reserved = self._try_reserve_loop_funds(
                 side=str(state.entry_side),
                 volume=float(volume),

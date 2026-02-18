@@ -4620,6 +4620,13 @@ class BotEventLogTests(unittest.TestCase):
         self.assertIn("/api/churner/kill", dashboard.DASHBOARD_HTML)
         self.assertIn("/api/churner/config", dashboard.DASHBOARD_HTML)
 
+    def test_dashboard_churner_badge_markup_present(self):
+        self.assertIn(".churner-badge", dashboard.DASHBOARD_HTML)
+        self.assertIn("CHURN${churnerStage !== 'IDLE' ? ' ' + churnerStage : ''}", dashboard.DASHBOARD_HTML)
+
+    def test_dashboard_churner_reserve_label_updated(self):
+        self.assertIn("Churner Reserve", dashboard.DASHBOARD_HTML)
+
     def test_auto_drain_recovery_backlog_prefers_furthest_then_oldest(self):
         rt = bot.BotRuntime()
         rt.mode = "RUNNING"

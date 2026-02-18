@@ -157,6 +157,11 @@ DASHBOARD_HTML = """<!doctype html>
       font-weight: 700;
       border: 1px solid var(--line);
     }
+    .churner-badge {
+      color: var(--accent);
+      font-size: 11px;
+      background: rgba(0,255,200,.08);
+    }
     .S0 { color: var(--accent); }
     .S1a, .S1b { color: var(--warn); }
     .S2 { color: var(--bad); }
@@ -821,7 +826,7 @@ DASHBOARD_HTML = """<!doctype html>
             <button id=\"slotChurnerKillBtn\" type=\"button\" style=\"background:#8f3a2f\">Kill Churner</button>
           </div>
           <div style=\"height:8px\"></div>
-          <div class=\"k\">Runtime Reserve (USD)</div>
+          <div class=\"k\">Churner Reserve</div>
           <div style=\"display:flex;gap:8px\">
             <input id=\"churnerReserveInput\" type=\"number\" step=\"0.01\" min=\"0\" />
             <button id=\"churnerReserveSetBtn\" type=\"button\">Set</button>
@@ -3678,12 +3683,18 @@ DASHBOARD_HTML = """<!doctype html>
 
       const sb = document.getElementById('stateBar');
       const alias = slot.slot_alias || slot.slot_label || `slot-${slot.slot_id}`;
+      const slotChurner = runtimeChurnerState(slot.slot_id);
+      const churnerActive = Boolean(slotChurner && slotChurner.active);
+      const churnerStage = churnerActive ? churnerStageLabel(slotChurner.stage) : '';
       sb.innerHTML = `
         <span class=\"statepill ${slot.phase}\">${slot.phase}</span>
         <span class=\"tiny\">${alias} (#${slot.slot_id})</span>
         <span class=\"tiny\">price $${fmt(slot.market_price, 6)}</span>
         <span class=\"tiny\">A.${slot.cycle_a} / B.${slot.cycle_b}</span>
         <span class=\"tiny\">open ${slot.open_orders.length}</span>
+        ${churnerActive
+          ? `<span class=\"statepill churner-badge\">CHURN${churnerStage !== 'IDLE' ? ' ' + churnerStage : ''}</span>`
+          : ''}
       `;
       const slotBeliefsEl = document.getElementById('slotBeliefs');
       const beliefBadges = Array.isArray(slot.belief_badges) ? slot.belief_badges : [];
@@ -3714,7 +3725,7 @@ DASHBOARD_HTML = """<!doctype html>
       const runtimePayload = churnerRuntime && typeof churnerRuntime === 'object' ? churnerRuntime : {};
       const fallbackChurner = s && s.self_healing && typeof s.self_healing.churner === 'object' ? s.self_healing.churner : {};
       const enabled = Boolean(runtimePayload.enabled != null ? runtimePayload.enabled : fallbackChurner.enabled);
-      const runtimeState = runtimeChurnerState(slot.slot_id);
+      const runtimeState = slotChurner;
       const active = Boolean(runtimeState && runtimeState.active);
       const stage = runtimeState ? churnerStageLabel(runtimeState.stage) : 'IDLE';
       const mtsValue = clamp(runtimePayload.mts, 0, 1);
