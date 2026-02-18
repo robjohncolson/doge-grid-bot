@@ -382,7 +382,6 @@ class PositionLedger:
 
     def snapshot_state(self) -> dict[str, Any]:
         return {
-            "enabled": bool(self.enabled),
             "position_ledger": [asdict(r) for r in self._positions.values()],
             "position_journal_recent": [asdict(r) for r in self._journal],
             "position_id_counter": int(self._next_position_id),
@@ -398,7 +397,10 @@ class PositionLedger:
     def restore_state(self, payload: dict[str, Any]) -> None:
         if not isinstance(payload, dict):
             return
-        self.enabled = bool(payload.get("enabled", self.enabled))
+        # Do NOT restore `enabled` from saved state — the config flag
+        # (via BotRuntime._flag_value) is authoritative.  A stale
+        # "enabled: false" in state.json was overriding the live config
+        # and silently disabling self-healing, trade beliefs, and churner.
 
         self._positions = {}
         raw_positions = payload.get("position_ledger", [])
