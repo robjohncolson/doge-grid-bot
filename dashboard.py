@@ -620,6 +620,64 @@ DASHBOARD_HTML = """<!doctype html>
       font-size: 12px;
       padding: 10px;
     }
+    /* Video modal */
+    .video-modal-overlay {
+      position: fixed; inset: 0; z-index: 9000;
+      background: rgba(0,0,0,.75);
+      display: flex; align-items: center; justify-content: center;
+    }
+    .video-modal {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 8px; width: 860px; max-width: 95vw;
+      max-height: 90vh; display: flex; flex-direction: column;
+      overflow: hidden;
+    }
+    .video-modal-header {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 10px 14px; border-bottom: 1px solid var(--border);
+    }
+    .video-modal-header h3 { margin: 0; font-size: 14px; }
+    .video-modal-body {
+      display: flex; flex: 1; min-height: 0; overflow: hidden;
+    }
+    .video-track-list {
+      width: 210px; min-width: 210px; overflow-y: auto;
+      border-right: 1px solid var(--border); padding: 6px 0;
+    }
+    .video-track-heading {
+      font-size: 10px; font-weight: 700; color: var(--muted);
+      text-transform: uppercase; letter-spacing: .5px;
+      padding: 8px 12px 4px;
+    }
+    .video-track-item {
+      padding: 5px 12px; cursor: pointer; font-size: 12px;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .video-track-item:hover { background: rgba(255,255,255,.05); }
+    .video-track-item.active {
+      background: rgba(22,199,154,.15); color: var(--accent);
+      font-weight: 600;
+    }
+    .video-player-area {
+      flex: 1; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; padding: 12px;
+      min-width: 0;
+    }
+    .video-player-area video {
+      width: 100%; max-height: 60vh; border-radius: 4px;
+      background: #000;
+    }
+    .video-now-playing {
+      font-size: 12px; color: var(--fg); margin: 8px 0 6px;
+      text-align: center;
+    }
+    .video-nav { display: flex; gap: 8px; }
+    .video-nav button {
+      font-size: 11px; padding: 4px 14px; border-radius: 4px;
+      border: 1px solid var(--border); background: var(--card);
+      color: var(--fg); cursor: pointer;
+    }
+    .video-nav button:hover { background: rgba(255,255,255,.08); }
   </style>
 </head>
 <body>
@@ -633,6 +691,7 @@ DASHBOARD_HTML = """<!doctype html>
           <span id=\"priceAge\" class=\"badge\">PRICE</span>
           <span id=\"kbMode\" class=\"badge\">KB NORMAL</span>
         </div>
+        <button id=\"videoLibraryBtn\" class=\"btn-soft\" type=\"button\">Explainers</button>
         <button id=\"opsDrawerBtn\" class=\"btn-soft\" type=\"button\">Ops Panel</button>
       </div>
     </div>
@@ -1040,6 +1099,7 @@ DASHBOARD_HTML = """<!doctype html>
 |  G     last slot   .    refresh       |
 |                    o    ops panel     |
 |                    f    factory view  |
+|                    v    explainers   |
 |                    s    api/status   |
 |                    :    command       |
 |                    ?    this help     |
@@ -1087,6 +1147,26 @@ DASHBOARD_HTML = """<!doctype html>
     </div>
   </div>
 
+  <div id=\"videoModal\" class=\"video-modal-overlay\" hidden>
+    <div class=\"video-modal\">
+      <div class=\"video-modal-header\">
+        <h3>Concept Explainers</h3>
+        <button id=\"videoCloseBtn\" class=\"btn-soft\" type=\"button\">Close</button>
+      </div>
+      <div class=\"video-modal-body\">
+        <div id=\"videoTrackList\" class=\"video-track-list\"></div>
+        <div class=\"video-player-area\">
+          <video id=\"videoPlayer\" controls preload=\"metadata\"></video>
+          <div id=\"videoNowPlaying\" class=\"video-now-playing\">Select a scene to begin</div>
+          <div class=\"video-nav\">
+            <button id=\"videoPrevBtn\" type=\"button\">Prev</button>
+            <button id=\"videoNextBtn\" type=\"button\">Next</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div id=\"toasts\"></div>
 
   <script>
@@ -1104,6 +1184,8 @@ DASHBOARD_HTML = """<!doctype html>
     let lastRefreshError = '';
     let equityChartRange = '24h';
     let opsDrawerOpen = false;
+    let videoModalOpen = false;
+    let videoCurrentIdx = -1;
     let opsToggles = null;
     let opsLastError = '';
     let churnerRuntime = null;
@@ -1352,11 +1434,84 @@ DASHBOARD_HTML = """<!doctype html>
       document.getElementById('confirmDialog').hidden = true;
     }
 
+    const VIDEO_SCENES = [
+      {track:'A',label:'Trading Mechanics',id:'S01',title:'Grid Concept',file:'S01GridConcept.mp4',dir:'scene_s01_grid'},
+      {track:'A',label:'Trading Mechanics',id:'S02',title:'State Machine',file:'S02StateMachine.mp4',dir:'scene_s02_state_machine'},
+      {track:'A',label:'Trading Mechanics',id:'S03',title:'Slots & Autoscale',file:'S03SlotsAutoscale.mp4',dir:'scene_s03_slots_autoscale'},
+      {track:'A',label:'Trading Mechanics',id:'S04',title:'Rangers',file:'S04Rangers.mp4',dir:'scene_s04_rangers'},
+      {track:'B',label:'Intelligence Layer',id:'S05',title:'HMM Regime Detection',file:'S05HMM.mp4',dir:'scene_s05_hmm'},
+      {track:'B',label:'Intelligence Layer',id:'S06',title:'Consensus',file:'S06Consensus.mp4',dir:'scene_s06_consensus'},
+      {track:'B',label:'Intelligence Layer',id:'S07',title:'Training Quality',file:'S07TrainingQuality.mp4',dir:'scene_s07_training_quality'},
+      {track:'B',label:'Intelligence Layer',id:'S08',title:'MTS',file:'S08MTS.mp4',dir:'scene_s08_mts'},
+      {track:'B',label:'Intelligence Layer',id:'S09',title:'BOCPD',file:'S09BOCPD.mp4',dir:'scene_s09_bocpd'},
+      {track:'B',label:'Intelligence Layer',id:'S14',title:'AI Advisor',file:'S14AIAdvisor.mp4',dir:'scene_s14_ai_advisor'},
+      {track:'C',label:'Risk & Sizing',id:'S10',title:'Throughput Sizer',file:'S10Throughput.mp4',dir:'scene_s10_throughput'},
+      {track:'C',label:'Risk & Sizing',id:'S11',title:'Survival Model',file:'S11Survival.mp4',dir:'scene_s11_survival'},
+      {track:'C',label:'Risk & Sizing',id:'S12',title:'Stats Engine',file:'S12Stats.mp4',dir:'scene_s12_stats'},
+      {track:'C',label:'Risk & Sizing',id:'S13',title:'Signal Digest',file:'S13Digest.mp4',dir:'scene_s13_digest'},
+      {track:'C',label:'Risk & Sizing',id:'S16',title:'Capacity',file:'S16Capacity.mp4',dir:'scene_s16_capacity'},
+      {track:'D',label:'Full System',id:'S15',title:'Main Loop',file:'S15MainLoop.mp4',dir:'scene_s15_main_loop'},
+      {track:'D',label:'Full System',id:'S17',title:'DCA Accumulation',file:'S17Accumulation.mp4',dir:'scene_s17_accumulation'},
+      {track:'D',label:'Full System',id:'S18',title:'Full Factory',file:'S18FullFactory.mp4',dir:'scene_s18_full_factory'},
+    ];
+
+    function openVideoModal() {
+      videoModalOpen = true;
+      const modal = document.getElementById('videoModal');
+      if (modal) modal.hidden = false;
+      renderVideoTrackList();
+      setKbMode('VIDEO');
+    }
+
+    function closeVideoModal() {
+      videoModalOpen = false;
+      const modal = document.getElementById('videoModal');
+      if (modal) modal.hidden = true;
+      const vid = document.getElementById('videoPlayer');
+      if (vid) vid.pause();
+    }
+
+    function renderVideoTrackList() {
+      const list = document.getElementById('videoTrackList');
+      if (!list) return;
+      let html = '';
+      let lastTrack = '';
+      VIDEO_SCENES.forEach((s, i) => {
+        if (s.track !== lastTrack) {
+          html += '<div class=\"video-track-heading\">Track ' + s.track + ': ' + s.label + '</div>';
+          lastTrack = s.track;
+        }
+        const active = i === videoCurrentIdx ? ' active' : '';
+        html += '<div class=\"video-track-item' + active + '\" data-idx=\"' + i + '\">'
+              + s.id + ' &mdash; ' + s.title + '</div>';
+      });
+      list.innerHTML = html;
+      list.querySelectorAll('.video-track-item').forEach(el => {
+        el.onclick = () => playVideoAt(Number(el.dataset.idx));
+      });
+    }
+
+    function playVideoAt(idx) {
+      if (idx < 0 || idx >= VIDEO_SCENES.length) return;
+      videoCurrentIdx = idx;
+      const scene = VIDEO_SCENES[idx];
+      const vid = document.getElementById('videoPlayer');
+      const label = document.getElementById('videoNowPlaying');
+      if (vid) {
+        vid.src = '/media/concept_animations/' + scene.dir + '/' + scene.file;
+        vid.load();
+        vid.play().catch(() => {});
+      }
+      if (label) label.textContent = scene.id + ' — ' + scene.title;
+      renderVideoTrackList();
+    }
+
     function leaveToNormal() {
       closeCommandBarUi();
       closeHelpUi();
       closeConfirmUi();
       closeOpsDrawer();
+      closeVideoModal();
       setKbMode('NORMAL');
     }
 
@@ -4431,6 +4586,11 @@ DASHBOARD_HTML = """<!doctype html>
         window.location.href = '/api/status';
         return true;
       }
+      if (key === 'v') {
+        clearChordBuffer();
+        openVideoModal();
+        return true;
+      }
       if (key === 'Escape') {
         clearChordBuffer();
         leaveToNormal();
@@ -4456,6 +4616,19 @@ DASHBOARD_HTML = """<!doctype html>
         if (event.key === 'Escape' || event.key === 'o') {
           event.preventDefault();
           closeOpsDrawer();
+        }
+        return;
+      }
+
+      if (videoModalOpen) {
+        event.preventDefault();
+        if (event.key === 'Escape') {
+          closeVideoModal();
+          setKbMode('NORMAL');
+        } else if (event.key === 'ArrowDown' || event.key === 'n' || event.key === 'ArrowRight') {
+          playVideoAt(videoCurrentIdx + 1);
+        } else if (event.key === 'ArrowUp' || event.key === 'p' || event.key === 'ArrowLeft') {
+          playVideoAt(videoCurrentIdx - 1);
         }
         return;
       }
@@ -4553,6 +4726,16 @@ DASHBOARD_HTML = """<!doctype html>
       equityChartRange = '7d';
       if (state) renderAll(state);
     };
+    document.getElementById('videoLibraryBtn').onclick = () => openVideoModal();
+    document.getElementById('videoCloseBtn').onclick = () => { closeVideoModal(); setKbMode('NORMAL'); };
+    document.getElementById('videoModal').onclick = (event) => {
+      if (event.target === event.currentTarget) { closeVideoModal(); setKbMode('NORMAL'); }
+    };
+    document.getElementById('videoPrevBtn').onclick = () => playVideoAt(videoCurrentIdx - 1);
+    document.getElementById('videoNextBtn').onclick = () => playVideoAt(videoCurrentIdx + 1);
+    document.getElementById('videoPlayer').addEventListener('ended', () => {
+      if (videoCurrentIdx < VIDEO_SCENES.length - 1) playVideoAt(videoCurrentIdx + 1);
+    });
     document.getElementById('opsDrawerBtn').onclick = () => { void openOpsDrawer(); };
     document.getElementById('opsOpenBtn').onclick = () => { void openOpsDrawer(); };
     document.getElementById('opsDrawerCloseBtn').onclick = () => closeOpsDrawer();

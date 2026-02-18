@@ -17345,7 +17345,87 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json(_RUNTIME._churner_candidates_payload())
             return
 
+        if self.path.startswith("/media/concept_animations/"):
+            self._send_video(self.path)
+            return
+
         self._send_json({"error": "not found"}, 404)
+
+    def _send_video(self, url_path: str) -> None:
+        """Serve MP4 files from media/concept_animations/ with Range support."""
+        import os
+        import urllib.parse
+
+        # Map URL to filesystem
+        rel = urllib.parse.unquote(url_path.lstrip("/"))
+        # Rewrite: /media/concept_animations/<scene>/<file>.mp4
+        # maps to: media/concept_animations/draft/videos/<scene>/480p15/<file>.mp4
+        parts = rel.split("/")
+        # Expect: media / concept_animations / <scene> / <file>.mp4
+        if len(parts) != 4 or not parts[3].endswith(".mp4"):
+            self.send_error(404, "Not found")
+            return
+        scene_dir, filename = parts[2], parts[3]
+        filepath = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "media", "concept_animations", "draft", "videos",
+            scene_dir, "480p15", filename,
+        )
+
+        # Sandbox check
+        base_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "media", "concept_animations",
+        )
+        real = os.path.realpath(filepath)
+        if not real.startswith(os.path.realpath(base_dir)):
+            self.send_error(403, "Forbidden")
+            return
+        if not os.path.isfile(real):
+            self.send_error(404, "Not found")
+            return
+
+        file_size = os.path.getsize(real)
+        range_header = self.headers.get("Range")
+        CHUNK = 65536
+
+        if range_header and range_header.startswith("bytes="):
+            # Parse Range: bytes=start-end
+            range_spec = range_header[6:]
+            parts_r = range_spec.split("-", 1)
+            start = int(parts_r[0]) if parts_r[0] else 0
+            end = int(parts_r[1]) if parts_r[1] else file_size - 1
+            if start >= file_size or end >= file_size or start > end:
+                self.send_error(416, "Range Not Satisfiable")
+                return
+            length = end - start + 1
+            self.send_response(206)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+            self.send_header("Content-Length", str(length))
+            self.end_headers()
+            with open(real, "rb") as f:
+                f.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = f.read(min(CHUNK, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        else:
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(file_size))
+            self.end_headers()
+            with open(real, "rb") as f:
+                while True:
+                    chunk = f.read(CHUNK)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
 
     def do_POST(self) -> None:  # noqa: N802
         global _RUNTIME
