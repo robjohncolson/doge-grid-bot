@@ -1,0 +1,20 @@
+[package]
+name = "doge-hmm"
+version = "0.1.0"
+edition = "2021"
+description = "Rust HMM backend scaffold for DOGE regime detection"
+license = "MIT"
+
+[lib]
+name = "doge_hmm"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"] }
+numpy = "0.22"
+ndarray = "0.16"
+serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+approx = "0.5"
+proptest = "1.6"

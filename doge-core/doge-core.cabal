@@ -1,0 +1,29 @@
+cabal-version: 3.0
+name:          doge-core
+version:       0.1.0
+build-type:    Simple
+
+library
+  exposed-modules:
+      DogeCore.Types
+    , DogeCore.Invariants
+    , DogeCore.Transition
+  hs-source-dirs: src
+  build-depends:
+      base >= 4.16 && < 5
+    , aeson >= 2.0
+    , text
+  default-language: GHC2021
+  ghc-options: -O2 -Wall
+
+executable doge-core-exe
+  main-is: Main.hs
+  hs-source-dirs: app
+  build-depends:
+      base >= 4.16 && < 5
+    , aeson >= 2.0
+    , bytestring
+    , doge-core
+    , text
+  default-language: GHC2021
+  ghc-options: -O2 -Wall

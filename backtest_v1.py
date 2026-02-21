@@ -27,8 +27,8 @@ from datetime import datetime, timezone
 from typing import Iterable
 
 import config
+import doge_core as sm
 import kraken_client
-import state_machine as sm
 
 
 @dataclass(frozen=True)
