@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PreCommit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "C:\\PROGRA~1\\Git\\usr\\bin\\bash.exe -c \"untracked=$(git ls-files --others --exclude-standard -- '*.mp3' '*.wav' '*.png' '*.jpg' '*.svg' '*.gif' '*.ico' '*.woff' '*.woff2' '*.ttf' 2>/dev/null | head -20); if [ -n \\\"$untracked\\\" ]; then echo \\\"WARNING: Untracked asset files detected:\\\"; echo \\\"$untracked\\\"; echo \\\"Consider staging these before committing.\\\"; fi\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
