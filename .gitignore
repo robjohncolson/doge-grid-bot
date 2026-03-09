@@ -35,3 +35,12 @@ media/
 nul
 package.json
 package-lock.json
+
+# Haskell build artifacts
+doge-core/.stack-work/
+doge-core/.stack-root/
+doge-core/.cabal-store/
+doge-core/dist-newstyle/
+
+# Rust build artifacts
+doge-hmm/target/

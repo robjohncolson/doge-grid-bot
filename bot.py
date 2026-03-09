@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from collections import deque
 import json
+import importlib
 import logging
 import os
 import signal
@@ -35,7 +36,7 @@ from throughput_sizer import ThroughputConfig, ThroughputSizer
 import notifier
 import ai_advisor
 import signal_digest
-import state_machine as sm
+import doge_core as sm
 import supabase_store
 
 try:
@@ -63,7 +64,26 @@ else:
     _survival_import_error = None
 
 
+def _import_hmm_module():
+    """Try Rust doge_hmm first, fall back to Python hmm_regime_detector."""
+    try:
+        mod = importlib.import_module("doge_hmm")
+        return mod, "rust"
+    except ImportError:
+        pass
+    try:
+        mod = importlib.import_module("hmm_regime_detector")
+        return mod, "python"
+    except ImportError:
+        pass
+    raise ImportError(
+        "No HMM backend available: neither doge_hmm (Rust) "
+        "nor hmm_regime_detector (Python) could be imported"
+    )
+
+
 logger = logging.getLogger(__name__)
+logger.info("State machine adapter: %s", sm.__name__)
 
 
 if _bayesian_engine is None:  # pragma: no cover - fallback path for minimal runtimes
@@ -9350,7 +9370,7 @@ class BotRuntime:
 
         try:
             import numpy as np  # type: ignore
-            import hmm_regime_detector as hmm_mod  # type: ignore
+            hmm_mod, _hmm_backend = _import_hmm_module()
 
             self._hmm_numpy = np
             self._hmm_module = hmm_mod
@@ -9405,7 +9425,7 @@ class BotRuntime:
                         e,
                     )
             self._push_private_features_to_hmm_detectors()
-            logger.info("HMM runtime initialized (advisory mode enabled)")
+            logger.info("HMM runtime initialized (advisory mode, backend=%s)", _hmm_backend)
         except Exception as e:
             self._hmm_state["available"] = False
             self._hmm_state["trained"] = False
