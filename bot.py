@@ -5227,9 +5227,14 @@ class BotRuntime:
             # Attempt self-heal before resuming from halt
             healed = self._heal_all_slots()
             remaining = []
-            for sid, slot in enumerate(self.slots):
+            for sid, slot in self.slots.items():
                 v = sm.check_invariants(slot.state)
                 if v:
+                    # Skip known-acceptable violations
+                    if self._is_min_size_wait_state(sid, v):
+                        continue
+                    if self._is_bootstrap_pending_state(sid, v):
+                        continue
                     remaining.extend(f"slot {sid}: {x}" for x in v)
             if remaining:
                 return False, f"invariants still failing: {remaining[0]}"
@@ -14154,7 +14159,7 @@ class BotRuntime:
     def _heal_all_slots(self) -> int:
         """Run all self-heal passes on every slot. Returns count of healed issues."""
         healed = 0
-        for sid, slot in enumerate(self.slots):
+        for sid, slot in self.slots.items():
             v = sm.check_invariants(slot.state)
             if v and self._heal_stale_s2_timestamp(sid, v):
                 healed += 1
