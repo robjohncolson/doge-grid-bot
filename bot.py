@@ -5224,7 +5224,16 @@ class BotRuntime:
             self.pause_reason = msg
             return False, msg
         if self.mode == "HALTED":
-            return False, "bot halted"
+            # Attempt self-heal before resuming from halt
+            healed = self._heal_all_slots()
+            remaining = []
+            for sid, slot in enumerate(self.slots):
+                v = sm.check_invariants(slot.state)
+                if v:
+                    remaining.extend(f"slot {sid}: {x}" for x in v)
+            if remaining:
+                return False, f"invariants still failing: {remaining[0]}"
+            logger.warning("Clearing HALT after self-heal (%s)", healed)
         self.mode = "RUNNING"
         self.pause_reason = ""
         self.consecutive_api_errors = 0
@@ -14141,6 +14150,15 @@ class BotRuntime:
                 return
             self.halt(f"slot {slot_id} invariant violation: {violations[0]}")
             logger.error("Slot %s invariant violations: %s", slot_id, violations)
+
+    def _heal_all_slots(self) -> int:
+        """Run all self-heal passes on every slot. Returns count of healed issues."""
+        healed = 0
+        for sid, slot in enumerate(self.slots):
+            v = sm.check_invariants(slot.state)
+            if v and self._heal_stale_s2_timestamp(sid, v):
+                healed += 1
+        return healed
 
     def _heal_stale_s2_timestamp(self, slot_id: int, violations: list[str]) -> bool:
         """Clear stale s2_entered_at on non-S2 slots. Returns True if healed."""
