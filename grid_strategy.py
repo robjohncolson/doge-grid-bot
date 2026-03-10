@@ -4812,12 +4812,12 @@ def check_s2_break_glass(state: GridState, current_price: float) -> bool:
     and either reprice or orphan/close the worse trade.
     Returns True if any changes were made.
     """
-    if not config.RECOVERY_ENABLED:
-        return False
     if state.pair_state != "S2":
-        # Clear S2 timer when leaving S2
+        # Clear S2 timer when leaving S2 (must run even with recovery disabled)
         if state.s2_entered_at is not None:
             state.s2_entered_at = None
+        return False
+    if not config.RECOVERY_ENABLED:
         return False
 
     now = time.time()

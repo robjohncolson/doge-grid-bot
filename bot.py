@@ -14118,6 +14118,11 @@ class BotRuntime:
         st = self.slots[slot_id].state
         violations = sm.check_invariants(st)
         if violations:
+            # Self-heal stale s2_entered_at (cosmetic timestamp, safe to clear)
+            if self._heal_stale_s2_timestamp(slot_id, violations):
+                violations = sm.check_invariants(st)
+                if not violations:
+                    return
             # Hotfix: if order size is intentionally below Kraken minimum, slot may
             # legally sit in an empty/incomplete S0 waiting state. Do not hard halt.
             if self._is_min_size_wait_state(slot_id, violations):
@@ -14136,6 +14141,20 @@ class BotRuntime:
                 return
             self.halt(f"slot {slot_id} invariant violation: {violations[0]}")
             logger.error("Slot %s invariant violations: %s", slot_id, violations)
+
+    def _heal_stale_s2_timestamp(self, slot_id: int, violations: list[str]) -> bool:
+        """Clear stale s2_entered_at on non-S2 slots. Returns True if healed."""
+        if not any("s2_entered_at must be null" in v for v in violations):
+            return False
+        st = self.slots[slot_id].state
+        if sm.derive_phase(st) == "S2":
+            return False  # genuinely in S2 — don't heal
+        logger.warning(
+            "Slot %s: healing stale s2_entered_at=%s (phase=%s)",
+            slot_id, st.s2_entered_at, sm.derive_phase(st),
+        )
+        st.s2_entered_at = None
+        return True
 
     def _is_min_size_wait_state(self, slot_id: int, violations: list[str]) -> bool:
         if not violations:
