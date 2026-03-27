@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  haskell-build:
+    runs-on: ubuntu-latest
+    env:
+      STACK_ROOT: ${{ github.workspace }}/.stack-root
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Haskell Toolchain
+        uses: haskell-actions/setup@v2
+        with:
+          ghc-version: "9.10.3"
+          cabal-version: "3.12.1.0"
+          enable-stack: true
+          stack-version: "3.7.1"
+
+      - name: Cache Stack Artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            .stack-root
+            doge-core/.stack-work
+          key: ${{ runner.os }}-stack-${{ hashFiles('doge-core/stack.yaml', 'doge-core/stack.yaml.lock', 'doge-core/doge-core.cabal') }}
+          restore-keys: |
+            ${{ runner.os }}-stack-
+
+      - name: Build Haskell Binary
+        working-directory: doge-core
+        run: stack build --no-terminal
+
+  python-tests:
+    runs-on: ubuntu-latest
+    env:
+      STACK_ROOT: ${{ github.workspace }}/.stack-root
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
+
+      - name: Setup Haskell Toolchain
+        uses: haskell-actions/setup@v2
+        with:
+          ghc-version: "9.10.3"
+          cabal-version: "3.12.1.0"
+          enable-stack: true
+          stack-version: "3.7.1"
+
+      - name: Cache Stack Artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            .stack-root
+            doge-core/.stack-work
+          key: ${{ runner.os }}-stack-${{ hashFiles('doge-core/stack.yaml', 'doge-core/stack.yaml.lock', 'doge-core/doge-core.cabal') }}
+          restore-keys: |
+            ${{ runner.os }}-stack-
+
+      - name: Build Haskell Binary
+        working-directory: doge-core
+        run: stack build --no-terminal
+
+      - name: Export Haskell Binary Path
+        working-directory: doge-core
+        run: echo "DOGE_CORE_EXE=$(stack path --local-install-root)/bin/doge-core-exe" >> "$GITHUB_ENV"
+
+      - name: Run Python Test Suite
+        run: python -m pytest tests -x
+
+      - name: Run Cross-Language Parity Against Real Binary
+        env:
+          DOGE_CORE_BACKEND: haskell
+        run: python -m pytest tests/test_cross_language.py -x -v

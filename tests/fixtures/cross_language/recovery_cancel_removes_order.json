@@ -1,0 +1,97 @@
+{
+  "name": "recovery_cancel_removes_order",
+  "config": {
+    "entry_pct": 0.2,
+    "profit_pct": 1.0,
+    "refresh_pct": 1.0,
+    "order_size_usd": 2.0,
+    "price_decimals": 6,
+    "volume_decimals": 0,
+    "min_volume": 13.0,
+    "min_cost_usd": 0.0,
+    "maker_fee_pct": 0.25,
+    "s1_orphan_after_sec": 600.0,
+    "s2_orphan_after_sec": 1800.0,
+    "loss_backoff_start": 3,
+    "loss_cooldown_start": 5,
+    "loss_cooldown_sec": 900.0
+  },
+  "initial_state": {
+    "market_price": 100.0,
+    "now": 1000.0,
+    "orders": [
+      {
+        "local_id": 1,
+        "side": "sell",
+        "role": "entry",
+        "price": 100.2,
+        "volume": 13.0,
+        "trade_id": "A",
+        "cycle": 1,
+        "txid": "TX-A-ENTRY",
+        "placed_at": 900.0,
+        "regime_at_entry": null
+      },
+      {
+        "local_id": 2,
+        "side": "buy",
+        "role": "entry",
+        "price": 99.8,
+        "volume": 13.0,
+        "trade_id": "B",
+        "cycle": 1,
+        "txid": "TX-B-ENTRY",
+        "placed_at": 900.0,
+        "regime_at_entry": null
+      }
+    ],
+    "recovery_orders": [
+      {
+        "recovery_id": 1,
+        "side": "sell",
+        "price": 101.0,
+        "volume": 13.0,
+        "trade_id": "B",
+        "cycle": 1,
+        "entry_price": 99.8,
+        "orphaned_at": 800.0,
+        "entry_fee": 0.01,
+        "entry_filled_at": 750.0,
+        "txid": "TX-REC-1",
+        "reason": "s2_timeout",
+        "regime_at_entry": null
+      }
+    ],
+    "cycle_a": 1,
+    "cycle_b": 2,
+    "next_order_id": 3,
+    "next_recovery_id": 2,
+    "total_profit": 0.0,
+    "total_fees": 0.0,
+    "today_realized_loss": 0.0,
+    "total_round_trips": 0,
+    "profit_pct_runtime": 1.0,
+    "total_settled_usd": 0.0,
+    "completed_cycles": []
+  },
+  "order_size_usd": 2.0,
+  "order_sizes": null,
+  "events": [
+    {
+      "type": "RecoveryCancelEvent",
+      "payload": {
+        "recovery_id": 1,
+        "txid": "TX-REC-1",
+        "timestamp": 1001.0
+      }
+    }
+  ],
+  "expected": {
+    "phase": "S0",
+    "open_orders": 2,
+    "recovery_orders": 0,
+    "round_trips": 0,
+    "completed_cycles": 0,
+    "invariants": []
+  }
+}

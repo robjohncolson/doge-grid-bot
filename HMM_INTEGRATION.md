@@ -1,314 +1,171 @@
-# HMM Regime Detector — Integration with STATE_MACHINE v1
+# HMM Integration Contract (Primary + Secondary + Tertiary)
 
-Last updated: 2026-02-15
+Last updated: 2026-02-18
+Primary references: `bot.py`, `hmm_regime_detector.py`, `doge-hmm/src/lib.rs`, `doge-hmm/src/regime.rs`, `config.py`
 
-## 1. Architectural Fit
+## 1. Scope and Invariants
 
-The HMM regime detector is a **read-only advisory layer**. It does not
-modify the reducer, does not emit actions, and does not touch the event
-transition rules. It lives entirely in `bot.py`'s runtime layer, alongside
-the existing rebalancer (§14) and trend detector (§15).
+The HMM subsystem is an advisory layer in runtime (`bot.py`).
 
-```
-                    ┌──────────────────────────────────────────┐
-                    │              bot.py runtime               │
-                    │                                          │
- Kraken OHLCV ──►  │  FeatureExtractor  ──►  RegimeDetector   │
- (ohlcv_candles)    │       │                      │           │
-                    │       │              RegimeState          │
-                    │       │           (bias_signal,           │
-                    │       │            confidence,            │
-                    │       │            regime)                │
-                    │       ▼                  │                │
-                    │  ┌─────────┐             │                │
-                    │  │ Trend   │◄────blend───┘                │
-                    │  │ §15     │                              │
-                    │  └────┬────┘                              │
-                    │       │ dynamic_idle_target               │
-                    │       ▼                                   │
-                    │  ┌──────────┐                             │
-                    │  │Rebalancer│ ◄── grid_bias (optional)   │
-                    │  │ §14      │                             │
-                    │  └────┬─────┘                             │
-                    │       │ skew                              │
-                    │       ▼                                   │
-                    │  _slot_order_size_usd() (§9)             │
-                    └──────────────────────────────────────────┘
-                                    │
-                                    ▼
-                    ┌──────────────────────────────┐
-                    │  state_machine.py (untouched) │
-                    │  transition() pure reducer    │
-                    └──────────────────────────────┘
-```
+Hard invariants:
 
-The reducer contract (§6) is **not modified**. All HMM influence flows
-through existing config parameters that are already tunable at runtime.
+1. Reducer semantics remain unchanged (`state_machine.py` / Haskell parity contract).
+2. HMM outputs can influence policy knobs, never reducer transition rules directly.
+3. Failure degrades to neutral behavior (RANGING/low-confidence), not hard-stop.
 
+## 2. Runtime Topology
 
-## 2. Integration Points in bot.py
+Three detector streams can be active:
 
-### 2.1 Initialization (in `__init__` or startup)
+1. Primary (base interval, default 1m)
+2. Secondary (default 15m, gated by `HMM_MULTI_TIMEFRAME_ENABLED`)
+3. Tertiary (default 1h, gated by `HMM_TERTIARY_ENABLED`)
 
-```python
-from hmm_regime_detector import RegimeDetector, restore_from_snapshot
+`bot.py` maintains per-stream state plus consensus output.
 
-self._hmm = RegimeDetector(config={
-    "HMM_BLEND_WITH_TREND": 0.5,       # tune this: 0=pure HMM, 1=ignore HMM
-    "HMM_CONFIDENCE_THRESHOLD": 0.15,
-    "HMM_RETRAIN_INTERVAL_SEC": 86400,
-})
+## 3. Training Depth and Quality Tiers
 
-# Restore state from snapshot (§19) if available
-if "_hmm_regime_state" in snapshot:
-    restore_from_snapshot(self._hmm, snapshot)
-```
+`bot.py` tracks per-stream depth metadata via `_update_hmm_training_depth(...)`:
 
-### 2.2 Training (startup, after OHLCV sync/backfill)
+- `current_candles`
+- `target_candles`
+- `min_train_samples`
+- `quality_tier`
+- `confidence_modifier`
+- ETA/percent completion
 
-```python
-# After FETCH INITIAL PRICE in lifecycle (§3)
-# Sync OHLCV, optionally backfill, then train from persisted candles
-self._sync_ohlcv_candles(_now())
-self._maybe_backfill_ohlcv_on_startup()
-closes, volumes = self._fetch_training_candles(
-    count=int(getattr(config, "HMM_TRAINING_CANDLES", 2000))
-)
-self._hmm.train(closes, volumes)
-```
+Tier buckets:
 
-### 2.3 Per-Tick Inference (in main loop, step 12 — rebalancer update)
+1. `shallow` -> `0.70`
+2. `baseline` -> `0.85`
+3. `deep` -> `0.95`
+4. `full` -> `1.00`
 
-```python
-# Inside _update_rebalancer(), after computing trend_score
-closes_recent, volumes_recent = self._fetch_recent_candles(count=100)
-regime_state = self._hmm.update(closes_recent, volumes_recent)
+These modifiers scale effective confidence before policy decisions.
 
-# OPTION A: Blend with existing §15 trend_score
-# Replace the raw_target line in _compute_dynamic_idle_target()
-from hmm_regime_detector import compute_blended_idle_target
+## 4. Confidence Modifier Pipeline
 
-dynamic_target = compute_blended_idle_target(
-    trend_score=self._trend_score,
-    hmm_bias=regime_state.bias_signal,
-    blend_factor=self._hmm.cfg["HMM_BLEND_WITH_TREND"],
-    base_target=cfg.REBALANCE_TARGET_IDLE_PCT,
-    sensitivity=cfg.TREND_IDLE_SENSITIVITY,
-    floor=cfg.TREND_IDLE_FLOOR,
-    ceiling=cfg.TREND_IDLE_CEILING,
-)
+Runtime confidence flow:
 
-# OPTION B: Additionally adjust grid spacing (more aggressive)
-from hmm_regime_detector import compute_grid_bias
-grid_bias = compute_grid_bias(regime_state)
-# Apply spacing multipliers when computing entry prices
-```
+1. Raw confidence from selected source stream (`primary` / `secondary` / `tertiary` / `consensus`)
+2. Source-specific modifier selection
+3. `confidence_effective = confidence_raw * confidence_modifier`
+4. Clamp to `[0, 1]`
 
-### 2.4 Periodic Retrain (in main loop, lightweight check)
+In Python runtime (`bot.py`): `_hmm_confidence_modifier_for_source(...)` currently applies:
 
-```python
-# At the end of main loop, check if retrain is due
-if self._hmm.needs_retrain():
-    closes, volumes = self._fetch_training_candles(
-        count=int(getattr(config, "HMM_TRAINING_CANDLES", 2000))
-    )
-    self._hmm.train(closes, volumes)
-```
+- primary mode: primary modifier
+- consensus mode: `min(primary_modifier, secondary_modifier)`
 
-### 2.5 Persistence (in save_state, §19)
+In Rust module (`doge_hmm`): `confidence_modifier_for_source(...)` supports:
 
-```python
-from hmm_regime_detector import serialize_for_snapshot
+- `primary`
+- `secondary` / `15m`
+- `tertiary` / `1h`
+- `consensus` / `consensus_min`
 
-snapshot_payload = {
-    # ... existing fields ...
-    **serialize_for_snapshot(self._hmm),
-}
-```
+## 5. Tertiary Transition Tracking
 
-### 2.6 Dashboard Telemetry (in status_payload, §20)
+Tertiary transition metadata is tracked in runtime and exposed in status/snapshots:
 
-Add to `/api/status` response:
+- `from_regime`
+- `to_regime`
+- `confirmation_count`
+- `confirmed`
+- `changed_at`
+- `transition_age_sec`
 
-```python
-"hmm_regime": {
-    "regime": Regime(self._hmm.state.regime).name,
-    "confidence": self._hmm.state.confidence,
-    "bias_signal": self._hmm.state.bias_signal,
-    "probabilities": {
-        "bearish": self._hmm.state.probabilities[0],
-        "ranging": self._hmm.state.probabilities[1],
-        "bullish": self._hmm.state.probabilities[2],
-    },
-    "trained": self._hmm._trained,
-    "observation_count": self._hmm.state.observation_count,
-    "blend_factor": self._hmm.cfg["HMM_BLEND_WITH_TREND"],
-},
+Confirmation behavior:
 
-"hmm_data_pipeline": {
-    "interval_min": int(getattr(config, "HMM_OHLCV_INTERVAL_MIN", 1)),
-    "sync_interval_sec": float(getattr(config, "HMM_OHLCV_SYNC_INTERVAL_SEC", 60.0)),
-    "samples": sample_count,
-    "coverage_pct": coverage_pct,
-    "freshness_sec": freshness_sec,
-    "freshness_limit_sec": freshness_limit_sec,  # max(180s, interval*3)
-    "freshness_ok": freshness_ok,
-    "backfill_last_at": self._hmm_backfill_last_at,
-    "backfill_last_rows": self._hmm_backfill_last_rows,
-    "backfill_last_message": self._hmm_backfill_last_message,
-}
-```
+1. Transition starts when tertiary regime changes.
+2. Confirmation count accrues by tertiary candle age.
+3. `confirmed` flips once count >= `ACCUM_CONFIRMATION_CANDLES` (default `2`) and regime actually changed.
 
+Rust parity object:
 
-## 3. What Changes vs. What Stays
+- `TertiaryTransition` PyO3 class with dict round-trip support.
 
-### Untouched (hard guarantees)
-- `state_machine.py` — zero modifications
-- Reducer contract (§6) — pure function, no HMM awareness
-- Event transition rules (§7) — unchanged
-- Invariants (§10) — unchanged
-- `entry_pct` — sacred, never touched (§14.3 constraint respected)
-- No market orders — all influence through limit-order sizing
+## 6. Backend Surface
 
-### Modified (bot.py runtime only)
-- `_compute_dynamic_idle_target()` — blended formula
-- `_update_hmm()` / `_train_hmm()` — startup + periodic HMM lifecycle
-- `_sync_ohlcv_candles()` — incremental OHLCV persistence
-- `_maybe_backfill_ohlcv_on_startup()` + `backfill_ohlcv_history()` — one-time warmup
-- `/backfill_ohlcv [target_candles] [max_pages]` — operator-triggered backfill
-- `_hmm_data_readiness()` — readiness + freshness diagnostics
-- `save_state()` / `load_state()` — HMM + backfill snapshot keys
-- `status_payload()` / dashboard — `hmm_regime` + `hmm_data_pipeline` telemetry
+### 6.1 Python module (`hmm_regime_detector.py`)
 
-### New files
-- `hmm_regime_detector.py` — self-contained module
+Provides:
 
+- `Regime`, `RegimeState`, `RegimeDetector`
+- `compute_blended_idle_target(...)`
+- `compute_grid_bias(...)`
+- `serialize_for_snapshot(...)`, `restore_from_snapshot(...)`
 
-## 4. Tuning Strategy
+### 6.2 Rust module (`doge_hmm`)
 
-Start conservative, increase influence gradually.
+PyO3 exports:
 
-### Phase 1: Shadow Mode (observe only)
-```python
-HMM_BLEND_WITH_TREND = 1.0    # pure §15, HMM has zero influence
-```
-Run for 1-2 weeks. Log regime classifications alongside actual outcomes.
-Verify that the HMM's state labels make intuitive sense by comparing
-to price action in the dashboard.
+- `Regime`, `RegimeState`, `RegimeDetector`, `TertiaryTransition`
+- `compute_blended_idle_target(...)`
+- `compute_grid_bias(...)`
+- `serialize_for_snapshot(...)`, `restore_from_snapshot(...)`
+- `confidence_modifier_for_source(...)`
 
-### Phase 2: Gentle Blend
-```python
-HMM_BLEND_WITH_TREND = 0.7    # 30% HMM, 70% existing trend
-```
-The HMM can now nudge the idle target but can't overpower the trend
-signal. Monitor for:
-- Does inventory balance improve?
-- Does realized P&L per cycle change?
-- Are orphan rates affected?
+Rust `RegimeDetector` additionally exposes:
 
-### Phase 3: Equal Weight
-```python
-HMM_BLEND_WITH_TREND = 0.5
-```
-Now also enable grid_bias spacing adjustments. Monitor aggressively.
+- `training_depth`
+- `quality_tier()`
+- `confidence_modifier()`
+- `tertiary_transition` getter/setter
 
-### Phase 4: HMM-Primary (if validated)
-```python
-HMM_BLEND_WITH_TREND = 0.3    # 70% HMM, 30% trend
-```
-Only move here if Phase 3 data shows clear improvement.
+## 7. Snapshot Contract
 
-### Key Metrics to Track
-- Win rate per regime (did BULLISH regime correlate with profitable B-side cycles?)
-- Orphan rate per regime (does RANGING reduce orphans?)
-- Inventory skew stability (does blending smooth out the rebalancer?)
-- False regime transitions (how often does HMM flip states?)
+HMM snapshot payloads include base keys:
 
+- `_hmm_regime_state`
+- `_hmm_last_train_ts`
+- `_hmm_trained`
 
-## 5. Failure Modes and Safeguards
+Extended parity keys (Rust surface):
 
-| Failure | Impact | Safeguard |
-|---------|--------|-----------|
-| hmmlearn not installed | No HMM, pure §15 | Graceful import fallback |
-| Training data insufficient | Stays in RANGING | `HMM_MIN_TRAIN_SAMPLES` check |
-| Inference exception | Returns last valid state | try/catch in `update()` |
-| All states near-equal probability | Neutral bias | Confidence threshold |
-| Overfitted model | Misleading signals | Daily retrain + shadow mode |
-| Price gap > 2x slow halflife | Stale EMAs in features | Same §15.4 cold-start logic applies |
-| Model disagrees with trend_score | Blend factor moderates | Never 100% either signal |
+- `_hmm_training_depth`
+- `_hmm_quality_tier`
+- `_hmm_confidence_modifier`
+- `_hmm_tertiary_transition`
 
-The critical safety property: **if the HMM breaks or returns garbage,
-the bot degrades to its current behavior** (RANGING state, zero bias,
-trend_score-only idle target). This is guaranteed by:
-1. Default RegimeState is RANGING with 0.0 bias
-2. blend_factor=1.0 is pure §15
-3. All grid_bias spacing multipliers default to 1.0
+`bot.py` additionally persists runtime-managed HMM fields:
 
+- `hmm_state_secondary`, `hmm_state_tertiary`, `hmm_consensus`
+- `hmm_backfill_*` for primary/secondary/tertiary
+- `hmm_tertiary_transition`
 
-## 6. Data Pipeline
+Backward-compat policy: absent keys default to safe neutral values.
 
-```
-Kraken OHLC endpoint (interval = HMM_OHLCV_INTERVAL_MIN, default 1m)
-        │
-        ▼
-Supabase ohlcv_candles table
-        │
-        ├── _fetch_training_candles(HMM_TRAINING_CANDLES) → train() on startup + periodic retrain
-        │
-        └── _fetch_recent_candles(HMM_RECENT_CANDLES) → update() every REBALANCE_INTERVAL_SEC
-```
+## 8. Data Pipeline
 
-Startup sequence includes:
-1. `_sync_ohlcv_candles()` to ingest recent closed bars
-2. `_maybe_backfill_ohlcv_on_startup()` (best-effort history warmup)
-3. initial HMM train/update
+Primary/secondary/tertiary OHLCV streams are synchronized independently and can backfill on startup.
 
-Readiness uses a freshness gate:
-- `freshness_limit_sec = max(180, interval_sec * 3)`
-- At 1m cadence, stale after ~3 minutes.
+Relevant config groups:
 
+1. Base HMM: `HMM_*`
+2. Secondary: `HMM_SECONDARY_*`
+3. Tertiary: `HMM_TERTIARY_*`
+4. Consensus: `CONSENSUS_*`
 
-## 7. Config Summary
+Readiness/freshness telemetry is exposed in status endpoints and dashboard payloads.
 
-New env vars / config keys:
+## 9. Operational Modes
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `HMM_ENABLED` | False | Master enable (start disabled) |
-| `HMM_OHLCV_ENABLED` | True | Master switch for OHLCV persistence |
-| `HMM_OHLCV_INTERVAL_MIN` | 1 | Candle interval in minutes |
-| `HMM_OHLCV_SYNC_INTERVAL_SEC` | 60.0 | OHLCV pull cadence |
-| `HMM_OHLCV_RETENTION_DAYS` | 14 | Supabase retention period |
-| `HMM_OHLCV_BACKFILL_ON_STARTUP` | True | Attempt warmup backfill at startup |
-| `HMM_OHLCV_BACKFILL_MAX_PAGES` | 40 | Max Kraken pages per backfill run |
-| `HMM_TRAINING_CANDLES` | 2000 | Target training window size |
-| `HMM_RECENT_CANDLES` | 100 | Inference fetch window |
-| `HMM_READINESS_CACHE_SEC` | 300.0 | Readiness cache TTL |
-| `HMM_N_STATES` | 3 | Number of hidden states |
-| `HMM_N_ITER` | 100 | Baum-Welch iterations |
-| `HMM_COVARIANCE_TYPE` | "diag" | Gaussian covariance structure |
-| `HMM_INFERENCE_WINDOW` | 50 | Observations used per inference |
-| `HMM_CONFIDENCE_THRESHOLD` | 0.15 | Min confidence for non-zero bias |
-| `HMM_RETRAIN_INTERVAL_SEC` | 86400.0 | Retrain period (1 day) |
-| `HMM_MIN_TRAIN_SAMPLES` | 500 | Minimum candles for training |
-| `HMM_BIAS_GAIN` | 1.0 | Scales bias magnitude |
-| `HMM_BLEND_WITH_TREND` | 0.5 | Blend ratio (0=HMM, 1=trend) |
+Recommended rollout:
 
+1. Start with `HMM_ENABLED=false` (trend-only path)
+2. Enable primary HMM and verify readiness + training depth progression
+3. Enable secondary multi-timeframe consensus
+4. Enable tertiary and watch transition confirmation behavior
+5. Tune confidence gates and consensus weights only after stability
 
-## 8. Bauhaus Overlay Visualization
+## 10. Validation Targets
 
-The regime state is a natural fit for the organism metaphor:
+Regression coverage should include:
 
-- **Regime → organism mood**: color palette shifts
-  - BULLISH: warm tones, upward organic flow
-  - BEARISH: cool tones, downward contraction
-  - RANGING: neutral, breathing rhythm
-- **Confidence → visual certainty**: high confidence = sharp, defined forms;
-  low confidence = diffuse, uncertain edges
-- **State transition probabilities → fluid morphing**: the probability
-  distribution drives smooth blending between visual states, not hard cuts
-- **bias_signal → directional energy**: the organism leans or flows in
-  the direction of the bias, with intensity proportional to magnitude
+1. HMM train/update snapshot round-trip
+2. tertiary transition confirmation logic
+3. training-depth tier thresholds/modifiers
+4. confidence modifier source routing
+5. status payload integrity for primary/secondary/tertiary fields
 
-This gives you an immediate intuitive read on what the model thinks
-without looking at numbers.
